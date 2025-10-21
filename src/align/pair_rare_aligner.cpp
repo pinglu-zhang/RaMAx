@@ -727,14 +727,28 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
 					[&, strand, q, r, cluster_vec_ptr]() {
 						AnchorPtrVec anchors;
 						anchors.reserve(1);
-						for (auto & c : (*cluster_vec_ptr)) {
-							Anchor anchor = extendClusterToAnchor(c, *ref_seqpro_manager, query_seqpro_manager);
-							AnchorPtr p = std::make_shared<Anchor>(std::move(anchor));
-							anchors.push_back(p);
-						}
-						if (is_first) {
+						// TODO 二轮之后的处理方式有点粗糙
+						if (!is_first)
+						{
+							for (auto & c : (*cluster_vec_ptr)) {
+								for (auto & sub_c : c)
+								{	MatchVec mc;
+									mc.push_back(sub_c);
+									Anchor anchor = extendClusterToAnchor(mc, *ref_seqpro_manager, query_seqpro_manager);
+									AnchorPtr p = std::make_shared<Anchor>(std::move(anchor));
+									anchors.push_back(p);
+								}
+							}
+
+						}else {
+							for (auto & c : (*cluster_vec_ptr)) {
+								Anchor anchor = extendClusterToAnchor(c, *ref_seqpro_manager, query_seqpro_manager);
+								AnchorPtr p = std::make_shared<Anchor>(std::move(anchor));
+								anchors.push_back(p);
+							}
 							linkClusters(anchors, *ref_seqpro_manager, query_seqpro_manager);
 						}
+
 						
 						if (anchors.empty()) return;
 						(*result)[strand][q][r] = anchors;
