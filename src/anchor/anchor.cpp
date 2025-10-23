@@ -1434,7 +1434,7 @@ void linkClusters(AnchorPtrVec& anchors,
     const int K = 2000; // 最多向前看 50 个 anchor
 
     auto curr = anchors.begin();
-   
+
     while (true) {
         if (curr == anchors.end()) {
             break;
@@ -1450,7 +1450,7 @@ void linkClusters(AnchorPtrVec& anchors,
         //    std::cout << "";
         //}
 
-        
+
         auto best = anchors.end();
 
         int_t break_len = 200;
@@ -1458,7 +1458,7 @@ void linkClusters(AnchorPtrVec& anchors,
 		int_t best_score = std::numeric_limits<int_t>::max();
 
         int looked = 0;
-        
+
         for (auto it = curr + 1; it != anchors.end() && looked < K; ++it) {
             if ((*it)->is_linked) continue;
             ++looked;
@@ -1564,7 +1564,7 @@ void linkClusters(AnchorPtrVec& anchors,
             qry_len = countQryLength(gap_cigar);
         }
         // ========== 调用 WFA 进行 gap 比对 ==========
-        
+
         //if (checkGapCigarQuality(gap_cigar, ref_gap_len, qry_gap_len, 0.6)){
         if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
 			reach = true;
@@ -1722,11 +1722,11 @@ void linkClusters(AnchorPtrVec& anchors,
        //                 else {
 							//std::cout << (int_t)((*best_it)->qry_start) - (int_t)((*curr)->qry_start + (*curr)->qry_len) << std::endl;
        //                 }
-       //                 
+       //
        //             }
                 }
             }
- 
+
             linked.push_back(*curr);
 
 
@@ -1749,12 +1749,12 @@ void linkClusters(AnchorPtrVec& anchors,
                         ((*curr)->strand == REVERSE && it_qry_end >= curr_qry_end))) {
                     (*it2)->is_linked = true;
                 }
-           
+
 
             }
             // 将新的cur设置为和老cur不冲突的anchor
             // TODO考虑反向链
-            
+
             curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
             curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
             int_t cur_qry_start = (*curr)->qry_start;
@@ -1786,7 +1786,7 @@ void linkClusters(AnchorPtrVec& anchors,
 
         //++curr;
     }
-  
+
     anchors.swap(linked);
     return;
 

@@ -230,7 +230,7 @@ Cigar_t extendAlignKSW2(const std::string& ref,
     KSW2AlignConfig cfg;
 	cfg.mat = dna5_simd_mat;
     cfg.zdrop = zdrop;
-    cfg.flag = KSW_EZ_EXTZ_ONLY | KSW_EZ_RIGHT;
+    cfg.flag = KSW_EZ_EXTZ_ONLY | KSW_EZ_RIGHT | KSW_EZ_APPROX_DROP;
     cfg.end_bonus = 50;
     cfg.band_width = -1;
     cfg.alphabet_size = 5;
