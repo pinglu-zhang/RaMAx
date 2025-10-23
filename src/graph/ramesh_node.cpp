@@ -394,6 +394,7 @@ namespace RaMesh {
             }
         }
     }
+
     void RaMesh::GenomeEnd::alignInterval(const SpeciesName ref_name,
         const SpeciesName query_name,
         const ChrName query_chr_name,
@@ -456,7 +457,7 @@ namespace RaMesh {
             bool find = false;
             while (true) {
                 if (ref_left_node->isHead()) break;
-                if (ref_left_node->left_extend && ref_left_node->right_extend) break;
+                //if (ref_left_node->left_extend && ref_left_node->right_extend) continue;
 
                 for (const auto& [key, seg] : ref_left_node->parent_block->anchors) {
                     if (key.first == query_name)
@@ -578,7 +579,7 @@ namespace RaMesh {
             SegPtr ref_right_node = ref_cur_node->primary_path.next.load(std::memory_order_acquire);
             while (true) {
 				if (ref_right_node->isTail()) break;
-                if (ref_right_node->left_extend && ref_right_node->right_extend) break;
+                //if (ref_right_node->left_extend && ref_right_node->right_extend) continue;
 
                 for (const auto& [key, seg] : ref_right_node->parent_block->anchors) {
                     if (key.first == query_name) {
@@ -590,7 +591,7 @@ namespace RaMesh {
                     break;
                 }
                 ref_right_node = ref_right_node->primary_path.next.load(std::memory_order_acquire);
-            }          
+            }
 
             int_t ref_start = ref_cur_node->start + ref_cur_node->length;
             int_t ref_len = (!ref_right_node->isTail()) ? (int_t)ref_right_node->start - (int_t)ref_start : (int_t)getChrLen(*managers[ref_name], cur_block->ref_chr) - (int_t)ref_start;
@@ -616,7 +617,7 @@ namespace RaMesh {
 
                 // Cigar_t result = globalAlignWFA2(ref_seq, query_seq);
                 Cigar_t result = extendAlignKSW2(ref_seq, query_seq, 200);
-                
+
                 //Cigar_t result = globalAlignKSW2_2(ref_seq, query_seq);
 				//if (checkGapCigarQuality(result, ref_len, query_len, 0.6)){
                 if (true) {
@@ -626,7 +627,7 @@ namespace RaMesh {
                         cur_node->start -= cnt.query_bases;
                     }
                     else {
-                        
+
                     }
 
                     cur_node->length += cnt.query_bases;
@@ -650,7 +651,7 @@ namespace RaMesh {
                 //    }
                 //}
 
-                
+
             }
             //else {
             //     === 有重叠：回退对齐直到两侧长度都恢复到非负 ===

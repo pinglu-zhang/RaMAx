@@ -515,7 +515,7 @@ starAlignment(
     // uint_t count = 0;
     // 创建当前迭代的多基因组图
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
-    //for (uint_t i = 0; i < 1; i++) { 
+    //for (uint_t i = 0; i < 1; i++) {
     for (uint_t i = 0; i < leaf_num; i++) {
         //auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
         // 使用工具函数构建缓存
