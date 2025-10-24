@@ -457,7 +457,7 @@ namespace RaMesh {
             bool find = false;
             while (true) {
                 if (ref_left_node->isHead()) break;
-                //if (ref_left_node->left_extend && ref_left_node->right_extend) continue;
+                if (ref_left_node->left_extend && ref_left_node->right_extend) break;
 
                 for (const auto& [key, seg] : ref_left_node->parent_block->anchors) {
                     if (key.first == query_name)
@@ -474,8 +474,8 @@ namespace RaMesh {
             int_t ref_len = (int_t)ref_cur_node->start - (int_t)ref_start;
 
             // 与右扩一致：先标记，再进行比对（避免重复进入）
-            cur_node->left_extend = true;
-            ref_cur_node->left_extend = true;
+            // cur_node->left_extend = true;
+            // ref_cur_node->left_extend = true;
 
             // === 实际比对逻辑 ===
             if (find && query_len > 0 && ref_len > 0) {
@@ -579,7 +579,7 @@ namespace RaMesh {
             SegPtr ref_right_node = ref_cur_node->primary_path.next.load(std::memory_order_acquire);
             while (true) {
 				if (ref_right_node->isTail()) break;
-                //if (ref_right_node->left_extend && ref_right_node->right_extend) continue;
+                if (ref_right_node->left_extend && ref_right_node->right_extend) break;
 
                 for (const auto& [key, seg] : ref_right_node->parent_block->anchors) {
                     if (key.first == query_name) {
@@ -596,8 +596,8 @@ namespace RaMesh {
             int_t ref_start = ref_cur_node->start + ref_cur_node->length;
             int_t ref_len = (!ref_right_node->isTail()) ? (int_t)ref_right_node->start - (int_t)ref_start : (int_t)getChrLen(*managers[ref_name], cur_block->ref_chr) - (int_t)ref_start;
 
-            cur_node->right_extend = true;
-            ref_cur_node->right_extend = true;
+            // cur_node->right_extend = true;
+            // ref_cur_node->right_extend = true;
 
             // === 实际比对逻辑 ===
             if (find && query_len > 0 && ref_len > 0) {

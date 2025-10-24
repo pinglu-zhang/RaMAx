@@ -559,8 +559,11 @@ starAlignment(
         constructMultipleGraphsByDp(
             seqpro_managers, ref_name, *cluster_map, *multi_graph, min_span, i==0);
 
+        if (true)
+        {
+            multi_graph->extendRefNodes(ref_name, seqpro_managers, thread_num);
+        }
 
-        multi_graph->extendRefNodes(ref_name, seqpro_managers, thread_num);
 
 
         multi_graph->optimizeGraphStructure();
