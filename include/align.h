@@ -238,13 +238,10 @@ static void init_simd_mat() {
 
 //------------------------------------------- 带宽估计
 inline int auto_band(int qlen, int tlen,
-    double indel_rate = 0.05,
-    int    margin = 64)           // 多一点保险
+    double indel_rate = 0.1,
+    int    margin = 200)           // 多一点保险
 {
-    int diff = std::abs(qlen - tlen);
-    int extra = static_cast<int>(indel_rate * std::min(qlen, tlen));
-    int w = diff + extra;
-    return ((w + 15) / 16 * 16) + margin;                         // 向上取 16 的倍数
+    return margin + static_cast<int>(indel_rate * (qlen + tlen / 2));
 }
 
 /// \brief 生成 KSW2 的对齐配置

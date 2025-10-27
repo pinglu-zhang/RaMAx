@@ -770,7 +770,7 @@ int main(int argc, char** argv) {
         case MultipleGenomeOutputFormat::MAF:
             spdlog::info("Exporting to MAF format...");
             // TODO双基因组比对模式后续要改为false，目前只是调试
-            graph->exportToMaf(common_args.output_path, seqpro_managers, true, true);
+            graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
             /// 导出没有反向链的maf仅供调试使用
             // graph->exportToMafWithoutReverse(common_args.output_path, seqpro_managers, true, false);
             /// 导出多个参考maf

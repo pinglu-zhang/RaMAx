@@ -273,8 +273,8 @@ void RaMeshMultiGenomeGraph::insertAnchorIntoGraph(
 void RaMeshMultiGenomeGraph::extendRefNodes(
     const SpeciesName &ref_name,
     std::map<SpeciesName, SeqPro::SharedManagerVariant> managers,
-    uint_t thread_num) {
-  ThreadPool pool(thread_num);
+    int_t zdrop) {
+  //ThreadPool pool(thread_num);
   for (auto &[sp, g] : species_graphs) {
     if (sp == ref_name) {
       continue;
@@ -291,7 +291,7 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
         //
         // });
         end.alignInterval(ref_name, sp, chr_name, cur_node, managers, false,
-                          true);
+                          zdrop);
         cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
       }
     }
@@ -308,12 +308,12 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
             //
             // });
             end.alignInterval(ref_name, sp, chr_name, cur_node, managers, true,
-                false);
+                zdrop);
             cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
         }
     }
   }
-  pool.waitAllTasksDone();
+  //pool.waitAllTasksDone();
 
   //for (auto& [sp, g] : species_graphs) {
   //    if (sp == ref_name) {

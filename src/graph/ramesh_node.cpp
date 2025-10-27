@@ -400,8 +400,7 @@ namespace RaMesh {
         const ChrName query_chr_name,
         SegPtr cur_node,
         std::map<SpeciesName, SeqPro::SharedManagerVariant> managers,
-        bool left_extend,
-        bool right_extend) {
+        bool is_left_extend, int_t zdrop) {
         if (cur_node == head || cur_node == tail || cur_node == NULL) return;
 		//if (cur_node->right_extend) return; // 已经扩展过了
         if (cur_node->right_extend && cur_node->left_extend) return; // 已经扩展过了
@@ -427,7 +426,7 @@ namespace RaMesh {
             };
 
         // ---------------- 左扩展 ----------------
-        if (left_extend && cur_node->left_extend == false) {
+        if (is_left_extend && cur_node->left_extend == false) {
 
             int_t  query_len = 0;
             Strand strand = cur_node->strand;
@@ -503,7 +502,7 @@ namespace RaMesh {
                 }
 
                 // 与右扩统一：使用 KSW2 延伸
-                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, 200);
+                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, zdrop);
 
                 // 将 CIGAR 恢复到原坐标方向，再拼到左侧
                 std::reverse(result.begin(), result.end());
@@ -544,7 +543,7 @@ namespace RaMesh {
 
 
         // ---------------- 右扩展 ----------------
-        if (right_extend && cur_node->right_extend == false) {
+        if (!is_left_extend && cur_node->right_extend == false) {
             int_t query_len = 0;
             Strand strand = cur_node->strand;
             int_t query_start = 0;
@@ -616,7 +615,7 @@ namespace RaMesh {
                 }
 
                 // Cigar_t result = globalAlignWFA2(ref_seq, query_seq);
-                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, 200);
+                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, zdrop);
 
                 //Cigar_t result = globalAlignKSW2_2(ref_seq, query_seq);
 				//if (checkGapCigarQuality(result, ref_len, query_len, 0.6)){

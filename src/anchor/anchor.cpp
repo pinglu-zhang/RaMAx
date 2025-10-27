@@ -989,9 +989,7 @@ Anchor extendClusterToAnchor(MatchCluster& cluster,
                 }, mv);
         };
     const Match& first = cluster.front();
-    if (first.qry_start == 212285) {
-        std::cout << "";
-    }
+
     Strand strand = first.strand();
     bool   fwd = (strand == FORWARD);
 

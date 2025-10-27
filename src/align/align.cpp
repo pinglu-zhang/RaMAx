@@ -236,6 +236,7 @@ Cigar_t extendAlignKSW2(const std::string& ref,
     cfg.alphabet_size = 5;
     cfg.gap_open = 5;
     cfg.gap_extend = 2;
+    cfg.band_width = auto_band(ref.size(), query.size());
 
 
     /* ---------- 3. 调用 KSW2 ---------- */

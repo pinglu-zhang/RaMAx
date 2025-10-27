@@ -700,73 +700,130 @@ ClusterVecPtrByStrandByQueryRefPtr PairRareAligner::filterPairSpeciesAnchors(Spe
 
 }
 
-AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterVecPtrByStrandByQueryRefPtr cluster, ThreadPool& pool, bool is_first) {
-	// 输出结构
-	auto result = std::make_shared<AnchorPtrVecByStrandByQueryByRef>();
 
-	//ThreadPool pool(thread_num);
-	std::vector<std::future<void>> futures;
+AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
+    SpeciesName query_name,
+    SeqPro::ManagerVariant& query_seqpro_manager,
+    ClusterVecPtrByStrandByQueryRefPtr cluster,
+    ThreadPool& pool,
+    bool is_first
+) {
+    // 输出结构
+   auto result = std::make_shared<AnchorPtrVecByStrandByQueryByRef>();
 
+	// 1. 先根据 cluster 的形状，把 result 完整 resize
+	result->resize(2); // 两个strand: 0和1
 	for (size_t strand = 0; strand < 2; ++strand) {
-		const auto& byQueryRef = (*cluster)[strand];
-		result->emplace_back(); // 对应 strand
+	    const auto& byQueryRef = (*cluster)[strand];
+	    (*result)[strand].resize(byQueryRef.size());
 
-		for (size_t q = 0; q < byQueryRef.size(); ++q) {
-			const auto& byRef = byQueryRef[q];
-			(*result)[strand].emplace_back(); // 对应 query_chr
+	    for (size_t q = 0; q < byQueryRef.size(); ++q) {
+	        const auto& byRef = byQueryRef[q];
+	        (*result)[strand][q].resize(byRef.size());
 
-			for (size_t r = 0; r < byRef.size(); ++r) {
-				MatchClusterVecPtr cluster_vec_ptr = byRef[r];
-				(*result)[strand][q].emplace_back(); // 对应 ref_chr
-
-				if (!cluster_vec_ptr) continue;
-				//if (strand == 1) continue;
-
-				// 提交任务：处理一个 ClusterVec
-				futures.emplace_back(pool.enqueue(
-					[&, strand, q, r, cluster_vec_ptr]() {
-						AnchorPtrVec anchors;
-						anchors.reserve(1);
-						// TODO 二轮之后的处理方式有点粗糙
-						if (!is_first)
-						{
-							for (auto & c : (*cluster_vec_ptr)) {
-								for (auto & sub_c : c)
-								{	MatchVec mc;
-									mc.push_back(sub_c);
-									Anchor anchor = extendClusterToAnchor(mc, *ref_seqpro_manager, query_seqpro_manager);
-									AnchorPtr p = std::make_shared<Anchor>(std::move(anchor));
-									anchors.push_back(p);
-								}
-							}
-
-						}else {
-							for (auto & c : (*cluster_vec_ptr)) {
-								Anchor anchor = extendClusterToAnchor(c, *ref_seqpro_manager, query_seqpro_manager);
-								AnchorPtr p = std::make_shared<Anchor>(std::move(anchor));
-								anchors.push_back(p);
-							}
-							linkClusters(anchors, *ref_seqpro_manager, query_seqpro_manager);
-						}
-
-						
-						if (anchors.empty()) return;
-						(*result)[strand][q][r] = anchors;
-
-					}
-				));
-			}
-		}
+	        // 现在 (*result)[strand][q][r] 已经是合法索引了
+	        // 里面可能是默认构造的空 AnchorPtrVec
+	    }
 	}
 
-	// 等待所有任务完成
-	for (auto& f : futures) f.get();
+	// 2. 现在才提交任务（不会再 emplace_back）
+	std::vector<std::future<void>> futures;
+	std::atomic<std::size_t> done{0};
+	for (size_t strand = 0; strand < 2; ++strand) {
+	    const auto& byQueryRef = (*cluster)[strand];
+
+	    for (size_t q = 0; q < byQueryRef.size(); ++q) {
+	        const auto& byRef = byQueryRef[q];
+
+	        for (size_t r = 0; r < byRef.size(); ++r) {
+	            MatchClusterVecPtr cluster_vec_ptr = byRef[r];
+	            if (!cluster_vec_ptr) continue;
+
+	            futures.emplace_back(pool.enqueue(
+	                [&, strand, q, r, cluster_vec_ptr, is_first]() {
+	                    AnchorPtrVec anchors;
+	                    anchors.reserve(1);
+
+	                    if (!is_first) {
+	                        for (auto & c : (*cluster_vec_ptr)) {
+	                            for (auto & sub_c : c) {
+	                                MatchVec mc;
+	                                mc.push_back(sub_c);
+	                                Anchor anchor = extendClusterToAnchor(mc, *ref_seqpro_manager, query_seqpro_manager);
+	                                anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
+	                            }
+	                        }
+	                    } else {
+	                        for (auto & c : (*cluster_vec_ptr)) {
+	                            Anchor anchor = extendClusterToAnchor(c, *ref_seqpro_manager, query_seqpro_manager);
+	                            anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
+	                        }
+	                        linkClusters(anchors, *ref_seqpro_manager, query_seqpro_manager);
+	                    }
+
+	                    if (!anchors.empty()) {
+	                        // 这里没有再扩容 vector，只是往既有槽位写入
+	                        (*result)[strand][q][r] = std::move(anchors);
+	                    }
+
+	                    ++done;
+	                }
+	            ));
+	        }
+	    }
+	}
 
 
+    // ====== 进度监听部分（主线程轮询，而不是等到最后一口气） ======
+	int p = 10;
+    const std::size_t total = futures.size();
+    int next_milestone = p;
+
+    // 循环检查完成度，直到所有任务 done == total
+    while (done.load() < total) {
+        if (total > 0) {
+            int pct = static_cast<int>((done.load() * 100) / total);
+
+            while (pct >= next_milestone && next_milestone <= 100) {
+                spdlog::info(
+                    "extend cluster progress for {}: {}% ({}/{})",
+                    query_name,
+                    next_milestone,
+                    done.load(),
+                    total
+                );
+                next_milestone += p;
+            }
+        }
+
+        // 稍微睡一下，避免忙等占满一个CPU核
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    // 最后确保100%被打印（有可能 while 循环结束时 next_milestone 还在100）
+    if (total > 0) {
+        int pct = static_cast<int>((done.load() * 100) / total);
+        while (pct >= next_milestone && next_milestone <= 100) {
+            spdlog::info(
+                "extend cluster progress for {}: {}% ({}/{})",
+                query_name,
+                next_milestone,
+                done.load(),
+                total
+            );
+            next_milestone += p;
+        }
+    }
+
+    // ====== 收尾，把所有 future 的异常取出来 ======
+    for (auto& f : futures) {
+        f.get();
+    }
 
     spdlog::info("extend cluster to anchor successfully for {}", query_name);
-	return result;
+    return result;
 }
+
 
 static void filterChrByDP(
 	AnchorPtrVecByStrandByQueryByRefPtr anchor_map,
