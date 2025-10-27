@@ -406,6 +406,7 @@ bool RaMeshMultiGenomeGraph::verifyGraphCorrectness(
   options.disable(VerificationType::MEMORY_INTEGRITY);
   options.disable(VerificationType::THREAD_SAFETY);
   options.disable(VerificationType::PERFORMANCE_ISSUES);
+  options.enable(VerificationType::BLOCK_REFERENCE_CHR);
 
   VerificationResult result = verifyGraphCorrectness(options);
   return result.is_valid;
@@ -429,6 +430,7 @@ bool RaMeshMultiGenomeGraph::verifyGraphCorrectness(
   options.enableReferenceOverlapPolicy(
       reference_species, allow_reference_overlap, require_reference_overlap,
       forbid_non_reference_overlap);
+  options.enable(VerificationType::BLOCK_REFERENCE_CHR);
 
   VerificationResult result = verifyGraphCorrectness(options);
   return result.is_valid;
@@ -560,7 +562,8 @@ void RaMeshMultiGenomeGraph::logVerificationSummary(
         {VerificationType::BLOCK_CONSISTENCY, "BLOCK_CONSISTENCY"},
         {VerificationType::MEMORY_INTEGRITY, "MEMORY_INTEGRITY"},
         {VerificationType::THREAD_SAFETY, "THREAD_SAFETY"},
-        {VerificationType::PERFORMANCE_ISSUES, "PERFORMANCE_ISSUES"}};
+        {VerificationType::PERFORMANCE_ISSUES, "PERFORMANCE_ISSUES"},
+        {VerificationType::BLOCK_REFERENCE_CHR, "BLOCK_REFERENCE_CHR"}};
 
     for (const auto &[type, count] : result.error_counts) {
       auto type_name_it = type_names.find(type);
@@ -633,6 +636,12 @@ RaMeshMultiGenomeGraph::verifyGraphCorrectness(
 
   if (options.isEnabled(VerificationType::BLOCK_CONSISTENCY)) {
     verifyBlockConsistency(result, options);
+    if (shouldStopVerification(result, options))
+      goto verification_complete;
+  }
+
+  if (options.isEnabled(VerificationType::BLOCK_REFERENCE_CHR)) {
+    verifyBlockReferenceChromosome(result, options);
     if (shouldStopVerification(result, options))
       goto verification_complete;
   }
@@ -1118,6 +1127,156 @@ void RaMeshMultiGenomeGraph::verifyBlockConsistency(
   }
 }
 
+void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
+    VerificationResult &result, const VerificationOptions &options) const {
+  if (options.verbose) {
+    spdlog::debug("Verifying block reference chromosome coverage...");
+  }
+
+  size_t checked_blocks = 0;
+  size_t missing_ref_definition = 0;
+  size_t missing_ref_anchor = 0;
+
+  for (const auto &weak_block : blocks) {
+    if (auto block_ptr = weak_block.lock()) {
+      checked_blocks++;
+      std::shared_lock block_lock(block_ptr->rw);
+
+      if (block_ptr->anchors.empty()) {
+        continue;
+      }
+
+      const auto makeAnchorSummary = [](const ChrHeadMap &anchors) {
+        std::string detail = "[";
+        size_t anchor_idx = 0;
+        const size_t total_anchors = anchors.size();
+        constexpr size_t kMaxAnchorSamples = 3;
+        constexpr size_t kMaxSegmentSamples = 2;
+
+        for (const auto &entry : anchors) {
+          const auto &species_chr = entry.first;
+          const SegPtr &head_ptr = entry.second;
+
+          if (anchor_idx > 0) {
+            detail += "; ";
+          }
+
+          detail += species_chr.first + ":" + species_chr.second;
+          detail += " {";
+
+          if (!head_ptr) {
+            detail += "null_head";
+          } else {
+            bool printed_segment = false;
+            bool truncated = false;
+            size_t segment_samples = 0;
+
+            SegPtr seg =
+                head_ptr->primary_path.next.load(std::memory_order_acquire);
+            while (seg && !seg->isTail()) {
+              if (seg->isSegment()) {
+                {
+                  std::shared_lock seg_lock(seg->rw);
+                  if (printed_segment) {
+                    detail += " | ";
+                  }
+                  detail += "start=" + std::to_string(seg->start) +
+                            ",len=" + std::to_string(seg->length);
+                }
+
+                printed_segment = true;
+                ++segment_samples;
+                if (segment_samples >= kMaxSegmentSamples) {
+                  SegPtr probe =
+                      seg->primary_path.next.load(std::memory_order_acquire);
+                  while (probe && !probe->isTail()) {
+                    if (probe->isSegment()) {
+                      truncated = true;
+                      break;
+                    }
+                    probe =
+                        probe->primary_path.next.load(std::memory_order_acquire);
+                  }
+                  break;
+                }
+              }
+              seg = seg->primary_path.next.load(std::memory_order_acquire);
+            }
+
+            if (!printed_segment) {
+              detail += "no_segment";
+            } else if (truncated) {
+              detail += " | ...";
+            }
+          }
+
+          detail += "}";
+          ++anchor_idx;
+          if (anchor_idx >= kMaxAnchorSamples) {
+            break;
+          }
+        }
+
+        detail += "]";
+        if (total_anchors > anchor_idx) {
+          detail += " +" + std::to_string(total_anchors - anchor_idx) + " more";
+        }
+        return detail;
+      };
+
+      if (block_ptr->ref_chr.empty()) {
+        missing_ref_definition++;
+        std::string hint_species;
+        std::string hint_chr;
+        if (!block_ptr->anchors.empty()) {
+          const auto &first_anchor = *block_ptr->anchors.begin();
+          hint_species = first_anchor.first.first;
+          hint_chr = first_anchor.first.second;
+        }
+
+        addVerificationError(
+            result, options, VerificationType::BLOCK_REFERENCE_CHR,
+            ErrorSeverity::ERROR, hint_species, hint_chr, 0, 0,
+            "Block missing reference chromosome assignment",
+            "anchors=" + makeAnchorSummary(block_ptr->anchors));
+        continue;
+      }
+
+      bool has_ref_anchor = false;
+      SpeciesName first_species;
+      for (const auto &entry : block_ptr->anchors) {
+        const auto &species_chr = entry.first;
+        if (first_species.empty()) {
+          first_species = species_chr.first;
+        }
+        if (species_chr.second == block_ptr->ref_chr) {
+          has_ref_anchor = true;
+          break;
+        }
+      }
+
+      if (!has_ref_anchor) {
+        missing_ref_anchor++;
+        addVerificationError(result, options,
+                             VerificationType::BLOCK_REFERENCE_CHR,
+                             ErrorSeverity::ERROR, first_species,
+                             block_ptr->ref_chr, 0, 0,
+                             "Block missing anchor entry for reference "
+                             "chromosome",
+                             "ref_chr=" + block_ptr->ref_chr +
+                                 ", anchors=" +
+                                 makeAnchorSummary(block_ptr->anchors));
+      }
+    }
+  }
+
+  if (options.verbose) {
+    spdlog::debug("Blocks without ref_chr: {} (checked {})",
+                  missing_ref_definition, checked_blocks);
+    spdlog::debug("Blocks without ref_chr anchor: {}", missing_ref_anchor);
+  }
+}
+
 void RaMeshMultiGenomeGraph::verifyMemoryIntegrity(
     VerificationResult &result, const VerificationOptions &options) const {
   if (options.verbose) {
@@ -1598,7 +1757,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
     std::string align_role_str;
     size_t cigar_size;
     std::string parent_block_ref_chr;
-    size_t parent_block_anchors_count;
+    std::vector<std::string> parent_block_chromosomes;
 
     SegmentDebugInfo(const SegPtr &seg) {
       if (!seg)
@@ -1615,10 +1774,18 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
       if (seg->parent_block) {
         parent_block_ref_chr = seg->parent_block->ref_chr;
-        parent_block_anchors_count = seg->parent_block->anchors.size();
+        std::shared_lock block_lock(seg->parent_block->rw);
+        parent_block_chromosomes.reserve(seg->parent_block->anchors.size());
+        for (const auto &anchor_entry : seg->parent_block->anchors) {
+          const auto &species = anchor_entry.first.first;
+          const auto &chr = anchor_entry.first.second;
+          parent_block_chromosomes.emplace_back(species + "." + chr);
+        }
+        std::sort(parent_block_chromosomes.begin(),
+                  parent_block_chromosomes.end());
       } else {
         parent_block_ref_chr = "null";
-        parent_block_anchors_count = 0;
+        parent_block_chromosomes.clear();
       }
     }
   };

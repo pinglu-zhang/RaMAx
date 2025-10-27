@@ -268,14 +268,15 @@ namespace RaMesh {
 
         // ――― Enhanced verification system ―――
         enum class VerificationType : uint32_t {
-            POINTER_VALIDITY = 1 << 0,      // 指针有效性
-            LINKED_LIST_INTEGRITY = 1 << 1, // 链表完整性
-            COORDINATE_OVERLAP = 1 << 2,     // 坐标重叠检测
-            COORDINATE_ORDERING = 1 << 3,    // 坐标排序检测
-            BLOCK_CONSISTENCY = 1 << 4,      // Block一致性
-            MEMORY_INTEGRITY = 1 << 5,       // 内存完整性
-            THREAD_SAFETY = 1 << 6,          // 线程安全
-            PERFORMANCE_ISSUES = 1 << 7      // 性能问题
+            POINTER_VALIDITY = 1 << 0,        // 指针有效性
+            LINKED_LIST_INTEGRITY = 1 << 1,   // 链表完整性
+            COORDINATE_OVERLAP = 1 << 2,      // 坐标重叠检测
+            COORDINATE_ORDERING = 1 << 3,     // 坐标排序检测
+            BLOCK_CONSISTENCY = 1 << 4,       // Block一致性
+            MEMORY_INTEGRITY = 1 << 5,        // 内存完整性
+            THREAD_SAFETY = 1 << 6,           // 线程安全
+            PERFORMANCE_ISSUES = 1 << 7,      // 性能问题
+            BLOCK_REFERENCE_CHR = 1 << 8      // Block 缺失参考染色体或未注册参考锚点
         };
 
         enum class ErrorSeverity {
@@ -500,6 +501,7 @@ namespace RaMesh {
         void verifyCoordinateOverlap(VerificationResult& result, const VerificationOptions& options) const;
         void verifyCoordinateOrdering(VerificationResult& result, const VerificationOptions& options) const;
         void verifyBlockConsistency(VerificationResult& result, const VerificationOptions& options) const;
+        void verifyBlockReferenceChromosome(VerificationResult& result, const VerificationOptions& options) const;
         void verifyMemoryIntegrity(VerificationResult& result, const VerificationOptions& options) const;
         void verifyThreadSafety(VerificationResult& result, const VerificationOptions& options) const;
         void verifyPerformanceIssues(VerificationResult& result, const VerificationOptions& options) const;

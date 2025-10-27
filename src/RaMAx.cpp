@@ -46,6 +46,10 @@ struct CommonArgs {
     bool compress_output = false;              // 压缩输出文件
     bool show_progress = false;                // 显示进度条
 
+    // 遮蔽区间导入导出
+    std::filesystem::path mask_import_dir = "";
+    std::filesystem::path mask_export_dir = "";
+
     // 质量控制参数
     float min_identity = 0.0;                  // 最小序列相似度
     uint_t max_gaps = 0;                       // 最大gap数量
@@ -85,6 +89,8 @@ struct CommonArgs {
             CEREAL_NVP(keep_temp),
             CEREAL_NVP(compress_output),
             CEREAL_NVP(show_progress),
+            CEREAL_NVP(mask_import_dir),
+            CEREAL_NVP(mask_export_dir),
             CEREAL_NVP(min_identity),
             CEREAL_NVP(max_gaps),
             CEREAL_NVP(filter_short),
@@ -113,6 +119,12 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Output format    : {}",
         args.output_format == MultipleGenomeOutputFormat::HAL ? "HAL" :
         args.output_format == MultipleGenomeOutputFormat::MAF ? "MAF" : "Unknown");
+    if (!args.mask_import_dir.empty()) {
+        spdlog::info("  Mask import dir  : {}", args.mask_import_dir.string());
+    }
+    if (!args.mask_export_dir.empty()) {
+        spdlog::info("  Mask export dir  : {}", args.mask_export_dir.string());
+    }
 
     spdlog::info("");
 
@@ -203,6 +215,16 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     auto* workspace_opt = cmd->add_option("-w,--workdir", args.work_dir_path,
         "Path to the working directory for temporary files.")
+        ->group("Output")->type_name("<path>")
+        ->transform(trim_whitespace);
+
+    auto* mask_import_opt = cmd->add_option("--import-mask-dir", args.mask_import_dir,
+        "Directory containing mask interval files for each species.")
+        ->group("Input Files")->type_name("<path>")
+        ->transform(trim_whitespace);
+
+    auto* mask_export_opt = cmd->add_option("--export-mask-dir", args.mask_export_dir,
+        "Directory to export mask interval files after the first round.")
         ->group("Output")->type_name("<path>")
         ->transform(trim_whitespace);
 
@@ -608,6 +630,30 @@ int main(int argc, char** argv) {
         // 清洗 FASTA 文件（统一格式，替换非法字符）
         cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
 
+        auto import_mask_if_needed = [&](SeqPro::MaskedSequenceManager& manager,
+                                         const SpeciesName& species_name) {
+            if (common_args.mask_import_dir.empty()) {
+                return;
+            }
+
+            std::filesystem::path mask_file = common_args.mask_import_dir / (species_name + ".intervals");
+            if (!std::filesystem::exists(mask_file)) {
+                spdlog::debug("[mask-import] Mask file not found for {} at {}", species_name, mask_file.string());
+                return;
+            }
+
+            try {
+                if (manager.loadMaskIntervalsFromFile(mask_file, true)) {
+                    manager.finalizeMaskIntervals();
+                    spdlog::info("[mask-import] Loaded mask intervals for {} from {}", species_name, mask_file.string());
+                } else {
+                    spdlog::warn("[mask-import] Failed to load mask intervals for {} from {}", species_name, mask_file.string());
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("[mask-import] Exception while loading mask for {}: {}", species_name, e.what());
+            }
+        };
+
         // 如果要重复遮蔽
         if (common_args.enable_repeat_masking) {
             spdlog::info("Repeat masking enabled. Generating interval files based on raw files...");
@@ -632,6 +678,7 @@ int main(int argc, char** argv) {
                             std::move(original_manager),
                             interval_files_map[species_name]
                         );
+                        import_mask_if_needed(*manager, species_name);
                         spdlog::info("[{}] SeqPro Manager created with repeat masking: {}",
                             species_name, cleaned_fasta_path.string());
 
@@ -680,6 +727,7 @@ int main(int argc, char** argv) {
                     auto manager = std::make_unique<SeqPro::MaskedSequenceManager>(
                         std::move(original_manager)
                     );
+                    import_mask_if_needed(*manager, species_name);
                     spdlog::info("[{}] SeqPro Manager created: {}", species_name,
                         cleaned_fasta_path.string());
                     // 记录序列统计信息
@@ -712,6 +760,12 @@ int main(int argc, char** argv) {
             common_args.min_anchor_length,
             common_args.max_anchor_frequency
         );
+
+        if (!common_args.mask_export_dir.empty()) {
+            mra.mask_export_dir = common_args.mask_export_dir;
+            mra.enable_mask_export = true;
+            mra.mask_export_done = false;
+        }
 
         spdlog::info("");
         spdlog::info("============================================================");

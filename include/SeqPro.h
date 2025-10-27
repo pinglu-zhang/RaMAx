@@ -166,7 +166,7 @@ class MaskManager {
 public:
   MaskManager() = default;
 
-  bool loadFromIntervalFile(const std::filesystem::path &interval_file);
+  bool loadFromIntervalFile(const std::filesystem::path &interval_file, bool append = false);
   void addMaskInterval(const std::string &seq_name, const MaskInterval &interval);
   void addMaskInterval(SequenceId seq_id, const MaskInterval &interval);
 
