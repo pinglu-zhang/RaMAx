@@ -186,6 +186,7 @@ function(configure_rama_target target)
     endif()
 
     target_compile_options(${target} PRIVATE -Wall -g)
+
 endfunction()
 
 # add_compile_definitions(KSW_CPU_DISPATCH)
@@ -193,21 +194,21 @@ add_compile_options(-w)
 
 # ================= 创建两个可执行文件 =================
 # add_executable(RaMA-G ${MAIN_G} ${RAMA_COMMON_SOURCES})
-# configure_rama_target(RaMA-G)
+# clonfigure_rama_target(RaMA-G)
 
-add_executable(RaMAx ${MAIN_X} ${RAMA_COMMON_SOURCES})
-configure_rama_target(RaMAx)
+add_executable(ramax ${MAIN_X} ${RAMA_COMMON_SOURCES})
+configure_rama_target(ramax)
 
 # 如需确保先有 HAL 工具，再编你的程序：
 #add_dependencies(RaMA-G hal_tools)
-add_dependencies(RaMAx  hal_tools)
+add_dependencies(ramax  hal_tools)
 
 # ================= 安装规则（可选） =================
 # install(TARGETS RaMAG RaMAx DESTINATION bin)
 
 # ================= 安装规则 =================
 # 安装主程序
-install(TARGETS RaMAx DESTINATION bin)
+install(TARGETS ramax DESTINATION bin)
 
 # 安装 windowmasker 工具
 install(FILES "${BIN_DIR}/windowmasker" 
