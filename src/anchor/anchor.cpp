@@ -180,16 +180,18 @@ void groupMatchByQueryRef(
 
         // sIdx & qIdx 只需要从 slice 第一个元素即可得出
         const Match& first = slice.front().front();
-        const uint_t sIdx = (first.strand() == REVERSE ? 1u : 0u);
+        // const uint_t sIdx = (first.strand() == REVERSE ? 1u : 0u);
 
-        ChrIndex qIdx = first.qry_chr_index;
-        if (qIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
+        //ChrIndex qIdx = first.qry_chr_index;
+        //if (qIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
 
         // --- 遍历 slice 内的每个 MatchVec（同一 query & strand, 不同 ref）
         for (auto& vec : slice) {
             if (vec.empty()) continue;
 
             ChrIndex rIdx = vec.front().ref_chr_index;
+            ChrIndex qIdx = vec.front().qry_chr_index;
+            const uint_t sIdx = (vec.front().strand() == REVERSE ? 1u : 0u);
             if (rIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
 
             // MatchVec& dest = (vec.size() == 1)

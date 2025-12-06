@@ -1302,7 +1302,7 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
 
 	// 2. 现在才提交任务（不会再 emplace_back）
 	std::vector<std::future<void>> futures;
-	std::atomic<std::size_t> done{0};
+	//std::atomic<std::size_t> done{0};
 	for (size_t strand = 0; strand < 2; ++strand) {
 	    const auto& byQueryRef = (*cluster)[strand];
 
@@ -1338,10 +1338,10 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
 
 	                    if (!anchors.empty()) {
 	                        // 这里没有再扩容 vector，只是往既有槽位写入
-	                        (*result)[strand][q][r] = std::move(anchors);
+	                        (*result)[strand][q][r] = anchors;
 	                    }
 
-	                    ++done;
+	                    //++done;
 	                }
 	            ));
 	        }
@@ -1349,51 +1349,68 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
 	}
 
 
-    // ====== 进度监听部分（主线程轮询，而不是等到最后一口气） ======
-	int p = 10;
-    const std::size_t total = futures.size();
-    int next_milestone = p;
-
-    // 循环检查完成度，直到所有任务 done == total
-    while (done.load() < total) {
-        if (total > 0) {
-            int pct = static_cast<int>((done.load() * 100) / total);
-
-            while (pct >= next_milestone && next_milestone <= 100) {
-                spdlog::info(
-                    "extend cluster progress for {}: {}% ({}/{})",
-                    query_name,
-                    next_milestone,
-                    done.load(),
-                    total
-                );
-                next_milestone += p;
-            }
-        }
-
-        // 稍微睡一下，避免忙等占满一个CPU核
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // 最后确保100%被打印（有可能 while 循环结束时 next_milestone 还在100）
-    if (total > 0) {
-        int pct = static_cast<int>((done.load() * 100) / total);
-        while (pct >= next_milestone && next_milestone <= 100) {
-            spdlog::info(
-                "extend cluster progress for {}: {}% ({}/{})",
-                query_name,
-                next_milestone,
-                done.load(),
-                total
-            );
-            next_milestone += p;
-        }
-    }
+ //    // ====== 进度监听部分（主线程轮询，而不是等到最后一口气） ======
+	// int p = 10;
+ //    const std::size_t total = futures.size();
+ //    int next_milestone = p;
+ //
+ //    // 循环检查完成度，直到所有任务 done == total
+ //    while (done.load() < total) {
+ //        if (total > 0) {
+ //            int pct = static_cast<int>((done.load() * 100) / total);
+ //
+ //            while (pct >= next_milestone && next_milestone <= 100) {
+ //                spdlog::info(
+ //                    "extend cluster progress for {}: {}% ({}/{})",
+ //                    query_name,
+ //                    next_milestone,
+ //                    done.load(),
+ //                    total
+ //                );
+ //                next_milestone += p;
+ //            }
+ //        }
+ //
+ //        // 稍微睡一下，避免忙等占满一个CPU核
+ //        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+ //    }
+ //
+ //    // 最后确保100%被打印（有可能 while 循环结束时 next_milestone 还在100）
+ //    if (total > 0) {
+ //        int pct = static_cast<int>((done.load() * 100) / total);
+ //        while (pct >= next_milestone && next_milestone <= 100) {
+ //            spdlog::info(
+ //                "extend cluster progress for {}: {}% ({}/{})",
+ //                query_name,
+ //                next_milestone,
+ //                done.load(),
+ //                total
+ //            );
+ //            next_milestone += p;
+ //        }
+ //    }
 
     // ====== 收尾，把所有 future 的异常取出来 ======
-    for (auto& f : futures) {
-        f.get();
-    }
+	const std::size_t total = futures.size();
+	std::size_t completed = 0;
+	int next_milestone = 10;
+
+	for (auto& f : futures) {
+		f.get();   // 阻塞直到该任务完成
+		completed++;
+
+		int pct = static_cast<int>((completed * 100) / total);
+		if (pct >= next_milestone && next_milestone <= 100) {
+			spdlog::info(
+				"extend cluster progress for {}: {}% ({}/{})",
+				query_name,
+				next_milestone,
+				completed,
+				total
+			);
+			next_milestone += 10;
+		}
+	}
 
     spdlog::info("extend cluster to anchor successfully for {}", query_name);
     return result;
