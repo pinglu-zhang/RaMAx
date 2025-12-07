@@ -576,11 +576,9 @@ void compareMatchedSequences(
 std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> MultipleRareAligner::
 starAlignment(
     std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers,
-    uint_t tree_root,
-    SearchMode                 search_mode,
+    std::string ref_name,
+    bool only_one_round,
     bool                       fast_build,
-    bool                       allow_MEM,
-    bool                       mask_mode,
     SeqPro::Length sampling_interval,
     uint_t min_span)
 {
@@ -670,6 +668,14 @@ starAlignment(
     for (const auto &p : species_sizes) {
         species_order.push_back(p.first);
     }
+    // 把ref_name放到最前面
+    auto it = std::find(species_order.begin(), species_order.end(), ref_name);
+    if (it != species_order.end()) {
+        SpeciesName ref = *it;
+        species_order.erase(it);
+        species_order.insert(species_order.begin(), std::move(ref));
+
+    }
     uint_t leaf_num = species_order.size();
 
     // 打印 speicies order 信息
@@ -690,7 +696,7 @@ starAlignment(
     // 创建当前迭代的多基因组图
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
     //for (uint_t i = 0; i < 1; i++) {
-    for (uint_t i = 0; i < leaf_num; i++) {
+    for (uint_t i = 0; i < only_one_round ? 1 : leaf_num; i++) {
         //auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
         // 使用工具函数构建缓存
         SpeciesName ref_name = species_order[i];

@@ -40,6 +40,8 @@ struct CommonArgs {
 
     // HAL root name
     std::string root_name = "root";
+    std::string ref_name = "";
+    bool one_round = false;
 
     // 支持 cereal 序列化
     template<class Archive>
@@ -62,7 +64,9 @@ struct CommonArgs {
             CEREAL_NVP(log_level),
             CEREAL_NVP(verbose),
             CEREAL_NVP(quiet),
-            CEREAL_NVP(root_name)
+            CEREAL_NVP(root_name),
+            CEREAL_NVP(ref_name),
+            CEREAL_NVP(one_round)
         );
     }
 };
@@ -100,6 +104,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Cluster Min span      : {}", args.min_span);
     spdlog::info("  Repeat masking        : {}", args.enable_repeat_masking ? "Enabled" : "Disabled");
     spdlog::info("  Tree root             ：{}", args.root_name);
+    spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
+    spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("");
 
 
@@ -161,6 +167,12 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<string>")
         ->transform(trim_whitespace);
 
+    auto* ref_opt = cmd->add_option("--ref", args.ref_name,
+    "Ref genome name used in alignment")
+    ->group("Software Parameters")
+    ->type_name("<string>")
+    ->transform(trim_whitespace);
+
     auto* overlap_size_opt = cmd->add_option("--overlap_size", args.overlap_size,
         "Size of overlap between chunks (default: 100000).")
         ->default_val(0)
@@ -207,6 +219,10 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* allow_mem_flag = cmd->add_flag("--allow-mem", args.allow_MEM,
         "Allow MEM (Maximal Exact Match) instead of only MUM.")
         ->group("Software Parameters");
+
+    auto* one_round_flag = cmd->add_flag("--one-round", args.one_round,
+    "Only run one round for alignment.")
+    ->group("Software Parameters");
 
     auto* slow_build_flag = cmd->add_flag("--slow-build",
         "Use slow but more accurate index building method.")
@@ -284,7 +300,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         chunk_size_opt, overlap_size_opt,
         min_anchor_length_opt, max_anchor_frequency_opt,
         search_mode_opt, allow_mem_flag, slow_build_flag,
-        sampling_interval_opt, min_span_opt, root_opt);
+        sampling_interval_opt, min_span_opt, root_opt, ref_opt, one_round_flag);
 
     // 互斥选项
     verbose_flag->excludes(quiet_flag);
@@ -603,7 +619,7 @@ int main(int argc, char** argv) {
         auto sampling_interval = std::min(static_cast<SeqPro::Length>(common_args.sampling_interval), reference_min_seq_length);
         uint_t tree_root = 0;
 
-        std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> graph = mra.starAlignment(seqpro_managers, tree_root, common_args.search_mode, common_args.fast_build, common_args.allow_MEM, common_args.enable_repeat_masking, sampling_interval, common_args.min_span);
+        std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> graph = mra.starAlignment(seqpro_managers, common_args.ref_name, common_args.one_round, common_args.fast_build,  sampling_interval, common_args.min_span);
 
         auto t_end_align = std::chrono::steady_clock::now();
         std::chrono::duration<double> align_time = t_end_align - t_start_align;

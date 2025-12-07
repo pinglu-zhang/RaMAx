@@ -41,14 +41,12 @@ public:
     );
 
     std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> starAlignment(
-        std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers,
-        uint_t tree_root,
-        SearchMode                 search_mode,
-        bool                       fast_build,
-        bool                       allow_MEM,
-        bool                       mask_mode=false,
-        SeqPro::Length sampling_interval=32,
-        uint_t min_span=65);
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers,
+    std::string ref_name,
+    bool only_one_round,
+    bool                       fast_build,
+    SeqPro::Length sampling_interval=32,
+    uint_t min_span=65);
 
     SpeciesMatchVec3DPtrMapPtr alignMultipleGenome(SpeciesName ref_name, std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& species_fasta_manager_map, SearchMode search_mode, bool fast_build, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval);
 
