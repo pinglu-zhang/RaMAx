@@ -584,43 +584,43 @@ starAlignment(
     SeqPro::Length sampling_interval,
     uint_t min_span)
 {
-    auto import_mask_if_needed = [&](SeqPro::MaskedSequenceManager& manager,
-                                                 const SpeciesName& species_name) {
-
-        std::filesystem::path mask_file = work_dir / "mask_interval" / std::to_string(0) / (species_name + ".intervals");
-        if (!std::filesystem::exists(mask_file)) {
-            spdlog::debug("[mask-import] Mask file not found for {} at {}", species_name, mask_file.string());
-            return;
-        }
-
-        try {
-            if (manager.loadMaskIntervalsFromFile(mask_file, true)) {
-                manager.finalizeMaskIntervals();
-                spdlog::info("[mask-import] Loaded mask intervals for {} from {}", species_name, mask_file.string());
-            } else {
-                spdlog::warn("[mask-import] Failed to load mask intervals for {} from {}", species_name, mask_file.string());
-            }
-        } catch (const std::exception& e) {
-            spdlog::error("[mask-import] Exception while loading mask for {}: {}", species_name, e.what());
-        }
-    };
-    for (auto [sp, mgr_variant] : seqpro_managers) {
-        if (!mgr_variant) continue;
-
-        auto* masked_mgr = std::visit(
-            [](auto& ptr) -> SeqPro::MaskedSequenceManager* {
-                using T = std::decay_t<decltype(ptr)>;
-                if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-                    return ptr.get();
-                }
-                return nullptr;
-            },
-            *mgr_variant);
-
-        if (masked_mgr) {
-            import_mask_if_needed(*masked_mgr, sp);
-        }
-    }
+    // auto import_mask_if_needed = [&](SeqPro::MaskedSequenceManager& manager,
+    //                                              const SpeciesName& species_name) {
+    //
+    //     std::filesystem::path mask_file = work_dir / "mask_interval" / std::to_string(0) / (species_name + ".intervals");
+    //     if (!std::filesystem::exists(mask_file)) {
+    //         spdlog::debug("[mask-import] Mask file not found for {} at {}", species_name, mask_file.string());
+    //         return;
+    //     }
+    //
+    //     try {
+    //         if (manager.loadMaskIntervalsFromFile(mask_file, true)) {
+    //             manager.finalizeMaskIntervals();
+    //             spdlog::info("[mask-import] Loaded mask intervals for {} from {}", species_name, mask_file.string());
+    //         } else {
+    //             spdlog::warn("[mask-import] Failed to load mask intervals for {} from {}", species_name, mask_file.string());
+    //         }
+    //     } catch (const std::exception& e) {
+    //         spdlog::error("[mask-import] Exception while loading mask for {}: {}", species_name, e.what());
+    //     }
+    // };
+    // for (auto [sp, mgr_variant] : seqpro_managers) {
+    //     if (!mgr_variant) continue;
+    //
+    //     auto* masked_mgr = std::visit(
+    //         [](auto& ptr) -> SeqPro::MaskedSequenceManager* {
+    //             using T = std::decay_t<decltype(ptr)>;
+    //             if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+    //                 return ptr.get();
+    //             }
+    //             return nullptr;
+    //         },
+    //         *mgr_variant);
+    //
+    //     if (masked_mgr) {
+    //         import_mask_if_needed(*masked_mgr, sp);
+    //     }
+    // }
 
     std::vector<std::pair<SpeciesName, SeqPro::Length>> species_sizes;
     species_sizes.reserve(seqpro_managers.size());
@@ -690,7 +690,7 @@ starAlignment(
     // 创建当前迭代的多基因组图
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
     //for (uint_t i = 0; i < 1; i++) {
-    for (uint_t i = 1; i < leaf_num; i++) {
+    for (uint_t i = 0; i < leaf_num; i++) {
         //auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
         // 使用工具函数构建缓存
         SpeciesName ref_name = species_order[i];
@@ -781,7 +781,6 @@ starAlignment(
 
     // 在所有迭代完成后，进行最终的图正确性验证
     spdlog::default_logger()->flush();
-
 
     return std::move(multi_graph);
     //return std::move(std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers));
