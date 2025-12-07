@@ -586,9 +586,44 @@ starAlignment(
     SeqPro::Length sampling_interval,
     uint_t min_span)
 {
+    auto import_mask_if_needed = [&](SeqPro::MaskedSequenceManager& manager,
+                                             const SpeciesName& species_name) {
 
-    // FilePath mask_import_dir = work_dir / "mask_interval" / std::to_string(1);
-    // import_mask_if_needed(mask_import_dir, seqpro_managers);
+        std::filesystem::path mask_file = work_dir / "mask_interval" / std::to_string(1) / (species_name + ".intervals");
+        if (!std::filesystem::exists(mask_file)) {
+            spdlog::debug("[mask-import] Mask file not found for {} at {}", species_name, mask_file.string());
+            return;
+        }
+
+        try {
+            if (manager.loadMaskIntervalsFromFile(mask_file, true)) {
+                manager.finalizeMaskIntervals();
+                spdlog::info("[mask-import] Loaded mask intervals for {} from {}", species_name, mask_file.string());
+            } else {
+                spdlog::warn("[mask-import] Failed to load mask intervals for {} from {}", species_name, mask_file.string());
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("[mask-import] Exception while loading mask for {}: {}", species_name, e.what());
+        }
+    };
+    // for (auto [sp, mgr_variant] : seqpro_managers) {
+    //     if (!mgr_variant) continue;
+    //
+    //     auto* masked_mgr = std::visit(
+    //         [](auto& ptr) -> SeqPro::MaskedSequenceManager* {
+    //             using T = std::decay_t<decltype(ptr)>;
+    //             if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+    //                 return ptr.get();
+    //             }
+    //             return nullptr;
+    //         },
+    //         *mgr_variant);
+    //
+    //     if (masked_mgr) {
+    //         import_mask_if_needed(*masked_mgr, sp);
+    //     }
+    // }
+
     std::vector<std::pair<SpeciesName, SeqPro::Length>> species_sizes;
     species_sizes.reserve(seqpro_managers.size());
 
@@ -740,9 +775,9 @@ starAlignment(
         }
 
 
-        // spdlog::info("[mask-export] Exporting mask intervals captured during first round...");
-        // FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
-        // exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
+        spdlog::info("[mask-export] Exporting mask intervals captured during first round...");
+        FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
+        exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
 
 
     }
@@ -853,72 +888,6 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
             next_progress = progress_stage + 1;
         }
     }
-
-    /* ---------- 7. 保存到文件 ---------- */
-    // saveSpeciesMatchMap(anchor_file, result_map);
-    //spdlog::info("[alignMultipleQuerys] all species done. Saved to {}", anchor_file.string());
-
-    //{
-    //    SpeciesName target_species = "simOrang";
-    //    //int qry_chr_index = 1;
-    //    //int_t region_start = 54620705;
-    //    //int_t region_end = 54636058;
-  
-    //    int qry_chr_index = 1;
-    //    int_t region_start = 54320705;
-    //    int_t region_end = 54336058;
-
-    //    std::vector<Match> matched_vec; // 先收集
-
-    //    auto it = result_map->find(target_species);
-    //    if (it != result_map->end()) {
-    //        auto match3d_ptr = it->second;
-    //        if (match3d_ptr) {
-    //            for (const auto& by_ref : *match3d_ptr) {
-    //                for (const auto& by_qry : by_ref) {
-    //                    for (const auto& m : by_qry) {
-    //                        if (m.qry_chr_index == qry_chr_index) {
-    //                            Coord_t m_start = m.ref_start;
-    //                            Coord_t m_end = m.ref_start + m.match_len();
-    //                            if (m_end > region_start && m_start < region_end) {
-    //                                matched_vec.push_back(m);
-    //                            }
-    //                        }
-    //                    }
-    //                }
-    //            }
-    //        }
-    //    }
-    //    else {
-    //        spdlog::warn("Species {} not found in result_map", target_species);
-    //    }
-
-    //    if (!matched_vec.empty()) {
-    //        std::sort(matched_vec.begin(), matched_vec.end(),
-    //            [](const Match& a, const Match& b) {
-    //                return a.ref_start < b.ref_start;
-    //            });
-
-    //        for (const auto& m : matched_vec) {
-    //            spdlog::info(
-    //                "[{}] chr={} 区间 [{}, {}) match: "
-    //                "ref_chr={} ref_start={} len={} strand={}",
-    //                target_species,
-    //                m.qry_chr_index,
-    //                m.qry_start,
-    //                m.qry_start + m.match_len(),
-    //                m.ref_chr_index,
-    //                m.ref_start,
-    //                m.match_len(),
-    //                (m.strand() == Strand::FORWARD ? "FORWARD" : "REVERSE")
-    //            );
-    //        }
-    //    }
-    //    else {
-    //        spdlog::info("[{}] chr={} 区间 [{}, {}) 没有任何 match",
-    //            target_species, qry_chr_index, region_start, region_end);
-    //    }
-    //}
 
     return result_map;
 }
