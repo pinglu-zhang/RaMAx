@@ -144,8 +144,7 @@ void groupMatchByQueryRef(
     MatchByStrandByQueryRefPtr unique_anchors,
     MatchByStrandByQueryRefPtr repeat_anchors,
     SeqPro::ManagerVariant& ref_fasta_manager,
-    SeqPro::ManagerVariant& query_fasta_manager,
-    ThreadPool & pool)
+    SeqPro::ManagerVariant& query_fasta_manager)
 {
     constexpr uint_t STRAND_CNT = 2; // 0 = FWD, 1 = REV
 
@@ -231,19 +230,6 @@ void groupMatchByQueryRef(
 }
 
 
-
-// 重载版本：支持 SharedManagerVariant，通过解引用调用原始版本
-void groupMatchByQueryRef(MatchVec3DPtr& anchors,
-    MatchByStrandByQueryRefPtr unique_anchors,
-    MatchByStrandByQueryRefPtr repeat_anchors,
-    SeqPro::SharedManagerVariant& ref_fasta_manager,
-    SeqPro::SharedManagerVariant& query_fasta_manager,
-    ThreadPool& pool)
-{
-    // 解引用 SharedManagerVariant 并调用原始函数
-    groupMatchByQueryRef(anchors, unique_anchors, repeat_anchors,
-                        *ref_fasta_manager, *query_fasta_manager, pool);
-}
 
 //void sortMatchByRefStart(MatchByQueryRefPtr& anchors, ThreadPool& pool) {
 //

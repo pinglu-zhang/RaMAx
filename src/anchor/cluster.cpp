@@ -1,5 +1,6 @@
 #include "anchor.h"
 #include "data_process.h"
+#include <omp.h>
 
 // ────────────────────────────────────────────
 //  Constructors / reset
@@ -264,114 +265,107 @@ MatchClusterVec buildClusters(MatchVec& unique_match,
     return clusters;
 }
 
+
 ClusterVecPtrByStrandByQueryRefPtr
 clusterAllChrMatch(const MatchByStrandByQueryRefPtr& unique_anchors,
-    const MatchByStrandByQueryRefPtr& repeat_anchors,
-    ThreadPool& pool, uint_t min_cluster_length)
+                   const MatchByStrandByQueryRefPtr& repeat_anchors,
+                   uint_t min_cluster_length)
 {
     // ---------- 0. 判空 ----------
-    if (unique_anchors->empty() && repeat_anchors->empty()) {
+    if ((!unique_anchors || unique_anchors->empty()) &&
+        (!repeat_anchors || repeat_anchors->empty())) {
         spdlog::warn("[clusterAllChrAnchors] empty anchor ptr");
-        return std::make_shared<ClusterVecPtrByStrandByQueryRef>();   // 返回空指针容器
+        return std::make_shared<ClusterVecPtrByStrandByQueryRef>();
     }
 
+    // ---------- 1. 选择维度基准（避免 unique 为空时 front 越界） ----------
+    const auto& base = (unique_anchors && !unique_anchors->empty())
+                        ? unique_anchors
+                        : repeat_anchors;
 
-    // ---------- 1. 构建结果桶 ----------
+    // 防御式检查
+    if (!base || base->empty() || (*base)[0].empty() || (*base)[0][0].empty()) {
+        return std::make_shared<ClusterVecPtrByStrandByQueryRef>();
+    }
+
+    const size_t query_chr_n = (*base)[0].size();
+    const size_t ref_chr_n   = (*base)[0][0].size();
+
+    // ---------- 2. 构建结果桶 ----------
     auto cluster_ptr = std::make_shared<ClusterVecPtrByStrandByQueryRef>();
     cluster_ptr->resize(2);  // strand 维度
 
     for (auto& query_layer : *cluster_ptr) {
-        query_layer.resize(unique_anchors->front().size());           // query-chr
-        for (auto& ref_row : query_layer)
-            ref_row.resize(unique_anchors->front().front().size());   // ref-chr
+        query_layer.resize(query_chr_n);
+        for (auto& ref_row : query_layer) {
+            ref_row.resize(ref_chr_n);
+        }
     }
 
-    // ---------- 2. 收集非空任务，优化调度 ----------
+    // ---------- 3. 收集非空任务 ----------
     struct ClusterTask {
         uint_t k, i, j;
         MatchVec* uniq_ptr;
         MatchVec* rept_ptr;
         size_t total_size;
-        
+
         ClusterTask(uint_t _k, uint_t _i, uint_t _j, MatchVec* _uniq, MatchVec* _rept)
-            : k(_k), i(_i), j(_j), uniq_ptr(_uniq), rept_ptr(_rept) {
-            total_size = _uniq->size() + _rept->size();
-        }
+            : k(_k), i(_i), j(_j), uniq_ptr(_uniq), rept_ptr(_rept),
+              total_size((_uniq ? _uniq->size() : 0) + (_rept ? _rept->size() : 0)) {}
     };
-    
+
     std::vector<ClusterTask> tasks;
-    tasks.reserve(2 * unique_anchors->front().size() * unique_anchors->front().front().size());
-    
+    tasks.reserve(1000);
+
     for (uint_t k = 0; k < 2; ++k) {
-        for (uint_t i = 0; i < (*unique_anchors)[k].size(); ++i) {
-            for (uint_t j = 0; j < (*unique_anchors)[k][i].size(); ++j) {
+        // 假设 unique/repeat 的形状一致；若不一致可加更严格检查
+        for (uint_t i = 0; i < query_chr_n; ++i) {
+            for (uint_t j = 0; j < ref_chr_n; ++j) {
+
                 MatchVec& uniq = (*unique_anchors)[k][i][j];
                 MatchVec& rept = (*repeat_anchors)[k][i][j];
-                
-                // 只对非空向量创建任务
+
                 if (!uniq.empty() || !rept.empty()) {
                     tasks.emplace_back(k, i, j, &uniq, &rept);
                 }
             }
         }
     }
-    
-    if (tasks.empty()) return cluster_ptr;
-    
-    // 按任务大小排序，优先处理大任务
-    std::sort(tasks.begin(), tasks.end(), 
+
+    if (tasks.empty()) {
+        return cluster_ptr;
+    }
+
+    // ---------- 4. 按任务大小排序（可保留，也可去掉） ----------
+    std::sort(tasks.begin(), tasks.end(),
         [](const ClusterTask& a, const ClusterTask& b) {
             return a.total_size > b.total_size;
         });
-    
-    // ---------- 3. 批处理小任务，减少调度开销 ----------
-    constexpr size_t MIN_PARALLEL_SIZE = 100;  // 小于100个元素的任务批处理
-    constexpr size_t BATCH_SIZE = 20;          // 每批处理20个小任务
-    
-    using ClusterFuture = std::future<std::vector<std::pair<size_t, std::shared_ptr<MatchClusterVec>>>>;
-    std::vector<ClusterFuture> futures;
-    
-    size_t task_idx = 0;
-    while (task_idx < tasks.size()) {
-        if (tasks[task_idx].total_size >= MIN_PARALLEL_SIZE) {
-            // 大任务：单独处理
-            const auto& task = tasks[task_idx];
-            futures.emplace_back(pool.enqueue([task, task_idx, min_cluster_length]() -> std::vector<std::pair<size_t, std::shared_ptr<MatchClusterVec>>> {
-                auto result = clusterChrMatch(*task.uniq_ptr, *task.rept_ptr, min_cluster_length);
-                return {{task_idx, result}};
-            }));
-            ++task_idx;
-        } else {
-            // 小任务：批处理
-            size_t batch_end = std::min(task_idx + BATCH_SIZE, tasks.size());
-            std::vector<ClusterTask> batch(tasks.begin() + task_idx, tasks.begin() + batch_end);
-            
-            futures.emplace_back(pool.enqueue([batch, task_idx, min_cluster_length]() -> std::vector<std::pair<size_t, std::shared_ptr<MatchClusterVec>>> {
-                std::vector<std::pair<size_t, std::shared_ptr<MatchClusterVec>>> results;
-                results.reserve(batch.size());
-                
-                for (size_t i = 0; i < batch.size(); ++i) {
-                    const auto& task = batch[i];
-                    auto result = clusterChrMatch(*task.uniq_ptr, *task.rept_ptr, min_cluster_length);
-                    results.emplace_back(task_idx + i, result);
-                }
-                return results;
-            }));
-            task_idx = batch_end;
-        }
+
+    // ---------- 5. OpenMP 并行处理 tasks ----------
+    // 说明：
+    // - schedule(dynamic) 适合你这种任务大小不均
+    // - 是否显式 num_threads 取决于你的上层是否已经 omp_set_num_threads(thread_num)
+    //   如果你希望在这里强制线程数，可以取消注释 num_threads(...)
+    //
+    // #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+    #pragma omp parallel for schedule(dynamic)
+    for (long long t = 0; t < static_cast<long long>(tasks.size()); ++t) {
+        const auto& task = tasks[static_cast<size_t>(t)];
+
+        auto cluster_result = clusterChrMatch(
+            *task.uniq_ptr,
+            *task.rept_ptr,
+            min_cluster_length
+        );
+
+        // 每个 task 写不同的 [k][i][j]，不冲突
+        (*cluster_ptr)[task.k][task.i][task.j] = std::move(cluster_result);
     }
 
-    // ---------- 4. 收集结果 ----------
-    for (auto& future : futures) {
-        auto results = future.get();
-        for (const auto& [idx, cluster_result] : results) {
-            const auto& task = tasks[idx];
-            (*cluster_ptr)[task.k][task.i][task.j] = cluster_result;
-        }
-    }
-
-    return cluster_ptr;   // 返回 shared_ptr
+    return cluster_ptr;
 }
+
 
 /*!
  * \brief  把 src（三维：strand × query × ref）按 ref 合并

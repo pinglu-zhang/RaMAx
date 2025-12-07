@@ -179,16 +179,9 @@ void groupMatchByQueryRef(MatchVec3DPtr& anchors,
     MatchByStrandByQueryRefPtr unique_anchors,
     MatchByStrandByQueryRefPtr repeat_anchors,
     SeqPro::ManagerVariant& ref_fasta_manager,
-    SeqPro::ManagerVariant& query_fasta_manager,
-    ThreadPool& pool);
+    SeqPro::ManagerVariant& query_fasta_manager);
 
-// 重载版本：支持 SharedManagerVariant
-void groupMatchByQueryRef(MatchVec3DPtr& anchors,
-    MatchByStrandByQueryRefPtr unique_anchors,
-    MatchByStrandByQueryRefPtr repeat_anchors,
-    SeqPro::SharedManagerVariant& ref_fasta_manager,
-    SeqPro::SharedManagerVariant& query_fasta_manager,
-    ThreadPool& pool);
+
 
 MatchClusterVecPtr
 groupClustersToVec(const ClusterVecPtrByStrandByQueryRefPtr& src,
@@ -221,8 +214,7 @@ MatchClusterVec buildClusters(MatchVec& unique_match,
 
 ClusterVecPtrByStrandByQueryRefPtr
 clusterAllChrMatch(const MatchByStrandByQueryRefPtr& unique_anchors,
-    const MatchByStrandByQueryRefPtr& repeat_anchors,
-    ThreadPool& pool, uint_t min_span);
+    const MatchByStrandByQueryRefPtr& repeat_anchors, uint_t min_span);
 
 MatchClusterVec
 splitCluster(const MatchCluster& cl,

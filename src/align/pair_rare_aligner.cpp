@@ -1,6 +1,8 @@
 #include "rare_aligner.h"
 #include "anchor.h"
 #include "align.h"
+#include <omp.h>
+#include <atomic>
 
 PairRareAligner::PairRareAligner(const FilePath work_dir,
 	const uint_t thread_num,
@@ -35,10 +37,9 @@ MatchVec3DPtr PairRareAligner::alignPairGenome(
 	sdsl::int_vector<0>& ref_global_cache,
 	SeqPro::Length sampling_interval) {
 
-	ThreadPool shared_pool(thread_num);
 
 	MatchVec3DPtr anchors = findQueryFileAnchor(
-		query_name, query_fasta_manager, search_mode, allow_MEM, allow_short_mum, shared_pool, ref_global_cache, sampling_interval);
+		query_name, query_fasta_manager, search_mode, allow_MEM, allow_short_mum,  ref_global_cache, sampling_interval);
 
 	return anchors;
 
@@ -96,176 +97,127 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 	SearchMode         search_mode,
 	bool allow_MEM,
 	bool allow_short_mum,
-	ThreadPool& pool,
 	sdsl::int_vector<0>& ref_global_cache,
 	SeqPro::Length sampling_interval,
 	bool isMultiple)
 {
-	/* ---------- 1. 结果文件路径，与多基因组保持同一目录 ---------- */
 	FilePath result_dir = work_dir / RESULT_DIR
-		/ ("group_" + std::to_string(group_id))
-		/ ("round_" + std::to_string(round_id));
-	std::filesystem::create_directories(result_dir);
+        / ("group_" + std::to_string(group_id))
+        / ("round_" + std::to_string(round_id));
+    std::filesystem::create_directories(result_dir);
 
-	spdlog::info("[findQueryFileAnchor] begin to algin {}", prefix);
+    spdlog::info("[findQueryFileAnchor] begin to algin {}", prefix);
 
-	FilePath anchor_file = result_dir /
-		(prefix + "_" + SearchModeToString(search_mode) + "." + ANCHOR_EXTENSION);
+    FilePath anchor_file = result_dir /
+        (prefix + "_" + SearchModeToString(search_mode) + "." + ANCHOR_EXTENSION);
 
-	/* ---------- 若已存在结果文件，直接加载 ---------- */
-	//if (std::filesystem::exists(anchor_file)) {
-	//	MatchVec3DPtr result = std::make_shared<MatchVec3D>();
-	//	loadMatchVec3D(anchor_file, result);
-	//	return result;
-	//}
-	// TODO 对于二轮之后，低于20的chunk可以不用输入
-	/* ---------- 读取 FASTA 并分片 ---------- */
-	// 修改：使用新的预分割逻辑，支持多基因组模式
-	RegionVec chunks;
-	if (isMultiple) {
-		// 多基因组模式：使用遮蔽区间预分割
-		chunks = preAllocateChunksBySize(query_fasta_manager, chunk_size, overlap_size, 10000, true);
-	} else {
-		// 双基因组模式：使用普通分割
-		chunks = preAllocateChunks(query_fasta_manager, chunk_size, overlap_size, 1000, 10000);
-	}
-	// 智能分块策略：自动根据序列数量和长度选择最优的分块方式
-	/* ---------- ① 计时：搜索 Anchor ---------- */
-	auto t_search0 = std::chrono::steady_clock::now();
+    RegionVec chunks;
+    if (isMultiple) {
+        chunks = preAllocateChunksBySize(query_fasta_manager, chunk_size, overlap_size, 10000, true);
+    } else {
+        chunks = preAllocateChunks(query_fasta_manager, chunk_size, overlap_size, 1000, 10000);
+    }
 
-	// ThreadPool pool(thread_num);
-	std::vector<std::future<MatchVec2DPtr>> futures;
-	// 根据线程数量和chunk数量决定每个线程处理的chunk数量
-	// 确保每个线程至少处理一个chunk，同时避免线程过多
-	size_t num_chunks_per_thread = chunks.size() / thread_num;
-	if (chunks.size() % thread_num != 0) {
-		num_chunks_per_thread++; // 如果不能整除，则向上取整，确保所有chunk都被处理
-	}
-	if (num_chunks_per_thread == 0 && !chunks.empty()) { // 至少处理一个chunk
-	    num_chunks_per_thread = 1;
-	}
+    auto t_search0 = std::chrono::steady_clock::now();
 
-	futures.reserve(chunks.size() / num_chunks_per_thread + (chunks.size() % num_chunks_per_thread != 0 ? 1 : 0));
+    const size_t N = chunks.size();
 
-	for (size_t i = 0; i < chunks.size(); i += num_chunks_per_thread) {
-		std::vector<Region> chunk_group;
-		for (size_t j = i; j < std::min(i + num_chunks_per_thread, chunks.size()); ++j) {
-			chunk_group.push_back(chunks[j]);
-		}
+    // 暂存每个chunk的结果，避免并发 push 到 result
+    std::vector<MatchVec2D> forward_parts(N);
+    std::vector<MatchVec2D> reverse_parts(N);
 
-		futures.emplace_back(
-			pool.enqueue(
-				[this, chunk_group, &query_fasta_manager, search_mode, allow_MEM, allow_short_mum, &ref_global_cache, sampling_interval, isMultiple]() -> MatchVec2DPtr {
-					MatchVec2DPtr group_matches = std::make_shared<MatchVec2D>();
-					for (const auto& ck : chunk_group) {
-						std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
-							using PtrType = std::decay_t<decltype(manager_ptr)>;
-							if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-								return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-								// 不再使用分隔符，因为chunks已经预分割了
-								return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else {
-								throw std::runtime_error("Unhandled manager type in variant.");
-							}
-						}, query_fasta_manager);
-						if (seq.length() <ck.length) continue;
-						MatchVec2DPtr forwoard_matches = ref_index->findAnchors(
-							ck.chr_index, seq, search_mode,
-							Strand::FORWARD,
-							allow_MEM,
-							ck.start,
-							min_anchor_length,
-							allow_short_mum,
-							max_anchor_frequency,
-							ref_global_cache,
-							sampling_interval);
+    // 如果你希望代码内强制线程数：
+    // omp_set_num_threads(thread_num);
 
-						// 合并当前chunk的matches到group_matches
-						for (const auto& match_list : *forwoard_matches) {
-							group_matches->push_back(match_list);
-						}	
-					}
-					return group_matches;
-				}));
-		futures.emplace_back(
-			pool.enqueue(
-				[this, chunk_group, &query_fasta_manager, search_mode, allow_MEM,allow_short_mum, &ref_global_cache, sampling_interval, isMultiple]() -> MatchVec2DPtr {
-					MatchVec2DPtr group_matches = std::make_shared<MatchVec2D>();
-					for (const auto& ck : chunk_group) {
-						std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
-							using PtrType = std::decay_t<decltype(manager_ptr)>;
-							if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-								return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-								// 不再使用分隔符，因为chunks已经预分割了
-								return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else {
-								throw std::runtime_error("Unhandled manager type in variant.");
-							}
-						}, query_fasta_manager);
-						if (seq.length() <ck.length) continue;
-						MatchVec2DPtr reverse_matches = ref_index->findAnchors(
-							ck.chr_index, seq, ACCURATE_SEARCH,
-							Strand::REVERSE,
-							allow_MEM,
-							ck.start,
-							min_anchor_length,
-							allow_short_mum,
-							max_anchor_frequency,
-							ref_global_cache,
-							sampling_interval);
-						// 合并当前chunk的matches到group_matches
-						for (const auto& match_list : *reverse_matches) {
-							group_matches->push_back(match_list);
-						}
-					}
-					return group_matches;
-				}));
+    // 重要：如果 ref_global_cache 不是线程安全的，见下方“线程安全注意事项”
+    #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+    for (long long i = 0; i < static_cast<long long>(N); ++i) {
+        const auto& ck = chunks[static_cast<size_t>(i)];
 
-	}
+        std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
+            using PtrType = std::decay_t<decltype(manager_ptr)>;
+            if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
+                return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
+            } else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+                return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
+            } else {
+                throw std::runtime_error("Unhandled manager type in variant.");
+            }
+        }, query_fasta_manager);
 
-	MatchVec3DPtr result = std::make_shared<MatchVec3D>();
+        if (seq.length() < ck.length) continue;
 
-	result->reserve(futures.size());
-	size_t total = futures.size();
-	size_t count = 0;
-	size_t next_progress = 1; // 1~20
+        // forward
+        {
+            MatchVec2DPtr fm = ref_index->findAnchors(
+                ck.chr_index, seq, search_mode,
+                Strand::FORWARD,
+                allow_MEM,
+                ck.start,
+                min_anchor_length,
+                allow_short_mum,
+                max_anchor_frequency,
+                ref_global_cache,
+                sampling_interval);
 
-	for (auto& fut : futures) {
-		MatchVec2DPtr part = fut.get();
-		result->emplace_back(std::move(*part));
-		++count;
-		size_t progress_stage = (count * 20) / total;
-		if (progress_stage >= next_progress || count == total) {
-			int percent = static_cast<int>((progress_stage * 100) / 20);
-			spdlog::info("[{}] Progress: {}% ({} of {})", prefix, percent, count, total);
-			next_progress = progress_stage + 1;
-		}
-	}
+            auto& out = forward_parts[static_cast<size_t>(i)];
+            out.reserve(fm->size());
+            for (const auto& match_list : *fm) {
+                out.push_back(match_list);
+            }
+        }
 
+        // reverse
+        {
+            MatchVec2DPtr rm = ref_index->findAnchors(
+                ck.chr_index, seq, ACCURATE_SEARCH,
+                Strand::REVERSE,
+                allow_MEM,
+                ck.start,
+                min_anchor_length,
+                allow_short_mum,
+                max_anchor_frequency,
+                ref_global_cache,
+                sampling_interval);
 
-	auto t_search1 = std::chrono::steady_clock::now();
-	double search_ms = std::chrono::duration<double, std::milli>(t_search1 - t_search0).count();
+            auto& out = reverse_parts[static_cast<size_t>(i)];
+            out.reserve(rm->size());
+            for (const auto& match_list : *rm) {
+                out.push_back(match_list);
+            }
+        }
+    }
 
-	/* ---------- ③ 计时：保存 ---------- */
-	auto t_save0 = std::chrono::steady_clock::now();
-	// saveMatchVec3D(anchor_file, result);
-	auto t_save1 = std::chrono::steady_clock::now();
-	double save_ms = std::chrono::duration<double, std::milli>(t_save1 - t_save0).count();
+    // 合并为你的 3D 结构
+    MatchVec3DPtr result = std::make_shared<MatchVec3D>();
+    result->reserve(2 * N);
 
-	/* ---------- Performance Statistics ---------- */
-	spdlog::info("");
-	spdlog::info("┌─────────────────────────────────────────────────────────┐");
-	spdlog::info("│               findQueryFileAnchor Performance           │");
-	spdlog::info("├─────────────────────────────────────────────────────────┤");
-	spdlog::info("│  Search phase    : {:>8.3f} ms                          │", search_ms);
-	spdlog::info("│  Save phase      : {:>8.3f} ms                          │", save_ms);
-	spdlog::info("│  Total time      : {:>8.3f} ms                          │", search_ms + save_ms);
-	spdlog::info("└─────────────────────────────────────────────────────────┘");
-	spdlog::info("");
+    for (size_t i = 0; i < N; ++i) {
+        if (!forward_parts[i].empty())
+            result->emplace_back(std::move(forward_parts[i]));
+        if (!reverse_parts[i].empty())
+            result->emplace_back(std::move(reverse_parts[i]));
+    }
 
-	return result;          // NRVO / move-elided
+    auto t_search1 = std::chrono::steady_clock::now();
+    double search_ms = std::chrono::duration<double, std::milli>(t_search1 - t_search0).count();
+
+    auto t_save0 = std::chrono::steady_clock::now();
+    // saveMatchVec3D(anchor_file, result);
+    auto t_save1 = std::chrono::steady_clock::now();
+    double save_ms = std::chrono::duration<double, std::milli>(t_save1 - t_save0).count();
+
+    spdlog::info("");
+    spdlog::info("┌─────────────────────────────────────────────────────────┐");
+    spdlog::info("│               findQueryFileAnchor Performance           │");
+    spdlog::info("├─────────────────────────────────────────────────────────┤");
+    spdlog::info("│  Search phase    : {:>8.3f} ms                          │", search_ms);
+    spdlog::info("│  Save phase      : {:>8.3f} ms                          │", save_ms);
+    spdlog::info("│  Total time      : {:>8.3f} ms                          │", search_ms + save_ms);
+    spdlog::info("└─────────────────────────────────────────────────────────┘");
+    spdlog::info("");
+
+    return result;
 }
 
 
@@ -670,30 +622,21 @@ void PairRareAligner::constructGraphByDpByRef(SpeciesName query_name, SeqPro::Ma
 
 ClusterVecPtrByStrandByQueryRefPtr PairRareAligner::filterPairSpeciesAnchors(SpeciesName query_name, MatchVec3DPtr& anchors, SeqPro::ManagerVariant& query_fasta_manager, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span)
 {
-	ThreadPool shared_pool(thread_num);
+
 	MatchByStrandByQueryRefPtr unique_anchors = std::make_shared<MatchByStrandByQueryRef>();;
 	MatchByStrandByQueryRefPtr repeat_anchors = std::make_shared<MatchByStrandByQueryRef>();;
 
 	groupMatchByQueryRef(anchors, unique_anchors, repeat_anchors,
-		*ref_seqpro_manager, query_fasta_manager, shared_pool);
+		*ref_seqpro_manager, query_fasta_manager);
 
-	shared_pool.waitAllTasksDone();
-	//anchors->clear();
-	//anchors->shrink_to_fit();
 	anchors.reset();
 	spdlog::info("groupMatchByQueryRef done");
-	sortMatchByQueryStart(unique_anchors, shared_pool);
-	sortMatchByQueryStart(repeat_anchors, shared_pool);
-
-	shared_pool.waitAllTasksDone();
-	spdlog::info("sortMatchByQueryStart done");
 
 	ClusterVecPtrByStrandByQueryRefPtr cluster_ptr = clusterAllChrMatch(
 		unique_anchors,
 		repeat_anchors,
-		shared_pool, min_span);
+		min_span);
 
-	shared_pool.waitAllTasksDone();
 
 	spdlog::info("clusterAllChrMatch done");
 
@@ -1273,148 +1216,124 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
 }
 
 
-
 AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
     SpeciesName query_name,
     SeqPro::ManagerVariant& query_seqpro_manager,
     ClusterVecPtrByStrandByQueryRefPtr cluster,
-    ThreadPool& pool,
     bool is_first
 ) {
     // 输出结构
-   auto result = std::make_shared<AnchorPtrVecByStrandByQueryByRef>();
+    auto result = std::make_shared<AnchorPtrVecByStrandByQueryByRef>();
 
-	// 1. 先根据 cluster 的形状，把 result 完整 resize
-	result->resize(2); // 两个strand: 0和1
-	for (size_t strand = 0; strand < 2; ++strand) {
-	    const auto& byQueryRef = (*cluster)[strand];
-	    (*result)[strand].resize(byQueryRef.size());
+    // -------- 1) 先根据 cluster 的形状，把 result 完整 resize --------
+    result->resize(2); // 两个strand
 
-	    for (size_t q = 0; q < byQueryRef.size(); ++q) {
-	        const auto& byRef = byQueryRef[q];
-	        (*result)[strand][q].resize(byRef.size());
+    for (size_t strand = 0; strand < 2; ++strand) {
+        const auto& byQueryRef = (*cluster)[strand];
+        (*result)[strand].resize(byQueryRef.size());
 
-	        // 现在 (*result)[strand][q][r] 已经是合法索引了
-	        // 里面可能是默认构造的空 AnchorPtrVec
-	    }
-	}
+        for (size_t q = 0; q < byQueryRef.size(); ++q) {
+            const auto& byRef = byQueryRef[q];
+            (*result)[strand][q].resize(byRef.size());
+        }
+    }
 
+    // -------- 2) 收集任务（避免不规则三重循环直接 collapse） --------
+    struct Task {
+        size_t strand, q, r;
+        MatchClusterVecPtr cluster_vec_ptr;
+    };
 
-	// 2. 现在才提交任务（不会再 emplace_back）
-	std::vector<std::future<void>> futures;
-	//std::atomic<std::size_t> done{0};
-	for (size_t strand = 0; strand < 2; ++strand) {
-	    const auto& byQueryRef = (*cluster)[strand];
+    std::vector<Task> tasks;
+    tasks.reserve(1024);
 
-	    for (size_t q = 0; q < byQueryRef.size(); ++q) {
-	        const auto& byRef = byQueryRef[q];
+    for (size_t strand = 0; strand < 2; ++strand) {
+        const auto& byQueryRef = (*cluster)[strand];
 
-	        for (size_t r = 0; r < byRef.size(); ++r) {
-	            MatchClusterVecPtr cluster_vec_ptr = byRef[r];
-	            if (!cluster_vec_ptr) continue;
+        for (size_t q = 0; q < byQueryRef.size(); ++q) {
+            const auto& byRef = byQueryRef[q];
 
-	            futures.emplace_back(pool.enqueue(
-	                [&, strand, q, r, cluster_vec_ptr, is_first]() {
-	                    AnchorPtrVec anchors;
-	                    anchors.reserve(1);
+            for (size_t r = 0; r < byRef.size(); ++r) {
+                MatchClusterVecPtr cluster_vec_ptr = byRef[r];
+                if (!cluster_vec_ptr) continue;
 
-	                    if (!is_first) {
-	                        for (auto & c : (*cluster_vec_ptr)) {
-	                            for (auto & sub_c : c) {
-	                                MatchVec mc;
-	                                mc.push_back(sub_c);
-	                                Anchor anchor = extendClusterToAnchor(mc, *ref_seqpro_manager, query_seqpro_manager);
-	                                anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
-	                            }
-	                        }
-	                    } else {
-	                        // for (auto & c : (*cluster_vec_ptr)) {
-	                        //     Anchor anchor = extendClusterToAnchor(c, *ref_seqpro_manager, query_seqpro_manager);
-	                        //     anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
-	                        // }
-	                        // linkClusters(anchors, *ref_seqpro_manager, query_seqpro_manager);
-	                    	anchors = linkClusters(*cluster_vec_ptr, *ref_seqpro_manager, query_seqpro_manager);
-	                    }
+                tasks.push_back(Task{strand, q, r, cluster_vec_ptr});
+            }
+        }
+    }
 
-	                    if (!anchors.empty()) {
-	                        // 这里没有再扩容 vector，只是往既有槽位写入
-	                        (*result)[strand][q][r] = anchors;
-	                    }
+    if (tasks.empty()) {
+        spdlog::info("extend cluster to anchor successfully for {} (no tasks)", query_name);
+        return result;
+    }
 
-	                    //++done;
-	                }
-	            ));
-	        }
-	    }
-	}
+    // -------- 3) OpenMP 并行执行任务 --------
+    // -------- 3) OpenMP 并行执行任务 + 进度条 --------
+    const size_t total = tasks.size();
+    std::atomic<size_t> completed{0};
+    std::atomic<int> next_milestone{10}; // 10%,20%...
 
+    #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+    for (long long t = 0; t < static_cast<long long>(total); ++t) {
+        const auto& task = tasks[static_cast<size_t>(t)];
 
- //    // ====== 进度监听部分（主线程轮询，而不是等到最后一口气） ======
-	// int p = 10;
- //    const std::size_t total = futures.size();
- //    int next_milestone = p;
- //
- //    // 循环检查完成度，直到所有任务 done == total
- //    while (done.load() < total) {
- //        if (total > 0) {
- //            int pct = static_cast<int>((done.load() * 100) / total);
- //
- //            while (pct >= next_milestone && next_milestone <= 100) {
- //                spdlog::info(
- //                    "extend cluster progress for {}: {}% ({}/{})",
- //                    query_name,
- //                    next_milestone,
- //                    done.load(),
- //                    total
- //                );
- //                next_milestone += p;
- //            }
- //        }
- //
- //        // 稍微睡一下，避免忙等占满一个CPU核
- //        std::this_thread::sleep_for(std::chrono::milliseconds(500));
- //    }
- //
- //    // 最后确保100%被打印（有可能 while 循环结束时 next_milestone 还在100）
- //    if (total > 0) {
- //        int pct = static_cast<int>((done.load() * 100) / total);
- //        while (pct >= next_milestone && next_milestone <= 100) {
- //            spdlog::info(
- //                "extend cluster progress for {}: {}% ({}/{})",
- //                query_name,
- //                next_milestone,
- //                done.load(),
- //                total
- //            );
- //            next_milestone += p;
- //        }
- //    }
+        AnchorPtrVec anchors;
+        anchors.reserve(1);
 
-    // ====== 收尾，把所有 future 的异常取出来 ======
-	const std::size_t total = futures.size();
-	std::size_t completed = 0;
-	int next_milestone = 10;
+        if (!is_first) {
+            for (auto& c : (*task.cluster_vec_ptr)) {
+                for (auto& sub_c : c) {
+                    MatchVec mc;
+                    mc.push_back(sub_c);
 
-	for (auto& f : futures) {
-		f.get();   // 阻塞直到该任务完成
-		completed++;
+                    Anchor anchor = extendClusterToAnchor(
+                        mc, *ref_seqpro_manager, query_seqpro_manager
+                    );
+                    anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
+                }
+            }
+        } else {
+            anchors = linkClusters(
+                *task.cluster_vec_ptr, *ref_seqpro_manager, query_seqpro_manager
+            );
+        }
 
-		int pct = static_cast<int>((completed * 100) / total);
-		if (pct >= next_milestone && next_milestone <= 100) {
-			spdlog::info(
-				"extend cluster progress for {}: {}% ({}/{})",
-				query_name,
-				next_milestone,
-				completed,
-				total
-			);
-			next_milestone += 10;
-		}
-	}
+        if (!anchors.empty()) {
+            (*result)[task.strand][task.q][task.r] = std::move(anchors);
+        }
+
+        // ===== 进度条2：10% 里程碑打印 =====
+        size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        // 避免 total=0 的极端情况
+        if (total > 0) {
+            int pct = static_cast<int>((done * 100) / total);
+            int milestone = next_milestone.load(std::memory_order_relaxed);
+
+            if (pct >= milestone && milestone <= 100) {
+                #pragma omp critical
+                {
+                    milestone = next_milestone.load(std::memory_order_relaxed);
+                    if (pct >= milestone && milestone <= 100) {
+                        spdlog::info(
+                            "extend cluster progress for {}: {}% ({}/{})",
+                            query_name,
+                            milestone,
+                            done,
+                            total
+                        );
+                        next_milestone.store(milestone + 10, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
+
 
     spdlog::info("extend cluster to anchor successfully for {}", query_name);
     return result;
 }
+
 
 
 static void filterChrByDP(
