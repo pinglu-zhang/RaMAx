@@ -1,5 +1,8 @@
 #include <sequence_utils.h>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
@@ -299,6 +302,83 @@ SeqPro::MaskedSequenceManager* ensureMaskedManager(SeqPro::SharedManagerVariant&
     }
     
     throw std::runtime_error("Invalid SeqPro manager variant type");
+}
+
+void exportMaskIntervalsToDirectory(
+    const std::filesystem::path& export_dir,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
+
+    if (export_dir.empty()) {
+        spdlog::warn("[mask-export] Export directory is empty, skip exporting.");
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(export_dir, ec);
+    if (ec) {
+        spdlog::error("[mask-export] Failed to create export directory {}: {}", export_dir.string(), ec.message());
+        return;
+    }
+
+    for (const auto& [species_name, manager_variant] : seqpro_managers) {
+        if (!manager_variant) {
+            spdlog::warn("[mask-export] Skip species {} due to null manager.", species_name);
+            continue;
+        }
+
+        auto* masked_manager = std::visit(
+            [](auto& ptr) -> SeqPro::MaskedSequenceManager* {
+                using T = std::decay_t<decltype(ptr)>;
+                if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+                    return ptr.get();
+                }
+                return nullptr;
+            },
+            *manager_variant);
+
+        if (!masked_manager) {
+            spdlog::warn("[mask-export] Species {} does not use MaskedSequenceManager, skip exporting.", species_name);
+            continue;
+        }
+
+        std::ostringstream buffer;
+        size_t species_total_intervals = 0;
+        auto seq_names = masked_manager->getSequenceNames();
+
+        for (const auto& seq_name : seq_names) {
+            const auto& intervals = masked_manager->getMaskIntervals(seq_name);
+            if (intervals.empty()) {
+                continue;
+            }
+
+            buffer << '>' << seq_name << '\n';
+            for (size_t i = 0; i < intervals.size(); ++i) {
+                const auto& interval = intervals[i];
+                buffer << (interval.start + 1) << '-' << interval.end;
+                if (i + 1 < intervals.size()) {
+                    buffer << ' ';
+                }
+            }
+            buffer << '\n';
+            species_total_intervals += intervals.size();
+        }
+
+        if (species_total_intervals == 0) {
+            spdlog::info("[mask-export] No intervals found for species {}, skip writing file.", species_name);
+            continue;
+        }
+
+        auto output_path = export_dir / (species_name + ".intervals");
+        std::ofstream ofs(output_path);
+        if (!ofs.is_open()) {
+            spdlog::error("[mask-export] Failed to open file {} for species {}", output_path.string(), species_name);
+            continue;
+        }
+
+        ofs << buffer.str();
+        ofs.close();
+        spdlog::info("[mask-export] Exported {} intervals for species {} to {}", species_total_intervals, species_name, output_path.string());
+    }
 }
 
 /**
@@ -717,6 +797,12 @@ starAlignment(
         }
         catch (const std::exception& e) {
             spdlog::error("Failed to add mask intervals for {}: {}", ref_name, e.what());
+        }
+
+        if (enable_mask_export && !mask_export_done && i == 0) {
+            spdlog::info("[mask-export] Exporting mask intervals captured during first round...");
+            exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
+            mask_export_done = true;
         }
         // std::string s = std::to_string(count);
         // multi_graph->exportToMaf("/mnt/d/Result/RaMAx/Alignathon/result/primate-small"+ s + ".maf", seqpro_managers, true, false);

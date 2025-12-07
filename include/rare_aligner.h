@@ -24,6 +24,10 @@ public:
     uint_t group_id;
     uint_t round_id;
 
+    bool enable_mask_export = false;
+    bool mask_export_done = false;
+    FilePath mask_export_dir;
+
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(
         const FilePath& work_dir,

@@ -21,13 +21,15 @@ namespace SeqPro {
 
 const std::vector<MaskInterval> MaskManager::empty_intervals_;
 
-bool MaskManager::loadFromIntervalFile(const std::filesystem::path &interval_file) {
+bool MaskManager::loadFromIntervalFile(const std::filesystem::path &interval_file, bool append) {
   std::ifstream file(interval_file);
   if (!file.is_open()) {
     return false;
   }
 
-  clear();
+  if (!append) {
+    clear();
+  }
 
   std::string line;
   std::string current_seq_name;
@@ -1555,7 +1557,7 @@ bool MaskedSequenceManager::loadMaskIntervalsFromFile(const std::filesystem::pat
     unfinalized_sequences_.clear();
   }
   
-  bool success = mask_manager_.loadFromIntervalFile(file_path);
+  bool success = mask_manager_.loadFromIntervalFile(file_path, append);
   if (success) {
     // 标记所有序列为已定案（从文件加载的区间已经是原始坐标）
     unfinalized_sequences_.clear();
