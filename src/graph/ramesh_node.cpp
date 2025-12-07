@@ -99,13 +99,20 @@ namespace RaMesh {
         SegPtr prev = seg->primary_path.prev.load(std::memory_order_acquire);
         SegPtr next = seg->primary_path.next.load(std::memory_order_acquire);
 
-        uint_t cur_start = prev->start;
+        if (!prev || !next) {
+            seg->primary_path.next.store(nullptr, std::memory_order_release);
+            seg->primary_path.prev.store(nullptr, std::memory_order_release);
+            return;
+        }
 
-		prev->primary_path.next.store(next);
-        next->primary_path.prev.store(prev);
+        if (prev->primary_path.next.load(std::memory_order_acquire) == seg &&
+            next->primary_path.prev.load(std::memory_order_acquire) == seg) {
+            prev->primary_path.next.store(next, std::memory_order_release);
+            next->primary_path.prev.store(prev, std::memory_order_release);
+        }
 
-		seg->primary_path.next.store(nullptr);
-		seg->primary_path.prev.store(nullptr);
+        seg->primary_path.next.store(nullptr, std::memory_order_release);
+        seg->primary_path.prev.store(nullptr, std::memory_order_release);
     }
 
 

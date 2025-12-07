@@ -382,7 +382,7 @@ int main(int argc, char** argv) {
                 throw CLI::RequiredError("Missing required option: --workdir (-w)");
 
 #ifndef _DEBUG_
-            // // 非调试模式下：确保工作目录为空
+            // 非调试模式下：确保工作目录为空
             // if (std::filesystem::exists(common_args.work_dir_path)) {
             //     if (!std::filesystem::is_directory(common_args.work_dir_path)) {
             //         throw CLI::ValidationError("Work directory is not valid: " + common_args.work_dir_path.string());
@@ -432,7 +432,6 @@ int main(int argc, char** argv) {
 
     // 显示运行配置
     printRunConfiguration(common_args);
-    omp_set_num_threads(common_args.thread_num);
 
     //	// ------------------------------
     //	// 主流程开始
