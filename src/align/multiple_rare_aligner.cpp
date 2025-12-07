@@ -587,6 +587,8 @@ starAlignment(
     uint_t min_span)
 {
 
+    // FilePath mask_import_dir = work_dir / "mask_interval" / std::to_string(1);
+    // import_mask_if_needed(mask_import_dir, seqpro_managers);
     std::vector<std::pair<SpeciesName, SeqPro::Length>> species_sizes;
     species_sizes.reserve(seqpro_managers.size());
 
@@ -703,27 +705,6 @@ starAlignment(
         spdlog::info("begin to extend nodes for {}", ref_name);
         multi_graph->extendRefNodes(ref_name, seqpro_managers, 200);
 
-        // SpeciesName target_species = "simOrang";
-        // auto it = multi_graph->species_graphs.find(target_species);
-        // if (it != multi_graph->species_graphs.end()) {
-        //     const auto& genome_graph = it->second;
-        //     spdlog::info("Checking unaligned regions for species {}", target_species);
-        //
-        //     for (const auto& [chr_name, genome_end] : genome_graph.chr2end) {
-        //         spdlog::info("Chromosome {}", chr_name);
-        //
-        //         // 直接调用前面定义的函数
-        //         RaMesh::reportUnalignedRegions(
-        //             genome_end,
-        //             seqpro_managers.at(target_species),
-        //             chr_name
-        //         );
-        //     }
-        // }
-        // else {
-        //     spdlog::warn("Species {} not found in multi_graph", target_species);
-        // }
-
         multi_graph->optimizeGraphStructure();
 #ifdef _DEBUG_
         multi_graph->verifyGraphCorrectness(ref_name, true);
@@ -731,47 +712,6 @@ starAlignment(
         //multi_graph->verifyGraphCorrectness(ref_name, true);
         spdlog::info("construct multiple genome graphs for {} done", ref_name);
 
-         // SpeciesName target_species = "simOrang";
-         // auto it = multi_graph->species_graphs.find(target_species);
-         // if (it != multi_graph->species_graphs.end()) {
-         //     const auto& genome_graph = it->second;
-         //     spdlog::info("Checking unaligned regions for species {}", target_species);
-         //
-         //     for (const auto& [chr_name, genome_end] : genome_graph.chr2end) {
-         //         spdlog::info("Chromosome {}", chr_name);
-         //
-         //         // 直接调用前面定义的函数
-         //         RaMesh::reportUnalignedRegions(
-         //             genome_end,
-         //             seqpro_managers.at(target_species),
-         //             chr_name
-         //         );
-         //     }
-         // }
-         // else {
-         //     spdlog::warn("Species {} not found in multi_graph", target_species);
-         // }
-
-        // target_species = "simGorilla";
-        // it = multi_graph->species_graphs.find(target_species);
-        // if (it != multi_graph->species_graphs.end()) {
-        //     const auto& genome_graph = it->second;
-        //     spdlog::info("Checking unaligned regions for species {}", target_species);
-        //
-        //     for (const auto& [chr_name, genome_end] : genome_graph.chr2end) {
-        //         spdlog::info("Chromosome {}", chr_name);
-        //
-        //         // 直接调用前面定义的函数
-        //         RaMesh::reportUnalignedRegions(
-        //             genome_end,
-        //             seqpro_managers.at(target_species),
-        //             chr_name
-        //         );
-        //     }
-        // }
-        // else {
-        //     spdlog::warn("Species {} not found in multi_graph", target_species);
-        // }
 
         spdlog::info("merge multiple genome graphs for {}", ref_name);
         multi_graph->mergeMultipleGraphs(ref_name, thread_num);
@@ -799,14 +739,12 @@ starAlignment(
             spdlog::error("Failed to add mask intervals for {}: {}", ref_name, e.what());
         }
 
-        if (enable_mask_export && !mask_export_done && i == 0) {
-            spdlog::info("[mask-export] Exporting mask intervals captured during first round...");
-            exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
-            mask_export_done = true;
-        }
-        // std::string s = std::to_string(count);
-        // multi_graph->exportToMaf("/mnt/d/Result/RaMAx/Alignathon/result/primate-small"+ s + ".maf", seqpro_managers, true, false);
-        
+
+        // spdlog::info("[mask-export] Exporting mask intervals captured during first round...");
+        // FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
+        // exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
+
+
     }
 
     // 在所有迭代完成后，进行最终的图正确性验证
