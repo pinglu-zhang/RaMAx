@@ -383,17 +383,17 @@ int main(int argc, char** argv) {
 
 #ifndef _DEBUG_
             // 非调试模式下：确保工作目录为空
-            // if (std::filesystem::exists(common_args.work_dir_path)) {
-            //     if (!std::filesystem::is_directory(common_args.work_dir_path)) {
-            //         throw CLI::ValidationError("Work directory is not valid: " + common_args.work_dir_path.string());
-            //     }
-            //     if (!std::filesystem::is_empty(common_args.work_dir_path)) {
-            //         throw CLI::ValidationError("Work directory is not empty: " + common_args.work_dir_path.string());
-            //     }
-            // }
-            // else {
-            //     std::filesystem::create_directories(common_args.work_dir_path);
-            // }
+            if (std::filesystem::exists(common_args.work_dir_path)) {
+                if (!std::filesystem::is_directory(common_args.work_dir_path)) {
+                    throw CLI::ValidationError("Work directory is not valid: " + common_args.work_dir_path.string());
+                }
+                if (!std::filesystem::is_empty(common_args.work_dir_path)) {
+                    throw CLI::ValidationError("Work directory is not empty: " + common_args.work_dir_path.string());
+                }
+            }
+            else {
+                std::filesystem::create_directories(common_args.work_dir_path);
+            }
 #endif
 
             setupLoggerWithFile(common_args.work_dir_path);
