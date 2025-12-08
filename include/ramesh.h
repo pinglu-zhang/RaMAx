@@ -9,6 +9,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <map>
 #include <shared_mutex>
 #include <chrono>
@@ -267,14 +268,15 @@ namespace RaMesh {
 
         // ――― Enhanced verification system ―――
         enum class VerificationType : uint32_t {
-            POINTER_VALIDITY = 1 << 0,      // 指针有效性
-            LINKED_LIST_INTEGRITY = 1 << 1, // 链表完整性
-            COORDINATE_OVERLAP = 1 << 2,     // 坐标重叠检测
-            COORDINATE_ORDERING = 1 << 3,    // 坐标排序检测
-            BLOCK_CONSISTENCY = 1 << 4,      // Block一致性
-            MEMORY_INTEGRITY = 1 << 5,       // 内存完整性
-            THREAD_SAFETY = 1 << 6,          // 线程安全
-            PERFORMANCE_ISSUES = 1 << 7      // 性能问题
+            POINTER_VALIDITY = 1 << 0,        // 指针有效性
+            LINKED_LIST_INTEGRITY = 1 << 1,   // 链表完整性
+            COORDINATE_OVERLAP = 1 << 2,      // 坐标重叠检测
+            COORDINATE_ORDERING = 1 << 3,     // 坐标排序检测
+            BLOCK_CONSISTENCY = 1 << 4,       // Block一致性
+            MEMORY_INTEGRITY = 1 << 5,        // 内存完整性
+            THREAD_SAFETY = 1 << 6,           // 线程安全
+            PERFORMANCE_ISSUES = 1 << 7,      // 性能问题
+            BLOCK_REFERENCE_CHR = 1 << 8      // Block 缺失参考染色体或未注册参考锚点
         };
 
         enum class ErrorSeverity {
@@ -374,6 +376,8 @@ namespace RaMesh {
             mutable std::unordered_map<VerificationType, size_t> error_counts;
             mutable std::unordered_map<std::string,
                    std::unordered_map<VerificationType, size_t>> verbose_counts_by_species;
+            mutable std::unordered_map<VerificationType, std::array<size_t, 4>>
+                severity_verbose_counts;
 
             size_t getErrorCount(VerificationType type) const {
                 return std::count_if(errors.begin(), errors.end(),
@@ -404,6 +408,25 @@ namespace RaMesh {
             void incrementSpeciesVerboseCount(const std::string& species,
                                               VerificationType type) {
                 verbose_counts_by_species[species][type]++;
+            }
+
+            size_t getSeverityVerboseCount(VerificationType type,
+                                           ErrorSeverity severity) const {
+                auto it = severity_verbose_counts.find(type);
+                if (it == severity_verbose_counts.end()) {
+                    return 0;
+                }
+                auto idx = static_cast<size_t>(severity);
+                if (idx >= it->second.size()) {
+                    return 0;
+                }
+                return it->second[idx];
+            }
+
+            void incrementSeverityVerboseCount(VerificationType type,
+                                               ErrorSeverity severity) {
+                auto idx = static_cast<size_t>(severity);
+                severity_verbose_counts[type][idx]++;
             }
         };
 
@@ -478,6 +501,7 @@ namespace RaMesh {
         void verifyCoordinateOverlap(VerificationResult& result, const VerificationOptions& options) const;
         void verifyCoordinateOrdering(VerificationResult& result, const VerificationOptions& options) const;
         void verifyBlockConsistency(VerificationResult& result, const VerificationOptions& options) const;
+        void verifyBlockReferenceChromosome(VerificationResult& result, const VerificationOptions& options) const;
         void verifyMemoryIntegrity(VerificationResult& result, const VerificationOptions& options) const;
         void verifyThreadSafety(VerificationResult& result, const VerificationOptions& options) const;
         void verifyPerformanceIssues(VerificationResult& result, const VerificationOptions& options) const;
