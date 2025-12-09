@@ -794,6 +794,7 @@ starAlignment(
 
 }
 
+
 SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     SpeciesName                ref_name,
     std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& species_fasta_manager_map,
@@ -804,6 +805,7 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     sdsl::int_vector<0>& ref_global_cache,
     SeqPro::Length sampling_interval)
 {
+    /* ---------- 0. 合法性检查 ---------- */
     if (!species_fasta_manager_map.count(ref_name))
         throw std::runtime_error("[alignMultipleQuerys] reference species not found: " + ref_name);
 
@@ -812,46 +814,67 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
         return std::make_shared<SpeciesMatchVec3DPtrMap>();
     }
 
+    /* ---------- 1. 结果目录与缓存文件 ---------- */
     FilePath result_dir = work_dir / RESULT_DIR
         / ("group_" + std::to_string(group_id))
         / ("round_" + std::to_string(round_id));
     std::filesystem::create_directories(result_dir);
     round_id++;
-
     FilePath anchor_file = result_dir / (ref_name + "_"
         + SearchModeToString(search_mode) + "." + ANCHOR_EXTENSION);
 
+    /* ---------- 2. 如果已存在结果文件直接读取 ---------- */
+    //if (std::filesystem::exists(anchor_file)) {
+    //    spdlog::info("[alignMultipleQuerys] Load from {}", anchor_file.string());
+    //    auto mp = std::make_shared<SpeciesMatchVec3DPtrMap>();
+    //    if (loadSpeciesMatchMap(anchor_file, mp))
+    //        return mp;
+    //    // 如果读取失败则继续重新计算
+    //}
+
+    /* ---------- 3. 准备参考基因组索引 ---------- */
     FilePath ref_index_path = index_dir / ref_name;
     std::filesystem::create_directories(ref_index_path);
 
     PairRareAligner pra(*this);
-    pra.buildIndex(ref_name, *species_fasta_manager_map[ref_name], fast_build);
-    spdlog::info("[alignMultipleQuerys] reference index built for {}.", ref_name);
+	pra.buildIndex(ref_name, *species_fasta_manager_map[ref_name], fast_build);
+	spdlog::info("[alignMultipleQuerys] reference index built for {}.", ref_name);
 
+    /* ---------- 4. 创建共享线程池 ---------- */
+    ThreadPool shared_pool(thread_num);
 
-
-    auto result_map = std::make_shared<SpeciesMatchVec3DPtrMap>();
+    /* ---------- 5. 为每个 query 物种启动异步任务 ---------- */
+    std::unordered_map<SpeciesName, std::future<MatchVec3DPtr>> fut_map;
 
     for (auto& kv : species_fasta_manager_map) {
-        SpeciesName sp = kv.first;
-        if (sp == ref_name) continue;
+        SpeciesName  sp = kv.first;
+        if (sp == ref_name) continue;           // 跳过参考
 
-        std::string prefix = ref_name + "_vs_" + sp;
+        std::string   prefix = ref_name + "_vs_" + sp;
         auto& fm = kv.second;
 
-        try {
-            // 串行调用，每个物种内部由 OpenMP 并行
-            MatchVec3DPtr mv3 = pra.findQueryFileAnchor(
-                prefix,
-                *fm,
-                search_mode,
-                allow_MEM,
-                allow_short_mum,
-                ref_global_cache,
-                sampling_interval,
-                true
-            );
+        fut_map.emplace(
+            sp,
+            std::async(std::launch::async,
+                [&pra, prefix, &fm, search_mode, allow_MEM,allow_short_mum,  &shared_pool, &ref_global_cache, sampling_interval]() -> MatchVec3DPtr {
+                    return pra.findQueryFileAnchor(prefix, *fm, search_mode, allow_MEM, allow_short_mum, shared_pool, ref_global_cache, sampling_interval, true);
+                })
+        );
+    }
 
+    shared_pool.waitAllTasksDone();
+
+    /* ---------- 6. 收集所有结果 ---------- */
+    auto result_map = std::make_shared<SpeciesMatchVec3DPtrMap>();
+
+    size_t total = fut_map.size();
+    size_t count = 0;
+    size_t next_progress = 1;  // 下一次打印进度的“阶段”（1 到 20）
+
+    for (auto& kv : fut_map) {
+        const SpeciesName& sp = kv.first;
+        try {
+            MatchVec3DPtr mv3 = kv.second.get();  // 等待并获取
             (*result_map)[sp] = std::move(mv3);
             spdlog::info("[alignMultipleQuerys] {} aligned.", sp);
         }
@@ -859,7 +882,17 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
             spdlog::error("[alignMultipleQuerys] {} failed: {}", sp, e.what());
         }
 
+        ++count;
+
+        // 计算是否达到下一个进度段（总共 20 段）
+        size_t progress_stage = (count * 20) / total;
+        if (progress_stage >= next_progress) {
+            int percent = static_cast<int>((progress_stage * 100) / 20);
+            spdlog::info("[alignMultipleQuerys] Progress: {}%", percent);
+            next_progress = progress_stage + 1;
+        }
     }
+
     return result_map;
 }
 //
