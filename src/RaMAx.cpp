@@ -39,7 +39,7 @@ struct CommonArgs {
 
 
     // HAL root name
-    std::string root_name = "root";
+    std::string root_name = "";
     std::string ref_name = "";
     bool one_round = false;
 

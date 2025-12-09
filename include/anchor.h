@@ -8,10 +8,8 @@
 #include "align.h"
 #include <memory>                 // 用于智能指针（如 std::shared_ptr）
 #include <vector>                 // 用于 std::vector 容器
-#include <algorithm>              // 提供算法（如 sort 等）
-#include <list>                   // 用于 std::list 容器
 #include <SeqPro.h>
-#include <queue>
+#include <xxhash.h>
 
 
 #define ANCHOR_EXTENSION "anchor"  // Anchor 文件保存使用的默认扩展名
@@ -73,6 +71,20 @@ using RegionVec = std::vector<Region>;  // 区域集合
 // 链接方向：正向或反向
 enum Strand { FORWARD, REVERSE };
 
+inline uint64_t make_sqr_key(uint32_t s, uint32_t q, uint32_t r) noexcept {
+    return (uint64_t(s & 1u) << 62) | (uint64_t(q & 0x7FFFFFFFu) << 31) | uint64_t(r & 0x7FFFFFFFu);
+}
+inline uint32_t key_s(uint64_t k) noexcept { return uint32_t((k >> 62) & 1u); }
+inline uint32_t key_q(uint64_t k) noexcept { return uint32_t((k >> 31) & 0x7FFFFFFFu); }
+inline uint32_t key_r(uint64_t k) noexcept { return uint32_t(k & 0x7FFFFFFFu); }
+
+// -------------------- 2) xxHash hasher --------------------
+struct XXH64Hasher {
+    size_t operator()(uint64_t k) const noexcept {
+        return static_cast<size_t>(XXH64(&k, sizeof(k), 0));
+    }
+};
+
 // 表示参考与查询序列之间的一段匹配区域
 struct Match {
     ChrIndex ref_chr_index;
@@ -113,6 +125,8 @@ struct Match {
 using MatchVec = std::vector<Match>;
 using MatchPtr = std::shared_ptr<Match>; // 智能指针类型
 using MatchPtrVec = std::vector<MatchPtr>; // 智能指针集合
+using MatchBySQR_Sparse = std::unordered_map<uint64_t, MatchVec, XXH64Hasher>;
+using MatchBySQR_SparsePtr = std::shared_ptr<MatchBySQR_Sparse>;
 
 using MatchVec2D = std::vector<MatchVec>;
 using MatchVec2DPtr = std::shared_ptr<MatchVec2D>;
@@ -138,6 +152,9 @@ using ClusterSyntenyVec = std::vector<ClusterSynteny>;
 using ClusterSyntenyVecPtr = std::shared_ptr<ClusterSyntenyVec>;
 using ClusterSyntenyVecPtrByRef = std::vector<ClusterSyntenyVecPtr>;
 
+using ClusterBySQR_Sparse = std::unordered_map<uint64_t, MatchClusterVecPtr, XXH64Hasher>;
+using ClusterBySQR_SparsePtr = std::shared_ptr<ClusterBySQR_Sparse>;
+
 using ClusterVecPtrByRef = std::vector<MatchClusterVecPtr>;
 using ClusterVecPtrByQueryRef = std::vector<ClusterVecPtrByRef>;
 using ClusterVecPtrByStrandByQueryRef = std::vector<ClusterVecPtrByQueryRef>;
@@ -148,7 +165,7 @@ using ClusterVecPtrByRefQueryPtr = std::shared_ptr<ClusterVecPtrByRefQuery>;
 using ClusterVecPtrByStrandByQueryRefPtr = std::shared_ptr<ClusterVecPtrByStrandByQueryRef>;
 
 using SpeciesClusterMap =
-std::unordered_map<SpeciesName, ClusterVecPtrByStrandByQueryRefPtr>;
+std::unordered_map<SpeciesName, ClusterBySQR_SparsePtr>;
 using SpeciesClusterMapPtr = std::shared_ptr<SpeciesClusterMap>;
 
 inline Coord_t start1(const Match& m) { return (m.ref_start); }
@@ -181,7 +198,12 @@ void groupMatchByQueryRef(MatchVec3DPtr& anchors,
     SeqPro::ManagerVariant& ref_fasta_manager,
     SeqPro::ManagerVariant& query_fasta_manager);
 
-
+void groupMatchByQueryRefSparse(
+    MatchVec3DPtr& anchors,
+    MatchBySQR_SparsePtr unique_anchors,
+    MatchBySQR_SparsePtr repeat_anchors,
+    SeqPro::ManagerVariant& ref_fasta_manager,
+    SeqPro::ManagerVariant& query_fasta_manager);
 
 MatchClusterVecPtr
 groupClustersToVec(const ClusterVecPtrByStrandByQueryRefPtr& src,
@@ -203,7 +225,7 @@ groupClustersByRefQuery(const ClusterVecPtrByRefPtr& by_ref,
 
 void sortMatchByQueryStart(MatchByStrandByQueryRefPtr& anchors, ThreadPool& pool);
 
-MatchClusterVecPtr clusterChrMatch(MatchVec& unique_match, MatchVec& repeat_match, uint_t min_cluster_length, int_t max_gap = 90, int_t diagdiff = 5, double diagfactor = 0.12);
+MatchClusterVecPtr clusterChrMatch(MatchVec& unique_match, uint_t min_cluster_length, int_t max_gap = 90, int_t diagdiff = 5, double diagfactor = 0.12);
 
 MatchVec bestChainDP(MatchVec& cluster, double diagfactor);
 
@@ -215,6 +237,12 @@ MatchClusterVec buildClusters(MatchVec& unique_match,
 ClusterVecPtrByStrandByQueryRefPtr
 clusterAllChrMatch(const MatchByStrandByQueryRefPtr& unique_anchors,
     const MatchByStrandByQueryRefPtr& repeat_anchors, uint_t min_span);
+
+ClusterBySQR_SparsePtr clusterAllChrMatchSparse(
+    MatchBySQR_SparsePtr& unique_anchors,
+    MatchBySQR_SparsePtr& repeat_anchors,  // 按你的要求：占位不用
+    uint_t min_span,
+    uint_t thread_num);
 
 MatchClusterVec
 splitCluster(const MatchCluster& cl,
@@ -267,6 +295,9 @@ using AnchorPtrVec = std::vector<AnchorPtr>;
 using AnchorVec = std::vector<Anchor>;
 using AnchorPtrVecByStrandByQueryByRef = std::vector<std::vector<std::vector<AnchorPtrVec>>>;
 using AnchorPtrVecByStrandByQueryByRefPtr = std::shared_ptr<AnchorPtrVecByStrandByQueryByRef>;
+
+using AnchorBySQR_Sparse = std::vector<AnchorPtrVec>;
+using AnchorBySQR_SparsePtr = std::shared_ptr<AnchorBySQR_Sparse>;
 
 using AnchorPtrVecByQueryByRef = std::vector<std::vector<AnchorPtrVec>>;
 using AnchorPtrVecByQueryByRefPtr = std::shared_ptr<AnchorPtrVecByQueryByRef>;

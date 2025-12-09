@@ -620,29 +620,29 @@ void PairRareAligner::constructGraphByDpByRef(SpeciesName query_name, SeqPro::Ma
 	return;
 }
 
-ClusterVecPtrByStrandByQueryRefPtr PairRareAligner::filterPairSpeciesAnchors(SpeciesName query_name, MatchVec3DPtr& anchors, SeqPro::ManagerVariant& query_fasta_manager, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span)
-{
-
-	MatchByStrandByQueryRefPtr unique_anchors = std::make_shared<MatchByStrandByQueryRef>();;
-	MatchByStrandByQueryRefPtr repeat_anchors = std::make_shared<MatchByStrandByQueryRef>();;
-
-	groupMatchByQueryRef(anchors, unique_anchors, repeat_anchors,
-		*ref_seqpro_manager, query_fasta_manager);
-
-	anchors.reset();
-	spdlog::info("groupMatchByQueryRef done");
-
-	ClusterVecPtrByStrandByQueryRefPtr cluster_ptr = clusterAllChrMatch(
-		unique_anchors,
-		repeat_anchors,
-		min_span);
-
-
-	spdlog::info("clusterAllChrMatch done");
-
-	return cluster_ptr;
-
-}
+// ClusterVecPtrByStrandByQueryRefPtr PairRareAligner::filterPairSpeciesAnchors(SpeciesName query_name, MatchVec3DPtr& anchors, SeqPro::ManagerVariant& query_fasta_manager, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span)
+// {
+//
+// 	MatchByStrandByQueryRefPtr unique_anchors = std::make_shared<MatchByStrandByQueryRef>();;
+// 	MatchByStrandByQueryRefPtr repeat_anchors = std::make_shared<MatchByStrandByQueryRef>();;
+//
+// 	groupMatchByQueryRef(anchors, unique_anchors, repeat_anchors,
+// 		*ref_seqpro_manager, query_fasta_manager);
+//
+// 	anchors.reset();
+// 	spdlog::info("groupMatchByQueryRef done");
+//
+// 	ClusterVecPtrByStrandByQueryRefPtr cluster_ptr = clusterAllChrMatch(
+// 		unique_anchors,
+// 		repeat_anchors,
+// 		min_span);
+//
+//
+// 	spdlog::info("clusterAllChrMatch done");
+//
+// 	return cluster_ptr;
+//
+// }
 // ========== 工具：快速取子串 ==========
 static std::string subSeq(const SeqPro::ManagerVariant& mv,
                                  ChrIndex chr, int_t b, int_t l) {
@@ -1216,72 +1216,34 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
 }
 
 
-AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
-    SpeciesName query_name,
-    SeqPro::ManagerVariant& query_seqpro_manager,
-    ClusterVecPtrByStrandByQueryRefPtr cluster,
-    bool is_first
-) {
+AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first)
+{
     // 输出结构
-    auto result = std::make_shared<AnchorPtrVecByStrandByQueryByRef>();
+    AnchorBySQR_SparsePtr result = std::make_shared<AnchorBySQR_Sparse>();
 
-    // -------- 1) 先根据 cluster 的形状，把 result 完整 resize --------
-    result->resize(2); // 两个strand
 
-    for (size_t strand = 0; strand < 2; ++strand) {
-        const auto& byQueryRef = (*cluster)[strand];
-        (*result)[strand].resize(byQueryRef.size());
+	const uint_t cluster_num = static_cast<uint_t>(cluster->size());
+	std::vector<MatchClusterVecPtr> tmp_cluster_vec;
+	AnchorBySQR_Sparse tmp_res(cluster_num);
 
-        for (size_t q = 0; q < byQueryRef.size(); ++q) {
-            const auto& byRef = byQueryRef[q];
-            (*result)[strand][q].resize(byRef.size());
-        }
-    }
+	for (auto& [key, c_p] : *cluster)
+	{
+		tmp_cluster_vec.emplace_back(c_p);
+	}
 
-    // -------- 2) 收集任务（避免不规则三重循环直接 collapse） --------
-    struct Task {
-        size_t strand, q, r;
-        MatchClusterVecPtr cluster_vec_ptr;
-    };
 
-    std::vector<Task> tasks;
-    tasks.reserve(1024);
-
-    for (size_t strand = 0; strand < 2; ++strand) {
-        const auto& byQueryRef = (*cluster)[strand];
-
-        for (size_t q = 0; q < byQueryRef.size(); ++q) {
-            const auto& byRef = byQueryRef[q];
-
-            for (size_t r = 0; r < byRef.size(); ++r) {
-                MatchClusterVecPtr cluster_vec_ptr = byRef[r];
-                if (!cluster_vec_ptr) continue;
-
-                tasks.push_back(Task{strand, q, r, cluster_vec_ptr});
-            }
-        }
-    }
-
-    if (tasks.empty()) {
-        spdlog::info("extend cluster to anchor successfully for {} (no tasks)", query_name);
-        return result;
-    }
-
-    // -------- 3) OpenMP 并行执行任务 --------
-    // -------- 3) OpenMP 并行执行任务 + 进度条 --------
-    const size_t total = tasks.size();
     std::atomic<size_t> completed{0};
     std::atomic<int> next_milestone{10}; // 10%,20%...
 
     #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
-    for (long long t = 0; t < static_cast<long long>(total); ++t) {
-        const auto& task = tasks[static_cast<size_t>(t)];
-
+    for (long long t = 0; t < static_cast<long long>(cluster_num); ++t) {
+    	MatchClusterVecPtr tmp_p = tmp_cluster_vec[t];
+    	if (!tmp_p || tmp_p->empty()) continue;
         AnchorPtrVec anchors;
         anchors.reserve(1);
 
         if (!is_first) {
-            for (auto& c : (*task.cluster_vec_ptr)) {
+            for (auto& c : (*tmp_p)) {
                 for (auto& sub_c : c) {
                     MatchVec mc;
                     mc.push_back(sub_c);
@@ -1294,20 +1256,20 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
             }
         } else {
             anchors = linkClusters(
-                *task.cluster_vec_ptr, *ref_seqpro_manager, query_seqpro_manager
+                *tmp_p, *ref_seqpro_manager, query_seqpro_manager
             );
         }
 
         if (!anchors.empty()) {
-            (*result)[task.strand][task.q][task.r] = std::move(anchors);
+            tmp_res[t] = std::move(anchors);
         }
 
         // ===== 进度条2：10% 里程碑打印 =====
         size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
 
         // 避免 total=0 的极端情况
-        if (total > 0) {
-            int pct = static_cast<int>((done * 100) / total);
+        if (cluster_num > 0) {
+            int pct = static_cast<int>((done * 100) / cluster_num);
             int milestone = next_milestone.load(std::memory_order_relaxed);
 
             if (pct >= milestone && milestone <= 100) {
@@ -1320,7 +1282,7 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
                             query_name,
                             milestone,
                             done,
-                            total
+                            cluster_num
                         );
                         next_milestone.store(milestone + 10, std::memory_order_relaxed);
                     }
@@ -1329,6 +1291,13 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
         }
     }
 
+	for (uint_t i = 0; i < cluster_num; ++i)
+	{
+		if (tmp_res[i].size() > 0)
+		{
+			result->emplace_back(tmp_res[i]);
+		}
+	}
 
     spdlog::info("extend cluster to anchor successfully for {}", query_name);
     return result;
@@ -1337,7 +1306,7 @@ AnchorPtrVecByStrandByQueryByRefPtr PairRareAligner::extendClusterToAnchorByChr(
 
 
 static void filterChrByDP(
-	AnchorPtrVecByStrandByQueryByRefPtr anchor_map,
+	AnchorBySQR_SparsePtr anchor_map,
 	uint_t id,
 	bool filter_ref)
 {
@@ -1345,80 +1314,27 @@ static void filterChrByDP(
 
 	if (!anchor_map) return;
 
-	if (filter_ref) {
-		// 按 ref 来过滤：只看 ref == id
-		for (size_t strand_idx = 0; strand_idx < anchor_map->size(); ++strand_idx) {
-			const auto& queries = anchor_map->at(strand_idx);
-			for (size_t qry_idx = 0; qry_idx < queries.size(); ++qry_idx) {
-				const auto& refs = queries.at(qry_idx);
-				if (id < refs.size()) {
-					const auto& anchors = refs[id];
-					// AnchorPtrVec temp;
-					// for (const auto& a : anchors) {
-					// 	if (a->qry_selected) {
-					// 		temp.push_back(a);
-					// 	}
-					// }
-					// result.insert(result.end(), temp.begin(), temp.end());
-					result.insert(result.end(), anchors.begin(), anchors.end());
+	for (auto & a_vec : *anchor_map)
+	{
+		if (a_vec.size() > 0)
+		{
+			uint_t ref_idx = a_vec[0]->ref_chr_index;
+			uint_t qry_idx = a_vec[0]->qry_chr_index;
+			if (filter_ref)
+			{
+				if (ref_idx == id)
+				{
+					result.insert(result.end(), a_vec.begin(), a_vec.end());
+				}
+			}else
+			{
+				if (qry_idx == id)
+				{
+					result.insert(result.end(), a_vec.begin(), a_vec.end());
 				}
 			}
 		}
 	}
-	else {
-		// 按 qry 来过滤：只看 qry == id
-		for (size_t strand_idx = 0; strand_idx < anchor_map->size(); ++strand_idx) {
-			const auto& queries = anchor_map->at(strand_idx);
-			if (id < queries.size()) {
-				const auto& refs = queries.at(id);
-				for (const auto& anchors : refs) {
-					AnchorPtrVec temp;
-					for (const auto& a : anchors) {
-						if (a->ref_selected) {
-							temp.push_back(a);
-						}
-					}
-					result.insert(result.end(), temp.begin(), temp.end());
-
-					//result.insert(result.end(), anchors.begin(), anchors.end());
-				}
-			}
-		}
-	}
-	//if (filter_ref) {
-	//	// 按 ref 来过滤：只看 ref == id
-	//	for (size_t strand_idx = 0; strand_idx < anchor_map->size(); ++strand_idx) {
-	//		const auto& queries = anchor_map->at(strand_idx);
-	//		for (size_t qry_idx = 0; qry_idx < queries.size(); ++qry_idx) {
-	//			const auto& refs = queries.at(qry_idx);
-	//			if (id < refs.size()) {
-	//				const auto& anchors = refs[id];
-	//				for (const auto& a : anchors) {
-	//					if (!a->is_linked) {              // ✅ 只保留 is_linked == false
-	//						result.push_back(a);
-	//					}
-	//				}
-	//			}
-	//		}
-	//	}
-	//}
-	//else {
-	//	// 按 qry 来过滤：只看 qry == id
-	//	for (size_t strand_idx = 0; strand_idx < anchor_map->size(); ++strand_idx) {
-	//		const auto& queries = anchor_map->at(strand_idx);
-	//		if (id < queries.size()) {
-	//			const auto& refs = queries.at(id);
-	//			for (const auto& anchors : refs) {
-	//				for (const auto& a : anchors) {
-	//					if (!a->is_linked) {              // ✅ 只保留 is_linked == false
-	//						result.push_back(a);
-	//					}
-	//				}
-	//			}
-	//		}
-	//	}
-	//}
-
 
 	if (result.empty()) return;
 
@@ -1569,54 +1485,40 @@ static void filterChrByDP(
 #endif
 }
 
-void PairRareAligner::filterAnchorByDP(AnchorPtrVecByStrandByQueryByRefPtr anchor_map) {
+void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
 
-	ThreadPool pool(thread_num);
-	// 获得ref和query的染色体个数，根据AnchorVecByStrandByQueryByRefPtr的维度
-	uint_t qry_num = anchor_map->at(0).size();
-	uint_t ref_num = anchor_map->at(0)[0].size();
-	for (uint_t i = 0; i < ref_num; i++) {
-		pool.enqueue([&anchor_map, i]() {
-			filterChrByDP(anchor_map, i, true);
-			}
-		);
+	const uint_t n = anchor_map->size();
+#pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+	for (uint_t i = 0; i < ref_chr_cnt; i++) {
+		filterChrByDP(anchor_map, i, true);
 	}
 
-	pool.waitAllTasksDone();
-	for (uint_t i = 0; i < qry_num; i++) {
-		pool.enqueue([&anchor_map, i]() {
-				filterChrByDP(anchor_map, i, false);
-				}
-		);
+#pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+	for (uint_t i = 0; i < qry_chr_cnt; i++) {
+		filterChrByDP(anchor_map, i, false);
 	}
-	pool.waitAllTasksDone();
 
 	return;
 
 }
 
-void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorPtrVecByStrandByQueryByRefPtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph) {
-	for (size_t strand_idx = 0; strand_idx < anchor_ptr->size(); ++strand_idx) {
-		const auto& queries = anchor_ptr->at(strand_idx);
-		for (size_t qry_idx = 0; qry_idx < queries.size(); ++qry_idx) {
-			const auto& refs = queries.at(qry_idx);
-			for (size_t ref_idx = 0; ref_idx < refs.size(); ++ref_idx) {
-				const auto& anchors = refs.at(ref_idx);
-				for (size_t a_idx = 0; a_idx < anchors.size(); ++a_idx) {
-					AnchorPtr anchor = anchors.at(a_idx);
-					// if (anchor->ref_selected && anchor->qry_selected)
-					if (anchor->ref_selected && anchor->qry_selected) {
-						try {
-							graph.insertAnchorIntoGraph(*ref_seqpro_manager, query_seqpro_manager, ref_name, query_name, *anchor, false);
-						}
-						catch (const std::exception& e) {
-							spdlog::error("Error inserting anchor into graph: {}", e.what());
-						}
-					}
+void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph) {
+	for (auto & a_vec : *anchor_ptr)
+	{
+		for (size_t a_idx = 0; a_idx < a_vec.size(); ++a_idx)
+		{
+			AnchorPtr anchor = a_vec.at(a_idx);
+			if (anchor->ref_selected && anchor->qry_selected) {
+				try {
+					graph.insertAnchorIntoGraph(*ref_seqpro_manager, query_seqpro_manager, ref_name, query_name, *anchor, false);
+				}
+				catch (const std::exception& e) {
+					spdlog::error("Error inserting anchor into graph: {}", e.what());
 				}
 			}
 		}
 	}
+
 }
 
 
