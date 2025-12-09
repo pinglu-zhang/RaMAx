@@ -4,140 +4,57 @@
 
 #include "data_process.h"
 
-////--------------------------------------------------------------------
-//// 适配 4‑D 结构的聚类分发
-////--------------------------------------------------------------------
-//void groupMatchByQueryRef(MatchVec3DPtr& anchors,
-//    MatchByStrandByQueryRefPtr unique_anchors,
-//    MatchByStrandByQueryRefPtr repeat_anchors,
-//    SeqPro::ManagerVariant& ref_fasta_manager,
-//    SeqPro::ManagerVariant& query_fasta_manager,
-//	ThreadPool& pool)
-//{
-//    //------------------------------------------------------------
-//    // 0) 初始化输出矩阵 [strand][query][ref]
-//    //------------------------------------------------------------
-//    constexpr uint_t STRAND_CNT = 2;                         // 0=FWD,1=REV
-//    const uint_t ref_chr_cnt = std::visit([](auto&& manager) {
-//        using PtrType = std::decay_t<decltype(manager)>;
-//        if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-//            return manager->getSequenceCount();
-//        } else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-//            return manager->getSequenceCount();
-//        } else {
-//            throw std::runtime_error("Unhandled manager type in variant.");
-//        }
-//    }, ref_fasta_manager);
-//
-//    const uint_t query_chr_cnt = std::visit([](auto&& manager) {
-//        using PtrType = std::decay_t<decltype(manager)>;
-//        if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-//            return manager->getSequenceCount();
-//        } else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-//            return manager->getSequenceCount();
-//        } else {
-//            throw std::runtime_error("Unhandled manager type in variant.");
-//        }
-//    }, query_fasta_manager);
-//    auto initTarget = [&](MatchByStrandByQueryRefPtr& tgt) {
-//        tgt->resize(STRAND_CNT);
-//        for (uint_t s = 0; s < STRAND_CNT; ++s) {
-//            (*tgt)[s].resize(query_chr_cnt);
-//            for (uint_t q = 0; q < query_chr_cnt; ++q)
-//                (*tgt)[s][q].resize(ref_chr_cnt);
-//        }
-//        };
-//    initTarget(unique_anchors);
-//    initTarget(repeat_anchors);
-//
-//    //------------------------------------------------------------
-//    // 1) 行级互斥锁：放到堆上，用 shared_ptr 延长生命周期
-//    //------------------------------------------------------------
-//    auto rowLocks = std::make_shared<std::vector<std::mutex>>(STRAND_CNT * query_chr_cnt);
-//
-//    //------------------------------------------------------------
-//    // 2) 并行遍历 3-D 数据，slice 级别开任务
-//    //------------------------------------------------------------
-//    for (auto& slice : *anchors) {
-//        // 按值捕获 slice、rowLocks、unique_anchors 等
-//        pool.enqueue(
-//            [slice,                                               // 值
-//            rowLocks,                                            // 值 (shared_ptr)
-//            unique_anchors, repeat_anchors,                      // 值 (shared_ptr)
-//            &ref_fasta_manager, &query_fasta_manager,            // 引用
-//            query_chr_cnt] () mutable
-//            {
-//                if (slice.empty()) return;
-//
-//                const Match& first = slice.front().front();
-//                uint_t sIdx = (first.strand == REVERSE ? 1u : 0u);
-//
-//            uint_t qIdx = std::visit([&first](auto&& manager) {
-//                using PtrType = std::decay_t<decltype(manager)>;
-//                if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-//                    return manager->getSequenceId(first.query_region.chr_name);
-//                } else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-//                    return manager->getSequenceId(first.query_region.chr_name);
-//                } else {
-//                    throw std::runtime_error("Unhandled manager type in variant.");
-//                }
-//            }, query_fasta_manager);
-//
-//            if(qIdx == SeqPro::SequenceIndex::INVALID_ID) return;
-//
-//            for (auto& vec : slice)
-//            {
-//                if (vec.empty()) continue;
-//
-//                uint_t rIdx = std::visit([&vec](auto&& manager) {
-//                    using PtrType = std::decay_t<decltype(manager)>;
-//                    if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-//                        return manager->getSequenceId(vec.front().ref_region.chr_name);
-//                    } else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-//                        return manager->getSequenceId(vec.front().ref_region.chr_name);
-//                    } else {
-//                        throw std::runtime_error("Unhandled manager type in variant.");
-//                    }
-//                }, ref_fasta_manager);
-//
-//                if(rIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
-//
-//                // 计算锁下标并加锁
-//                uint_t lockIdx = sIdx * query_chr_cnt + qIdx;
-//                std::lock_guard<std::mutex> lk((*rowLocks)[lockIdx]);
-//
-//                MatchVec& tgt = (vec.size() == 1)
-//                    ? (*unique_anchors)[sIdx][qIdx][rIdx]
-//                    : (*repeat_anchors)[sIdx][qIdx][rIdx];
-//
-//                    tgt.insert(tgt.end(),
-//                        std::make_move_iterator(vec.begin()),
-//                        std::make_move_iterator(vec.end()));
-//                    vec.clear();
-//                    vec.shrink_to_fit();
-//                }
-//            });
-//    }
-//    
-//}
-// ---------------------------------------------------------------------------
-// groupMatchByQueryRef – SERIAL, LOW‑MEMORY VERSION
-// ---------------------------------------------------------------------------
-// - 完全取消并行，不依赖 ThreadPool，也不需要锁。
-// - 按需扩展 3‑D 目标结构，避免一次性为空槽分配 vector。
-// - 每次把 slice 内部 vec 的元素 move 到目标后，立即 clear()+shrink_to_fit()
-//   以释放多余 capacity，降低峰值 RSS。
-// ---------------------------------------------------------------------------
-// 依赖类型说明（保持与原工程一致）：
-//   using Match               = ...;
-//   using MatchVec            = std::vector<Match>;
-//   using MatchVec2D          = std::vector<MatchVec>;                // [ref]
-//   using MatchVec3D          = std::vector<MatchVec2D>;              // [query][ref]
-//   using MatchVec3DPtr       = std::shared_ptr<MatchVec3D>;          // slice 别名
-//   using MatchByStrandByQueryRef = std::vector<MatchVec3D>;          // [strand][query][ref]
-//   using MatchByStrandByQueryRefPtr = std::shared_ptr<MatchByStrandByQueryRef>;
-//   enum Strand { FORWARD, REVERSE };
-// ---------------------------------------------------------------------------
+// 稀疏版：不再 resize 出 [strand][qry][ref] 的满矩阵
+void groupMatchByQueryRefSparse(
+    MatchVec3DPtr& anchors,
+    MatchBySQR_SparsePtr unique_anchors,
+    MatchBySQR_SparsePtr repeat_anchors,
+    SeqPro::ManagerVariant& /*ref_fasta_manager*/,
+    SeqPro::ManagerVariant& /*query_fasta_manager*/)
+{
+    if (!anchors || anchors->empty()) return;
+
+    // 经验性 reserve，避免大量 rehash
+    // 你也可以按 anchors 的总 slice/vec 数粗略估算
+    unique_anchors->reserve(1024);
+    repeat_anchors->reserve(1024);
+
+    for (auto& slice : *anchors) {
+        if (slice.empty()) continue;
+
+        for (auto& vec : slice) {
+            if (vec.empty()) continue;
+
+            ChrIndex rIdx = vec.front().ref_chr_index;
+            ChrIndex qIdx = vec.front().qry_chr_index;
+            const uint32_t sIdx = (vec.front().strand() == REVERSE ? 1u : 0u);
+
+            if (rIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
+            if (qIdx == SeqPro::SequenceIndex::INVALID_ID) continue;
+
+            const uint64_t key = make_sqr_key(
+                sIdx,
+                static_cast<uint32_t>(qIdx),
+                static_cast<uint32_t>(rIdx)
+            );
+
+            // 如果你仍要区分 unique/repeat，可用 vec.size()==1 的规则
+            MatchBySQR_SparsePtr& tgt = (vec.size() == 1) ? unique_anchors : repeat_anchors;
+            auto& dest = (*tgt)[key];
+
+            if (dest.empty()) dest.reserve(vec.size());
+            dest.insert(dest.end(),
+                        std::make_move_iterator(vec.begin()),
+                        std::make_move_iterator(vec.end()));
+
+            vec.clear();
+            vec.shrink_to_fit();
+        }
+    }
+
+    anchors->clear();
+    anchors->shrink_to_fit();
+}
 
 void groupMatchByQueryRef(
     MatchVec3DPtr& anchors,
