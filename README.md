@@ -44,7 +44,7 @@ cmake ..
 make -j"$(nproc)"
 ```
 
-After a successful build, the executable **`RaMAx`** will be located in the `build/` directory.
+After a successful build, the executable **`ramax`** will be located in the `build/` directory.
 
 ---
 
@@ -53,7 +53,7 @@ After a successful build, the executable **`RaMAx`** will be located in the `bui
 ### Basic usage
 
 ```bash
-./RaMAx \
+./ramax \
   -i <path/to/seqfile.txt> \
   -o <path/to/output.{maf|hal}> \
   -w <path/to/workdir> \
