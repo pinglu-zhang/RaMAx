@@ -2271,7 +2271,7 @@ namespace hal_converter {
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> bottomSegmentsFull;
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> topSegmentsFull;
 
-        // 2.3 并行生成完整段列表
+        // 2.3 生成完整段列表
         auto t23_start = __now();
         std::map<std::pair<std::string, std::string>, hal_size_t> seqLengths; // 需预先串行获取
         std::set<std::pair<std::string, std::string>> allKeys;
@@ -2287,38 +2287,40 @@ namespace hal_converter {
             alignment->closeGenome(g);
         }
 
-        std::mutex bottom_full_mutex, top_full_mutex;
         for (const auto& key : allKeys) {
-            pool.enqueue([&, key]() {
-                std::set<hal_index_t> uni_bp;
-                if(bpBottom.count(key)) uni_bp.insert(bpBottom.at(key).begin(), bpBottom.at(key).end());
-                if(bpTop.count(key)) uni_bp.insert(bpTop.at(key).begin(), bpTop.at(key).end());
-                if(seqLengths.count(key)) {
-                    uni_bp.insert(0);
-                    uni_bp.insert((hal_index_t)seqLengths.at(key));
-                }
+            std::set<hal_index_t> uni_bp;
+            if (auto it = bpBottom.find(key); it != bpBottom.end()) {
+                uni_bp.insert(it->second.begin(), it->second.end());
+            }
+            if (auto it = bpTop.find(key); it != bpTop.end()) {
+                uni_bp.insert(it->second.begin(), it->second.end());
+            }
+            if (auto it = seqLengths.find(key); it != seqLengths.end()) {
+                uni_bp.insert(0);
+                uni_bp.insert(static_cast<hal_index_t>(it->second));
+            }
 
-                if (uni_bp.size() < 2) return;
+            if (uni_bp.size() < 2) {
+                continue;
+            }
 
-                std::vector<SimpleSegmentInfo> segs;
-                segs.reserve(uni_bp.size());
-                hal_index_t prev = -1;
-                for(hal_index_t x : uni_bp) {
-                    if (prev != -1 && x > prev) segs.push_back({prev, (hal_size_t)(x - prev)});
-                    prev = x;
-                }
+            std::vector<SimpleSegmentInfo> segs;
+            segs.reserve(uni_bp.size());
 
-                if (bpBottom.count(key)) {
-                    std::lock_guard<std::mutex> lk(bottom_full_mutex);
-                    bottomSegmentsFull[key] = segs;
+            auto prev_it = uni_bp.begin();
+            for (auto it = std::next(uni_bp.begin()); it != uni_bp.end(); ++it, ++prev_it) {
+                if (*it > *prev_it) {
+                    segs.push_back({*prev_it, static_cast<hal_size_t>(*it - *prev_it)});
                 }
-                if (bpTop.count(key)) {
-                    std::lock_guard<std::mutex> lk(top_full_mutex);
-                    topSegmentsFull[key] = segs;
-                }
-            });
+            }
+
+            if (bpBottom.count(key)) {
+                bottomSegmentsFull[key] = segs;
+            }
+            if (bpTop.count(key)) {
+                topSegmentsFull[key] = segs;
+            }
         }
-        pool.waitAllTasksDone();
         auto t23_end = __now();
         spdlog::info("  Pass2.3: built full segments in {} ms (bottom groups: {}, top groups: {})",
                       __ms(t23_start, t23_end), bottomSegmentsFull.size(), topSegmentsFull.size());
@@ -2617,7 +2619,7 @@ namespace hal_converter {
         }
         auto t_c2p_end = __now();
         spdlog::info("  Pass3.parentChild.c2p: linked {} child->parent in {} ms", successful_c2p, __ms(t_c2p_start, t_c2p_end));
-        
+
         size_t successfulMappings = std::min(successful_p2c, successful_c2p);
 
         auto t_map_end = __now();
