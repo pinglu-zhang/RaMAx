@@ -974,8 +974,8 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
         current = current->primary_path.next.load(std::memory_order_acquire);
       }
 
-      // 输出统计信息和调试信息
-      if (options.verbose) {
+      // 输出统计信息和调试信息（仅在启用详细段信息时输出，避免刷屏）
+      if (options.verbose && options.show_detailed_segments) {
         spdlog::debug("  Chromosome {}: {} segments, {} ordering violations, "
                       "{} large gaps",
                       chr_name, segment_count, ordering_violations, large_gaps);
@@ -1713,10 +1713,10 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       current_chr_processed = 0;
       current_position = 0;
 
-      spdlog::info("Starting to process chromosome: {}.{} (Length: {:.1f} MB)",
-                   species,
-                   chromosome,
-                   chr_length / 1000000.0);
+      // spdlog::info("Starting to process chromosome: {}.{} (Length: {:.1f} MB)",
+      //              species,
+      //              chromosome,
+      //              chr_length / 1000000.0);
 
       displayProgress();
     }
@@ -1742,11 +1742,11 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       }
 
       completed_chromosomes++;
-      spdlog::info("Completed chromosome: {}.{} ({}/{})",
-                   current_species,
-                   current_chromosome,
-                   completed_chromosomes,
-                   total_chromosomes);
+      // spdlog::info("Completed chromosome: {}.{} ({}/{})",
+      //              current_species,
+      //              current_chromosome,
+      //              completed_chromosomes,
+      //              total_chromosomes);
 
       displayProgress();
     }
@@ -3548,6 +3548,7 @@ void RaMeshMultiGenomeGraph::verifyWithUnifiedTraversal(
 
       SegPtr current = genome_end.head;
       SegPtr prev = nullptr;
+      SegPtr prev_nonzero_segment = nullptr; // 用于坐标重叠检查（忽略0长度segment）
       SegPtr prev_segment = nullptr; // 用于坐标排序检查
       size_t segment_count = 0;
       size_t ordering_violations = 0;
@@ -3626,14 +3627,17 @@ void RaMeshMultiGenomeGraph::verifyWithUnifiedTraversal(
                   current->start, "Zero-length segment detected",
                   "start=" + std::to_string(current->start));
 
+              // 继续遍历，但要保持 prev 同步为真实前驱节点，避免下一节点误报 prev 不一致
+              prev = current;
               current =
                   current->primary_path.next.load(std::memory_order_acquire);
               continue;
             }
 
             // 检查坐标是否有重叠
-            if (prev && prev->isSegment()) {
-              uint_t prev_end = prev->start + prev->length;
+            if (prev_nonzero_segment) {
+              uint_t prev_end =
+                  prev_nonzero_segment->start + prev_nonzero_segment->length;
               if (current->start < prev_end) {
                 uint_t overlap_size = prev_end - current->start;
                 bool is_reference_species = reference_policy_enabled &&
@@ -3730,6 +3734,11 @@ void RaMeshMultiGenomeGraph::verifyWithUnifiedTraversal(
           }
         }
 
+        // 记录上一段“有效segment”（长度>0），供坐标重叠检查使用
+        if (current->isSegment() && current->length > 0) {
+          prev_nonzero_segment = current;
+        }
+
         prev = current;
         current = current->primary_path.next.load(std::memory_order_acquire);
       }
@@ -3761,8 +3770,8 @@ void RaMeshMultiGenomeGraph::verifyWithUnifiedTraversal(
         }
       }
 
-      // 输出统计信息
-      if (options.verbose) {
+      // 输出统计信息（仅在启用详细段信息时输出，避免刷屏）
+      if (options.verbose && options.show_detailed_segments) {
         if (options.isEnabled(VerificationType::COORDINATE_ORDERING)) {
           spdlog::debug("  Chromosome {}: {} segments, {} ordering violations, "
                         "{} large gaps",

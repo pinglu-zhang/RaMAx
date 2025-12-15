@@ -8,7 +8,8 @@
 #include <chrono>
 #include <tuple>
 #include <unordered_map>
-#include <set>
+#include <unordered_set>
+#include <stdexcept>
 
 namespace std {
     template<>
@@ -503,7 +504,7 @@ namespace hal_converter {
             return;
         }
 
-        spdlog::debug("  Reconstructing chromosome '{}' for ancestor '{}'", chr_name, ancestor_name);
+        // spdlog::debug("  Reconstructing chromosome '{}' for ancestor '{}'", chr_name, ancestor_name);
 
         std::shared_lock end_lock(ref_genome_end.rw);
 
@@ -548,7 +549,7 @@ namespace hal_converter {
             }
         }
 
-        spdlog::debug("  Completed chromosome '{}': {} segments", chr_name, segment_count);
+        // spdlog::debug("  Completed chromosome '{}': {} segments", chr_name, segment_count);
     }
 
     /**
@@ -1865,6 +1866,7 @@ namespace hal_converter {
      */
     std::vector<Region> analyzeRegionsByParticipants(
         const std::unordered_map<std::string, std::string>& aligned_sequences,
+        const std::unordered_set<std::string>& leaf_species,
         size_t alignment_length) {
 
         std::vector<Region> regions;
@@ -1877,7 +1879,13 @@ namespace hal_converter {
             // 分析当前列的参与者
             std::set<std::string> col_participants;
             for (const auto& [species, sequence] : aligned_sequences) {
-                if (col < sequence.length() && sequence[col] != '-' && sequence[col] != 'N') {
+                if (col >= sequence.length()) continue;
+
+                const char c = sequence[col];
+                // 重要：对叶子物种而言，'N' 代表未知碱基，仍然占用基因组坐标；不能当作 gap。
+                //      对祖先序列而言，'N' 常被用作“缺失/空位”占位符，需要当作 gap 才能正确拆分映射区域。
+                const bool is_gap = (c == '-') || (!leaf_species.count(species) && (c == 'N' || c == 'n'));
+                if (!is_gap) {
                     col_participants.insert(species);
                 }
             }
@@ -1949,18 +1957,22 @@ namespace hal_converter {
     hal_size_t calculateGapOffset(
         const std::string& species_name,
         const Region& region,
-        const std::unordered_map<std::string, std::string>& aligned_sequences) {
+        const std::unordered_map<std::string, std::string>& aligned_sequences,
+        const std::unordered_set<std::string>& leaf_species) {
 
         auto it = aligned_sequences.find(species_name);
         if (it == aligned_sequences.end()) return 0;
 
         const std::string& sequence = it->second;
 
-        // 计算区域开始位置之前有多少个非gap字符（包括'N'也当作gap）
+        // 计算区域开始位置之前有多少个“占用基因组坐标”的字符
+        // - 叶子：'N' 仍占位（未知碱基），不能当作 gap
+        // - 祖先：'N' 作为占位符时不占位，需要当作 gap
         hal_size_t offset = 0;
         for (size_t i = 0; i < region.start_col && i < sequence.length(); ++i) {
             char c = sequence[i];
-            if (c != '-' && c != 'N' && c != 'n') {
+            const bool is_gap = (c == '-') || (!leaf_species.count(species_name) && (c == 'N' || c == 'n'));
+            if (!is_gap) {
                 offset++;
             }
         }
@@ -1974,6 +1986,7 @@ namespace hal_converter {
     std::vector<CurrentBlockMapping> createMappingsForRegion(
         const Region& region,
         const std::unordered_map<std::string, std::string>& aligned_sequences,
+        const std::unordered_set<std::string>& leaf_species,
         const std::vector<AncestorNode>& ancestor_nodes,
         BlockPtr block) {
 
@@ -1992,7 +2005,7 @@ namespace hal_converter {
             mapping.parent_chr_name = getChrNameFromBlock(block, ancestor.node_name);
 
             // 计算由于gap导致的坐标偏移（注意反向链需从右端计算）
-            hal_size_t parent_offset = calculateGapOffset(ancestor.node_name, region, aligned_sequences);
+            hal_size_t parent_offset = calculateGapOffset(ancestor.node_name, region, aligned_sequences, leaf_species);
             {
                 const hal_size_t rlen = region.length();
                 if (parent_segment->strand == Strand::REVERSE) {
@@ -2016,7 +2029,7 @@ namespace hal_converter {
                 child_info.child_genome = child_name;
                 child_info.child_chr_name = getChrNameFromBlock(block, child_name);
 
-                hal_size_t child_offset = calculateGapOffset(child_name, region, aligned_sequences);
+                hal_size_t child_offset = calculateGapOffset(child_name, region, aligned_sequences, leaf_species);
                 {
                     const hal_size_t rlen = region.length();
                     if (child_segment->strand == Strand::REVERSE) {
@@ -2045,6 +2058,7 @@ namespace hal_converter {
      */
     std::vector<CurrentBlockMapping> splitMappingsByColumns(
         const std::unordered_map<std::string, std::string>& aligned_sequences,
+        const std::unordered_set<std::string>& leaf_species,
         const std::vector<AncestorNode>& ancestor_nodes,
         const std::string& ref_key,
         BlockPtr block) {
@@ -2052,15 +2066,19 @@ namespace hal_converter {
         std::vector<CurrentBlockMapping> result;
         if (aligned_sequences.empty()) return result;
 
-        size_t alignment_length = aligned_sequences.begin()->second.length();
+        // aligned_sequences 是 unordered_map，begin() 的元素顺序不稳定；这里取最大长度作为对齐列数。
+        size_t alignment_length = 0;
+        for (const auto& [_, seq] : aligned_sequences) {
+            alignment_length = std::max(alignment_length, seq.length());
+        }
         if (alignment_length == 0) return result;
 
         // 1. 按列分析参与者集合变化，拆分成连续区域
-        std::vector<Region> regions = analyzeRegionsByParticipants(aligned_sequences, alignment_length);
+        std::vector<Region> regions = analyzeRegionsByParticipants(aligned_sequences, leaf_species, alignment_length);
 
         // 2. 为每个区域生成映射块
         for (const auto& region : regions) {
-            auto mappings = createMappingsForRegion(region, aligned_sequences, ancestor_nodes, block);
+            auto mappings = createMappingsForRegion(region, aligned_sequences, leaf_species, ancestor_nodes, block);
             result.insert(result.end(), mappings.begin(), mappings.end());
         }
 
@@ -2087,9 +2105,11 @@ namespace hal_converter {
 
         // 2. 选择参考序列（优先选择block的ref_chr对应的物种）
         std::string ref_key;
+        std::string block_ref_chr;
         {
             std::shared_lock blk_lock(block->rw);
-            const auto& ref_chr = block->ref_chr;
+            block_ref_chr = block->ref_chr;
+            const auto& ref_chr = block_ref_chr;
             for (const auto& [species_chr, segment] : block->anchors) {
                 if (species_chr.second == ref_chr) {
                     const std::string& species_name = species_chr.first;
@@ -2107,19 +2127,47 @@ namespace hal_converter {
         }
 
         // 3. 对叶子序列进行多序列比对
+        //    注意：mergeAlignmentByRef 依赖 cigar 与 ref/qry 序列长度一致，否则可能出现越界异常。
+        //    科研软件必须严格：一旦发现不一致，直接报错，避免生成错误 HAL。
+        const size_t ref_len = leaf_sequences.at(ref_key).size();
+        for (const auto& [species, cigar] : leaf_cigars) {
+            if (species == ref_key) {
+                continue;
+            }
+            auto seq_it = leaf_sequences.find(species);
+            if (seq_it == leaf_sequences.end()) {
+                throw std::runtime_error(
+                    "HAL构建失败：Block(ref_chr=" + block_ref_chr +
+                    ") 中 cigar 物种 '" + species + "' 未找到对应序列，无法进行多序列对齐");
+            }
+            AlignCount cnt = countAlignedBases(cigar);
+            const size_t qry_len = seq_it->second.size();
+            if (cnt.ref_bases != ref_len || cnt.query_bases != qry_len) {
+                throw std::runtime_error(
+                    "HAL构建失败：Block(ref_chr=" + block_ref_chr + ") 中 cigar 长度与序列长度不一致：species='" +
+                    species + "' cigar(ref=" + std::to_string(cnt.ref_bases) + ",qry=" +
+                    std::to_string(cnt.query_bases) + ") seq(ref=" + std::to_string(ref_len) + ",qry=" +
+                    std::to_string(qry_len) + ")");
+            }
+        }
+
         try {
             mergeAlignmentByRef(ref_key, leaf_sequences, leaf_cigars);
             // spdlog::debug("Multi-sequence alignment completed for {} leaf sequences", leaf_sequences.size());
         } catch (const std::exception& e) {
-            spdlog::warn("mergeAlignmentByRef failed for block: {}, falling back to original method", e.what());
-            return analyzeCurrentBlock(block, ancestor_nodes);
+            throw std::runtime_error(
+                "HAL构建失败：mergeAlignmentByRef 在 Block(ref_chr=" + block_ref_chr + ", ref_species=" + ref_key +
+                ") 上失败：" + std::string(e.what()));
         }
 
         // 4. 添加祖先序列到已对齐的序列中
         addAncestorSequencesToAlignment(block, ancestor_nodes, ancestor_data, ancestor_sequences, leaf_sequences);
 
         // 5. 按列分析并拆分映射
-        result = splitMappingsByColumns(leaf_sequences, ancestor_nodes, ref_key, block);
+        std::unordered_set<std::string> leaf_species;
+        leaf_species.reserve(leaf_sequences.size());
+        for (const auto& [sp, _] : leaf_sequences) leaf_species.insert(sp);
+        result = splitMappingsByColumns(leaf_sequences, leaf_species, ancestor_nodes, ref_key, block);
 
         return result;
     }
@@ -2186,27 +2234,45 @@ namespace hal_converter {
         auto t_total_start = __now();
         auto t1_start = __now();
 
-        size_t totalBlocks = 0;
-        SegmentIndexManager idxMgr;
-        std::map<BlockPtr, std::vector<CurrentBlockMapping>> refined_mappings; // 缓存拆分结果
-        ThreadPool pool(std::max(1u, std::thread::hardware_concurrency()));
-        std::mutex mapping_mutex;
+	        size_t totalBlocks = 0;
+	        SegmentIndexManager idxMgr;
+	        std::map<BlockPtr, std::vector<CurrentBlockMapping>> refined_mappings; // 缓存拆分结果
+	        ThreadPool pool(std::max(1u, std::thread::hardware_concurrency()));
+	        std::mutex mapping_mutex;
+	        std::atomic<bool> pass1_failed{false};
+	        std::vector<std::future<void>> pass1_futures;
+	        pass1_futures.reserve(blocks.size());
 
-        // Pass 1: 并行分析每个 block 的 gap-aware 映射
-        for (const auto& wb : blocks) {
-            if (auto block = wb.lock()) {
-                totalBlocks++;
-                pool.enqueue([&, block]() {
-                auto split_mappings = analyzeBlockWithGapHandling(block, ancestor_nodes, ancestor_data, ancestor_sequences, seqpro_managers);
-                    std::lock_guard<std::mutex> lk(mapping_mutex);
-                    refined_mappings[block] = std::move(split_mappings);
-                });
-            }
-        }
-        pool.waitAllTasksDone();
+	        // Pass 1: 并行分析每个 block 的 gap-aware 映射
+	        for (const auto& wb : blocks) {
+	            if (auto block = wb.lock()) {
+	                totalBlocks++;
+	                pass1_futures.emplace_back(pool.enqueue([&, block]() {
+	                    if (pass1_failed.load(std::memory_order_relaxed)) {
+	                        return;
+	                    }
+	                    try {
+	                        auto split_mappings = analyzeBlockWithGapHandling(
+	                            block, ancestor_nodes, ancestor_data, ancestor_sequences, seqpro_managers);
+	                        if (pass1_failed.load(std::memory_order_relaxed)) {
+	                            return;
+	                        }
+	                        std::lock_guard<std::mutex> lk(mapping_mutex);
+	                        refined_mappings[block] = std::move(split_mappings);
+	                    } catch (...) {
+	                        pass1_failed.store(true, std::memory_order_relaxed);
+	                        throw;
+	                    }
+	                }));
+	            }
+	        }
+	        pool.waitAllTasksDone();
+	        for (auto& f : pass1_futures) {
+	            f.get(); // 传播 worker 中的异常，保证科研软件 fail-fast
+	        }
 
-        auto t1_end = __now();
-        spdlog::info("  Pass1: analyzed {} blocks in {} ms", totalBlocks, __ms(t1_start, t1_end));
+	        auto t1_end = __now();
+	        spdlog::info("  Pass1: analyzed {} blocks in {} ms", totalBlocks, __ms(t1_start, t1_end));
 
         // Pass 2 (并行聚合): 收集、排序、计算分裂点、生成完整段列表
         auto t2_start = __now();
@@ -2263,8 +2329,15 @@ namespace hal_converter {
 
         // 2.2 并行排序
         auto t22_start = __now();
-        for (auto& [k, v] : rawBottomSegments) pool.enqueue([&v] { std::sort(v.begin(), v.end()); });
-        for (auto& [k, v] : rawTopSegments) pool.enqueue([&v] { std::sort(v.begin(), v.end()); });
+        // 注意：不能捕获结构化绑定变量 `v` 的引用（会形成悬垂引用，导致未定义行为/内存破坏）
+        for (auto& kv : rawBottomSegments) {
+            auto* vec = &kv.second;
+            pool.enqueue([vec] { std::sort(vec->begin(), vec->end()); });
+        }
+        for (auto& kv : rawTopSegments) {
+            auto* vec = &kv.second;
+            pool.enqueue([vec] { std::sort(vec->begin(), vec->end()); });
+        }
         pool.waitAllTasksDone();
         auto t22_end = __now();
         spdlog::info("  Pass2.2: sorted raw segments in {} ms", __ms(t22_start, t22_end));
@@ -2272,104 +2345,87 @@ namespace hal_converter {
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> bottomSegmentsFull;
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> topSegmentsFull;
 
-        // 2.3 生成完整段列表（优化：减少 HAL IO，向量归并断点，可控并行）
+        // 2.3 并行生成完整段列表
         auto t23_start = __now();
-        std::map<std::pair<std::string, std::string>, hal_size_t> seqLengths; // 需预先串行获取
+        // 重要：HAL 要求（有 parent 的 genome）每条 sequence 的 top segments 总长度必须等于 sequence 长度；
+        //      （有 children 的 genome）每条 sequence 的 bottom segments 总长度必须等于 sequence 长度。
+        //      因此即使某条染色体完全没有参与任何 block（bpTop/bpBottom 不含该 key），也必须生成“全长 gap 段”进行覆盖，
+        //      否则会因为 HDF5 段坐标的边界存储方式导致前一条染色体的末段被错误拉长，进而触发 parent/child length mismatch。
+        std::map<std::pair<std::string, std::string>, hal_size_t> seqLengths; // (genome, chr) -> chr length
+        std::set<std::pair<std::string, std::string>> keysNeedTop;
+        std::set<std::pair<std::string, std::string>> keysNeedBottom;
         std::set<std::pair<std::string, std::string>> allKeys;
-        for (auto const& [key, _] : bpBottom) allKeys.insert(key);
-        for (auto const& [key, _] : bpTop) allKeys.insert(key);
+        {
+            std::set<std::string> allGenomeNames;
+            for (const auto& [leafName, _] : seqpro_managers) allGenomeNames.insert(leafName);
+            for (const auto& anc : ancestor_nodes) allGenomeNames.insert(anc.node_name);
 
-        // 3.1 按 genome 批量获取序列长度，减少 open/close 开销
-        std::map<std::string, std::vector<std::string>> genomeToChrs;
-        for (const auto& [g, c] : allKeys) genomeToChrs[g].push_back(c);
-        for (auto& [g, chrs] : genomeToChrs) {
-            // 去重，避免同一 chr 重复获取长度
-            std::sort(chrs.begin(), chrs.end());
-            chrs.erase(std::unique(chrs.begin(), chrs.end()), chrs.end());
-            hal::Genome* genome = alignment->openGenome(g);
-            if (!genome) {
-                spdlog::warn("Cannot open genome '{}' for seq length fetch", g);
-                continue;
-            }
-            for (const auto& chr : chrs) {
-                if (auto* s = genome->getSequence(chr)) {
-                    seqLengths[std::make_pair(g, chr)] = s->getSequenceLength();
-                } else {
-                    spdlog::warn("Sequence '{}' not found in genome '{}'", chr, g);
+            for (const auto& genomeName : allGenomeNames) {
+                hal::Genome* g = alignment->openGenome(genomeName);
+                if (!g) continue;
+
+                const bool needTop = (g->getParent() != nullptr);
+                const bool needBottom = (g->getNumChildren() > 0);
+
+                for (auto seqIt = g->getSequenceIterator(0); !seqIt->atEnd(); seqIt->toNext()) {
+                    hal::Sequence* s = seqIt->getSequence();
+                    if (!s) continue;
+                    auto key = std::make_pair(genomeName, s->getName());
+                    seqLengths[key] = s->getSequenceLength();
+                    if (needTop) keysNeedTop.insert(key);
+                    if (needBottom) keysNeedBottom.insert(key);
+                    if (needTop || needBottom) allKeys.insert(key);
                 }
+
+                alignment->closeGenome(g);
             }
-            alignment->closeGenome(genome);
         }
 
-        // 工具：向量化归并断点并生成完整段
-        auto makeFullSegmentsForKey = [&](const std::pair<std::string, std::string>& key)
-            -> std::vector<SimpleSegmentInfo> {
-            std::vector<SimpleSegmentInfo> segs;
-            auto lenIt = seqLengths.find(key);
-            if (lenIt == seqLengths.end()) return segs;
-            const hal_index_t seqLen = static_cast<hal_index_t>(lenIt->second);
-            if (seqLen <= 0) return segs;
-
-            std::vector<hal_index_t> bp;
-            bp.reserve(4 +
-                       (bpBottom.count(key) ? bpBottom.at(key).size() : 0) +
-                       (bpTop.count(key) ? bpTop.at(key).size() : 0));
-            bp.push_back(0);
-            bp.push_back(seqLen);
-            if (auto it = bpBottom.find(key); it != bpBottom.end()) {
-                bp.insert(bp.end(), it->second.begin(), it->second.end());
-            }
-            if (auto it = bpTop.find(key); it != bpTop.end()) {
-                bp.insert(bp.end(), it->second.begin(), it->second.end());
-            }
-
-            std::sort(bp.begin(), bp.end());
-            bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
-            if (bp.size() < 2) return segs;
-
-            segs.reserve(bp.size());
-            for (size_t i = 1; i < bp.size(); ++i) {
-                if (bp[i] > bp[i - 1]) {
-                    segs.push_back({bp[i - 1], static_cast<hal_size_t>(bp[i] - bp[i - 1])});
+        std::mutex bottom_full_mutex, top_full_mutex;
+        std::vector<std::future<void>> pass23_futures;
+        pass23_futures.reserve(allKeys.size());
+        for (const auto& key : allKeys) {
+            pass23_futures.emplace_back(pool.enqueue([&, key]() {
+                std::set<hal_index_t> uni_bp;
+                if (auto it = bpBottom.find(key); it != bpBottom.end()) {
+                    uni_bp.insert(it->second.begin(), it->second.end());
                 }
-            }
-            return segs;
-        };
-
-        // 3.3 可控并行生成 full segments（任务内不触碰 HAL）
-        std::vector<std::pair<std::string, std::string>> keyVec(allKeys.begin(), allKeys.end());
-        const size_t numKeys = keyVec.size();
-        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const size_t taskCount = std::max<size_t>(1, std::min<size_t>(numKeys, hw));
-        const size_t chunk = (numKeys + taskCount - 1) / taskCount;
-
-        std::vector<std::future<std::tuple<SegMap, SegMap>>> futures23;
-        futures23.reserve(taskCount);
-
-        for (size_t t = 0; t < taskCount; ++t) {
-            const size_t begin = t * chunk;
-            const size_t end = std::min(numKeys, begin + chunk);
-            if (begin >= end) break;
-
-            futures23.emplace_back(pool.enqueue([&, begin, end]() {
-                SegMap localBottom, localTop;
-                for (size_t i = begin; i < end; ++i) {
-                    const auto& key = keyVec[i];
-                    auto segs = makeFullSegmentsForKey(key);
-                    if (segs.empty()) continue;
-                    if (bpBottom.count(key)) localBottom[key] = segs;
-                    if (bpTop.count(key))    localTop[key]    = std::move(segs);
+                if (auto it = bpTop.find(key); it != bpTop.end()) {
+                    uni_bp.insert(it->second.begin(), it->second.end());
                 }
-                return std::make_tuple(std::move(localBottom), std::move(localTop));
+
+                const auto lenIt = seqLengths.find(key);
+                if (lenIt == seqLengths.end()) {
+                    throw std::runtime_error("HAL构建失败：无法获取 sequence 长度（内部错误）：genome=" + key.first + " seq=" + key.second);
+                }
+                const hal_index_t seqLen = static_cast<hal_index_t>(lenIt->second);
+                uni_bp.insert(0);
+                uni_bp.insert(seqLen);
+
+                if (uni_bp.size() < 2) return;
+
+                std::vector<SimpleSegmentInfo> segs;
+                segs.reserve(uni_bp.size());
+                hal_index_t prev = -1;
+                for (hal_index_t x : uni_bp) {
+                    if (prev != -1 && x > prev) segs.push_back({prev, static_cast<hal_size_t>(x - prev)});
+                    prev = x;
+                }
+
+                if (keysNeedBottom.count(key)) {
+                    std::lock_guard<std::mutex> lk(bottom_full_mutex);
+                    bottomSegmentsFull[key] = segs;
+                }
+                if (keysNeedTop.count(key)) {
+                    std::lock_guard<std::mutex> lk(top_full_mutex);
+                    topSegmentsFull[key] = segs;
+                }
             }));
         }
-
-        for (auto& fut : futures23) {
-            auto [lb, lt] = fut.get();
-            for (auto& [k, v] : lb) bottomSegmentsFull.emplace(std::move(k), std::move(v));
-            for (auto& [k, v] : lt) topSegmentsFull.emplace(std::move(k), std::move(v));
+        pool.waitAllTasksDone();
+        for (auto& f : pass23_futures) {
+            f.get(); // 传播 worker 中的异常，保证科研软件 fail-fast
         }
-
         auto t23_end = __now();
         spdlog::info("  Pass2.3: built full segments in {} ms (bottom groups: {}, top groups: {})",
                       __ms(t23_start, t23_end), bottomSegmentsFull.size(), topSegmentsFull.size());
@@ -2532,6 +2588,26 @@ namespace hal_converter {
                 topIndexMap[key] = topIt->getArrayIndex();
                 topIt->toRight();
             }
+
+            // fail-fast: 写入后立即校验该 sequence 的 top segments 覆盖长度必须等于 sequence 长度（HAL 强制）
+            // 注意：HDF5TopSegment 的坐标采用“边界数组”存储，若存在断档/越界，会导致前一段长度被错误拉长，从而在后续建链阶段表现为 length mismatch。
+            {
+                const hal_size_t expected_len = seq->getSequenceLength();
+                hal_size_t total_len = 0;
+                auto verifyIt = seq->getTopSegmentIterator();
+                for (hal_size_t i = 0; i < seq->getNumTopSegments(); ++i) {
+                    total_len += verifyIt->getTopSegment()->getLength();
+                    verifyIt->toRight();
+                }
+                if (total_len != expected_len) {
+                    throw std::runtime_error(
+                        "HAL构建失败：写入 top segments 后 sequence 覆盖长度不等于 sequence 长度（会导致后续 parent/child 长度异常）：genome=" +
+                        genomeName + " seq=" + chrName +
+                        " seq_len=" + std::to_string(expected_len) +
+                        " top_total_len=" + std::to_string(total_len) +
+                        " numTopSegments=" + std::to_string(seq->getNumTopSegments()));
+                }
+            }
             // spdlog::debug("Written {} top segments for {}:{}", segments.size(), genomeName, chrName);
         }
         auto t_write_top_end = __now();
@@ -2560,16 +2636,8 @@ namespace hal_converter {
             bool is_reversed;
         };
 
-        auto parent_sorter = [](const LinkIdx& a, const LinkIdx& b) {
-            if (a.parent_gid != b.parent_gid) return a.parent_gid < b.parent_gid;
-            return a.parent_bidx < b.parent_bidx;
-        };
-        auto child_sorter = [](const LinkIdx& a, const LinkIdx& b) {
-            if (a.child_gid != b.child_gid) return a.child_gid < b.child_gid;
-            return a.child_tidx < b.child_tidx;
-        };
-
-        std::vector<LinkIdx> all_links;
+	
+	        std::vector<LinkIdx> all_links;
         size_t totalMappings = 0;
         size_t totalChildren = 0;
         for (const auto& [block, mappings] : refined_mappings) {
@@ -2600,79 +2668,283 @@ namespace hal_converter {
 
         // 生成压缩链接，直接解析成段数组索引，避免保存字符串键
         for (const auto& [block, mappings] : refined_mappings) {
+            std::string blk_ref_chr;
+            if (block) {
+                std::shared_lock blk_lock(block->rw);
+                blk_ref_chr = block->ref_chr;
+            }
             for (const auto& mapping : mappings) {
                 auto pgIt = openGenomes.find(mapping.parent_genome);
-                if (pgIt == openGenomes.end()) continue;
+                if (pgIt == openGenomes.end()) {
+                    throw std::runtime_error(
+                        "HAL构建失败(ref_chr=" + blk_ref_chr + ")：parent genome 未打开/不存在：parent=" + mapping.parent_genome);
+                }
                 hal::Genome* parentGenome = pgIt->second;
                 hal::Sequence* parentSeq = parentGenome->getSequence(mapping.parent_chr_name);
-                if (!parentSeq) continue;
+                if (!parentSeq) {
+                    throw std::runtime_error(
+                        "HAL构建失败(ref_chr=" + blk_ref_chr + ")：parent sequence 不存在：parent=" + mapping.parent_genome + " chr=" +
+                        mapping.parent_chr_name);
+                }
                 hal_index_t pSeqStart = parentSeq->getStartPosition();
                 SegmentKey pKey = std::make_tuple(mapping.parent_genome, mapping.parent_chr_name, pSeqStart + (hal_index_t)mapping.parent_start, mapping.parent_length);
                 auto pFound = bottomIndexMap.find(pKey);
-                if (pFound == bottomIndexMap.end()) continue;
+                if (pFound == bottomIndexMap.end()) {
+                    throw std::runtime_error(
+                        "HAL构建失败(ref_chr=" + blk_ref_chr + ")：未找到 parent bottom segment 索引：parent=" + mapping.parent_genome + ":" +
+                        mapping.parent_chr_name + " start=" + std::to_string(mapping.parent_start) +
+                        " len=" + std::to_string(mapping.parent_length));
+                }
                 hal_index_t pIdx = pFound->second;
                 uint32_t pg = genomeId[mapping.parent_genome];
 
+                // 强校验：bottomIndexMap 返回的索引必须与 key 对应的段一致（否则说明段写入/索引映射已损坏）
+                {
+                    auto pIt = parentGenome->getBottomSegmentIterator(pIdx);
+                    auto* pSeg = pIt->getBottomSegment();
+                    const hal_index_t expect_start = pSeqStart + (hal_index_t)mapping.parent_start;
+                    if (pSeg->getStartPosition() != expect_start || pSeg->getLength() != mapping.parent_length ||
+                        pSeg->getSequence()->getName() != mapping.parent_chr_name) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr +
+                            ")：parent bottom segment 索引映射不一致（常见原因：某些sequence未生成bottom segments导致边界坐标被覆盖，从而把上一条sequence末段错误拉长；也可能是写入越界/并发导致的内存破坏）：parent=" +
+                            mapping.parent_genome + " key_seq=" + mapping.parent_chr_name +
+                            " parent_seqStart=" + std::to_string(pSeqStart) +
+                            " parent_seqLen=" + std::to_string(parentSeq->getSequenceLength()) +
+                            " key_start_in_seq=" + std::to_string(mapping.parent_start) +
+                            " key_start=" + std::to_string(expect_start) +
+                            " key_len=" + std::to_string(mapping.parent_length) +
+                            " -> actual_seq=" + pSeg->getSequence()->getName() +
+                            " actual_start=" + std::to_string(pSeg->getStartPosition()) +
+                            " actual_len=" + std::to_string(pSeg->getLength()) +
+                            " parent_bidx=" + std::to_string(pIdx));
+                    }
+                }
+
                 for (const auto& child : mapping.children) {
+                    if (child.child_length != mapping.parent_length) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr + ")：parent/child 长度不一致（HAL要求必须等长）：parent=" +
+                            mapping.parent_genome + ":" + mapping.parent_chr_name +
+                            " start=" + std::to_string(mapping.parent_start) +
+                            " len=" + std::to_string(mapping.parent_length) +
+                            " -> child=" + child.child_genome + ":" + child.child_chr_name +
+                            " start=" + std::to_string(child.child_start) +
+                            " len=" + std::to_string(child.child_length));
+                    }
                     auto cgIt = openGenomes.find(child.child_genome);
-                    if (cgIt == openGenomes.end()) continue;
+                    if (cgIt == openGenomes.end()) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr + ")：child genome 未打开/不存在：child=" + child.child_genome);
+                    }
                     hal::Genome* childGenome = cgIt->second;
                     hal::Sequence* childSeq = childGenome->getSequence(child.child_chr_name);
-                    if (!childSeq) continue;
+                    if (!childSeq) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr + ")：child sequence 不存在：child=" + child.child_genome + " chr=" +
+                            child.child_chr_name);
+                    }
                     hal_index_t cSeqStart = childSeq->getStartPosition();
                     SegmentKey cKey = std::make_tuple(child.child_genome, child.child_chr_name, cSeqStart + (hal_index_t)child.child_start, child.child_length);
                     auto cFound = topIndexMap.find(cKey);
-                    if (cFound == topIndexMap.end()) continue;
+                    if (cFound == topIndexMap.end()) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr + ")：未找到 child top segment 索引：child=" + child.child_genome + ":" +
+                            child.child_chr_name + " start=" + std::to_string(child.child_start) +
+                            " len=" + std::to_string(child.child_length));
+                    }
                     hal_index_t cIdx = cFound->second;
+
+                    // 强校验：topIndexMap 返回的索引必须与 key 对应的段一致（否则说明段写入/索引映射已损坏）
+                    {
+                        auto cIt = childGenome->getTopSegmentIterator(cIdx);
+                        auto* cSeg = cIt->getTopSegment();
+                        const hal_index_t expect_start = cSeqStart + (hal_index_t)child.child_start;
+                        if (cSeg->getStartPosition() != expect_start || cSeg->getLength() != child.child_length ||
+                            cSeg->getSequence()->getName() != child.child_chr_name) {
+                            const hal_index_t expect_end = expect_start + static_cast<hal_index_t>(child.child_length);
+                            const hal_index_t actual_end = cSeg->getStartPosition() + static_cast<hal_index_t>(cSeg->getLength());
+                            throw std::runtime_error(
+                                "HAL构建失败(ref_chr=" + blk_ref_chr +
+                                ")：child top segment 索引映射不一致（常见原因：某些sequence未生成top segments导致边界坐标被覆盖，从而把上一条sequence末段错误拉长；也可能是写入越界/并发导致的内存破坏）：child=" +
+                                child.child_genome + " key_seq=" + child.child_chr_name +
+                                " child_seqStart=" + std::to_string(cSeqStart) +
+                                " child_seqLen=" + std::to_string(childSeq->getSequenceLength()) +
+                                " key_start_in_seq=" + std::to_string(child.child_start) +
+                                " key_start=" + std::to_string(expect_start) +
+                                " key_len=" + std::to_string(child.child_length) +
+                                " key_end=" + std::to_string(expect_end) +
+                                " -> actual_seq=" + cSeg->getSequence()->getName() +
+                                " actual_start=" + std::to_string(cSeg->getStartPosition()) +
+                                " actual_len=" + std::to_string(cSeg->getLength()) +
+                                " actual_end=" + std::to_string(actual_end) +
+                                " child_tidx=" + std::to_string(cIdx));
+                        }
+                    }
 
                     uint32_t cg = genomeId[child.child_genome];
                     auto pci = parentChildIdx.find(keyPC(pg, cg));
-                    if (pci == parentChildIdx.end()) continue;
+                    if (pci == parentChildIdx.end()) {
+                        throw std::runtime_error(
+                            "HAL构建失败(ref_chr=" + blk_ref_chr + ")：parent genome 不包含该 child genome（系统发育树/基因组关系不一致）：parent=" +
+                            mapping.parent_genome + " child=" + child.child_genome);
+                    }
 
                     all_links.push_back(LinkIdx{pg, cg, pIdx, cIdx, pci->second, child.is_reversed});
                 }
             }
         }
 
-        // Pass 3.1: Link Parent -> Child (sorted by parent)
-        auto t_p2c_start = __now();
-        std::sort(all_links.begin(), all_links.end(), parent_sorter);
-        size_t successful_p2c = 0;
-        // 反向映射 gid -> genome*
-        std::vector<hal::Genome*> gid2genome(genomeId.size(), nullptr);
-        for (const auto& [name, g] : openGenomes) gid2genome[genomeId[name]] = g;
-        for(const auto& link : all_links) {
-            hal::Genome* parentGenome = gid2genome[link.parent_gid];
-            auto parentBottomIt = parentGenome->getBottomSegmentIterator(link.parent_bidx);
-            auto* parentBottomSeg = parentBottomIt->getBottomSegment();
-            if (link.child_idx_in_parent < parentBottomSeg->getNumChildren()) {
-                parentBottomSeg->setChildIndex(link.child_idx_in_parent, link.child_tidx);
-                parentBottomSeg->setChildReversed(link.child_idx_in_parent, link.is_reversed);
-                successful_p2c++;
-            }
-        }
-        auto t_p2c_end = __now();
-        spdlog::info("  Pass3.parentChild.p2c: linked {} parent->child in {} ms", successful_p2c, __ms(t_p2c_start, t_p2c_end));
-
-        // Pass 3.2: Link Child -> Parent (sorted by child)
-        auto t_c2p_start = __now();
-        std::sort(all_links.begin(), all_links.end(), child_sorter);
-        size_t successful_c2p = 0;
-        for(const auto& link : all_links) {
-            hal::Genome* childGenome = gid2genome[link.child_gid];
-            auto childTopIt = childGenome->getTopSegmentIterator(link.child_tidx);
-            auto* childTopSeg = childTopIt->getTopSegment();
-            childTopSeg->setParentIndex(link.parent_bidx);
-            childTopSeg->setParentReversed(link.is_reversed);
-            successful_c2p++;
-        }
-        auto t_c2p_end = __now();
-        spdlog::info("  Pass3.parentChild.c2p: linked {} child->parent in {} ms", successful_c2p, __ms(t_c2p_start, t_c2p_end));
-
-        size_t successfulMappings = std::min(successful_p2c, successful_c2p);
-
-        auto t_map_end = __now();
-        spdlog::info("  Pass3.parentChild: mapped {}/{} links in {} ms (total)", successfulMappings, totalChildren, __ms(t_map_start, t_map_end));
+	        // 反向映射 gid -> genome*
+	        std::vector<hal::Genome*> gid2genome(genomeId.size(), nullptr);
+	        for (const auto& [name, g] : openGenomes) gid2genome[genomeId[name]] = g;
+	
+	        // Pass 3: Link Parent <-> Child，并处理 duplication（nextParalogy）
+	        // 说明：HAL 要求 parent bottom 与 child top 必须等长；并且若同一 child genome 中有多个 top segments 指向同一 parentIndex，
+	        //      必须设置 nextParalogyIndex（halValidate::validateDuplications 会强制检查）。
+	        auto t_link_start = __now();
+	        auto group_sorter = [](const LinkIdx& a, const LinkIdx& b) {
+	            if (a.parent_gid != b.parent_gid) return a.parent_gid < b.parent_gid;
+	            if (a.child_gid != b.child_gid) return a.child_gid < b.child_gid;
+	            if (a.parent_bidx != b.parent_bidx) return a.parent_bidx < b.parent_bidx;
+	            return a.child_tidx < b.child_tidx;
+	        };
+	        std::sort(all_links.begin(), all_links.end(), group_sorter);
+	
+	        size_t successful_p2c = 0;
+	        size_t successful_c2p = 0;
+	
+	        for (size_t i = 0; i < all_links.size();) {
+	            const LinkIdx& first = all_links[i];
+	            size_t j = i + 1;
+	
+	            const bool is_reversed = first.is_reversed;
+	            std::vector<hal_index_t> child_tidxs;
+	            child_tidxs.push_back(first.child_tidx);
+	
+	            while (j < all_links.size()) {
+	                const auto& cur = all_links[j];
+	                if (cur.parent_gid != first.parent_gid ||
+	                    cur.child_gid != first.child_gid ||
+	                    cur.parent_bidx != first.parent_bidx ||
+	                    cur.child_idx_in_parent != first.child_idx_in_parent) {
+	                    break;
+	                }
+	                if (cur.is_reversed != is_reversed) {
+	                    throw std::runtime_error(
+	                        "HAL构建失败：同一 parent/child/parentSeg 上出现不同方向的 mapping（无法安全表示）：parent_gid=" +
+	                        std::to_string(first.parent_gid) + " child_gid=" + std::to_string(first.child_gid) +
+	                        " parent_bidx=" + std::to_string(first.parent_bidx) +
+	                        " child_slot=" + std::to_string(first.child_idx_in_parent));
+	                }
+	                child_tidxs.push_back(cur.child_tidx);
+	                ++j;
+	            }
+	
+	            std::sort(child_tidxs.begin(), child_tidxs.end());
+	            child_tidxs.erase(std::unique(child_tidxs.begin(), child_tidxs.end()), child_tidxs.end());
+	
+	            hal::Genome* parentGenome = gid2genome[first.parent_gid];
+	            hal::Genome* childGenome = gid2genome[first.child_gid];
+	            if (!parentGenome || !childGenome) {
+	                throw std::runtime_error("HAL构建失败：gid->genome 映射为空（内部错误）");
+	            }
+	
+	            auto parentBottomIt = parentGenome->getBottomSegmentIterator(first.parent_bidx);
+	            auto* parentBottomSeg = parentBottomIt->getBottomSegment();
+	            if (first.child_idx_in_parent >= parentBottomSeg->getNumChildren()) {
+	                throw std::runtime_error(
+	                    "HAL构建失败：child slot 超出 parent bottom segment children 数量：parent=" + parentGenome->getName() +
+	                    " parent_bidx=" + std::to_string(first.parent_bidx) +
+	                    " child_slot=" + std::to_string(first.child_idx_in_parent) +
+	                    " numChildren=" + std::to_string(parentBottomSeg->getNumChildren()));
+	            }
+	
+	            // bottom: childIndex 只保存一个入口；若存在 duplication，依赖 nextParalogy 环遍历
+	            const hal_index_t rep_tidx = child_tidxs.front();
+	            const hal_index_t existing_child = parentBottomSeg->getChildIndex(first.child_idx_in_parent);
+	            if (existing_child == hal::NULL_INDEX) {
+	                parentBottomSeg->setChildIndex(first.child_idx_in_parent, rep_tidx);
+	                parentBottomSeg->setChildReversed(first.child_idx_in_parent, is_reversed);
+	                successful_p2c++;
+	            } else {
+	                if (!std::binary_search(child_tidxs.begin(), child_tidxs.end(), existing_child)) {
+	                    throw std::runtime_error(
+	                        "HAL构建失败：同一 parent bottom segment 的 childIndex 被不同 top segment 冲突占用（会导致输出错误）：parent=" +
+	                        parentGenome->getName() + " child=" + childGenome->getName() +
+	                        " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()) +
+	                        " child_slot=" + std::to_string(first.child_idx_in_parent) +
+	                        " existing_child_tidx=" + std::to_string(existing_child) +
+	                        " new_rep_child_tidx=" + std::to_string(rep_tidx));
+	                }
+	                if (parentBottomSeg->getChildReversed(first.child_idx_in_parent) != is_reversed) {
+	                    throw std::runtime_error(
+	                        "HAL构建失败：同一 parent bottom segment 上 childReversed 冲突（会导致输出错误）：parent=" +
+	                        parentGenome->getName() + " child=" + childGenome->getName() +
+	                        " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()) +
+	                        " child_slot=" + std::to_string(first.child_idx_in_parent));
+	                }
+	            }
+	
+	            // top: 设置 parentIndex / parentReversed，并校验等长（HAL 强制要求）
+	            for (const hal_index_t tidx : child_tidxs) {
+	                auto childTopIt = childGenome->getTopSegmentIterator(tidx);
+	                auto* childTopSeg = childTopIt->getTopSegment();
+	
+	                if (childTopSeg->getLength() != parentBottomSeg->getLength()) {
+	                    throw std::runtime_error(
+	                        "HAL构建失败：parent/child segment 长度不一致（HAL 不允许）：parent=" + parentGenome->getName() +
+	                        " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()) +
+	                        " parent_start=" + std::to_string(parentBottomSeg->getStartPosition()) +
+	                        " parent_len=" + std::to_string(parentBottomSeg->getLength()) +
+	                        " parent_seq=" + parentBottomSeg->getSequence()->getName() +
+	                        " child=" + childGenome->getName() +
+	                        " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()) +
+	                        " child_start=" + std::to_string(childTopSeg->getStartPosition()) +
+	                        " child_len=" + std::to_string(childTopSeg->getLength()) +
+	                        " child_seq=" + childTopSeg->getSequence()->getName());
+	                }
+	
+	                const hal_index_t existing_parent = childTopSeg->getParentIndex();
+	                if (existing_parent != hal::NULL_INDEX && existing_parent != parentBottomSeg->getArrayIndex()) {
+	                    throw std::runtime_error(
+	                        "HAL构建失败：同一 child top segment 被多个不同 parent bottom segment 复用（当前实现不支持；需先解决数据冲突或实现更复杂的表示）：child=" +
+	                        childGenome->getName() + " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()) +
+	                        " child_seq=" + childTopSeg->getSequence()->getName() +
+	                        " child_start=" + std::to_string(childTopSeg->getStartPosition()) +
+	                        " existing_parent_bidx=" + std::to_string(existing_parent) +
+	                        " new_parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()));
+	                }
+	
+	                childTopSeg->setParentIndex(parentBottomSeg->getArrayIndex());
+	                childTopSeg->setParentReversed(is_reversed);
+	                successful_c2p++;
+	            }
+	
+	            // duplication: nextParalogyIndex 需要对共享同一 parentIndex 的 top segments 设为非 NULL（这里用环形链表）
+	            if (child_tidxs.size() == 1) {
+	                auto tIt = childGenome->getTopSegmentIterator(child_tidxs[0]);
+	                tIt->getTopSegment()->setNextParalogyIndex(hal::NULL_INDEX);
+	            } else {
+	                for (size_t k = 0; k < child_tidxs.size(); ++k) {
+	                    const hal_index_t cur = child_tidxs[k];
+	                    const hal_index_t nxt = child_tidxs[(k + 1) % child_tidxs.size()];
+	                    auto tIt = childGenome->getTopSegmentIterator(cur);
+	                    tIt->getTopSegment()->setNextParalogyIndex(nxt);
+	                }
+	            }
+	
+	            i = j;
+	        }
+	
+	        auto t_link_end = __now();
+	        spdlog::info("  Pass3.parentChild.p2c: linked {} parent->child in {} ms", successful_p2c, __ms(t_link_start, t_link_end));
+	        spdlog::info("  Pass3.parentChild.c2p: linked {} child->parent in {} ms", successful_c2p, __ms(t_link_start, t_link_end));
+	
+	        size_t successfulMappings = std::min(successful_p2c, successful_c2p);
+	
+	        auto t_map_end = __now();
+	        spdlog::info("  Pass3.parentChild: mapped {}/{} links in {} ms (total)", successfulMappings, totalChildren, __ms(t_map_start, t_map_end));
 
         // 关闭所有打开的基因组
         auto t_close_start = __now();
