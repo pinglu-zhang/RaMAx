@@ -8,6 +8,7 @@
 #include <chrono>
 #include <tuple>
 #include <unordered_map>
+#include <set>
 
 namespace std {
     template<>
@@ -2271,54 +2272,104 @@ namespace hal_converter {
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> bottomSegmentsFull;
         std::map<std::pair<std::string, std::string>, std::vector<SimpleSegmentInfo>> topSegmentsFull;
 
-        // 2.3 并行生成完整段列表
+        // 2.3 生成完整段列表（优化：减少 HAL IO，向量归并断点，可控并行）
         auto t23_start = __now();
         std::map<std::pair<std::string, std::string>, hal_size_t> seqLengths; // 需预先串行获取
         std::set<std::pair<std::string, std::string>> allKeys;
-        for(auto const& [key, val] : bpBottom) allKeys.insert(key);
-        for(auto const& [key, val] : bpTop) allKeys.insert(key);
+        for (auto const& [key, _] : bpBottom) allKeys.insert(key);
+        for (auto const& [key, _] : bpTop) allKeys.insert(key);
 
-        for (const auto& gchr : allKeys) {
-            hal::Genome* g = alignment->openGenome(gchr.first);
-            if (!g) continue;
-            if (auto* s = g->getSequence(gchr.second)) {
-                seqLengths[gchr] = s->getSequenceLength();
+        // 3.1 按 genome 批量获取序列长度，减少 open/close 开销
+        std::map<std::string, std::vector<std::string>> genomeToChrs;
+        for (const auto& [g, c] : allKeys) genomeToChrs[g].push_back(c);
+        for (auto& [g, chrs] : genomeToChrs) {
+            // 去重，避免同一 chr 重复获取长度
+            std::sort(chrs.begin(), chrs.end());
+            chrs.erase(std::unique(chrs.begin(), chrs.end()), chrs.end());
+            hal::Genome* genome = alignment->openGenome(g);
+            if (!genome) {
+                spdlog::warn("Cannot open genome '{}' for seq length fetch", g);
+                continue;
             }
-            alignment->closeGenome(g);
+            for (const auto& chr : chrs) {
+                if (auto* s = genome->getSequence(chr)) {
+                    seqLengths[std::make_pair(g, chr)] = s->getSequenceLength();
+                } else {
+                    spdlog::warn("Sequence '{}' not found in genome '{}'", chr, g);
+                }
+            }
+            alignment->closeGenome(genome);
         }
 
-        std::mutex bottom_full_mutex, top_full_mutex;
-        for (const auto& key : allKeys) {
-            pool.enqueue([&, key]() {
-                std::set<hal_index_t> uni_bp;
-                if(bpBottom.count(key)) uni_bp.insert(bpBottom.at(key).begin(), bpBottom.at(key).end());
-                if(bpTop.count(key)) uni_bp.insert(bpTop.at(key).begin(), bpTop.at(key).end());
-                if(seqLengths.count(key)) {
-                    uni_bp.insert(0);
-                    uni_bp.insert((hal_index_t)seqLengths.at(key));
-                }
+        // 工具：向量化归并断点并生成完整段
+        auto makeFullSegmentsForKey = [&](const std::pair<std::string, std::string>& key)
+            -> std::vector<SimpleSegmentInfo> {
+            std::vector<SimpleSegmentInfo> segs;
+            auto lenIt = seqLengths.find(key);
+            if (lenIt == seqLengths.end()) return segs;
+            const hal_index_t seqLen = static_cast<hal_index_t>(lenIt->second);
+            if (seqLen <= 0) return segs;
 
-                if (uni_bp.size() < 2) return;
+            std::vector<hal_index_t> bp;
+            bp.reserve(4 +
+                       (bpBottom.count(key) ? bpBottom.at(key).size() : 0) +
+                       (bpTop.count(key) ? bpTop.at(key).size() : 0));
+            bp.push_back(0);
+            bp.push_back(seqLen);
+            if (auto it = bpBottom.find(key); it != bpBottom.end()) {
+                bp.insert(bp.end(), it->second.begin(), it->second.end());
+            }
+            if (auto it = bpTop.find(key); it != bpTop.end()) {
+                bp.insert(bp.end(), it->second.begin(), it->second.end());
+            }
 
-                std::vector<SimpleSegmentInfo> segs;
-                segs.reserve(uni_bp.size());
-                hal_index_t prev = -1;
-                for(hal_index_t x : uni_bp) {
-                    if (prev != -1 && x > prev) segs.push_back({prev, (hal_size_t)(x - prev)});
-                    prev = x;
-                }
+            std::sort(bp.begin(), bp.end());
+            bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
+            if (bp.size() < 2) return segs;
 
-                if (bpBottom.count(key)) {
-                    std::lock_guard<std::mutex> lk(bottom_full_mutex);
-                    bottomSegmentsFull[key] = segs;
+            segs.reserve(bp.size());
+            for (size_t i = 1; i < bp.size(); ++i) {
+                if (bp[i] > bp[i - 1]) {
+                    segs.push_back({bp[i - 1], static_cast<hal_size_t>(bp[i] - bp[i - 1])});
                 }
-                if (bpTop.count(key)) {
-                    std::lock_guard<std::mutex> lk(top_full_mutex);
-                    topSegmentsFull[key] = segs;
+            }
+            return segs;
+        };
+
+        // 3.3 可控并行生成 full segments（任务内不触碰 HAL）
+        std::vector<std::pair<std::string, std::string>> keyVec(allKeys.begin(), allKeys.end());
+        const size_t numKeys = keyVec.size();
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const size_t taskCount = std::max<size_t>(1, std::min<size_t>(numKeys, hw));
+        const size_t chunk = (numKeys + taskCount - 1) / taskCount;
+
+        std::vector<std::future<std::tuple<SegMap, SegMap>>> futures23;
+        futures23.reserve(taskCount);
+
+        for (size_t t = 0; t < taskCount; ++t) {
+            const size_t begin = t * chunk;
+            const size_t end = std::min(numKeys, begin + chunk);
+            if (begin >= end) break;
+
+            futures23.emplace_back(pool.enqueue([&, begin, end]() {
+                SegMap localBottom, localTop;
+                for (size_t i = begin; i < end; ++i) {
+                    const auto& key = keyVec[i];
+                    auto segs = makeFullSegmentsForKey(key);
+                    if (segs.empty()) continue;
+                    if (bpBottom.count(key)) localBottom[key] = segs;
+                    if (bpTop.count(key))    localTop[key]    = std::move(segs);
                 }
-            });
+                return std::make_tuple(std::move(localBottom), std::move(localTop));
+            }));
         }
-        pool.waitAllTasksDone();
+
+        for (auto& fut : futures23) {
+            auto [lb, lt] = fut.get();
+            for (auto& [k, v] : lb) bottomSegmentsFull.emplace(std::move(k), std::move(v));
+            for (auto& [k, v] : lt) topSegmentsFull.emplace(std::move(k), std::move(v));
+        }
+
         auto t23_end = __now();
         spdlog::info("  Pass2.3: built full segments in {} ms (bottom groups: {}, top groups: {})",
                       __ms(t23_start, t23_end), bottomSegmentsFull.size(), topSegmentsFull.size());
@@ -2617,7 +2668,7 @@ namespace hal_converter {
         }
         auto t_c2p_end = __now();
         spdlog::info("  Pass3.parentChild.c2p: linked {} child->parent in {} ms", successful_c2p, __ms(t_c2p_start, t_c2p_end));
-        
+
         size_t successfulMappings = std::min(successful_p2c, successful_c2p);
 
         auto t_map_end = __now();
