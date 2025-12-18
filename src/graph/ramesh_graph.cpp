@@ -3063,7 +3063,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
     size_t deleted_count = original_size - blocks.size();
     perf_stats.batch_deletion_operations = 1;
 
-    spdlog::info("批量删除完成，实际删除了 {} 个Block", deleted_count);
+    spdlog::info("Delete {} Block", deleted_count);
 
     // 释放写锁，重新获取读锁
     write_lock.unlock();

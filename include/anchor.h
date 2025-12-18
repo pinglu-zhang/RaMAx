@@ -244,12 +244,6 @@ ClusterBySQR_SparsePtr clusterAllChrMatchSparse(
     uint_t min_span,
     uint_t thread_num);
 
-MatchClusterVec
-splitCluster(const MatchCluster& cl,
-    bool  ref_hit,
-    int_t bad_r_beg, int_t bad_r_end,
-    bool  query_hit,
-    int_t bad_q_beg, int_t bad_q_end);
 
 void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr);
 
