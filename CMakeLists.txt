@@ -123,6 +123,7 @@ set(RAMA_COMMON_SOURCES
     "${ANCHOR_DIR}/anchor.cpp"
     "${ANCHOR_DIR}/anchor_chunk.cpp"
     "${ANCHOR_DIR}/cluster.cpp"
+    "${ANCHOR_DIR}/xxhash.c"
     "${ALIGN_DIR}/align.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"

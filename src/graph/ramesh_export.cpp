@@ -17,6 +17,7 @@
 #include <variant>
 #include "../../submodule/hal/api/inc/halAlignmentInstance.h"
 #include "../../submodule/hal/api/inc/halGenome.h"
+#include "../../submodule/hal/api/inc/halValidate.h"
 
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现
@@ -245,11 +246,30 @@ namespace RaMesh {
                 std::filesystem::create_directories(abs_hal_path.parent_path());
             }
 
-            hal::AlignmentPtr alignment = hal::openHalAlignment(abs_hal_path.string(), nullptr, hal::CREATE_ACCESS);
+            // 重要：为避免生成结构不合法的 HAL 文件后仍残留在用户指定路径，采用“临时文件 + 校验通过后原子替换”策略。
+            // - 成功：validate 通过后再 rename 为用户指定输出
+            // - 失败：自动删除临时文件，保证用户不会误用半成品
+            std::filesystem::path tmp_hal_path = abs_hal_path;
+            tmp_hal_path += ".tmp";
+            if (std::filesystem::exists(tmp_hal_path)) {
+                std::filesystem::remove(tmp_hal_path);
+            }
+            struct HalTmpGuard {
+                std::filesystem::path tmp;
+                bool keep = false;
+                ~HalTmpGuard() {
+                    if (!keep) {
+                        std::error_code ec;
+                        std::filesystem::remove(tmp, ec);
+                    }
+                }
+            } tmp_guard{tmp_hal_path};
+
+            hal::AlignmentPtr alignment = hal::openHalAlignment(tmp_hal_path.string(), nullptr, hal::CREATE_ACCESS);
             if (!alignment) {
                 throw std::runtime_error("Failed to create HAL alignment instance");
             }
-            spdlog::info("  HAL file created: {}", abs_hal_path.string());
+            spdlog::info("  HAL临时文件已创建: {}", tmp_hal_path.string());
             auto __t11_end = __now();
             spdlog::debug("  Phase 1.1 (open/create HAL) took {} ms", __ms(__t11_start, __t11_end));
 
@@ -361,92 +381,81 @@ namespace RaMesh {
             // - 为各基因组创建并填充 Top/Bottom 段坐标
             // - 建立 parent-child 关系与 parse 信息
             // ========================================
-            auto __t3_start = __now();
-            spdlog::info("Phase 3: Building HAL segments from blocks (gap-aware mapping phase)...");
-            if (!blocks.empty() && !ancestor_nodes.empty()) {
-                hal_converter::analyzeBlocksAndBuildHalStructure(blocks, ancestor_nodes, alignment,
-                                                               ancestor_reconstruction_data, ancestor_sequences, seqpro_managers);
-            } else {
-                spdlog::info("  Skipping mapping phase (no blocks or ancestors)");
+	            auto __t3_start = __now();
+	            spdlog::info("Phase 3: Building HAL segments from blocks (gap-aware mapping phase)...");
+
+	            // 重要：在建立 parent/child segment 链接之前，必须先确定最终系统发育树。
+	            // HAL 的 BottomSegment::childIndex 槽位是按“当前树中 child 的顺序”解释的；
+	            // 若建链后再 replaceNewickTree/rename，会改变 child 顺序，导致槽位语义变化，从而生成结构不一致的 HAL。
+	            try {
+	                auto __t_tree_start = __now();
+	                ::NewickParser final_parser = parser; // 以原解析器为基础
+	                hal_converter::ensureRootNode(final_parser, seqpro_managers, root_name);
+	                std::string final_newick = hal_converter::reconstructNewickFromParser(final_parser);
+	                if (final_newick.empty()) {
+	                    throw std::runtime_error("Final Newick reconstruction returned empty string");
+	                }
+	                alignment->replaceNewickTree(final_newick);
+	                spdlog::info("Applied final Newick tree with root '{}': {}", root_name, final_newick);
+	                auto __t_tree_end = __now();
+	                spdlog::debug("Final tree application took {} ms", __ms(__t_tree_start, __t_tree_end));
+	            } catch (const std::exception& e) {
+	                spdlog::warn("Failed to apply final Newick tree before segment linking: {}", e.what());
+	                // 回退：基于当前 HAL 拓扑重建一个简化 Newick（不含真实分支长度，统一 :0）
+	                try {
+	                    auto buildNewickFromAlignment = [&](auto&& self, const std::string& name) -> std::string {
+	                        auto children = alignment->getChildNames(name);
+	                        std::string res;
+	                        if (!children.empty()) {
+	                            res += "(";
+	                            for (size_t i = 0; i < children.size(); ++i) {
+	                                if (i) res += ",";
+	                                res += self(self, children[i]);
+	                            }
+	                            res += ")";
+	                        }
+	                        res += name + ":0"; // 无法可靠获取分支长度，给定占位 0
+	                        return res;
+	                    };
+	                    std::string root = alignment->getRootName();
+	                    if (root.empty()) {
+	                        root = root_name.empty() ? std::string("ancestor") : root_name;
+	                    }
+	                    std::string fallback_newick = buildNewickFromAlignment(buildNewickFromAlignment, root) + ";";
+	                    alignment->replaceNewickTree(fallback_newick);
+	                    spdlog::info("Applied fallback Newick tree: {}", fallback_newick);
+	                } catch (const std::exception& e2) {
+	                    throw std::runtime_error(std::string("Failed to apply Newick tree (final + fallback): ") + e2.what());
+	                }
+	            }
+	            if (!blocks.empty() && !ancestor_nodes.empty()) {
+	                hal_converter::analyzeBlocksAndBuildHalStructure(blocks, ancestor_nodes, alignment,
+	                                                               ancestor_reconstruction_data, ancestor_sequences, seqpro_managers);
+	            } else {
+	                spdlog::info("  Skipping mapping phase (no blocks or ancestors)");
             }
             auto __t3_end = __now();
             spdlog::debug("Phase 3 completed successfully ({} ms)", __ms(__t3_start, __t3_end));
 
-            // 应用最终系统发育树（用用户指定根名重写）
-            try {
-                auto __t4_start = __now();
-                ::NewickParser final_parser = parser; // 以原解析器为基础
-                hal_converter::ensureRootNode(final_parser, seqpro_managers, root_name);
-                std::string final_newick = hal_converter::reconstructNewickFromParser(final_parser);
-                if (!final_newick.empty()) {
-                    alignment->replaceNewickTree(final_newick);
-                    spdlog::info("Applied final Newick tree with root '{}': {}", root_name, final_newick);
-                }
-                auto __t4_end = __now();
-                spdlog::debug("Final tree application took {} ms", __ms(__t4_start, __t4_end));
-            } catch (const std::exception& e) {
-                spdlog::warn("Failed to apply final Newick tree: {}", e.what());
-                // 回退：基于当前 HAL 拓扑重建一个简化 Newick（不含真实分支长度，统一 :0）
-                try {
-                    auto buildNewickFromAlignment = [&](auto&& self, const std::string& name) -> std::string {
-                        auto children = alignment->getChildNames(name);
-                        std::string res;
-                        if (!children.empty()) {
-                            res += "(";
-                            for (size_t i = 0; i < children.size(); ++i) {
-                                if (i) res += ",";
-                                res += self(self, children[i]);
-                            }
-                            res += ")";
-                        }
-                        res += name + ":0"; // 无法可靠获取分支长度，给定占位 0
-                        return res;
-                    };
-                    std::string root = alignment->getRootName();
-                    if (root.empty()) {
-                        // 尝试使用最早创建的祖先作为根
-                        root = root_name.empty() ? std::string("ancestor") : root_name;
-                    }
-                    std::string fallback_newick = buildNewickFromAlignment(buildNewickFromAlignment, root) + ";";
-                    alignment->replaceNewickTree(fallback_newick);
-                    spdlog::info("Applied fallback Newick tree: {}", fallback_newick);
-                } catch (const std::exception& e2) {
-                    spdlog::warn("Fallback Newick application also failed: {}", e2.what());
-                }
-            }
 
-            // 确保实际根基因组名称与 --root 一致（必要时重命名）
-            try {
-                auto __t5_start = __now();
-                std::string currentRoot = alignment->getRootName();
-                if (currentRoot != root_name && !root_name.empty()) {
-                    if (alignment->openGenome(root_name) == nullptr) {
-                        if (auto* g = alignment->openGenome(currentRoot)) {
-                            g->rename(root_name);
-                            spdlog::info("Renamed HAL root genome '{}' -> '{}'", currentRoot, root_name);
-                        }
-                    } else {
-                        spdlog::warn("Genome with desired root name '{}' already exists; skip renaming", root_name);
-                    }
-                }
+		            // 最终结构校验：确保用户不会拿到结构不合法的 HAL（科研软件必须 fail-fast）
+		            spdlog::info("Validating HAL alignment (hal::validateAlignment)...");
+		            hal::validateAlignment(alignment.get());
+		            spdlog::info("HAL alignment validation passed.");
 
-                // 再次用当前树更新（以防 rename 未同步树名）
-                try {
-                    std::string treeNow = alignment->getNewickTree();
-                    ::NewickParser p2(treeNow);
-                    hal_converter::ensureRootNode(p2, seqpro_managers, root_name);
-                    std::string rebuilt = hal_converter::reconstructNewickFromParser(p2);
-                    if (!rebuilt.empty()) {
-                        alignment->replaceNewickTree(rebuilt);
-                    }
-                } catch (...) {}
-                auto __t5_end = __now();
-                spdlog::debug("Root rename & final tree sync took {} ms", __ms(__t5_start, __t5_end));
-            } catch (...) {}
-            auto __end_total = __now();
-            spdlog::debug("HAL export finished. Total time: {} ms ({} us)", __ms(__start_total, __end_total), __us(__start_total, __end_total));
+		            // 通过校验后再落盘到用户指定路径（原子替换）
+		            alignment.reset(); // 关闭 HDF5 句柄，避免 Windows/DrvFS 上 rename 失败
+		            if (std::filesystem::exists(abs_hal_path)) {
+		                std::filesystem::remove(abs_hal_path);
+		            }
+		            std::filesystem::rename(tmp_hal_path, abs_hal_path);
+		            tmp_guard.keep = true;
+		            spdlog::info("HAL文件已写入并通过校验: {}", abs_hal_path.string());
 
-    }
+	            auto __end_total = __now();
+	            spdlog::debug("HAL export finished. Total time: {} ms ({} us)", __ms(__start_total, __end_total), __us(__start_total, __end_total));
+
+	    }
 
     // 重载实现：直接使用已解析的 NewickParser，避免重复解析
     void RaMeshMultiGenomeGraph::exportToHal(const FilePath& hal_path,
