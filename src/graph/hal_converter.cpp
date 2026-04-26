@@ -2623,14 +2623,23 @@ namespace hal_converter {
 
             auto botIt = genome->getBottomSegmentIterator(seq->getBottomSegmentArrayIndex());
             const hal_index_t genome_start = seq_genome_start[meta.seq_id];
-            for (const auto& seg : segs) {
+            const bool has_top_parse = meta.need_top;
+            const hal_index_t top_parse_base = has_top_parse ? seq->getTopSegmentArrayIndex() : hal::NULL_INDEX;
+            if (has_top_parse && top_segments_full[meta.seq_id].size() != segs.size()) {
+                throw std::runtime_error(
+                    "HAL build failed: top/bottom segment counts differ for the same sequence; "
+                    "cannot write bottom parse index directly: genome=" +
+                    meta.genome_name + " seq=" + meta.chr_name);
+            }
+            for (size_t i = 0; i < segs.size(); ++i) {
+                const auto& seg = segs[i];
                 auto* bs = botIt->getBottomSegment();
                 bs->setCoordinates(genome_start + seg.start, seg.length);
                 const hal_size_t numChildren = bs->getNumChildren();
                 for (hal_size_t i = 0; i < numChildren; ++i) {
                     bs->setChildIndex(i, hal::NULL_INDEX);
                 }
-                bs->setTopParseIndex(hal::NULL_INDEX);
+                bs->setTopParseIndex(has_top_parse ? top_parse_base + static_cast<hal_index_t>(i) : hal::NULL_INDEX);
                 lookup.emplace(seg.start, SegmentLookupEntry{seg.length, botIt->getArrayIndex()});
                 botIt->toRight();
             }
@@ -2651,13 +2660,22 @@ namespace hal_converter {
 
             auto topIt = genome->getTopSegmentIterator(seq->getTopSegmentArrayIndex());
             const hal_index_t genome_start = seq_genome_start[meta.seq_id];
-            for (const auto& seg : segs) {
+            const bool has_bottom_parse = meta.need_bottom;
+            const hal_index_t bottom_parse_base = has_bottom_parse ? seq->getBottomSegmentArrayIndex() : hal::NULL_INDEX;
+            if (has_bottom_parse && bottom_segments_full[meta.seq_id].size() != segs.size()) {
+                throw std::runtime_error(
+                    "HAL build failed: top/bottom segment counts differ for the same sequence; "
+                    "cannot write top parse index directly: genome=" +
+                    meta.genome_name + " seq=" + meta.chr_name);
+            }
+            for (size_t i = 0; i < segs.size(); ++i) {
+                const auto& seg = segs[i];
                 auto* ts = topIt->getTopSegment();
                 ts->setCoordinates(genome_start + seg.start, seg.length);
                 ts->setParentIndex(hal::NULL_INDEX);
                 ts->setParentReversed(false);
                 ts->setNextParalogyIndex(hal::NULL_INDEX);
-                ts->setBottomParseIndex(hal::NULL_INDEX);
+                ts->setBottomParseIndex(has_bottom_parse ? bottom_parse_base + static_cast<hal_index_t>(i) : hal::NULL_INDEX);
                 lookup.emplace(seg.start, SegmentLookupEntry{seg.length, topIt->getArrayIndex()});
                 topIt->toRight();
             }
@@ -2684,12 +2702,9 @@ namespace hal_converter {
                           estimate_segment_bytes(bottom_segments_full) + estimate_segment_bytes(top_segments_full) +
                           estimate_lookup_bytes(bottom_lookup) + estimate_lookup_bytes(top_lookup));
 
-        // Pass 3.5：修复 parse 信息
+        // Pass 3.5: parse indexes are written during segment output, avoiding a full HAL scan.
         auto t35_start = __now();
-        spdlog::info("Phase 3 (pass 3.5): Fixing parse info per genome...");
-        for (auto* genome : gid_to_genome) {
-            genome->fixParseInfo();
-        }
+        spdlog::info("Phase 3 (pass 3.5): Parse info already written during segment output...");
         auto t35_end = __now();
         spdlog::info("  Pass3.fixParseInfo: {} ms", __ms(t35_start, t35_end));
 
@@ -2924,10 +2939,7 @@ namespace hal_converter {
                 successful_c2p++;
             }
 
-            if (child_tidxs.size() == 1) {
-                auto tIt = childGenome->getTopSegmentIterator(child_tidxs[0]);
-                tIt->getTopSegment()->setNextParalogyIndex(hal::NULL_INDEX);
-            } else {
+            if (child_tidxs.size() > 1) {
                 for (size_t k = 0; k < child_tidxs.size(); ++k) {
                     const hal_index_t cur = child_tidxs[k];
                     const hal_index_t nxt = child_tidxs[(k + 1) % child_tidxs.size()];

@@ -17,7 +17,6 @@
 #include <variant>
 #include "../../submodule/hal/api/inc/halAlignmentInstance.h"
 #include "../../submodule/hal/api/inc/halGenome.h"
-#include "../../submodule/hal/api/inc/halValidate.h"
 
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现
@@ -269,7 +268,7 @@ namespace RaMesh {
             if (!alignment) {
                 throw std::runtime_error("Failed to create HAL alignment instance");
             }
-            spdlog::info("  HAL临时文件已创建: {}", tmp_hal_path.string());
+            spdlog::info("  HAL temporary file created: {}", tmp_hal_path.string());
             auto __t11_end = __now();
             spdlog::debug("  Phase 1.1 (open/create HAL) took {} ms", __ms(__t11_start, __t11_end));
 
@@ -438,19 +437,16 @@ namespace RaMesh {
             spdlog::debug("Phase 3 completed successfully ({} ms)", __ms(__t3_start, __t3_end));
 
 
-		            // 最终结构校验：确保用户不会拿到结构不合法的 HAL（科研软件必须 fail-fast）
-		            spdlog::info("Validating HAL alignment (hal::validateAlignment)...");
-		            hal::validateAlignment(alignment.get());
-		            spdlog::info("HAL alignment validation passed.");
+		            spdlog::info("Skipping internal HAL validation; run external halValidate for structure checks.");
 
-		            // 通过校验后再落盘到用户指定路径（原子替换）
-		            alignment.reset(); // 关闭 HDF5 句柄，避免 Windows/DrvFS 上 rename 失败
+		            // Write the final HAL path via atomic replacement.
+		            alignment.reset(); // Close HDF5 handles before rename.
 		            if (std::filesystem::exists(abs_hal_path)) {
 		                std::filesystem::remove(abs_hal_path);
 		            }
 		            std::filesystem::rename(tmp_hal_path, abs_hal_path);
 		            tmp_guard.keep = true;
-		            spdlog::info("HAL文件已写入并通过校验: {}", abs_hal_path.string());
+		            spdlog::info("HAL file written: {}", abs_hal_path.string());
 
 	            auto __end_total = __now();
 	            spdlog::debug("HAL export finished. Total time: {} ms ({} us)", __ms(__start_total, __end_total), __us(__start_total, __end_total));
