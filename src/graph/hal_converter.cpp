@@ -2279,6 +2279,7 @@ namespace hal_converter {
             hal_index_t parent_bidx = hal::NULL_INDEX;
             hal_index_t child_tidx = hal::NULL_INDEX;
             hal_index_t child_idx_in_parent = hal::NULL_INDEX;
+            hal_size_t length = 0;
             bool is_reversed = false;
         };
 
@@ -2811,6 +2812,7 @@ namespace hal_converter {
                                 parent_bidx,
                                 child_lookup_it->second.array_index,
                                 child_slot_it->second,
+                                static_cast<hal_size_t>(mapping.parent_length),
                                 child.is_reversed
                             });
                         }
@@ -2836,39 +2838,70 @@ namespace hal_converter {
                           all_links.capacity() * sizeof(LinkIdx));
         spdlog::info("  Pass4.linkScan: built {} link candidates in {} ms", all_links.size(), __ms(t4_scan_start, t4_scan_end));
 
-        // Pass 4.5：建立 parent-child 链接并处理 duplication
+        // Pass 4.5：分两遍按目标数组顺序写 parent-child 链接。
         auto t45_start = __now();
-        auto group_sorter = [](const LinkIdx& a, const LinkIdx& b) {
+        auto parent_sorter = [](const LinkIdx& a, const LinkIdx& b) {
             if (a.parent_gid != b.parent_gid) return a.parent_gid < b.parent_gid;
-            if (a.child_gid != b.child_gid) return a.child_gid < b.child_gid;
             if (a.parent_bidx != b.parent_bidx) return a.parent_bidx < b.parent_bidx;
+            if (a.child_idx_in_parent != b.child_idx_in_parent) return a.child_idx_in_parent < b.child_idx_in_parent;
+            if (a.child_gid != b.child_gid) return a.child_gid < b.child_gid;
             return a.child_tidx < b.child_tidx;
         };
-        std::sort(all_links.begin(), all_links.end(), group_sorter);
+        auto same_parent_group = [](const LinkIdx& a, const LinkIdx& b) {
+            return a.parent_gid == b.parent_gid &&
+                   a.parent_bidx == b.parent_bidx &&
+                   a.child_idx_in_parent == b.child_idx_in_parent &&
+                   a.child_gid == b.child_gid;
+        };
+        auto child_sorter = [](const LinkIdx& a, const LinkIdx& b) {
+            if (a.child_gid != b.child_gid) return a.child_gid < b.child_gid;
+            if (a.child_tidx != b.child_tidx) return a.child_tidx < b.child_tidx;
+            if (a.parent_gid != b.parent_gid) return a.parent_gid < b.parent_gid;
+            return a.parent_bidx < b.parent_bidx;
+        };
+        auto same_child_group = [](const LinkIdx& a, const LinkIdx& b) {
+            return a.child_gid == b.child_gid &&
+                   a.child_tidx == b.child_tidx;
+        };
 
         size_t successful_p2c = 0;
         size_t successful_c2p = 0;
+        size_t parent_groups = 0;
+        size_t parent_multi_groups = 0;
+        size_t child_groups = 0;
+        size_t child_duplicate_groups = 0;
         std::vector<hal_index_t> child_tidxs;
         child_tidxs.reserve(8);
 
+        auto t45_sort_parent_start = __now();
+        std::sort(all_links.begin(), all_links.end(), parent_sorter);
+        auto t45_sort_parent_end = __now();
+        spdlog::info("  Pass4.parentChild.sortParent: {} ms", __ms(t45_sort_parent_start, t45_sort_parent_end));
+
+        auto t45_write_parent_start = __now();
         for (size_t i = 0; i < all_links.size();) {
             const LinkIdx& first = all_links[i];
             size_t j = i + 1;
             const bool is_reversed = first.is_reversed;
+            const hal_size_t length = first.length;
             child_tidxs.clear();
             child_tidxs.push_back(first.child_tidx);
 
             while (j < all_links.size()) {
                 const auto& cur = all_links[j];
-                if (cur.parent_gid != first.parent_gid ||
-                    cur.child_gid != first.child_gid ||
-                    cur.parent_bidx != first.parent_bidx ||
-                    cur.child_idx_in_parent != first.child_idx_in_parent) {
+                if (!same_parent_group(cur, first)) {
                     break;
                 }
                 if (cur.is_reversed != is_reversed) {
                     throw std::runtime_error(
                         "HAL构建失败：同一 parent/child/parentSeg 上出现不同方向的 mapping：parent_gid=" +
+                        std::to_string(first.parent_gid) + " child_gid=" + std::to_string(first.child_gid) +
+                        " parent_bidx=" + std::to_string(first.parent_bidx) +
+                        " child_slot=" + std::to_string(first.child_idx_in_parent));
+                }
+                if (cur.length != length) {
+                    throw std::runtime_error(
+                        "HAL构建失败：同一 parent/child/parentSeg 上出现不同长度的 mapping：parent_gid=" +
                         std::to_string(first.parent_gid) + " child_gid=" + std::to_string(first.child_gid) +
                         " parent_bidx=" + std::to_string(first.parent_bidx) +
                         " child_slot=" + std::to_string(first.child_idx_in_parent));
@@ -2884,6 +2917,11 @@ namespace hal_converter {
             hal::Genome* childGenome = gid_to_genome[first.child_gid];
             auto parentBottomIt = parentGenome->getBottomSegmentIterator(first.parent_bidx);
             auto* parentBottomSeg = parentBottomIt->getBottomSegment();
+            if (parentBottomSeg->getLength() != length) {
+                throw std::runtime_error(
+                    "HAL构建失败：parent bottom segment 长度不一致：parent=" + parentGenome->getName() +
+                    " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()));
+            }
             if (first.child_idx_in_parent >= parentBottomSeg->getNumChildren()) {
                 throw std::runtime_error(
                     "HAL构建失败：child slot 超出 parent bottom segment children 数量：parent=" + parentGenome->getName() +
@@ -2914,32 +2952,8 @@ namespace hal_converter {
                 }
             }
 
-            for (const hal_index_t tidx : child_tidxs) {
-                auto childTopIt = childGenome->getTopSegmentIterator(tidx);
-                auto* childTopSeg = childTopIt->getTopSegment();
-                if (childTopSeg->getLength() != parentBottomSeg->getLength()) {
-                    throw std::runtime_error(
-                        "HAL构建失败：parent/child segment 长度不一致：parent=" + parentGenome->getName() +
-                        " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()) +
-                        " child=" + childGenome->getName() +
-                        " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()));
-                }
-
-                const hal_index_t existing_parent = childTopSeg->getParentIndex();
-                if (existing_parent != hal::NULL_INDEX && existing_parent != parentBottomSeg->getArrayIndex()) {
-                    throw std::runtime_error(
-                        "HAL构建失败：同一 child top segment 被多个不同 parent bottom segment 复用：child=" +
-                        childGenome->getName() + " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()) +
-                        " existing_parent_bidx=" + std::to_string(existing_parent) +
-                        " new_parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()));
-                }
-
-                childTopSeg->setParentIndex(parentBottomSeg->getArrayIndex());
-                childTopSeg->setParentReversed(is_reversed);
-                successful_c2p++;
-            }
-
             if (child_tidxs.size() > 1) {
+                parent_multi_groups++;
                 for (size_t k = 0; k < child_tidxs.size(); ++k) {
                     const hal_index_t cur = child_tidxs[k];
                     const hal_index_t nxt = child_tidxs[(k + 1) % child_tidxs.size()];
@@ -2947,8 +2961,85 @@ namespace hal_converter {
                     tIt->getTopSegment()->setNextParalogyIndex(nxt);
                 }
             }
+            parent_groups++;
             i = j;
         }
+        auto t45_write_parent_end = __now();
+        spdlog::info("  Pass4.parentChild.writeParent: linked {} parent child slots across {} groups in {} ms (paralogy groups: {})",
+                     successful_p2c, parent_groups, __ms(t45_write_parent_start, t45_write_parent_end), parent_multi_groups);
+
+        auto t45_sort_child_start = __now();
+        std::sort(all_links.begin(), all_links.end(), child_sorter);
+        auto t45_sort_child_end = __now();
+        spdlog::info("  Pass4.parentChild.sortChild: {} ms", __ms(t45_sort_child_start, t45_sort_child_end));
+
+        auto t45_write_child_start = __now();
+        for (size_t i = 0; i < all_links.size();) {
+            const LinkIdx& first = all_links[i];
+            size_t j = i + 1;
+            const bool is_reversed = first.is_reversed;
+            const hal_index_t parent_bidx = first.parent_bidx;
+            const uint32_t parent_gid = first.parent_gid;
+            const hal_size_t length = first.length;
+
+            while (j < all_links.size()) {
+                const auto& cur = all_links[j];
+                if (!same_child_group(cur, first)) {
+                    break;
+                }
+                if (cur.parent_gid != parent_gid || cur.parent_bidx != parent_bidx) {
+                    throw std::runtime_error(
+                        "HAL构建失败：同一 child top segment 被多个不同 parent bottom segment 复用：child_gid=" +
+                        std::to_string(first.child_gid) +
+                        " child_tidx=" + std::to_string(first.child_tidx) +
+                        " existing_parent_bidx=" + std::to_string(parent_bidx) +
+                        " new_parent_bidx=" + std::to_string(cur.parent_bidx));
+                }
+                if (cur.is_reversed != is_reversed) {
+                    throw std::runtime_error(
+                        "HAL构建失败：同一 child top segment 上 parentReversed 冲突：child_gid=" +
+                        std::to_string(first.child_gid) +
+                        " child_tidx=" + std::to_string(first.child_tidx));
+                }
+                if (cur.length != length) {
+                    throw std::runtime_error(
+                        "HAL构建失败：同一 child top segment 上出现不同长度的 mapping：child_gid=" +
+                        std::to_string(first.child_gid) +
+                        " child_tidx=" + std::to_string(first.child_tidx));
+                }
+                ++j;
+            }
+
+            hal::Genome* childGenome = gid_to_genome[first.child_gid];
+            auto childTopIt = childGenome->getTopSegmentIterator(first.child_tidx);
+            auto* childTopSeg = childTopIt->getTopSegment();
+            if (childTopSeg->getLength() != length) {
+                throw std::runtime_error(
+                    "HAL构建失败：child top segment 长度不一致：child=" + childGenome->getName() +
+                    " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()));
+            }
+
+            const hal_index_t existing_parent = childTopSeg->getParentIndex();
+            if (existing_parent != hal::NULL_INDEX && existing_parent != parent_bidx) {
+                throw std::runtime_error(
+                    "HAL构建失败：同一 child top segment 被多个不同 parent bottom segment 复用：child=" +
+                    childGenome->getName() + " child_tidx=" + std::to_string(childTopSeg->getArrayIndex()) +
+                    " existing_parent_bidx=" + std::to_string(existing_parent) +
+                    " new_parent_bidx=" + std::to_string(parent_bidx));
+            }
+
+            childTopSeg->setParentIndex(parent_bidx);
+            childTopSeg->setParentReversed(is_reversed);
+            successful_c2p++;
+            if (j > i + 1) {
+                child_duplicate_groups++;
+            }
+            child_groups++;
+            i = j;
+        }
+        auto t45_write_child_end = __now();
+        spdlog::info("  Pass4.parentChild.writeChild: linked {} child top segments across {} groups in {} ms (deduplicated groups: {})",
+                     successful_c2p, child_groups, __ms(t45_write_child_start, t45_write_child_end), child_duplicate_groups);
         auto t45_end = __now();
         spdlog::info("  Pass4.parentChild.p2c: linked {} parent->child in {} ms", successful_p2c, __ms(t45_start, t45_end));
         spdlog::info("  Pass4.parentChild.c2p: linked {} child->parent in {} ms", successful_c2p, __ms(t45_start, t45_end));
