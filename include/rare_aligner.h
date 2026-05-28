@@ -127,10 +127,6 @@ public:
 
     void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
 
-    
-
-  
-
 };
 
 
