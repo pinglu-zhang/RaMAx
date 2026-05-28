@@ -892,6 +892,19 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         exportResults(common_args, newick_tree, seqpro_managers, graph.get());
 
         // ------------------------------
+        // 清理工作目录
+        // ------------------------------
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(common_args.work_dir_path, ec);
+            if (ec) {
+                spdlog::warn("Failed to remove work directory: {}", ec.message());
+            } else {
+                spdlog::info("Work directory removed: {}", common_args.work_dir_path.string());
+            }
+        }
+
+        // ------------------------------
         // 退出
         // ------------------------------
         spdlog::info("RaMAx execution completed successfully!");

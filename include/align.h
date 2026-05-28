@@ -3,11 +3,6 @@
 
 #include "ksw2.h"
 #include "config.hpp"              // 包含基本类型定义，如 int_t、uint_t 等
-// #include "bindings/cpp/WFAligner.hpp"
-// extern "C" {
-// #include "alignment/cigar.h"
-// #include "wavefront/wavefront_align.h"
-// }
 // ------------------------------------------------------------------
 // 类型定义
 // ------------------------------------------------------------------
