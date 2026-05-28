@@ -39,12 +39,18 @@ set(HAL_MAF2HAL  ${HAL_DIR}/bin/maf2hal)
 set(HAL_HAL2FASTA ${HAL_DIR}/bin/hal2fasta)
 
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
+set(RAMAX_HAL_JOBS "" CACHE STRING "Parallel jobs for bundled sonLib/HAL make builds")
+if(RAMAX_HAL_JOBS)
+    set(RAMAX_HAL_MAKE_JOBS "-j${RAMAX_HAL_JOBS}")
+else()
+    set(RAMAX_HAL_MAKE_JOBS "-j")
+endif()
 
 # ================= HAL tools =================
 # 只要 maf2hal / hal2fasta 缺失或过期，就重新 make -C hal
 add_custom_command(
     OUTPUT ${SONLIB_DIR}/lib/sonLib.h ${SONLIB_DIR}/lib/sonLib.a
-    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} -j
+    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS}
     WORKING_DIRECTORY ${SONLIB_DIR}
     COMMENT "Building sonLib…"
 )
@@ -55,7 +61,7 @@ add_custom_target(sonLib_build
 
 add_custom_command(
     OUTPUT ${HAL_MAF2HAL} ${HAL_HAL2FASTA} ${HAL_DIR}/lib/libHal.a
-    COMMAND ${MAKE_EXE} -C ${HAL_DIR} -j
+    COMMAND ${MAKE_EXE} -C ${HAL_DIR} ${RAMAX_HAL_MAKE_JOBS}
     WORKING_DIRECTORY ${HAL_DIR}
     COMMENT "Building HAL tools…"
 )
@@ -75,9 +81,12 @@ add_custom_command(TARGET hal_tools POST_BUILD
 
 
 # ============ 编译优化选项 ============
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mavx2")
-# ============ 编译优化选项 ============
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+# Conda packages must be portable across machines, so recipe/build.sh disables
+# native CPU tuning while keeping the existing local-build default.
+option(RAMAX_NATIVE_ARCH "Build with -march=native for local CPU tuning" ON)
+if(RAMAX_NATIVE_ARCH)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+endif()
 
 # 如果没有显式设置构建类型，默认使用 Release
 if(NOT CMAKE_BUILD_TYPE)
