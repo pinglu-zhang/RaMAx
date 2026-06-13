@@ -22,7 +22,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(SOURCE_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(INCLUDE_DIR        "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(SUBMODULE_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/submodule")
-set(BIN_DIR            "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 set(PREPROCESS_DIR     "${SOURCE_DIR}/preprocess")
 set(INDEX_DIR          "${SOURCE_DIR}/index")
 set(ALIGN_DIR          "${SOURCE_DIR}/align")
@@ -35,16 +34,23 @@ set(SUFFIX_ARRAY_INCLUDE_DIR "${INCLUDE_DIR}/suffix_array")
 set(SONLIB_DIR ${SUBMODULE_DIR}/sonLib)
 set(HAL_DIR    ${SUBMODULE_DIR}/hal)
 
-set(HAL_MAF2HAL  ${HAL_DIR}/bin/maf2hal)
-set(HAL_HAL2FASTA ${HAL_DIR}/bin/hal2fasta)
-
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
+set(RAMAX_HAL_JOBS "" CACHE STRING "Parallel jobs for bundled sonLib/HAL make builds")
+set(RAMAX_HAL_LIBS "" CACHE STRING "Additional linker flags for bundled HAL tools")
+if(RAMAX_HAL_JOBS)
+    set(RAMAX_HAL_MAKE_JOBS "-j${RAMAX_HAL_JOBS}")
+else()
+    set(RAMAX_HAL_MAKE_JOBS "-j")
+endif()
 
-# ================= HAL tools =================
-# 只要 maf2hal / hal2fasta 缺失或过期，就重新 make -C hal
+# ================= HAL library =================
 add_custom_command(
     OUTPUT ${SONLIB_DIR}/lib/sonLib.h ${SONLIB_DIR}/lib/sonLib.a
-    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} -j
+    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS}
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            "AR=${CMAKE_AR}"
+            "RANLIB=${CMAKE_RANLIB}"
     WORKING_DIRECTORY ${SONLIB_DIR}
     COMMENT "Building sonLib…"
 )
@@ -54,35 +60,30 @@ add_custom_target(sonLib_build
 )
 
 add_custom_command(
-    OUTPUT ${HAL_MAF2HAL} ${HAL_HAL2FASTA} ${HAL_DIR}/lib/libHal.a
-    COMMAND ${MAKE_EXE} -C ${HAL_DIR} -j
+    OUTPUT ${HAL_DIR}/lib/libHal.a
+    COMMAND ${MAKE_EXE} -C ${HAL_DIR} ${RAMAX_HAL_MAKE_JOBS} libs
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            "AR=${CMAKE_AR}"
+            "RANLIB=${CMAKE_RANLIB}"
+            "LIBS=${RAMAX_HAL_LIBS}"
     WORKING_DIRECTORY ${HAL_DIR}
-    COMMENT "Building HAL tools…"
+    COMMENT "Building HAL library..."
 )
 
-add_custom_target(hal_tools
+add_custom_target(hal_library
     DEPENDS ${HAL_DIR}/lib/libHal.a
 )
 
-add_dependencies(hal_tools sonLib_build)
-
-# 仅当刚刚重新生成时才复制到 bin
-add_custom_command(TARGET hal_tools POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${HAL_MAF2HAL}  ${BIN_DIR}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${HAL_HAL2FASTA} ${BIN_DIR}
-)
-
-
-
-# ============ 编译优化选项 ============
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mavx2")
-# ============ 编译优化选项 ============
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
-
+add_dependencies(hal_library sonLib_build)
 # 如果没有显式设置构建类型，默认使用 Release
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+# Local builds can opt into native CPU tuning for better performance. Conda
+# packages disable this in recipe/build.sh so the binary remains portable.
+option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 
 # 去掉符号表（减小二进制体积）
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-s")
@@ -102,7 +103,7 @@ add_subdirectory("${SUBMODULE_DIR}/libdivsufsort")
 # ================= 外部库依赖 =================
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(OpenMP)
+find_package(OpenMP REQUIRED)
 find_package(Threads REQUIRED)
 find_package(TBB REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS CXX)
@@ -187,6 +188,9 @@ function(configure_rama_target target)
     endif()
 
     target_compile_options(${target} PRIVATE -Wall -g)
+    if(RAMAX_NATIVE_ARCH)
+        target_compile_options(${target} PRIVATE -march=native)
+    endif()
 
 endfunction()
 
@@ -202,7 +206,7 @@ configure_rama_target(ramax)
 
 # 如需确保先有 HAL 工具，再编你的程序：
 #add_dependencies(RaMA-G hal_tools)
-add_dependencies(ramax  hal_tools)
+add_dependencies(ramax  hal_library)
 
 # ================= 安装规则（可选） =================
 # install(TARGETS RaMAG RaMAx DESTINATION bin)
@@ -210,12 +214,3 @@ add_dependencies(ramax  hal_tools)
 # ================= 安装规则 =================
 # 安装主程序
 install(TARGETS ramax DESTINATION bin)
-
-# 安装 windowmasker 工具
-install(FILES "${BIN_DIR}/windowmasker" 
-         ${BIN_DIR}/maf2hal
-         ${BIN_DIR}/hal2fasta
-        DESTINATION bin 
-        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE 
-                   GROUP_READ GROUP_EXECUTE 
-                   WORLD_READ WORLD_EXECUTE)

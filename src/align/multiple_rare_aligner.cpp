@@ -430,9 +430,6 @@ void addAlignedRegionsAsMask(
             
             // 创建遮蔽区间（使用原始坐标）
             SeqPro::MaskInterval interval(segment->start, segment->start + segment->length);
-            if (segment->start > 1000000) {
-                std::cout << "";
-            }
             species_chr_intervals[species_name][chr_name].push_back(interval);
             total_intervals++;
         }
