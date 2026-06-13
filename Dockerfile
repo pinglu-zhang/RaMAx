@@ -25,14 +25,11 @@ WORKDIR /src
 COPY CMakeLists.txt ./
 COPY include ./include
 COPY src ./src
-COPY submodule ./submodule
+COPY third_party ./third_party
 
 RUN set -eux; \
     hdf5_cflags="$(pkg-config --cflags hdf5)"; \
     hdf5_libs="$(pkg-config --libs hdf5)"; \
-    mkdir -p \
-        submodule/sonLib/externalTools/quicktree_1.1/bin \
-        submodule/sonLib/externalTools/quicktree_1.1/obj; \
     export CFLAGS="${hdf5_cflags}"; \
     export CXXFLAGS="${hdf5_cflags}"; \
     cmake -S . -B build \

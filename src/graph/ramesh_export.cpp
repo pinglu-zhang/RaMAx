@@ -15,8 +15,8 @@
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <variant>
-#include "../../submodule/hal/api/inc/halAlignmentInstance.h"
-#include "../../submodule/hal/api/inc/halGenome.h"
+#include "halAlignmentInstance.h"
+#include "halGenome.h"
 
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现

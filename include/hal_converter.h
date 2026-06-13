@@ -7,7 +7,7 @@
 #include <functional>
 #include <cctype>
 #include <optional>
-#include "../submodule/hal/api/inc/halDefs.h"
+#include "halDefs.h"
 #include <unordered_map>
 #include <set>
 
