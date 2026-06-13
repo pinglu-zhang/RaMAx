@@ -6,6 +6,18 @@ RaMAx aligns multiple genomes and produces whole‑genome alignments in standard
 
 ---
 
+## Install with Conda
+
+RaMAx can be installed from the `malab` conda channel:
+
+```bash
+conda install -c conda-forge -c malab ramax
+```
+
+The Linux conda package is built against the conda-forge sysroot and is intended to run on systems with `glibc >= 2.17`.
+
+---
+
 ## Build from Source
 
 ### Prerequisites (Ubuntu/Debian)
