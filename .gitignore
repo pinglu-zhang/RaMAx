@@ -382,6 +382,7 @@ FodyWeavers.xsd
 /submodule/sdsl-lite/include/divsufsort.h
 /submodule/sdsl-lite/include/divsufsort64.h
 /submodule/
+/bin/
 /benchmark/delta2maf
 /benchmark/filter_maf_by_species
 /benchmark/

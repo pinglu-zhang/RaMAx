@@ -46,6 +46,7 @@ RUN set -eux; \
     cmake --build build --parallel "${BUILD_JOBS}"; \
     cmake --install build; \
     /opt/ramax/bin/ramax --help >/dev/null; \
+    if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     test ! -e /src/bin; \
     test ! -e /opt/ramax/bin/windowmasker
 
@@ -69,6 +70,7 @@ COPY --from=builder /opt/ramax /opt/ramax
 
 RUN set -eux; \
     /opt/ramax/bin/ramax --help >/dev/null; \
+    if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax; \
     if ldd /opt/ramax/bin/ramax | grep -q "not found"; then exit 1; fi; \
     test ! -e /opt/ramax/bin/windowmasker; \
