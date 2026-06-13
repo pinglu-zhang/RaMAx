@@ -35,17 +35,20 @@ RUN set -eux; \
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/ramax \
-        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_INSTALL_LIBDIR=/opt/ramax/lib \
+        -DCMAKE_INSTALL_PKGCONFIGDIR=/opt/ramax/lib/pkgconfig \
         -DCMAKE_INSTALL_RPATH=/opt/ramax/lib \
         -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DBUILD_EXAMPLES=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
         -DRAMAX_NATIVE_ARCH=OFF \
         -DRAMAX_HAL_JOBS="${BUILD_JOBS}" \
         -DRAMAX_HAL_LIBS="${hdf5_libs} -lhdf5_cpp"; \
     cmake --build build --parallel "${BUILD_JOBS}"; \
     cmake --install build; \
     /opt/ramax/bin/ramax --help >/dev/null; \
+    if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     test ! -e /src/bin; \
     test ! -e /opt/ramax/bin/windowmasker
 
@@ -69,6 +72,7 @@ COPY --from=builder /opt/ramax /opt/ramax
 
 RUN set -eux; \
     /opt/ramax/bin/ramax --help >/dev/null; \
+    if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax; \
     if ldd /opt/ramax/bin/ramax | grep -q "not found"; then exit 1; fi; \
     test ! -e /opt/ramax/bin/windowmasker; \
