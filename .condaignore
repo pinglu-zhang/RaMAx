@@ -1,0 +1,17 @@
+.git
+.agents
+.codex
+.idea
+build
+build-*
+build-conda
+cmake-build-*
+recipe/build-conda
+benchmark
+third_party/hal/bin
+third_party/hal/lib
+third_party/hal/objs
+third_party/sonLib/bin
+third_party/sonLib/lib
+third_party/sonLib/C/impl/*.o
+third_party/sonLib/externalTools/quicktree_1.1/obj

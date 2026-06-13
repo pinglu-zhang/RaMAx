@@ -361,6 +361,8 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /build
+/build-vendor/
+/build-*/
 /workdir/data
 /workdir
 /workdi2r
@@ -379,8 +381,20 @@ FodyWeavers.xsd
 /test/报错.txt
 /submodule/sdsl-lite/include/divsufsort.h
 /submodule/sdsl-lite/include/divsufsort64.h
+/submodule/
 /benchmark/delta2maf
 /benchmark/filter_maf_by_species
+/benchmark/
+/third_party/hal/bin/
+/third_party/hal/lib/
+/third_party/hal/objs/
+/third_party/hal/**/*.depend
+/third_party/sonLib/bin/
+/third_party/sonLib/lib/
+/third_party/sonLib/C/impl/*.o
+/third_party/sonLib/externalTools/cutest/*.o
+/third_party/sonLib/externalTools/quicktree_1.1/bin/
+/third_party/sonLib/externalTools/quicktree_1.1/obj/
 /submodule/sdsl-lite/include/divsufsort.h
 /submodule/sdsl-lite/include/divsufsort64.h
 /benchmark/bin
