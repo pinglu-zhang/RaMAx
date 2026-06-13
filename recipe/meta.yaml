@@ -1,0 +1,55 @@
+{% set name = "ramax" %}
+{% set version = "1.0.1" %}
+{% set repository = "https://github.com/pinglu-zhang/RaMAx" %}
+{% set source_mode = environ.get("RAMAX_CONDA_SOURCE", "path") %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+{% if source_mode == "git" %}
+  git_url: "{{ repository }}.git"
+  git_rev: v{{ version }}
+{% else %}
+  path: ..
+{% endif %}
+
+build:
+  number: 2
+  skip: true  # [not linux]
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - {{ stdlib("c") }}
+    - cmake <4
+    - make
+    - pkg-config
+
+  host:
+    - zlib
+    - libcurl
+    - libgomp
+    - tbb-devel
+    - hdf5
+
+  run:
+    - zlib
+    - libcurl
+    - libgomp
+    - tbb
+    - hdf5
+
+test:
+  requires:
+    - binutils
+  commands:
+    - ramax --help
+
+about:
+  home: "{{ repository }}"
+  license: MIT
+  summary: "RaMAx"
+  description: "RaMAx aligns multiple genomes and produces whole-genome alignments in MAF and HAL formats."
