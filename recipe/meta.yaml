@@ -1,5 +1,5 @@
 {% set name = "ramax" %}
-{% set version = "1.0.1" %}
+{% set version = "1.0.2" %}
 {% set repository = "https://github.com/pinglu-zhang/RaMAx" %}
 {% set source_mode = environ.get("RAMAX_CONDA_SOURCE", "path") %}
 
