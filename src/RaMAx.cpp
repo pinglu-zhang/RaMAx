@@ -181,21 +181,21 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 输入序列文件路径
     auto* input_opt = cmd->add_option("-i,--input", args.input_path,
-        "Path to the sequence file (txt format).")
+        "Path to a Cactus-compatible seqfile.")
         ->group("Input Files")                      // 帮助信息分组
         ->type_name("<path>")                       // 参数类型显示名称
         ->transform(trim_whitespace);               // 去除首尾空白字符
 
     // 输出结果路径
     auto* output_opt = cmd->add_option("-o,--output", args.output_path,
-        "Path to save alignment results.")
+        "Output alignment path in MAF or HAL format.")
         ->group("Output")
         ->type_name("<path>")
         ->transform(trim_whitespace);
 
     // 工作目录路径（中间文件、索引缓存等）
     auto* workspace_opt = cmd->add_option("-w,--workdir", args.work_dir_path,
-        "Path to the working directory for temporary files.")
+        "Working directory for intermediate files and logs.")
         ->group("Output")
         ->type_name("<path>")
         ->transform(trim_whitespace);
