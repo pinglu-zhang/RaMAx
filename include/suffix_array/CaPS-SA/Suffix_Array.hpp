@@ -10,7 +10,9 @@
 #include <fstream>
 #include <chrono>
 
+#if defined(__AVX2__)
 #include <immintrin.h>
+#endif
 
 // =============================================================================
 
@@ -229,12 +231,18 @@ namespace CaPS_SA
             return 0;
         else
         {
+#if defined(__AVX2__)
             const auto v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x));
             const auto v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y));
             const auto cmp = _mm256_cmpeq_epi8(v1, v2);
             const auto mask = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
             if (mask != 0xFFFFFFFF)
                 return __builtin_ctz(~mask);
+#else
+            for (idx_t i = 0; i < 32; ++i)
+                if (x[i] != y[i])
+                    return i;
+#endif
 
             return 32 + LCP_unrolled<N - 1>(x + 32, y + 32);
         }

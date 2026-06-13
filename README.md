@@ -6,6 +6,55 @@ RaMAx aligns multiple genomes and produces whole‑genome alignments in standard
 
 ---
 
+## Run with Docker
+
+Docker is the recommended installation method for older or heterogeneous Linux systems because the image includes its own userspace libraries and does not depend on the host glibc version.
+
+Pull the published image and check that RaMAx starts:
+
+```bash
+docker pull ghcr.io/metaphysicser/ramax:latest
+docker run --rm ghcr.io/metaphysicser/ramax:latest --help
+```
+
+Run RaMAx against files in the current directory:
+
+```bash
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --volume "$PWD:/data" \
+  --workdir /data \
+  ghcr.io/metaphysicser/ramax:latest \
+  -i seqfile.txt \
+  -o output.maf \
+  -w workdir \
+  -t 8
+```
+
+To build the image locally from source:
+
+```bash
+git submodule update --init --recursive
+docker build --platform linux/amd64 -t ramax:local .
+docker run --rm ramax:local --help
+```
+
+The Docker build compiles `ramax` from `src/` and the initialized submodules with portable CPU settings. The repository `bin/` directory is excluded and none of its binaries are copied into the image.
+
+---
+
+## Install with Conda
+
+RaMAx can be installed from the `malab` conda channel:
+
+```bash
+conda install -c conda-forge -c malab ramax
+```
+
+The Linux conda package is built against the conda-forge sysroot and is intended to run on systems with `glibc >= 2.17`.
+
+---
+
 ## Build from Source
 
 ### Prerequisites (Ubuntu/Debian)

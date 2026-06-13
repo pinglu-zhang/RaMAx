@@ -807,20 +807,6 @@ Anchor extendClusterToAnchor(MatchCluster& cluster,
         match_len += countMatchOperations(gap);
         aln_len += countAlignmentLength(gap);
 
-  //      //如果identity小于70% ，打印出具体比对结果
-  //      uint_t min_len = std::min(ref_end - ref_start, qry_end - qry_start);
-		//double identity = (min_len > 0) ? static_cast<double>(countMatchOperations(gap)) / min_len : 0.0;
-  //      if (first.qry_start == 212285) {
-  //          spdlog::warn("Low identity gap detected: Ref[{}:{}-{}], Qry[{}:{}-{}], Identity: {:.2f}%",
-  //              ref_chr, ref_start, ref_end,
-  //              qry_chr, qry_start, qry_end,
-  //              identity * 100.0);
-  //          auto [ref_aln, qry_aln] = renderAlignment(ref_gap, qry_gap, gap);
-
-  //          spdlog::info("Ref: {}", ref_aln);
-  //          spdlog::info("Qry: {}", qry_aln);
-  //          std::cout << "";
-  //      }
     }
 	const Match last = cluster.back();
     if (fwd) {
@@ -829,22 +815,6 @@ Anchor extendClusterToAnchor(MatchCluster& cluster,
     else {
         anchor = Anchor(ref_chr, first.ref_start, last.ref_start + last.match_len() - first.ref_start, qry_chr, last.qry_start, first.qry_start + first.match_len() - last.qry_start, strand, aln_len, match_len, std::move(cigar));
     }
-
-    //if (first.qry_start == 212285) {
-    //    // 提取 anchor 对应的序列
-    //    std::string ref_seq = subSeq(ref_mgr, ref_chr, anchor.ref_start, anchor.ref_len);
-    //    std::string qry_seq = subSeq(query_mgr, qry_chr, anchor.qry_start, anchor.qry_len);
-
-    //    // 渲染对齐结果
-    //    auto [ref_aln,  qry_aln] = renderAlignment(ref_seq, qry_seq, anchor.cigar);
-
-    //    spdlog::info("Ref: {}", ref_aln);
-    //    spdlog::info("Qry: {}", qry_aln);
-    //    spdlog::info("CIGAR: {}", cigarToString(anchor.cigar));
-    //    std::cout << "";
-    //}
-
-    
 
     return anchor;
 }
@@ -998,12 +968,6 @@ void linkClusters(AnchorPtrVec& anchors,
             continue;
         }
 
-
-        //if ((*curr)->qry_chr_index == 4 && (*curr)->qry_start < 357618 + 24610 && (*curr)->qry_start + (*curr)->qry_len > 357618) {
-        //    std::cout << "";
-        //}
-
-
         auto best = anchors.end();
 
         int_t break_len = 200;
@@ -1267,16 +1231,6 @@ void linkClusters(AnchorPtrVec& anchors,
                             prependCigar((*curr)->cigar, gap_cigar);
                         }
                     }
-       //             if (!linked.empty()) {
-       //                 // 打印curr和best
-       //                 if (strand == FORWARD) {
-       //                     std::cout << (int_t)(*curr)->qry_start - (int_t)((*best_it)->qry_start + (*best_it)->qry_len) << std::endl;
-       //                 }
-       //                 else {
-							//std::cout << (int_t)((*best_it)->qry_start) - (int_t)((*curr)->qry_start + (*curr)->qry_len) << std::endl;
-       //                 }
-       //
-       //             }
                 }
             }
 
@@ -1305,34 +1259,6 @@ void linkClusters(AnchorPtrVec& anchors,
 
 
             }
-            // 将新的cur设置为和老cur不冲突的anchor
-            // TODO考虑反向链
-
-            // curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
-            // curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
-            // int_t cur_qry_start = (*curr)->qry_start;
-            // //curr = best;
-            // while (true) {
-            //     if (strand == FORWARD) {
-            //         //if (!(*curr)->is_linked && (*curr)->qry_start >= curr_qry_end && (*curr)->ref_start >= curr_ref_end) {
-            //         //    break;
-            //         //}
-            //         if (!(*curr)->is_linked && (*curr)->qry_start >= curr_qry_end) {
-            //             break;
-            //         }
-            //     }
-            //     else {
-            //         //if (!(*curr)->is_linked && (*curr)->qry_start + (*curr)->qry_len <= cur_qry_start && (*curr)->ref_start >= curr_ref_end) {
-            //         //    break;
-            //         //}
-            //         if (!(*curr)->is_linked && (*curr)->qry_start + (*curr)->qry_len <= cur_qry_start) {
-            //             break;
-            //         }
-            //     }
-            //
-            //     ++curr;
-            // }
-            //++curr;
 
             curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
             curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
@@ -1345,8 +1271,6 @@ void linkClusters(AnchorPtrVec& anchors,
 
                 ++curr;
             }
-            std::cout << "";
-            // it = curr + 1;
         }
 
         //++curr;
@@ -1495,12 +1419,6 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
             continue;
         }
 
-
-        //if ((*curr)->qry_chr_index == 4 && (*curr)->qry_start < 357618 + 24610 && (*curr)->qry_start + (*curr)->qry_len > 357618) {
-        //    std::cout << "";
-        //}
-
-
         auto best = anchors.end();
 
         int_t break_len = 200;
@@ -1764,16 +1682,6 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                             prependCigar((*curr)->cigar, gap_cigar);
                         }
                     }
-       //             if (!linked.empty()) {
-       //                 // 打印curr和best
-       //                 if (strand == FORWARD) {
-       //                     std::cout << (int_t)(*curr)->qry_start - (int_t)((*best_it)->qry_start + (*best_it)->qry_len) << std::endl;
-       //                 }
-       //                 else {
-							//std::cout << (int_t)((*best_it)->qry_start) - (int_t)((*curr)->qry_start + (*curr)->qry_len) << std::endl;
-       //                 }
-       //
-       //             }
                 }
             }
 
@@ -1802,34 +1710,6 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
 
 
             }
-            // 将新的cur设置为和老cur不冲突的anchor
-            // TODO考虑反向链
-
-            // curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
-            // curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
-            // int_t cur_qry_start = (*curr)->qry_start;
-            // //curr = best;
-            // while (true) {
-            //     if (strand == FORWARD) {
-            //         //if (!(*curr)->is_linked && (*curr)->qry_start >= curr_qry_end && (*curr)->ref_start >= curr_ref_end) {
-            //         //    break;
-            //         //}
-            //         if (!(*curr)->is_linked && (*curr)->qry_start >= curr_qry_end) {
-            //             break;
-            //         }
-            //     }
-            //     else {
-            //         //if (!(*curr)->is_linked && (*curr)->qry_start + (*curr)->qry_len <= cur_qry_start && (*curr)->ref_start >= curr_ref_end) {
-            //         //    break;
-            //         //}
-            //         if (!(*curr)->is_linked && (*curr)->qry_start + (*curr)->qry_len <= cur_qry_start) {
-            //             break;
-            //         }
-            //     }
-            //
-            //     ++curr;
-            // }
-            //++curr;
 
             curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
             curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
@@ -1842,8 +1722,6 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
 
                 ++curr;
             }
-            std::cout << "";
-            // it = curr + 1;
         }
 
         //++curr;
