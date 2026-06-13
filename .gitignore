@@ -429,3 +429,7 @@ bin/maf2hal
 bin/output.maf
 /interval.py
 /unaligned.txt
+
+# Local-only packaging and CI files
+/.github/
+/recipe/
