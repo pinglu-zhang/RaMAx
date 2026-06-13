@@ -21,7 +21,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ================= 路径设置 =================
 set(SOURCE_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(INCLUDE_DIR        "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set(SUBMODULE_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/submodule")
+set(THIRD_PARTY_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(PREPROCESS_DIR     "${SOURCE_DIR}/preprocess")
 set(INDEX_DIR          "${SOURCE_DIR}/index")
 set(ALIGN_DIR          "${SOURCE_DIR}/align")
@@ -31,8 +31,8 @@ set(BIGBWT_DIR         "${INDEX_DIR}/bigBWT")
 set(BIGBWT_INCLUDE_DIR "${INCLUDE_DIR}/bigBWT")
 set(SUFFIX_ARRAY_DIR   "${INDEX_DIR}/suffix_array")
 set(SUFFIX_ARRAY_INCLUDE_DIR "${INCLUDE_DIR}/suffix_array")
-set(SONLIB_DIR ${SUBMODULE_DIR}/sonLib)
-set(HAL_DIR    ${SUBMODULE_DIR}/hal)
+set(SONLIB_DIR ${THIRD_PARTY_DIR}/sonLib)
+set(HAL_DIR    ${THIRD_PARTY_DIR}/hal)
 
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
 set(RAMAX_HAL_JOBS "" CACHE STRING "Parallel jobs for bundled sonLib/HAL make builds")
@@ -43,10 +43,23 @@ else()
     set(RAMAX_HAL_MAKE_JOBS "-j")
 endif()
 
+# ================= 外部库依赖 =================
+find_package(CURL REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
+find_package(TBB REQUIRED)
+find_package(HDF5 REQUIRED COMPONENTS CXX)
+
+set(RAMAX_HAL_HDF5_INCLUDE_FLAGS "")
+foreach(dir IN LISTS HDF5_CXX_INCLUDE_DIRS)
+    set(RAMAX_HAL_HDF5_INCLUDE_FLAGS "${RAMAX_HAL_HDF5_INCLUDE_FLAGS} -I${dir}")
+endforeach()
+
 # ================= HAL library =================
 add_custom_command(
     OUTPUT ${SONLIB_DIR}/lib/sonLib.h ${SONLIB_DIR}/lib/sonLib.a
-    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS}
+    COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS} libs
             "CC=${CMAKE_C_COMPILER}"
             "CXX=${CMAKE_CXX_COMPILER}"
             "AR=${CMAKE_AR}"
@@ -66,6 +79,7 @@ add_custom_command(
             "CXX=${CMAKE_CXX_COMPILER}"
             "AR=${CMAKE_AR}"
             "RANLIB=${CMAKE_RANLIB}"
+            "HAL_HDF5_CFLAGS=${RAMAX_HAL_HDF5_INCLUDE_FLAGS}"
             "LIBS=${RAMAX_HAL_LIBS}"
     WORKING_DIRECTORY ${HAL_DIR}
     COMMENT "Building HAL library..."
@@ -89,24 +103,16 @@ option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-s")
 
 
-# ================= 子模块依赖 =================
-add_subdirectory("${SUBMODULE_DIR}/spdlog")
-# add_subdirectory("${SUBMODULE_DIR}/CLI11")
-# add_subdirectory("${SUBMODULE_DIR}/sdsl-lite")
+# ================= bundled dependencies =================
+# add_subdirectory("${THIRD_PARTY_DIR}/CLI11")
+# add_subdirectory("${THIRD_PARTY_DIR}/sdsl-lite")
 #set(WFA_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 #set(WFA_BUILD_STATIC ON CACHE BOOL "" FORCE)
-# add_subdirectory("${SUBMODULE_DIR}/WFA2-lib")
+# add_subdirectory("${THIRD_PARTY_DIR}/WFA2-lib")
 # 已经 add_subdirectory(...) 产生了目标 "divsufsort"
 set(BUILD_DIVSUFSORT64 ON CACHE BOOL "" FORCE)
-add_subdirectory("${SUBMODULE_DIR}/libdivsufsort")
-
-# ================= 外部库依赖 =================
-find_package(CURL REQUIRED)
-find_package(ZLIB REQUIRED)
-find_package(OpenMP REQUIRED)
-find_package(Threads REQUIRED)
-find_package(TBB REQUIRED)
-find_package(HDF5 REQUIRED COMPONENTS CXX)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort")
 
 # ================= 公共源文件 =================
 set(RAMA_COMMON_SOURCES
@@ -143,16 +149,16 @@ set(MAIN_X "${SOURCE_DIR}/RaMAx.cpp")
 # ================= 公共头文件路径 =================
 set(RAMA_INCLUDE_DIRS
     "${INCLUDE_DIR}"
-    "${SUBMODULE_DIR}/spdlog/include"
-    # "${SUBMODULE_DIR}/CLI11/include"
-#   "${SUBMODULE_DIR}/cereal/include"
+    "${THIRD_PARTY_DIR}/spdlog/include"
+    # "${THIRD_PARTY_DIR}/CLI11/include"
+#   "${THIRD_PARTY_DIR}/cereal/include"
     "${BIGBWT_INCLUDE_DIR}"
     "${SUFFIX_ARRAY_INCLUDE_DIR}"
-    # "${SUBMODULE_DIR}/sdsl-lite/include"
-    # "${SUBMODULE_DIR}/sdsl-lite/external/libdivsufsort/include"
-    "${CMAKE_BINARY_DIR}/submodule/libdivsufsort/include"
-    # "${SUBMODULE_DIR}/WFA2-lib"
-    "${SUBMODULE_DIR}/parlaylib/include"
+    # "${THIRD_PARTY_DIR}/sdsl-lite/include"
+    # "${THIRD_PARTY_DIR}/sdsl-lite/external/libdivsufsort/include"
+    "${CMAKE_BINARY_DIR}/third_party/libdivsufsort/include"
+    # "${THIRD_PARTY_DIR}/WFA2-lib"
+    "${THIRD_PARTY_DIR}/parlaylib/include"
     "${HAL_DIR}/api/inc"
     "${SONLIB_DIR}/C/inc"
     ${HDF5_CXX_INCLUDE_DIRS}
@@ -163,7 +169,6 @@ function(configure_rama_target target)
     target_include_directories(${target} PRIVATE ${RAMA_INCLUDE_DIRS})
 
     target_link_libraries(${target} PRIVATE
-        spdlog::spdlog
         # CLI11::CLI11
         ZLIB::ZLIB
         CURL::libcurl
@@ -182,7 +187,7 @@ function(configure_rama_target target)
     # 确保在构建目标前先构建libdivsufsort（生成头文件）
     add_dependencies(${target} divsufsort divsufsort64)
 
-    target_compile_definitions(${target} PRIVATE M64)
+    target_compile_definitions(${target} PRIVATE M64 SPDLOG_HEADER_ONLY)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_definitions(${target} PRIVATE _DEBUG_)
     endif()

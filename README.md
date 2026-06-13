@@ -13,8 +13,8 @@ Docker is the recommended installation method for older or heterogeneous Linux s
 Pull the published image and check that RaMAx starts:
 
 ```bash
-docker pull ghcr.io/metaphysicser/ramax:latest
-docker run --rm ghcr.io/metaphysicser/ramax:latest --help
+docker pull ghcr.io/pinglu-zhang/ramax:latest
+docker run --rm ghcr.io/pinglu-zhang/ramax:latest --help
 ```
 
 Run RaMAx against files in the current directory:
@@ -24,7 +24,7 @@ docker run --rm \
   --user "$(id -u):$(id -g)" \
   --volume "$PWD:/data" \
   --workdir /data \
-  ghcr.io/metaphysicser/ramax:latest \
+  ghcr.io/pinglu-zhang/ramax:latest \
   -i seqfile.txt \
   -o output.maf \
   -w workdir \
@@ -34,12 +34,11 @@ docker run --rm \
 To build the image locally from source:
 
 ```bash
-git submodule update --init --recursive
 docker build --platform linux/amd64 -t ramax:local .
 docker run --rm ramax:local --help
 ```
 
-The Docker build compiles `ramax` from `src/` and the initialized submodules with portable CPU settings. The repository `bin/` directory is excluded and none of its binaries are copied into the image.
+The Docker build compiles `ramax` from `src/` and the vendored source in `third_party/` with portable CPU settings. The repository `bin/` directory is excluded and none of its binaries are copied into the image.
 
 ---
 
@@ -79,8 +78,8 @@ sudo apt install -y \
 ### Build Steps
 
 ```bash
-# Clone the repository (with submodules)
-git clone https://github.com/metaphysicser/RaMAx --recursive
+# Clone the repository
+git clone https://github.com/pinglu-zhang/RaMAx
 cd RaMAx
 
 # Create a build directory

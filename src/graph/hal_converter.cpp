@@ -1,8 +1,8 @@
 #include "hal_converter.h"
 #include "align.h"
 #include <spdlog/spdlog.h>
-#include "../submodule/hal/api/inc/hal.h"
-#include "../submodule/hal/api/inc/halCommon.h"
+#include "hal.h"
+#include "halCommon.h"
 #include "../../include/threadpool.h"
 #include <mutex>
 #include <chrono>

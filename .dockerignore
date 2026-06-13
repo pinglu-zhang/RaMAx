@@ -24,10 +24,10 @@ _build
 **/*.so
 **/*.so.*
 
-submodule/hal/bin
-submodule/hal/lib
-submodule/hal/objs
-submodule/sonLib/bin
-submodule/sonLib/lib
-submodule/sonLib/externalTools/quicktree_1.1/bin
-submodule/sonLib/externalTools/quicktree_1.1/obj
+third_party/hal/bin
+third_party/hal/lib
+third_party/hal/objs
+third_party/sonLib/bin
+third_party/sonLib/lib
+third_party/sonLib/externalTools/quicktree_1.1/bin
+third_party/sonLib/externalTools/quicktree_1.1/obj
