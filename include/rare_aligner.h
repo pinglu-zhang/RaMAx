@@ -1,5 +1,8 @@
 #ifndef RARE_ALIGNER_H
 #define RARE_ALIGNER_H
+
+#include <optional>
+
 #include "config.hpp"
 #include "index.h"
 #include "SeqPro.h"
@@ -131,7 +134,6 @@ public:
 
 
 #endif
-
 
 
 
