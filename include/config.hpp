@@ -168,9 +168,9 @@ public:
 	std::string make_usage(const CLI::App* app, std::string name) const override {
 		std::ostringstream out;
 		out << "Usage:\n"
-			<< "  ./RaMAx -r <ref.fa> -q <query.fa> -o <out_dir> [options]\n\n"
+			<< "  ramax -i <seqfile.txt> -o <output.{maf|hal}> -w <workdir> [options]\n\n"
 			<< "Example:\n"
-			<< "  ./RaMAx -r ref.fa -q query.fa -o output/ -t 8\n\n";
+			<< "  ramax -i seqfile.txt -o output.maf -w workdir -t 8\n\n";
 		return out.str();
 	}
 };
