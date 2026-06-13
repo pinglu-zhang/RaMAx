@@ -110,6 +110,7 @@ set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-s")
 #set(WFA_BUILD_STATIC ON CACHE BOOL "" FORCE)
 # add_subdirectory("${THIRD_PARTY_DIR}/WFA2-lib")
 # 已经 add_subdirectory(...) 产生了目标 "divsufsort"
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build bundled libraries statically" FORCE)
 set(BUILD_DIVSUFSORT64 ON CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort")

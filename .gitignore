@@ -363,6 +363,7 @@ FodyWeavers.xsd
 /build
 /build-vendor/
 /build-*/
+/lib/
 /workdir/data
 /workdir
 /workdi2r

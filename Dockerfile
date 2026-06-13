@@ -35,11 +35,13 @@ RUN set -eux; \
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/ramax \
-        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_INSTALL_LIBDIR=/opt/ramax/lib \
+        -DCMAKE_INSTALL_PKGCONFIGDIR=/opt/ramax/lib/pkgconfig \
         -DCMAKE_INSTALL_RPATH=/opt/ramax/lib \
         -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DBUILD_EXAMPLES=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
         -DRAMAX_NATIVE_ARCH=OFF \
         -DRAMAX_HAL_JOBS="${BUILD_JOBS}" \
         -DRAMAX_HAL_LIBS="${hdf5_libs} -lhdf5_cpp"; \
