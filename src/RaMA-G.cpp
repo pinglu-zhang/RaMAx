@@ -307,10 +307,11 @@ inline void setupCommonOptions(CLI::App *cmd, CommonArgs &args) {
                     {"dp", "dp"}
                 }, CLI::ignore_case));
 
-    /* auto* mask_repeats_flag = */
-    cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
-                  "Enable repeat sequence masking.")
-            ->group("Software Parameters");
+    // Repeat masking is currently disabled because it depends on external
+    // windowmasker binaries that are no longer bundled with RaMAx.
+    // cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
+    //               "Enable repeat sequence masking.")
+    //         ->group("Software Parameters");
 
     // 质量控制参数
     auto *min_identity_opt = cmd->add_option("--min-identity", args.min_identity,
@@ -628,6 +629,10 @@ int main(int argc, char **argv) {
     // 清洗 FASTA 文件（统一格式，替换非法字符）
     cleanRawDataset(common_args.work_dir_path, species_path_map,
                     common_args.thread_num);
+    if (common_args.enable_repeat_masking) {
+        spdlog::warn("Repeat masking is currently disabled; continuing without repeat masking.");
+        common_args.enable_repeat_masking = false;
+    }
     // ------------------------------
     // 重复遮蔽
     // ------------------------------

@@ -27,14 +27,7 @@ std::string findWindowmaskerPath() {
         spdlog::warn("Failed to determine executable path: {}", e.what());
     }
 
-    // 3. 尝试项目开发目录的 bin 路径
-    if (std::filesystem::exists("bin/windowmasker") &&
-        std::filesystem::is_regular_file("bin/windowmasker")) {
-        spdlog::info("Found windowmasker in development bin directory");
-        return "bin/windowmasker";
-    }
-
-    // 4. 如果都找不到，抛出异常
+    // 3. 如果都找不到，抛出异常
     throw std::runtime_error("windowmasker executable not found. Please ensure it is installed or available in PATH.");
 }
 

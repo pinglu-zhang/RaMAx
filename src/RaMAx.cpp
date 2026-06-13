@@ -321,10 +321,11 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
-    // 是否启用重复序列遮蔽
-    cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
-        "Enable repeat sequence masking.")
-        ->group("Software Parameters");
+    // Repeat masking is currently disabled because it depends on external
+    // windowmasker binaries that are no longer bundled with RaMAx.
+    // cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
+    //     "Enable repeat sequence masking.")
+    //     ->group("Software Parameters");
 
     // ========================
     // 性能相关参数
@@ -639,6 +640,11 @@ static int preprocessingPhase(
 
     // 清洗 FASTA 文件（统一格式，替换非法字符）
     cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+
+    if (common_args.enable_repeat_masking) {
+        spdlog::warn("Repeat masking is currently disabled; continuing without repeat masking.");
+        common_args.enable_repeat_masking = false;
+    }
 
     // 若启用重复遮蔽：生成 interval 并创建 MaskedSequenceManager(带 interval)
     if (common_args.enable_repeat_masking) {

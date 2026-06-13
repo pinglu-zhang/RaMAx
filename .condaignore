@@ -7,6 +7,7 @@ build-*
 build-conda
 cmake-build-*
 recipe/build-conda
+bin
 benchmark
 third_party/hal/bin
 third_party/hal/lib
