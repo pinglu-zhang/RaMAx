@@ -26,8 +26,8 @@ Docker is an alternative for older or heterogeneous Linux systems, especially wh
 Pull the published image and check that RaMAx starts:
 
 ```bash
-docker pull pinglu-zhang/ramax:latest
-docker run pinglu-zhang/ramax:latest --help
+docker pull pingluzhang/ramax:latest
+docker run pingluzhang/ramax:latest --help
 ```
 
 ## Install from Source
