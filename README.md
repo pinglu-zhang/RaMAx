@@ -19,7 +19,7 @@ The Linux conda package is built against the conda-forge sysroot and is intended
 
 ---
 
-## Run with Docker
+## Install with Docker
 
 Docker is an alternative for older or heterogeneous Linux systems, especially when the host glibc is incompatible. The image includes its own userspace libraries.
 
@@ -30,7 +30,7 @@ docker pull pinglu-zhang/ramax:latest
 docker run pinglu-zhang/ramax:latest --help
 ```
 
-## Build from Source
+## Install from Source
 
 ### Prerequisites (Ubuntu/Debian)
 
