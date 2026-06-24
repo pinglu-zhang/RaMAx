@@ -349,6 +349,67 @@ void exportMaskIntervalsToDirectory(
         }
         return false;
     }
+
+    struct SpeciesAssemblyQuality {
+        SpeciesName name;
+        SeqPro::Length n50 = 0;
+        SeqPro::Length total_length = 0;
+        size_t sequence_count = 0;
+    };
+
+    SeqPro::Length calculateN50(std::vector<SeqPro::Length> lengths, SeqPro::Length total_length) {
+        if (lengths.empty() || total_length == 0) {
+            return 0;
+        }
+
+        std::sort(lengths.begin(), lengths.end(), [](SeqPro::Length a, SeqPro::Length b) {
+            return a > b;
+        });
+
+        const SeqPro::Length half_total = (total_length + 1) / 2;
+        SeqPro::Length cumulative = 0;
+
+        for (SeqPro::Length length : lengths) {
+            cumulative += length;
+            if (cumulative >= half_total) {
+                return length;
+            }
+        }
+
+        return 0;
+    }
+
+    SpeciesAssemblyQuality getAssemblyQuality(
+        const SpeciesName& species_name,
+        const SeqPro::SequenceManager& manager) {
+
+        SpeciesAssemblyQuality quality;
+        quality.name = species_name;
+
+        auto seq_names = manager.getSequenceNames();
+        quality.sequence_count = seq_names.size();
+
+        std::vector<SeqPro::Length> lengths;
+        lengths.reserve(seq_names.size());
+
+        for (const auto& seq_name : seq_names) {
+            SeqPro::Length length = manager.getSequenceLength(seq_name);
+            if (length == 0) {
+                continue;
+            }
+            lengths.push_back(length);
+            quality.total_length += length;
+        }
+
+        quality.n50 = calculateN50(std::move(lengths), quality.total_length);
+        return quality;
+    }
+
+    SpeciesAssemblyQuality getAssemblyQuality(
+        const SpeciesName& species_name,
+        const SeqPro::MaskedSequenceManager& manager) {
+        return getAssemblyQuality(species_name, manager.getOriginalManager());
+    }
 } // anonymous namespace
 
 /**
@@ -633,81 +694,98 @@ starAlignment(
     // }
 
     // ------------------------------------------------------------
-    // 1) 统计每个物种的总长度，用于决定处理顺序
+    // 1) 统计每个物种的 assembly N50，用于决定处理顺序
     //    - seqpro_managers 里 value 是 SharedManagerVariant（shared_ptr<variant<...>>）
-    //    - 通过 visit 获取 manager->getTotalLength()
+    //    - N50 根据原始序列长度计算；MaskedSequenceManager 使用原始 manager，避免 mask 影响组装质量
     // ------------------------------------------------------------
-    std::vector<std::pair<SpeciesName, SeqPro::Length>> species_sizes;
-    species_sizes.reserve(seqpro_managers.size());
+    std::vector<SpeciesAssemblyQuality> species_qualities;
+    species_qualities.reserve(seqpro_managers.size());
 
     for (const auto& entry : seqpro_managers) {
         const SpeciesName& species_name = entry.first;
         const SeqPro::SharedManagerVariant& shared_mgr_variant = entry.second;
 
         if (!shared_mgr_variant) {
-            // 空指针则长度记为 0（保持原逻辑）
-            species_sizes.emplace_back(species_name, 0);
+            // 空指针则 N50 和长度记为 0（保持原逻辑）
+            species_qualities.push_back({species_name, 0, 0, 0});
             continue;
         }
 
-        // 用 std::visit 取该物种 total length
-        SeqPro::Length total_len = std::visit(
-            [](auto const& mgrPtr) -> SeqPro::Length {
+        // 用 std::visit 计算该物种 assembly N50
+        SpeciesAssemblyQuality quality = std::visit(
+            [&species_name](auto const& mgrPtr) -> SpeciesAssemblyQuality {
                 using ManagerPtrT = std::decay_t<decltype(mgrPtr)>;
 
                 if constexpr (std::is_same_v<ManagerPtrT, std::unique_ptr<SeqPro::SequenceManager>>) {
-                    return mgrPtr ? mgrPtr->getTotalLength() : 0;
+                    return mgrPtr ? getAssemblyQuality(species_name, *mgrPtr)
+                                  : SpeciesAssemblyQuality{species_name, 0, 0, 0};
                 }
                 else if constexpr (std::is_same_v<ManagerPtrT, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-                    return mgrPtr ? mgrPtr->getTotalLength() : 0;
+                    return mgrPtr ? getAssemblyQuality(species_name, *mgrPtr)
+                                  : SpeciesAssemblyQuality{species_name, 0, 0, 0};
                 }
                 else {
                     // 理论上不会到这里（保持原逻辑）
-                    return 0;
+                    return SpeciesAssemblyQuality{species_name, 0, 0, 0};
                 }
             },
             *shared_mgr_variant // shared_ptr<variant<...>> 解引用得到 variant
         );
 
-        species_sizes.emplace_back(species_name, total_len);
+        species_qualities.push_back(std::move(quality));
     }
 
     // ------------------------------------------------------------
-    // 2) 按总长度从大到小排序（降序）
+    // 2) 按 assembly N50 从大到小排序（降序）
+    //    N50 相同时，使用总长度和物种名做确定性 tie-break
     // ------------------------------------------------------------
     std::sort(
-        species_sizes.begin(),
-        species_sizes.end(),
+        species_qualities.begin(),
+        species_qualities.end(),
         [](const auto& a, const auto& b) {
-            return a.second > b.second;
+            if (a.n50 != b.n50) {
+                return a.n50 > b.n50;
+            }
+            if (a.total_length != b.total_length) {
+                return a.total_length > b.total_length;
+            }
+            return a.name < b.name;
         }
     );
 
     // ------------------------------------------------------------
-    // 3) 提取排序后的物种名列表 species_order
+    // 3) 将指定的 ref_name 移动到最前面（如果存在于列表）
     // ------------------------------------------------------------
-    std::vector<SpeciesName> species_order;
-    species_order.reserve(species_sizes.size());
-    for (const auto& p : species_sizes) {
-        species_order.push_back(p.first);
+    auto ref_it = std::find_if(
+        species_qualities.begin(),
+        species_qualities.end(),
+        [&ref_name](const SpeciesAssemblyQuality& quality) {
+            return quality.name == ref_name;
+        }
+    );
+    if (ref_it != species_qualities.end()) {
+        SpeciesAssemblyQuality ref = std::move(*ref_it);
+        species_qualities.erase(ref_it);
+        species_qualities.insert(species_qualities.begin(), std::move(ref));
     }
 
     // ------------------------------------------------------------
-    // 4) 将指定的 ref_name 移动到最前面（如果存在于列表）
+    // 4) 提取排序后的物种名列表 species_order
     // ------------------------------------------------------------
-    auto it = std::find(species_order.begin(), species_order.end(), ref_name);
-    if (it != species_order.end()) {
-        SpeciesName ref = *it;
-        species_order.erase(it);
-        species_order.insert(species_order.begin(), std::move(ref));
+    std::vector<SpeciesName> species_order;
+    species_order.reserve(species_qualities.size());
+    for (const auto& quality : species_qualities) {
+        species_order.push_back(quality.name);
     }
 
     uint_t leaf_num = species_order.size();
 
     // 打印物种处理顺序
-    spdlog::info("Species processing order ({} total):", leaf_num);
-    for (size_t i = 0; i < species_order.size(); ++i) {
-        spdlog::info("  [{}] {}", i, species_order[i]);
+    spdlog::info("Species processing order ({} total, sorted by assembly N50):", leaf_num);
+    for (size_t i = 0; i < species_qualities.size(); ++i) {
+        const auto& quality = species_qualities[i];
+        spdlog::info("  [{}] {} (N50={}, total_length={}, sequences={})",
+            i, quality.name, quality.n50, quality.total_length, quality.sequence_count);
     }
 
     // ------------------------------------------------------------
