@@ -1,5 +1,7 @@
 #include <sequence_utils.h>
 #include <algorithm>
+#include <stdexcept>
+#include <unordered_set>
 
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
@@ -8,6 +10,8 @@
 
 // 辅助函数：根据CIGAR字符串计算query区间对应关系
 namespace {
+
+    constexpr size_t kMaxReferenceSequenceCount = 100000;
 
     /**
      * @brief 获取query segment在ref上的映射区间
@@ -355,7 +359,40 @@ void exportMaskIntervalsToDirectory(
         SeqPro::Length n50 = 0;
         SeqPro::Length total_length = 0;
         size_t sequence_count = 0;
+        bool reference_eligible = false;
     };
+
+    bool isReferenceEligibleSequenceCount(size_t sequence_count) {
+        return sequence_count > 0 && sequence_count <= kMaxReferenceSequenceCount;
+    }
+
+    size_t getManagerSequenceCount(const SeqPro::SharedManagerVariant& manager_variant) {
+        if (!manager_variant) {
+            return 0;
+        }
+
+        return std::visit(
+            [](auto const& manager_ptr) -> size_t {
+                return manager_ptr ? manager_ptr->getSequenceCount() : 0;
+            },
+            *manager_variant
+        );
+    }
+
+    void validateReferenceSequenceCount(
+        const SpeciesName& ref_name,
+        const SeqPro::SharedManagerVariant& manager_variant) {
+
+        const size_t sequence_count = getManagerSequenceCount(manager_variant);
+        if (isReferenceEligibleSequenceCount(sequence_count)) {
+            return;
+        }
+
+        throw std::runtime_error(
+            "[reference-selection] Genome " + ref_name + " cannot be used as reference: sequence_count=" +
+            std::to_string(sequence_count) + ", max_allowed=" +
+            std::to_string(kMaxReferenceSequenceCount));
+    }
 
     SeqPro::Length calculateN50(std::vector<SeqPro::Length> lengths, SeqPro::Length total_length) {
         if (lengths.empty() || total_length == 0) {
@@ -388,6 +425,7 @@ void exportMaskIntervalsToDirectory(
 
         auto seq_names = manager.getSequenceNames();
         quality.sequence_count = seq_names.size();
+        quality.reference_eligible = isReferenceEligibleSequenceCount(quality.sequence_count);
 
         std::vector<SeqPro::Length> lengths;
         lengths.reserve(seq_names.size());
@@ -739,22 +777,20 @@ starAlignment(
     // 2) 按 assembly N50 从大到小排序（降序）
     //    N50 相同时，使用总长度和物种名做确定性 tie-break
     // ------------------------------------------------------------
-    std::sort(
-        species_qualities.begin(),
-        species_qualities.end(),
-        [](const auto& a, const auto& b) {
-            if (a.n50 != b.n50) {
-                return a.n50 > b.n50;
-            }
-            if (a.total_length != b.total_length) {
-                return a.total_length > b.total_length;
-            }
-            return a.name < b.name;
+    auto quality_order_less = [](const auto& a, const auto& b) {
+        if (a.n50 != b.n50) {
+            return a.n50 > b.n50;
         }
-    );
+        if (a.total_length != b.total_length) {
+            return a.total_length > b.total_length;
+        }
+        return a.name < b.name;
+    };
+    std::sort(species_qualities.begin(), species_qualities.end(), quality_order_less);
 
     // ------------------------------------------------------------
     // 3) 将指定的 ref_name 移动到最前面（如果存在于列表）
+    //    若显式指定的 reference 超过序列数阈值，则直接报错
     // ------------------------------------------------------------
     auto ref_it = std::find_if(
         species_qualities.begin(),
@@ -764,28 +800,55 @@ starAlignment(
         }
     );
     if (ref_it != species_qualities.end()) {
+        if (!ref_it->reference_eligible) {
+            throw std::runtime_error(
+                "[reference-selection] Explicit reference " + ref_it->name +
+                " cannot be used as reference: sequence_count=" +
+                std::to_string(ref_it->sequence_count) + ", max_allowed=" +
+                std::to_string(kMaxReferenceSequenceCount));
+        }
+
         SpeciesAssemblyQuality ref = std::move(*ref_it);
         species_qualities.erase(ref_it);
         species_qualities.insert(species_qualities.begin(), std::move(ref));
     }
 
     // ------------------------------------------------------------
-    // 4) 提取排序后的物种名列表 species_order
+    // 4) 提取排序后的物种名列表 species_order，并单独构建合法 reference 列表
+    //    超过序列数阈值的物种保留为 query，但不会进入 reference_order
     // ------------------------------------------------------------
     std::vector<SpeciesName> species_order;
     species_order.reserve(species_qualities.size());
+    std::vector<SpeciesName> reference_order;
+    reference_order.reserve(species_qualities.size());
+
     for (const auto& quality : species_qualities) {
         species_order.push_back(quality.name);
+        if (quality.reference_eligible) {
+            reference_order.push_back(quality.name);
+        }
     }
 
     uint_t leaf_num = species_order.size();
+    uint_t reference_num = reference_order.size();
+    if (reference_num == 0) {
+        throw std::runtime_error(
+            "[reference-selection] No eligible reference genome found. Genomes with sequence_count > " +
+            std::to_string(kMaxReferenceSequenceCount) + " cannot be used as reference.");
+    }
 
     // 打印物种处理顺序
     spdlog::info("Species processing order ({} total, sorted by assembly N50):", leaf_num);
     for (size_t i = 0; i < species_qualities.size(); ++i) {
         const auto& quality = species_qualities[i];
-        spdlog::info("  [{}] {} (N50={}, total_length={}, sequences={})",
-            i, quality.name, quality.n50, quality.total_length, quality.sequence_count);
+        spdlog::info("  [{}] {} (N50={}, total_length={}, sequences={}, reference_eligible={})",
+            i, quality.name, quality.n50, quality.total_length, quality.sequence_count,
+            quality.reference_eligible ? "true" : "false");
+        if (!quality.reference_eligible) {
+            spdlog::warn(
+                "[reference-selection] Excluding {} as reference: sequence_count={}, max_allowed={}",
+                quality.name, quality.sequence_count, kMaxReferenceSequenceCount);
+        }
     }
 
     // ------------------------------------------------------------
@@ -800,29 +863,33 @@ starAlignment(
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
 
     // ------------------------------------------------------------
-    // 7) 决定轮数：only_one_round 只跑 1 轮，否则跑 leaf_num 轮
-    //    每轮把 species_order[i] 作为 reference
+    // 7) 决定轮数：only_one_round 只跑 1 轮，否则只遍历合法 reference
+    //    超过序列数阈值的物种保留为 query，但不会作为 reference
     // ------------------------------------------------------------
-    uint_t round = only_one_round ? 1 : leaf_num;
+    uint_t round = only_one_round ? 1 : reference_num;
+    std::unordered_set<SpeciesName> processed_reference_species;
 
     for (uint_t i = 0; i < round; i++) {
 
         // --------------------------------------------------------
-        // 7-1) 当前轮参考物种 ref_name（注意这里会 shadow 外层 ref_name）
+        // 7-1) 当前轮参考物种
         // --------------------------------------------------------
-        SpeciesName ref_name = species_order[i];
-        spdlog::info("build ref global cache for {}", ref_name);
+        SpeciesName current_ref_name = reference_order[i];
+        spdlog::info("build ref global cache for {}", current_ref_name);
 
         // 构建 ref_global_cache（用 sampling_interval 采样）
-        SequenceUtils::buildRefGlobalCache(seqpro_managers[ref_name], sampling_interval, ref_global_cache);
+        SequenceUtils::buildRefGlobalCache(seqpro_managers[current_ref_name], sampling_interval, ref_global_cache);
 
         // --------------------------------------------------------
         // 7-2) 构造本轮参与比对的物种集合：
-        //      从 i 到 leaf_num-1 的物种都作为 query（包含 ref 自身，但后续会跳过/处理）
+        //      当前 reference + 尚未作为合法 reference 处理过的物种都作为 query
+        //      超过序列数阈值的物种永不进入 processed_reference_species，因此仍作为 query 参与
         // --------------------------------------------------------
         std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant> species_fasta_manager_map;
-        for (uint_t j = i; j < leaf_num; j++) {
-            SpeciesName query_name = species_order[j];
+        for (const auto& query_name : species_order) {
+            if (processed_reference_species.count(query_name) > 0) {
+                continue;
+            }
             auto query_fasta_manager = seqpro_managers.at(query_name);
             species_fasta_manager_map.emplace(query_name, query_fasta_manager);
         }
@@ -830,7 +897,7 @@ starAlignment(
         // 从第二轮开始允许短 MUM（保持原逻辑：i==0 -> true，否则 false）
         bool allow_short_mum = (i == 0) ? true : false;
 
-        spdlog::info("align multiple genome for {}", ref_name);
+        spdlog::info("align multiple genome for {}", current_ref_name);
 
         // --------------------------------------------------------
         // 7-3) 多物种比对：对当前 ref 与各 query 进行 anchor 搜索
@@ -838,7 +905,7 @@ starAlignment(
         //      allow_MEM 固定 false
         // --------------------------------------------------------
         SpeciesMatchVec3DPtrMapPtr match_ptr = alignMultipleGenome(
-            ref_name,
+            current_ref_name,
             species_fasta_manager_map,
             ACCURATE_SEARCH,
             fast_build,
@@ -848,28 +915,28 @@ starAlignment(
             sampling_interval
         );
 
-        spdlog::info("align multiple genome for {} done", ref_name);
+        spdlog::info("align multiple genome for {} done", current_ref_name);
 
         // --------------------------------------------------------
         // 7-4) 过滤 anchors：对多个物种的 anchors 聚簇/筛选，得到 cluster_map
         // --------------------------------------------------------
-        spdlog::info("filter multiple species anchors for {}", ref_name);
+        spdlog::info("filter multiple species anchors for {}", current_ref_name);
         SpeciesClusterMapPtr cluster_map = filterMultipeSpeciesAnchors(
-            ref_name,
+            current_ref_name,
             species_fasta_manager_map,
             match_ptr,
             min_span
         );
-        spdlog::info("filter multiple species anchors for {} done", ref_name);
+        spdlog::info("filter multiple species anchors for {} done", current_ref_name);
 
         // --------------------------------------------------------
         // 7-5) 构建多基因组图：DP 方式构图（i==0 作为 is_first）
         // --------------------------------------------------------
-        spdlog::info("construct multiple genome graphs for {}", ref_name);
+        spdlog::info("construct multiple genome graphs for {}", current_ref_name);
 
         constructMultipleGraphsByDp(
             seqpro_managers,
-            ref_name,
+            current_ref_name,
             *cluster_map,
             *multi_graph,
             min_span,
@@ -879,23 +946,23 @@ starAlignment(
         // --------------------------------------------------------
         // 7-6) 扩展/优化/验证图结构
         // --------------------------------------------------------
-        spdlog::info("begin to extend nodes for {}", ref_name);
-        multi_graph->extendRefNodes(ref_name, seqpro_managers, 200);
+        spdlog::info("begin to extend nodes for {}", current_ref_name);
+        multi_graph->extendRefNodes(current_ref_name, seqpro_managers, 200);
 
         multi_graph->optimizeGraphStructure();
 
 #ifdef _DEBUG_
-        multi_graph->verifyGraphCorrectness(ref_name, true);
+        multi_graph->verifyGraphCorrectness(current_ref_name, true);
 #endif // _DEBUG_
 
-        spdlog::info("construct multiple genome graphs for {} done", ref_name);
+        spdlog::info("construct multiple genome graphs for {} done", current_ref_name);
 
         // --------------------------------------------------------
         // 7-7) 合并本轮生成的多个子图到 multi_graph
         // --------------------------------------------------------
-        spdlog::info("merge multiple genome graphs for {}", ref_name);
-        multi_graph->mergeMultipleGraphs(ref_name, thread_num);
-        spdlog::info("merge multiple genome graphs for {} done", ref_name);
+        spdlog::info("merge multiple genome graphs for {}", current_ref_name);
+        multi_graph->mergeMultipleGraphs(current_ref_name, thread_num);
+        spdlog::info("merge multiple genome graphs for {} done", current_ref_name);
 
 #ifdef _DEBUG_
         multi_graph->verifyGraphCorrectness(true);
@@ -903,26 +970,26 @@ starAlignment(
 
         // 合并后再优化一次
         multi_graph->optimizeGraphStructure();
-        spdlog::info("optimize graph genome graphs for {} done", ref_name);
+        spdlog::info("optimize graph genome graphs for {} done", current_ref_name);
 
         // 标记所有节点已扩展
         multi_graph->markAllExtended();
 
 #ifdef _DEBUG_
-        multi_graph->verifyGraphCorrectness(ref_name, true, false, false, true, false);
+        multi_graph->verifyGraphCorrectness(current_ref_name, true, false, false, true, false);
 #endif // _DEBUG_
 
         // --------------------------------------------------------
         // 7-8) 将本轮已对齐区域加入遮蔽区间（mask intervals）
         //      目的：后续轮次避免重复比对已成功对齐的区间
         // --------------------------------------------------------
-        spdlog::info("Adding aligned regions as mask intervals for {}", ref_name);
+        spdlog::info("Adding aligned regions as mask intervals for {}", current_ref_name);
         try {
-            addAlignedRegionsAsMask(*multi_graph, seqpro_managers, ref_name);
-            spdlog::info("Successfully added mask intervals for round with reference {}", ref_name);
+            addAlignedRegionsAsMask(*multi_graph, seqpro_managers, current_ref_name);
+            spdlog::info("Successfully added mask intervals for round with reference {}", current_ref_name);
         }
         catch (const std::exception& e) {
-            spdlog::error("Failed to add mask intervals for {}: {}", ref_name, e.what());
+            spdlog::error("Failed to add mask intervals for {}: {}", current_ref_name, e.what());
         }
 
         // --------------------------------------------------------
@@ -931,6 +998,7 @@ starAlignment(
         spdlog::info("[mask-export] Exporting mask intervals captured...");
         FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
         exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
+        processed_reference_species.insert(current_ref_name);
     }
 
     // 所有轮次完成后，flush logger
@@ -965,6 +1033,8 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     /* ---------- 0. 合法性检查 ---------- */
     if (!species_fasta_manager_map.count(ref_name))
         throw std::runtime_error("[alignMultipleQuerys] reference species not found: " + ref_name);
+
+    validateReferenceSequenceCount(ref_name, species_fasta_manager_map.at(ref_name));
 
     if (species_fasta_manager_map.size() <= 1) {
         spdlog::warn("[alignMultipleQuerys] only reference genome present, nothing to align.");
