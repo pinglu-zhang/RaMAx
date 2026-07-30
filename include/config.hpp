@@ -35,7 +35,7 @@
 // ------------------------------------------------------------------
 // 通用配置常量
 // ------------------------------------------------------------------
-#define VERSION "1.0.2"                   // 版本号
+#define VERSION "1.0.4"                   // 版本号
 #define LOGGER_NAME "logger"              // 默认日志器名称
 #define LOGGER_FILE "RaMAx.log"          // 默认日志文件名
 #define CONFIG_FILE "config.json"         // 配置文件路径
