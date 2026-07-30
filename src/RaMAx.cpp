@@ -450,6 +450,14 @@ static inline void configureLogLevel(const CommonArgs& common_args) {
     }
 }
 
+static inline void logBuildMode() {
+#ifdef _DEBUG_
+    spdlog::info("Build mode: Debug");
+#else
+    spdlog::info("Build mode: Release");
+#endif
+}
+
 // ------------------------------
 // 工具函数：确保工作目录存在且合法；必要时创建
 //（用于 restart / normal 两种模式的目录检查）
@@ -484,6 +492,7 @@ static int runRestartMode(CommonArgs& common_args) {
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
     spdlog::info("RaMAx version {}", VERSION);
+    logBuildMode();
     spdlog::info("Restart mode enabled.");
 
     // 加载之前保存的参数配置文件
@@ -537,6 +546,7 @@ static int runNormalMode(CommonArgs& common_args) {
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
     spdlog::info("RaMAx version {}", VERSION);
+    logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
     // 根据输出文件扩展名检测输出格式（.hal / .maf）
