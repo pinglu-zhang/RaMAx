@@ -3,6 +3,8 @@
 #include "align.h"
 #include <omp.h>
 #include <atomic>
+#include <exception>
+#include <mutex>
 
 PairRareAligner::PairRareAligner(const FilePath work_dir,
 	const uint_t thread_num,
@@ -97,7 +99,6 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 	SearchMode         search_mode,
 	bool allow_MEM,
 	bool allow_short_mum,
-	ThreadPool& pool,
 	sdsl::int_vector<0>& ref_global_cache,
 	SeqPro::Length sampling_interval,
 	bool isMultiple)
@@ -134,115 +135,91 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 	/* ---------- ① 计时：搜索 Anchor ---------- */
 	auto t_search0 = std::chrono::steady_clock::now();
 
-	// ThreadPool pool(thread_num);
-	std::vector<std::future<MatchVec2DPtr>> futures;
-	// 根据线程数量和chunk数量决定每个线程处理的chunk数量
-	// 确保每个线程至少处理一个chunk，同时避免线程过多
-	size_t num_chunks_per_thread = chunks.size() / thread_num;
-	if (chunks.size() % thread_num != 0) {
-		num_chunks_per_thread++; // 如果不能整除，则向上取整，确保所有chunk都被处理
+	struct AnchorSearchTask {
+		Region chunk;
+		Strand strand;
+	};
+
+	std::vector<AnchorSearchTask> tasks;
+	tasks.reserve(chunks.size() * 2);
+	for (const auto& ck : chunks) {
+		tasks.push_back({ck, Strand::FORWARD});
+		tasks.push_back({ck, Strand::REVERSE});
 	}
-	if (num_chunks_per_thread == 0 && !chunks.empty()) { // 至少处理一个chunk
-	    num_chunks_per_thread = 1;
-	}
 
-	futures.reserve(chunks.size() / num_chunks_per_thread + (chunks.size() % num_chunks_per_thread != 0 ? 1 : 0));
-
-	for (size_t i = 0; i < chunks.size(); i += num_chunks_per_thread) {
-		std::vector<Region> chunk_group;
-		for (size_t j = i; j < std::min(i + num_chunks_per_thread, chunks.size()); ++j) {
-			chunk_group.push_back(chunks[j]);
-		}
-
-		futures.emplace_back(
-			pool.enqueue(
-				[this, chunk_group, &query_fasta_manager, search_mode, allow_MEM, allow_short_mum, &ref_global_cache, sampling_interval, isMultiple]() -> MatchVec2DPtr {
-					MatchVec2DPtr group_matches = std::make_shared<MatchVec2D>();
-					for (const auto& ck : chunk_group) {
-						std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
-							using PtrType = std::decay_t<decltype(manager_ptr)>;
-							if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-								return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-								// 不再使用分隔符，因为chunks已经预分割了
-								return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else {
-								throw std::runtime_error("Unhandled manager type in variant.");
-							}
-						}, query_fasta_manager);
-						if (seq.length() <ck.length) continue;
-						MatchVec2DPtr forwoard_matches = ref_index->findAnchors(
-							ck.chr_index, seq, search_mode,
-							Strand::FORWARD,
-							allow_MEM,
-							ck.start,
-							min_anchor_length,
-							allow_short_mum,
-							max_anchor_frequency,
-							ref_global_cache,
-							sampling_interval);
-
-						// 合并当前chunk的matches到group_matches
-						for (const auto& match_list : *forwoard_matches) {
-							group_matches->push_back(match_list);
-						}
-					}
-					return group_matches;
-				}));
-		futures.emplace_back(
-			pool.enqueue(
-				[this, chunk_group, &query_fasta_manager, search_mode, allow_MEM,allow_short_mum, &ref_global_cache, sampling_interval, isMultiple]() -> MatchVec2DPtr {
-					MatchVec2DPtr group_matches = std::make_shared<MatchVec2D>();
-					for (const auto& ck : chunk_group) {
-						std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
-							using PtrType = std::decay_t<decltype(manager_ptr)>;
-							if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-								return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-								// 不再使用分隔符，因为chunks已经预分割了
-								return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
-							} else {
-								throw std::runtime_error("Unhandled manager type in variant.");
-							}
-						}, query_fasta_manager);
-						if (seq.length() <ck.length) continue;
-						MatchVec2DPtr reverse_matches = ref_index->findAnchors(
-							ck.chr_index, seq, ACCURATE_SEARCH,
-							Strand::REVERSE,
-							allow_MEM,
-							ck.start,
-							min_anchor_length,
-							allow_short_mum,
-							max_anchor_frequency,
-							ref_global_cache,
-							sampling_interval);
-						// 合并当前chunk的matches到group_matches
-						for (const auto& match_list : *reverse_matches) {
-							group_matches->push_back(match_list);
-						}
-					}
-					return group_matches;
-				}));
-
-	}
+	std::vector<MatchVec2DPtr> task_results(tasks.size());
+	std::atomic<size_t> completed_tasks{0};
+	size_t next_progress = 1; // 1~20
+	std::exception_ptr task_exception = nullptr;
+	std::mutex task_exception_mutex;
 
 	MatchVec3DPtr result = std::make_shared<MatchVec3D>();
 
-	result->reserve(futures.size());
-	size_t total = futures.size();
-	size_t count = 0;
-	size_t next_progress = 1; // 1~20
+	const size_t total = tasks.size();
 
-	for (auto& fut : futures) {
-		MatchVec2DPtr part = fut.get();
-		result->emplace_back(std::move(*part));
-		++count;
-		size_t progress_stage = (count * 20) / total;
-		if (progress_stage >= next_progress || count == total) {
-			int percent = static_cast<int>((progress_stage * 100) / 20);
-			spdlog::info("[{}] Progress: {}% ({} of {})", prefix, percent, count, total);
-			next_progress = progress_stage + 1;
+#pragma omp parallel for schedule(dynamic) num_threads(thread_num)
+	for (long long task_idx = 0; task_idx < static_cast<long long>(tasks.size()); ++task_idx) {
+		try {
+			const auto& task = tasks[static_cast<size_t>(task_idx)];
+			const auto& ck = task.chunk;
+
+			std::string seq = std::visit([&ck](auto&& manager_ptr) -> std::string {
+				using PtrType = std::decay_t<decltype(manager_ptr)>;
+				if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
+					return manager_ptr->getSubSequence(ck.chr_index, ck.start, ck.length);
+				} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+					// 不再使用分隔符，因为chunks已经预分割了
+					return manager_ptr->getOriginalManager().getSubSequence(ck.chr_index, ck.start, ck.length);
+				} else {
+					throw std::runtime_error("Unhandled manager type in variant.");
+				}
+			}, query_fasta_manager);
+
+			if (seq.length() < ck.length) {
+				task_results[static_cast<size_t>(task_idx)] = std::make_shared<MatchVec2D>();
+			} else {
+				const SearchMode task_search_mode =
+					(task.strand == Strand::FORWARD) ? search_mode : ACCURATE_SEARCH;
+				task_results[static_cast<size_t>(task_idx)] = ref_index->findAnchors(
+					ck.chr_index, seq, task_search_mode,
+					task.strand,
+					allow_MEM,
+					ck.start,
+					min_anchor_length,
+					allow_short_mum,
+					max_anchor_frequency,
+					ref_global_cache,
+					sampling_interval);
+			}
+		} catch (...) {
+			std::lock_guard<std::mutex> lock(task_exception_mutex);
+			if (!task_exception) {
+				task_exception = std::current_exception();
+			}
 		}
+
+		const size_t count = ++completed_tasks;
+		size_t progress_stage = (count * 20) / total;
+#pragma omp critical(find_query_file_anchor_progress)
+		{
+			if (progress_stage >= next_progress || count == total) {
+				int percent = static_cast<int>((progress_stage * 100) / 20);
+				spdlog::info("[{}] Progress: {}% ({} of {})", prefix, percent, count, total);
+				next_progress = progress_stage + 1;
+			}
+		}
+	}
+
+	if (task_exception) {
+		std::rethrow_exception(task_exception);
+	}
+
+	result->reserve(task_results.size());
+	for (auto& part : task_results) {
+		if (!part) {
+			part = std::make_shared<MatchVec2D>();
+		}
+		result->emplace_back(std::move(*part));
 	}
 
 
@@ -1146,7 +1123,6 @@ void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::Manager
 	}
 
 }
-
 
 
 
