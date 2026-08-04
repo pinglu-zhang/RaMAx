@@ -637,6 +637,7 @@ static int preprocessingPhase(
     CommonArgs& common_args,
     SpeciesPathMap& species_path_map,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    SoftMask::PathMap& softmask_path_map,
     SeqPro::Length& reference_min_seq_length
 ) {
     // 拷贝或下载原始文件（并行执行）
@@ -648,8 +649,14 @@ static int preprocessingPhase(
     // 参考序列最短长度（用于后续 sampling_interval 截断）
     reference_min_seq_length = std::numeric_limits<SeqPro::Length>::max();
 
-    // 清洗 FASTA 文件（统一格式，替换非法字符）
-    cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+    // HAL uses the same all-uppercase alignment input as before and stores
+    // original lowercase runs in an export-only sidecar. MAF is unchanged.
+    if (common_args.output_format == MultipleGenomeOutputFormat::HAL) {
+        cleanRawDatasetWithSoftMaskIndex(common_args.work_dir_path, species_path_map,
+                                         softmask_path_map, common_args.thread_num);
+    } else {
+        cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+    }
 
     if (common_args.enable_repeat_masking) {
         spdlog::warn("Repeat masking is currently disabled; continuing without repeat masking.");
@@ -812,6 +819,7 @@ static void exportResults(
     const CommonArgs& common_args,
     const NewickParser& newick_tree,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    const SoftMask::PathMap& softmask_path_map,
     RaMesh::RaMeshMultiGenomeGraph* graph
 ) {
     // 清理遮蔽区间（导出前）
@@ -833,7 +841,8 @@ static void exportResults(
             seqpro_managers,
             newick_tree,
             true,
-            common_args.root_name
+            common_args.root_name,
+            softmask_path_map
         );
         break;
 
@@ -877,9 +886,11 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // 数据预处理阶段
         // ------------------------------
         std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers;
+        SoftMask::PathMap softmask_path_map;
         SeqPro::Length reference_min_seq_length = std::numeric_limits<SeqPro::Length>::max();
 
-        if (preprocessingPhase(common_args, species_path_map, seqpro_managers, reference_min_seq_length) != 0) {
+        if (preprocessingPhase(common_args, species_path_map, seqpro_managers,
+                               softmask_path_map, reference_min_seq_length) != 0) {
             return 1;
         }
 
@@ -905,7 +916,8 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // ------------------------------
         // 导出阶段
         // ------------------------------
-        exportResults(common_args, newick_tree, seqpro_managers, graph.get());
+        exportResults(common_args, newick_tree, seqpro_managers,
+                      softmask_path_map, graph.get());
 
         // ------------------------------
         // 清理工作目录

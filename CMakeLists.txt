@@ -121,6 +121,7 @@ set(RAMA_COMMON_SOURCES
     "${PREPROCESS_DIR}/newick_tree.cpp"
     "${PREPROCESS_DIR}/sequence_utils.cpp"
     "${PREPROCESS_DIR}/SeqPro.cpp"
+    "${PREPROCESS_DIR}/softmask_index.cpp"
     "${INDEX_DIR}/fm_index.cpp"
     "${INDEX_DIR}/bigBWT_build.cpp"
     "${INDEX_DIR}/bigBWT/newscan.cpp"
@@ -220,3 +221,34 @@ add_dependencies(ramax  hal_library)
 # ================= 安装规则 =================
 # 安装主程序
 install(TARGETS ramax DESTINATION bin)
+
+# ================= optional regression tests =================
+option(RAMAX_BUILD_TESTS "Build RaMAx soft-mask regression tests" OFF)
+if(RAMAX_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(ramax_softmask_index_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/softmask_index_test.cpp"
+        "${PREPROCESS_DIR}/softmask_index.cpp")
+    target_include_directories(ramax_softmask_index_test PRIVATE
+        "${INCLUDE_DIR}")
+    target_link_libraries(ramax_softmask_index_test PRIVATE ZLIB::ZLIB)
+    target_compile_options(ramax_softmask_index_test PRIVATE -Wall)
+    add_test(NAME ramax_softmask_index COMMAND ramax_softmask_index_test)
+
+    add_executable(ramax_hal_softmask_roundtrip_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_roundtrip_test.cpp"
+        "${PREPROCESS_DIR}/softmask_index.cpp")
+    configure_rama_target(ramax_hal_softmask_roundtrip_test)
+    add_dependencies(ramax_hal_softmask_roundtrip_test hal_library)
+    add_test(NAME ramax_hal_softmask_roundtrip
+        COMMAND ramax_hal_softmask_roundtrip_test)
+
+    add_executable(ramax_hal_softmask_export_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp"
+        ${RAMA_COMMON_SOURCES})
+    configure_rama_target(ramax_hal_softmask_export_test)
+    add_dependencies(ramax_hal_softmask_export_test hal_library)
+    add_test(NAME ramax_hal_softmask_export
+        COMMAND ramax_hal_softmask_export_test)
+endif()

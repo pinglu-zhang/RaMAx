@@ -209,7 +209,8 @@ namespace RaMesh {
                                             const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                                             const std::string& newick_tree,
                                             bool only_primary,
-                                            const std::string& root_name) const
+                                            const std::string& root_name,
+                                            const SoftMask::PathMap& softmask_paths) const
     {
         auto __now = []() { return std::chrono::steady_clock::now(); };
         auto __ms = [](auto a, auto b) { return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
@@ -225,6 +226,19 @@ namespace RaMesh {
         if (seqpro_managers.empty()) {
             throw std::runtime_error("No sequence managers provided for HAL export");
         }
+
+        if (softmask_paths.size() != seqpro_managers.size()) {
+            throw std::runtime_error("HAL export requires one soft-mask index per leaf genome");
+        }
+        for (const auto& [species, unused_manager] : seqpro_managers) {
+            (void)unused_manager;
+            if (!softmask_paths.contains(species)) {
+                throw std::runtime_error("Missing HAL soft-mask index for species: " + species);
+            }
+        }
+        // Sidecars are deliberately opened only after alignment has completed
+        // and HAL export has begun.
+        const SoftMask::IndexMap softmask_indexes = SoftMask::loadIndexes(softmask_paths);
 
         if (blocks.empty()) {
             spdlog::warn("No alignment blocks found - creating HAL with genomes only");
@@ -305,7 +319,8 @@ namespace RaMesh {
                 spdlog::info("  Created genomes from phylogeny (topology only)");
                 // 为所有叶基因组设置真实维度与DNA
                 auto __t13a_start = __now();
-                hal_converter::setupLeafGenomesWithRealDNA(alignment, seqpro_managers);
+                hal_converter::setupLeafGenomesWithRealDNA(
+                    alignment, seqpro_managers, softmask_indexes);
                 spdlog::info("  Set up leaf genomes with real DNA");
                 auto __t13_end = __now();
                 spdlog::debug("  Phase 1.3 (create topology) took {} ms; leaves DNA took {} ms",
@@ -364,7 +379,8 @@ namespace RaMesh {
                 spdlog::info("  Phase 2.3: Building ancestor sequences using voting method...");
 
                 ancestor_sequences = hal_converter::buildAllAncestorSequencesByVoting(
-                    ancestor_reconstruction_data, ancestor_nodes, seqpro_managers, reconstruction_plan, alignment);
+                    ancestor_reconstruction_data, ancestor_nodes, seqpro_managers,
+                    reconstruction_plan, softmask_indexes, alignment);
                 auto __t23_end = __now();
                 spdlog::debug("  Phase 2.3 completed successfully ({} ms)", __ms(__t23_start, __t23_end));
 
@@ -458,13 +474,15 @@ namespace RaMesh {
                                             const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                                             const NewickParser& parser,
                                             bool only_primary,
-                                            const std::string& root_name) const
+                                            const std::string& root_name,
+                                            const SoftMask::PathMap& softmask_paths) const
     {
         // 通过重建 Newick 字符串委托给字符串版本，避免重复读取原始文件，保留子树裁剪
         std::string rebuilt_newick = hal_converter::reconstructNewickFromParser(parser);
         if (rebuilt_newick.empty()) {
             throw std::runtime_error("exportToHal: reconstructed Newick from parser is empty");
         }
-        exportToHal(hal_path, seqpro_managers, rebuilt_newick, only_primary, root_name);
+        exportToHal(hal_path, seqpro_managers, rebuilt_newick, only_primary,
+                    root_name, softmask_paths);
     }
 } // namespace RaMesh

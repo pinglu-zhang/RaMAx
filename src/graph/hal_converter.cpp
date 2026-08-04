@@ -753,7 +753,8 @@ namespace hal_converter {
     std::pair<std::unordered_map<std::string, std::string>, std::unordered_map<ChrName, Cigar_t>>
     extractSequencesAndCigarsFromBlock(
         BlockPtr block,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap* softmask_indexes) {
 
         std::unordered_map<std::string, std::string> sequences;
         std::unordered_map<ChrName, Cigar_t> cigars;
@@ -796,6 +797,17 @@ namespace hal_converter {
                 // 提取DNA序列
                 std::string sequence = fetchSeq(it->second, chr_name, segment->start, segment->length);
 
+                // Restore input soft masks only for ancestor reconstruction
+                // during HAL export. All alignment/graph callers leave the
+                // optional map null and continue to see uppercase DNA.
+                if (softmask_indexes != nullptr) {
+                    auto mask_it = softmask_indexes->find(species_name);
+                    if (mask_it == softmask_indexes->end() || !mask_it->second) {
+                        throw std::runtime_error("Missing soft-mask index for species: " + species_name);
+                    }
+                    mask_it->second->restore(chr_name, segment->start, sequence);
+                }
+
                 // 如果是反向链，进行反向互补转换
                 if (segment->strand == Strand::REVERSE) {
                     hal::reverseComplement(sequence);
@@ -814,6 +826,9 @@ namespace hal_converter {
 
             } catch (const std::exception& e) {
                 spdlog::error("Failed to extract sequence for species '{}': {}", species_name, e.what());
+                if (softmask_indexes != nullptr) {
+                    throw;
+                }
             }
         }
 
@@ -839,39 +854,20 @@ namespace hal_converter {
         // spdlog::debug("Voting for ancestor sequence from {} aligned sequences, length: {}",
         //              aligned_sequences.size(), alignment_length);
 
-        // 按列进行投票
+        // Vote on base identity without case. The case is reconstructed only
+        // for HAL output: at least half of the observations supporting the
+        // winning base must be lowercase.
         for (size_t pos = 0; pos < alignment_length; ++pos) {
-            std::map<char, int> base_counts;
+            SoftMask::AncestorBaseVote vote;
 
             // 统计该位置所有后代叶子的碱基
             for (const std::string& leaf : ancestor.descendant_leaves) {
                 auto it = aligned_sequences.find(leaf);
                 if (it != aligned_sequences.end() && pos < it->second.length()) {
-                    char base = std::toupper(it->second[pos]);
-
-                    // 只统计有效碱基，忽略gap和N
-                    if (base != '-' && base != 'N' &&
-                        (base == 'A' || base == 'C' || base == 'G' || base == 'T')) {
-                        base_counts[base]++;
-                    }
+                    vote.add(it->second[pos]);
                 }
             }
-
-            // 选择出现次数最多的碱基
-            char best_base = 'N';
-            int max_count = 0;
-
-            for (const auto& [base, count] : base_counts) {
-                if (count > max_count) {
-                    max_count = count;
-                    best_base = base;
-                }
-            }
-
-            // 只添加非gap字符到最终序列
-            if (best_base != '-') {
-                ancestor_sequence += best_base;
-            }
+            ancestor_sequence += vote.result();
         }
 
         // spdlog::debug("Voting completed: {} -> {} bp", alignment_length, ancestor_sequence.length());
@@ -881,10 +877,12 @@ namespace hal_converter {
     std::string reconstructSegmentByVoting(
         const AncestorSegmentInfo& segment,
         const AncestorNode& ancestor,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes) {
 
         // 1. 从block中提取所有物种的序列和CIGAR
-        auto [sequences, cigars] = extractSequencesAndCigarsFromBlock(segment.source_block, seqpro_managers);
+        auto [sequences, cigars] = extractSequencesAndCigarsFromBlock(
+            segment.source_block, seqpro_managers, &softmask_indexes);
 
         if (sequences.empty()) {
             spdlog::warn("No sequences extracted from block for segment");
@@ -945,6 +943,7 @@ namespace hal_converter {
         const AncestorReconstructionData& data,
         const AncestorNode& ancestor,
         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes,
         const std::string& chr_name) {
 
         // spdlog::debug("Building ancestor sequence using voting method from {} segments for chr '{}'",
@@ -970,7 +969,8 @@ namespace hal_converter {
 
             // 使用投票法重建该segment的序列
             try {
-                std::string segment_sequence = reconstructSegmentByVoting(segment_info, ancestor, seqpro_managers);
+                std::string segment_sequence = reconstructSegmentByVoting(
+                    segment_info, ancestor, seqpro_managers, softmask_indexes);
                 // 创建祖先segment并加入到block中
                 if (segment_info.source_block && !segment_sequence.empty()) {
                     SegPtr ancestor_seg = Segment::create(
@@ -1025,6 +1025,7 @@ namespace hal_converter {
         const std::vector<AncestorNode>& ancestor_nodes,
         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
         const std::vector<std::pair<std::string, std::string>>& reconstruction_plan,
+        const SoftMask::IndexMap& softmask_indexes,
         hal::AlignmentPtr alignment) {
 
         spdlog::info("Building sequences for {} ancestors using voting method", ancestor_reconstruction_data.size());
@@ -1034,9 +1035,11 @@ namespace hal_converter {
         // 并行为每个祖先构建序列（计算并行，HAL 写入加锁）
         ThreadPool pool(std::max(1u, std::thread::hardware_concurrency()));
         std::mutex seq_write_mutex; // 保护 ancestor_sequences 的并发写入
+        std::vector<std::future<void>> futures;
+        futures.reserve(reconstruction_plan.size());
 
         for (const auto& [ancestor_name, ref_leaf] : reconstruction_plan) {
-            pool.enqueue([&, ancestor_name, ref_leaf]() {
+            futures.emplace_back(pool.enqueue([&, ancestor_name, ref_leaf]() {
             auto it = ancestor_reconstruction_data.find(ancestor_name);
             if (it == ancestor_reconstruction_data.end()) {
                 spdlog::warn("Ancestor '{}' not found in reconstruction data", ancestor_name);
@@ -1083,7 +1086,9 @@ namespace hal_converter {
                     for (const auto& segment : data.segments) if (segment.chr_id == chr_id) chr_data.segments.push_back(segment);
 
                     if (!chr_data.segments.empty()) {
-                        std::string chr_sequence = buildAncestorSequenceByVoting(chr_data, *ancestor, seqpro_managers, ancestor_chr_name);
+                        std::string chr_sequence = buildAncestorSequenceByVoting(
+                            chr_data, *ancestor, seqpro_managers,
+                            softmask_indexes, ancestor_chr_name);
                         built.push_back({ancestor_chr_name, chr_sequence, chr_data.segments.size()});
                         chr_sequences[ancestor_chr_name] = chr_sequence;
                         total_length += chr_sequence.length();
@@ -1116,8 +1121,11 @@ namespace hal_converter {
 
                 spdlog::info("Successfully built sequence for ancestor '{}' using voting: {} chromosomes, {} bp total",
                             ancestor_name, built.size(), total_length);
-            });
+            }));
             }
+        for (auto& future : futures) {
+            future.get();
+        }
         pool.waitAllTasksDone();
 
         // 输出统计信息
@@ -1235,13 +1243,21 @@ namespace hal_converter {
 
     void setupLeafGenomesWithRealDNA(
         hal::AlignmentPtr alignment,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes) {
 
         spdlog::info("Setting up leaf genomes with real chromosome dimensions and DNA (parallel read, locked write)...");
 
         ThreadPool pool(std::max(1u, std::thread::hardware_concurrency()));
+        std::vector<std::future<void>> futures;
+        futures.reserve(seqpro_managers.size());
         for (const auto& [species_name, seq_mgr] : seqpro_managers) {
-            pool.enqueue([alignment, species_name, seq_mgr]() {
+            const auto mask_it = softmask_indexes.find(species_name);
+            if (mask_it == softmask_indexes.end() || !mask_it->second) {
+                throw std::runtime_error("Missing soft-mask index for leaf genome: " + species_name);
+            }
+            auto softmask_index = mask_it->second;
+            futures.emplace_back(pool.enqueue([alignment, species_name, seq_mgr, softmask_index]() {
                 // 1) 读取该叶物种的所有染色体名称与长度（无 HAL 访问，可并行）
             std::vector<std::string> chr_names;
             std::vector<hal::Sequence::Info> dims;
@@ -1284,6 +1300,12 @@ namespace hal_converter {
                         dna = mgr->getOriginalManager().getSubSequence(chr_id, 0, len);
                     }
 
+                    if (softmask_index->sequenceLength(chr) != static_cast<uint64_t>(len)) {
+                        throw std::runtime_error("Soft-mask sequence length mismatch for " +
+                            species_name + "." + chr);
+                    }
+                    softmask_index->restore(chr, 0, dna);
+
                         if (!dna.empty()) {
                             std::lock_guard<std::mutex> lk(g_hal_write_mutex);
                             if (auto* hal_seq = genome->getSequence(chr)) {
@@ -1299,7 +1321,10 @@ namespace hal_converter {
                          species_name, genome->getNumSequences(), genome->getSequenceLength());
             alignment->closeGenome(genome);
         }
-            });
+            }));
+        }
+        for (auto& future : futures) {
+            future.get();
         }
 
         pool.waitAllTasksDone();

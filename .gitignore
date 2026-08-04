@@ -433,3 +433,4 @@ bin/output.maf
 # Local-only packaging and CI files
 /.github/
 /recipe/
+submodule.zip
