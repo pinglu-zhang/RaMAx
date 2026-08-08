@@ -9,6 +9,7 @@ Cactus and Alignathon truth evidence. It does not modify a HAL, MAF or graph.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import gzip
 import json
@@ -129,10 +130,18 @@ class TruthMatcher:
         self.rows = rows
         self.tolerance = tolerance
         self.by_pair: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+        # Reference-endpoint bucket index per (reference, chromosome) pair. Each
+        # bucket is a sorted list of (endpoint, truth_row_index). Fallback
+        # matching uses bisect instead of scanning all 41k truth rows per
+        # candidate boundary, which made the phase-1 replay effectively hang on
+        # the full Alignathon output (~1.1M boundary-genome rows).
+        self.buckets: dict[
+            tuple[str, str, str], list[tuple[int, int, int, int, int, int, int, int, int]]
+        ] = defaultdict(list)
         self.by_exact_reference: dict[
             tuple[str, str, str, int, int, int, int], list[dict[str, str]]
         ] = defaultdict(list)
-        for row in rows:
+        for index, row in enumerate(rows):
             pair_key = (
                 row["reference_species"],
                 row["target_species"],
@@ -147,6 +156,18 @@ class TruthMatcher:
                 as_int(row, "right_ref_end"),
             )
             self.by_exact_reference[exact_key].append(row)
+            reference_key = (row["reference_species"], row["ref_chrom"])
+            self.buckets[reference_key].append(
+                (
+                    as_int(row, "left_ref_start"),
+                    as_int(row, "left_ref_end"),
+                    as_int(row, "right_ref_start"),
+                    as_int(row, "right_ref_end"),
+                    index,
+                )
+            )
+        for values in self.buckets.values():
+            values.sort(key=lambda item: item[0])
 
     @staticmethod
     def _target_compatible(evidence: dict[str, str], truth: dict[str, str], tolerance: int) -> bool:
@@ -220,16 +241,33 @@ class TruthMatcher:
         if self.tolerance <= 0:
             return MatchResult(None, "none", None, "no_exact_match")
 
+        bucket_key = (boundary["reference_species"], boundary["reference_chromosome"])
+        bucket = self.buckets.get(bucket_key, [])
+        if not bucket:
+            return MatchResult(None, "none", None, "no_tolerance_match")
+
+        left_ref_start = as_int(boundary, "left_ref_start")
+        left_ref_end = as_int(boundary, "left_ref_end")
+        right_ref_start = as_int(boundary, "right_ref_start")
+        right_ref_end = as_int(boundary, "right_ref_end")
+        candidate_counts: dict[int, int] = defaultdict(int)
+        for endpoint, value, tolerance in (
+            (0, left_ref_start, self.tolerance),
+            (1, left_ref_end, self.tolerance),
+            (2, right_ref_start, self.tolerance),
+            (3, right_ref_end, self.tolerance),
+        ):
+            lo = bisect.bisect_left(bucket, (value - tolerance, -1, -1, -1, -1))
+            hi = bisect.bisect_right(bucket, (value + tolerance, -1, -1, -1, -1))
+            for item in bucket[lo:hi]:
+                if abs(item[endpoint] - value) <= tolerance:
+                    candidate_counts[item[4]] += 1
+
         candidates: list[tuple[int, dict[str, str]]] = []
-        for truth in self.by_pair.get(pair_key, []):
-            reference_differences = (
-                abs(as_int(boundary, "left_ref_start") - as_int(truth, "left_ref_start")),
-                abs(as_int(boundary, "left_ref_end") - as_int(truth, "left_ref_end")),
-                abs(as_int(boundary, "right_ref_start") - as_int(truth, "right_ref_start")),
-                abs(as_int(boundary, "right_ref_end") - as_int(truth, "right_ref_end")),
-            )
-            if max(reference_differences) > self.tolerance:
+        for index, count in candidate_counts.items():
+            if count != 4:
                 continue
+            truth = self.rows[index]
             if not self._target_compatible(evidence, truth, self.tolerance):
                 continue
             candidates.append((self._distance(boundary, evidence, truth), truth))
@@ -306,7 +344,7 @@ def evaluate_boundaries(
     }
     output: list[dict[str, str | int]] = []
     seen_evidence: set[tuple[str, str, str]] = set()
-    for evidence in boundary_genomes:
+    for row_index, evidence in enumerate(boundary_genomes, start=1):
         evidence_key = (
             evidence["window_id"],
             evidence["boundary_id"],
@@ -348,15 +386,16 @@ def evaluate_boundaries(
                 "cactus_bridges": truth.get("cactus_bridges", ""),
             }
         )
-    output.sort(
+        output.sort(
         key=lambda row: (
             str(row["source_round_dir"]),
             str(row["window_id"]),
             str(row["boundary_id"]),
             str(row["target_species"]),
         )
-    )
-    return output
+        )
+        log(f"matched {len(output)} boundary-genome rows")
+        return output
 
 
 def classify_windows(
