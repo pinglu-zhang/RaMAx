@@ -71,6 +71,24 @@ struct CommonArgs {
     bool one_round = false;                     // 是否只执行一轮处理流程
 
     // ========================
+    // 第一阶段问题窗口识别
+    // ========================
+
+    bool detect_windows = false;
+    std::string window_detection_mode = "each-round";
+    std::filesystem::path window_report_dir = "";
+    std::string window_threshold_profile = "alignathon-v1";
+    uint64_t window_micro_block = 10;
+    uint64_t window_short_block = 100;
+    uint64_t window_primary_gap = 100;
+    uint64_t window_extended_gap = 500;
+    uint64_t window_hard_boundary = 1000;
+    uint64_t window_anchor_min = 100;
+    uint64_t window_strong_anchor = 500;
+    uint64_t window_max_span = 100000;
+    uint64_t window_subset_search_budget = 100000;
+
+    // ========================
     // cereal 序列化支持
     // ========================
 
@@ -100,6 +118,126 @@ struct CommonArgs {
         );
     }
 };
+
+namespace {
+constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
+
+// Window detection uses a separate optional config so older restart directories
+// remain readable by newer RaMAx binaries. The historical CommonArgs JSON schema
+// is intentionally unchanged.
+struct WindowDetectionConfigFile {
+    bool enabled = false;
+    std::string mode = "each-round";
+    std::filesystem::path report_dir;
+    std::string threshold_profile = "alignathon-v1";
+    uint64_t micro_block = 10;
+    uint64_t short_block = 100;
+    uint64_t primary_gap = 100;
+    uint64_t extended_gap = 500;
+    uint64_t hard_boundary = 1000;
+    uint64_t anchor_min = 100;
+    uint64_t strong_anchor = 500;
+    uint64_t max_span = 100000;
+    uint64_t subset_search_budget = 100000;
+
+    template<class Archive>
+    void serialize(Archive& ar) {
+        ar(CEREAL_NVP(enabled), CEREAL_NVP(mode), CEREAL_NVP(report_dir),
+           CEREAL_NVP(threshold_profile), CEREAL_NVP(micro_block),
+           CEREAL_NVP(short_block), CEREAL_NVP(primary_gap),
+           CEREAL_NVP(extended_gap), CEREAL_NVP(hard_boundary),
+           CEREAL_NVP(anchor_min), CEREAL_NVP(strong_anchor),
+           CEREAL_NVP(max_span), CEREAL_NVP(subset_search_budget));
+    }
+};
+
+WindowDetectionConfigFile windowConfigFromArgs(const CommonArgs& args) {
+    return {args.detect_windows,
+            args.window_detection_mode,
+            args.window_report_dir,
+            args.window_threshold_profile,
+            args.window_micro_block,
+            args.window_short_block,
+            args.window_primary_gap,
+            args.window_extended_gap,
+            args.window_hard_boundary,
+            args.window_anchor_min,
+            args.window_strong_anchor,
+            args.window_max_span,
+            args.window_subset_search_budget};
+}
+
+void applyWindowConfig(CommonArgs& args,
+                       const WindowDetectionConfigFile& config) {
+    args.detect_windows = config.enabled;
+    args.window_detection_mode = config.mode;
+    args.window_report_dir = config.report_dir;
+    args.window_threshold_profile = config.threshold_profile;
+    args.window_micro_block = config.micro_block;
+    args.window_short_block = config.short_block;
+    args.window_primary_gap = config.primary_gap;
+    args.window_extended_gap = config.extended_gap;
+    args.window_hard_boundary = config.hard_boundary;
+    args.window_anchor_min = config.anchor_min;
+    args.window_strong_anchor = config.strong_anchor;
+    args.window_max_span = config.max_span;
+    args.window_subset_search_budget = config.subset_search_budget;
+}
+
+void finalizeWindowConfig(CommonArgs& args) {
+    if (args.detect_windows && args.window_report_dir.empty() &&
+        !args.output_path.empty()) {
+        args.window_report_dir = args.output_path.string() + ".window_detection";
+    }
+    if (args.window_micro_block > args.window_short_block) {
+        throw std::runtime_error(
+            "--window-micro-block must be <= --window-short-block");
+    }
+    if (args.window_primary_gap > args.window_extended_gap) {
+        throw std::runtime_error(
+            "--window-primary-gap must be <= --window-extended-gap");
+    }
+    if (args.window_extended_gap > args.window_hard_boundary) {
+        throw std::runtime_error(
+            "--window-extended-gap must be <= --window-hard-boundary");
+    }
+    if (args.window_anchor_min > args.window_strong_anchor) {
+        throw std::runtime_error(
+            "--window-anchor-min must be <= --window-strong-anchor");
+    }
+    if (args.window_subset_search_budget == 0) {
+        throw std::runtime_error(
+            "--window-subset-search-budget must be greater than zero");
+    }
+    (void)RaMesh::WindowDetection::detectionModeFromString(
+        args.window_detection_mode);
+    if (args.detect_windows) {
+        const auto report =
+            std::filesystem::absolute(args.window_report_dir).lexically_normal();
+        const auto work =
+            std::filesystem::absolute(args.work_dir_path).lexically_normal();
+        auto report_it = report.begin();
+        auto work_it = work.begin();
+        while (report_it != report.end() && work_it != work.end() &&
+               *report_it == *work_it) {
+            ++report_it;
+            ++work_it;
+        }
+        if (work_it == work.end()) {
+            throw std::runtime_error(
+                "--window-report-dir must be outside --workdir because the "
+                "work directory is removed after a successful run");
+        }
+        if (std::filesystem::exists(report) &&
+            !std::filesystem::is_directory(report)) {
+            throw std::runtime_error(
+                "--window-report-dir exists but is not a directory: " +
+                report.string());
+        }
+        args.window_report_dir = report;
+    }
+}
+}  // namespace
 
 
 // ------------------------------------------------------------------
@@ -137,6 +275,21 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Tree root             ：{}", args.root_name);
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
+    spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
+    if (args.detect_windows) {
+        spdlog::info("  Window mode           : {}", args.window_detection_mode);
+        spdlog::info("  Window report dir     : {}", args.window_report_dir.string());
+        spdlog::info("  Window profile        : {}", args.window_threshold_profile);
+        spdlog::info(
+            "  Window thresholds     : micro={}, short={}, gap={}/{}/{}, "
+            "anchor={}/{}, max_span={}",
+            args.window_micro_block, args.window_short_block,
+            args.window_primary_gap, args.window_extended_gap,
+            args.window_hard_boundary, args.window_anchor_min,
+            args.window_strong_anchor, args.window_max_span);
+        spdlog::info("  Subset search budget  : {}",
+                     args.window_subset_search_budget);
+    }
     spdlog::info("");
 
 
@@ -328,6 +481,91 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     //     ->group("Software Parameters");
 
     // ========================
+    // 第一阶段问题窗口识别
+    // ========================
+
+    auto* detect_windows_flag = cmd->add_flag(
+        "--detect-windows", args.detect_windows,
+        "Detect and export suspicious graph windows without modifying the graph.")
+        ->group("Window Detection");
+
+    auto* window_mode_opt = cmd->add_option(
+        "--window-detection-mode", args.window_detection_mode,
+        "Window detection mode: each-round or final-only (default: each-round).")
+        ->default_val("each-round")
+        ->capture_default_str()
+        ->group("Window Detection")
+        ->transform(CLI::CheckedTransformer(
+            std::map<std::string, std::string>{
+                {"each-round", "each-round"},
+                {"final-only", "final-only"}},
+            CLI::ignore_case));
+
+    auto* window_report_dir_opt = cmd->add_option(
+        "--window-report-dir", args.window_report_dir,
+        "Persistent window report directory (default: <output>.window_detection).")
+        ->group("Window Detection")
+        ->type_name("<path>")
+        ->transform(trim_whitespace);
+
+    auto* window_profile_opt = cmd->add_option(
+        "--window-threshold-profile", args.window_threshold_profile,
+        "Window threshold profile name recorded in the report.")
+        ->default_val("alignathon-v1")
+        ->capture_default_str()
+        ->group("Window Detection")
+        ->type_name("<string>")
+        ->transform(trim_whitespace);
+
+    auto add_window_threshold = [&](const std::string& name, uint64_t& value,
+                                    const std::string& description,
+                                    uint64_t default_value) {
+        return cmd->add_option(name, value, description)
+            ->default_val(default_value)
+            ->capture_default_str()
+            ->group("Window Detection")
+            ->check(CLI::Range(static_cast<uint64_t>(0),
+                               static_cast<uint64_t>(1000000000)))
+            ->type_name("<bp>")
+            ->transform(trim_whitespace);
+    };
+
+    auto* window_micro_opt = add_window_threshold(
+        "--window-micro-block", args.window_micro_block,
+        "Maximum micro-Block length (bp).", 10);
+    auto* window_short_opt = add_window_threshold(
+        "--window-short-block", args.window_short_block,
+        "Maximum short-Block length (bp).", 100);
+    auto* window_primary_gap_opt = add_window_threshold(
+        "--window-primary-gap", args.window_primary_gap,
+        "Maximum primary short gap (bp).", 100);
+    auto* window_extended_gap_opt = add_window_threshold(
+        "--window-extended-gap", args.window_extended_gap,
+        "Maximum extended gap (bp).", 500);
+    auto* window_hard_boundary_opt = add_window_threshold(
+        "--window-hard-boundary", args.window_hard_boundary,
+        "Gap above which ordinary windows cannot expand (bp).", 1000);
+    auto* window_anchor_min_opt = add_window_threshold(
+        "--window-anchor-min", args.window_anchor_min,
+        "Minimum reliable anchor length (bp).", 100);
+    auto* window_strong_anchor_opt = add_window_threshold(
+        "--window-strong-anchor", args.window_strong_anchor,
+        "Strong anchor length recorded for calibration (bp).", 500);
+    auto* window_max_span_opt = add_window_threshold(
+        "--window-max-span", args.window_max_span,
+        "Maximum ordinary candidate-window span (bp).", 100000);
+    auto* window_subset_budget_opt = cmd->add_option(
+        "--window-subset-search-budget", args.window_subset_search_budget,
+        "Maximum branch-and-bound nodes per n-to-k compatibility search.")
+        ->default_val(100000)
+        ->capture_default_str()
+        ->group("Window Detection")
+        ->check(CLI::Range(static_cast<uint64_t>(1),
+                           static_cast<uint64_t>(1000000000)))
+        ->type_name("<int>")
+        ->transform(trim_whitespace);
+
+    // ========================
     // 性能相关参数
     // ========================
 
@@ -402,7 +640,20 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         root_opt,
         ref_opt,
         one_round_flag,
-        log_level_opt
+        log_level_opt,
+        detect_windows_flag,
+        window_mode_opt,
+        window_report_dir_opt,
+        window_profile_opt,
+        window_micro_opt,
+        window_short_opt,
+        window_primary_gap_opt,
+        window_extended_gap_opt,
+        window_hard_boundary_opt,
+        window_anchor_min_opt,
+        window_strong_anchor_opt,
+        window_max_span_opt,
+        window_subset_budget_opt
     );
 
     // verbose 与 quiet 互斥
@@ -508,6 +759,26 @@ static int runRestartMode(CommonArgs& common_args) {
     archive(common_args);
     spdlog::info("CommonArgs loaded from {}", config_path.string());
 
+    const FilePath window_config_path =
+        common_args.work_dir_path / WINDOW_CONFIG_FILE;
+    if (std::filesystem::exists(window_config_path)) {
+        std::ifstream window_input(window_config_path);
+        if (!window_input) {
+            throw std::runtime_error(
+                "Failed to open window detection restart config: " +
+                window_config_path.string());
+        }
+        WindowDetectionConfigFile window_config;
+        cereal::JSONInputArchive window_archive(window_input);
+        window_archive(window_config);
+        applyWindowConfig(common_args, window_config);
+        spdlog::info("Window detection config loaded from {}",
+                     window_config_path.string());
+    } else {
+        common_args.detect_windows = false;
+    }
+    finalizeWindowConfig(common_args);
+
     return 0;
 }
 
@@ -560,6 +831,8 @@ static int runNormalMode(CommonArgs& common_args) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
 
+    finalizeWindowConfig(common_args);
+
     // 保存参数配置文件（用于 --restart）
     FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
     std::ofstream os(config_path);
@@ -571,6 +844,22 @@ static int runNormalMode(CommonArgs& common_args) {
     cereal::JSONOutputArchive archive(os);
     archive(cereal::make_nvp("common_args", common_args));
     spdlog::info("Configuration saved to {}", config_path.string());
+
+    if (common_args.detect_windows) {
+        const FilePath window_config_path =
+            common_args.work_dir_path / WINDOW_CONFIG_FILE;
+        std::ofstream window_output(window_config_path);
+        if (!window_output) {
+            throw std::runtime_error(
+                "Failed to save window detection config: " +
+                window_config_path.string());
+        }
+        auto window_config = windowConfigFromArgs(common_args);
+        cereal::JSONOutputArchive window_archive(window_output);
+        window_archive(cereal::make_nvp("window_detection", window_config));
+        spdlog::info("Window detection config saved to {}",
+                     window_config_path.string());
+    }
 
     return 0;
 }
@@ -784,6 +1073,32 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.min_anchor_length,
         common_args.max_anchor_frequency
     );
+
+    mra.window_detection_options.enabled = common_args.detect_windows;
+    mra.window_detection_options.mode =
+        RaMesh::WindowDetection::detectionModeFromString(
+            common_args.window_detection_mode);
+    mra.window_detection_options.report_dir = common_args.window_report_dir;
+    mra.window_detection_options.threshold_profile =
+        common_args.window_threshold_profile;
+    mra.window_detection_options.micro_block_max_bp =
+        common_args.window_micro_block;
+    mra.window_detection_options.short_block_max_bp =
+        common_args.window_short_block;
+    mra.window_detection_options.primary_gap_max_bp =
+        common_args.window_primary_gap;
+    mra.window_detection_options.extended_gap_max_bp =
+        common_args.window_extended_gap;
+    mra.window_detection_options.hard_boundary_gap_bp =
+        common_args.window_hard_boundary;
+    mra.window_detection_options.anchor_min_segment_bp =
+        common_args.window_anchor_min;
+    mra.window_detection_options.strong_anchor_bp =
+        common_args.window_strong_anchor;
+    mra.window_detection_options.max_window_span_bp =
+        common_args.window_max_span;
+    mra.window_detection_options.subset_search_budget =
+        static_cast<size_t>(common_args.window_subset_search_budget);
 
     // 计时：star alignment 总耗时
     auto t_start_align = std::chrono::steady_clock::now();

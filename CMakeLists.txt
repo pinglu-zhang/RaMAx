@@ -140,6 +140,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
+    "${GRAPH_DIR}/window_detector.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
 )
@@ -251,4 +252,11 @@ if(RAMAX_BUILD_TESTS)
     add_dependencies(ramax_hal_softmask_export_test hal_library)
     add_test(NAME ramax_hal_softmask_export
         COMMAND ramax_hal_softmask_export_test)
+
+    add_executable(ramax_window_detector_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/window_detector_test.cpp"
+        ${RAMA_COMMON_SOURCES})
+    configure_rama_target(ramax_window_detector_test)
+    add_dependencies(ramax_window_detector_test hal_library)
+    add_test(NAME ramax_window_detector COMMAND ramax_window_detector_test)
 endif()

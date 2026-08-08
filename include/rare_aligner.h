@@ -8,6 +8,7 @@
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
+#include "window_detector.h"
 
 // 多基因组比对核心调度类
 class MultipleRareAligner {
@@ -30,6 +31,8 @@ public:
     bool enable_mask_export = false;
     bool mask_export_done = false;
     FilePath mask_export_dir;
+
+    RaMesh::WindowDetection::Options window_detection_options;
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(
@@ -134,6 +137,5 @@ public:
 
 
 #endif
-
 
 
