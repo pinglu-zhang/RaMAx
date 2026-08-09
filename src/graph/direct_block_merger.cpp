@@ -26,6 +26,7 @@ struct BlockView {
     BlockPtr block;
     OrderedAnchors anchors;
     SegPtr reference_segment;
+    ChrName declared_reference_chromosome;
     size_t species_count = 0;
 };
 
@@ -251,6 +252,7 @@ bool buildBlockView(const BlockPtr& block,
             return false;
         }
 
+        view.declared_reference_chromosome = block->ref_chr;
         for (const auto& [key, segment] : block->anchors) {
             if (!segment || !segment->isSegment() || !segment->isPrimary() ||
                 segment->length == 0 || segment->parent_block.get() != block.get()) {
@@ -583,7 +585,334 @@ void detachPreparedBlocks(std::vector<PreparedChain>& prepared) {
     }
 }
 
+bool buildDiagnosticBlockView(const BlockPtr& block,
+                              const SpeciesName& reference_species,
+                              const ChrName& reference_chromosome,
+                              BlockView& view) {
+    if (!block) {
+        return false;
+    }
+
+    view = BlockView{};
+    view.block = block;
+
+    std::set<SpeciesName> species;
+    std::shared_lock block_lock(block->rw);
+    if (block->anchors.size() < 2) {
+        return false;
+    }
+
+    view.declared_reference_chromosome = block->ref_chr;
+    for (const auto& [key, segment] : block->anchors) {
+        if (!segment || !segment->isSegment() || !segment->isPrimary() ||
+            segment->length == 0 ||
+            segment->parent_block.get() != block.get() ||
+            !species.insert(key.first).second) {
+            return false;
+        }
+        view.anchors.emplace(key, segment);
+    }
+
+    const SpeciesChrPair reference_key{
+        reference_species, reference_chromosome};
+    const auto reference_it = view.anchors.find(reference_key);
+    if (reference_it == view.anchors.end() ||
+        reference_it->second->strand != Strand::FORWARD) {
+        return false;
+    }
+
+    view.reference_segment = reference_it->second;
+    view.species_count = species.size();
+    return view.species_count >= 2;
+}
+
+bool sameParticipantSpecies(const BlockView& left,
+                            const BlockView& right) {
+    std::set<SpeciesName> left_species;
+    std::set<SpeciesName> right_species;
+    for (const auto& [key, unused] : left.anchors) {
+        (void)unused;
+        left_species.insert(key.first);
+    }
+    for (const auto& [key, unused] : right.anchors) {
+        (void)unused;
+        right_species.insert(key.first);
+    }
+    return left_species == right_species;
+}
+
+bool pathLinksAreDirectlyAdjacent(const SegPtr& left,
+                                  const SegPtr& right) {
+    if (!left || !right || left->strand != right->strand) {
+        return false;
+    }
+    if (left->strand == Strand::FORWARD) {
+        return left->primary_path.next.load(std::memory_order_acquire) ==
+                   right &&
+               right->primary_path.prev.load(std::memory_order_acquire) ==
+                   left;
+    }
+    return right->primary_path.next.load(std::memory_order_acquire) ==
+               left &&
+           left->primary_path.prev.load(std::memory_order_acquire) ==
+               right;
+}
+
+int64_t signedGapInReferenceOrder(const SegPtr& left,
+                                  const SegPtr& right) {
+    if (left->strand == Strand::FORWARD) {
+        return static_cast<int64_t>(right->start) -
+               static_cast<int64_t>(segmentEnd(left));
+    }
+    return static_cast<int64_t>(left->start) -
+           static_cast<int64_t>(segmentEnd(right));
+}
+
+BoundaryReason classifyBoundary(
+    const BlockView& left,
+    const BlockView& right,
+    const SpeciesName& reference_species,
+    const ChrName& reference_chromosome,
+    uint_t maximum_reference_span,
+    BoundaryDiagnostics& diagnostics) {
+    diagnostics.participant_transitions[
+        {left.species_count, right.species_count}]++;
+
+    if (left.block == right.block ||
+        left.declared_reference_chromosome != reference_chromosome ||
+        right.declared_reference_chromosome != reference_chromosome) {
+        return BoundaryReason::BLOCK_REFERENCE_MISMATCH;
+    }
+
+    if (!sameParticipantSpecies(left, right)) {
+        return BoundaryReason::PARTICIPANT_SPECIES_MISMATCH;
+    }
+    if (!sameAnchorKeys(left, right)) {
+        return BoundaryReason::PARTICIPANT_CHROMOSOME_MISMATCH;
+    }
+
+    const int64_t reference_gap =
+        signedGapInReferenceOrder(
+            left.reference_segment, right.reference_segment);
+    if (reference_gap > 0) {
+        diagnostics.reference_gap_bins[
+            gapBin(static_cast<uint64_t>(reference_gap))]++;
+        return BoundaryReason::REFERENCE_GAP;
+    }
+    if (reference_gap < 0) {
+        return BoundaryReason::REFERENCE_OVERLAP;
+    }
+    if (!pathLinksAreDirectlyAdjacent(
+            left.reference_segment, right.reference_segment)) {
+        return BoundaryReason::REFERENCE_PATH_DISCONTINUITY;
+    }
+
+    const SpeciesChrPair reference_key{
+        reference_species, reference_chromosome};
+    bool query_strand_mismatch = false;
+    bool query_path_discontinuity = false;
+    uint64_t maximum_query_gap = 0;
+    uint64_t maximum_query_overlap = 0;
+
+    for (const auto& [key, left_segment] : left.anchors) {
+        if (key == reference_key) {
+            continue;
+        }
+        const auto right_it = right.anchors.find(key);
+        if (right_it == right.anchors.end()) {
+            return BoundaryReason::PARTICIPANT_CHROMOSOME_MISMATCH;
+        }
+        const auto& right_segment = right_it->second;
+        if (left_segment->strand != right_segment->strand) {
+            query_strand_mismatch = true;
+            continue;
+        }
+
+        const int64_t gap =
+            signedGapInReferenceOrder(left_segment, right_segment);
+        if (gap > 0) {
+            maximum_query_gap = std::max(
+                maximum_query_gap, static_cast<uint64_t>(gap));
+        } else if (gap < 0) {
+            maximum_query_overlap = std::max(
+                maximum_query_overlap, static_cast<uint64_t>(-gap));
+        }
+        if (!pathLinksAreDirectlyAdjacent(left_segment, right_segment)) {
+            query_path_discontinuity = true;
+        }
+    }
+
+    if (query_strand_mismatch) {
+        return BoundaryReason::QUERY_STRAND_MISMATCH;
+    }
+    if (maximum_query_gap > 0) {
+        diagnostics.query_gap_bins[gapBin(maximum_query_gap)]++;
+        return BoundaryReason::QUERY_GAP;
+    }
+    if (maximum_query_overlap > 0) {
+        return BoundaryReason::QUERY_OVERLAP;
+    }
+    if (query_path_discontinuity) {
+        return BoundaryReason::QUERY_PATH_DISCONTINUITY;
+    }
+
+    for (const auto& [key, left_segment] : left.anchors) {
+        const auto right_it = right.anchors.find(key);
+        Cigar_t normalized;
+        if (right_it == right.anchors.end() ||
+            !normalizeAndValidateCigar(
+                left_segment, left.reference_segment->length, normalized) ||
+            !normalizeAndValidateCigar(
+                right_it->second, right.reference_segment->length,
+                normalized)) {
+            return BoundaryReason::CIGAR_INVALID;
+        }
+    }
+
+    const uint64_t proposed_span =
+        segmentEnd(right.reference_segment) -
+        static_cast<uint64_t>(left.reference_segment->start);
+    if (proposed_span > maximum_reference_span ||
+        proposed_span > std::numeric_limits<uint_t>::max()) {
+        return BoundaryReason::MAX_REFERENCE_SPAN;
+    }
+
+    return BoundaryReason::MERGEABLE;
+}
+
+BoundaryDiagnostics collectBoundaryDiagnostics(
+    const RaMeshMultiGenomeGraph& graph,
+    const SpeciesName& reference_species,
+    uint_t maximum_reference_span) {
+    BoundaryDiagnostics diagnostics;
+    const auto reference_graph_it =
+        graph.species_graphs.find(reference_species);
+    if (reference_graph_it == graph.species_graphs.end()) {
+        throw std::runtime_error(
+            "Exact Block scan reference is absent from the graph: " +
+            reference_species);
+    }
+
+    for (const auto& [chromosome, genome_end] :
+         reference_graph_it->second.chr2end) {
+        auto left_segment =
+            genome_end.head->primary_path.next.load(
+                std::memory_order_acquire);
+        while (left_segment && !left_segment->isTail()) {
+            const auto right_segment =
+                left_segment->primary_path.next.load(
+                    std::memory_order_acquire);
+            if (!right_segment || right_segment->isTail()) {
+                break;
+            }
+
+            ++diagnostics.total_boundaries;
+            BlockView left;
+            BlockView right;
+            BoundaryReason reason = BoundaryReason::LEFT_BLOCK_INVALID;
+            if (!buildDiagnosticBlockView(
+                    left_segment->parent_block, reference_species,
+                    chromosome, left)) {
+                reason = BoundaryReason::LEFT_BLOCK_INVALID;
+            } else if (!buildDiagnosticBlockView(
+                           right_segment->parent_block, reference_species,
+                           chromosome, right)) {
+                reason = BoundaryReason::RIGHT_BLOCK_INVALID;
+            } else {
+                reason = classifyBoundary(
+                    left, right, reference_species, chromosome,
+                    maximum_reference_span, diagnostics);
+            }
+            diagnostics.reasons[static_cast<size_t>(reason)]++;
+            left_segment = right_segment;
+        }
+    }
+
+    return diagnostics;
+}
+
+void logBoundaryDiagnostics(const BoundaryDiagnostics& diagnostics,
+                            const SpeciesName& reference_species,
+                            const std::string& stage,
+                            uint_t maximum_reference_span) {
+    const size_t mergeable =
+        diagnostics.reasons[
+            static_cast<size_t>(BoundaryReason::MERGEABLE)];
+    const size_t rejected =
+        diagnostics.total_boundaries >= mergeable
+            ? diagnostics.total_boundaries - mergeable
+            : 0;
+    spdlog::info(
+        "[exact-block-scan] stage={} reference={} total_boundaries={} "
+        "mergeable={} rejected={} max_reference_span={}",
+        stage, reference_species, diagnostics.total_boundaries,
+        mergeable, rejected, maximum_reference_span);
+
+    size_t classified = 0;
+    for (size_t index = 0; index < kBoundaryReasonCount; ++index) {
+        const size_t count = diagnostics.reasons[index];
+        classified += count;
+        if (count == 0) {
+            continue;
+        }
+        const double percent =
+            diagnostics.total_boundaries == 0
+                ? 0.0
+                : 100.0 * static_cast<double>(count) /
+                      static_cast<double>(diagnostics.total_boundaries);
+        spdlog::info(
+            "[exact-block-scan] stage={} reason={} count={} percent={:.6f}",
+            stage,
+            boundaryReasonName(static_cast<BoundaryReason>(index)),
+            count, percent);
+    }
+
+    for (size_t bin = 0; bin < kGapBinCount; ++bin) {
+        if (diagnostics.reference_gap_bins[bin] != 0) {
+            spdlog::info(
+                "[exact-block-scan] stage={} reference_gap_bin={} count={}",
+                stage, gapBinName(bin),
+                diagnostics.reference_gap_bins[bin]);
+        }
+        if (diagnostics.query_gap_bins[bin] != 0) {
+            spdlog::info(
+                "[exact-block-scan] stage={} query_max_gap_bin={} count={}",
+                stage, gapBinName(bin),
+                diagnostics.query_gap_bins[bin]);
+        }
+    }
+
+    for (const auto& [transition, count] :
+         diagnostics.participant_transitions) {
+        spdlog::info(
+            "[exact-block-scan] stage={} participant_transition={}_to_{} "
+            "count={}",
+            stage, transition.first, transition.second, count);
+    }
+
+    if (classified != diagnostics.total_boundaries) {
+        throw std::runtime_error(
+            "Exact Block scan classification count mismatch");
+    }
+}
+
 }  // namespace
+
+void RaMeshMultiGenomeGraph::inspectExactContiguousBlockBoundaries(
+    const SpeciesName& reference_species,
+    const std::string& stage,
+    uint_t maximum_reference_span) const {
+    if (maximum_reference_span == 0) {
+        throw std::invalid_argument(
+            "maximum_reference_span must be greater than zero");
+    }
+
+    std::shared_lock graph_lock(rw);
+    const auto diagnostics = collectBoundaryDiagnostics(
+        *this, reference_species, maximum_reference_span);
+    logBoundaryDiagnostics(
+        diagnostics, reference_species, stage, maximum_reference_span);
+}
 
 size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     const SpeciesName& reference_species,
@@ -601,6 +930,12 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
             "Exact Block merge reference is absent from the graph: " +
             reference_species);
     }
+
+    const auto diagnostics = collectBoundaryDiagnostics(
+        *this, reference_species, maximum_reference_span);
+    logBoundaryDiagnostics(
+        diagnostics, reference_species, "pre-merge-current-reference",
+        maximum_reference_span);
 
     std::unordered_map<const Block*, BlockView> view_cache;
     std::unordered_set<const Block*> invalid_views;

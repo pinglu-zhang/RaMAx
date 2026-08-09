@@ -971,13 +971,13 @@ starAlignment(
         // 合并后再优化一次
         multi_graph->optimizeGraphStructure();
         spdlog::info("optimize graph genome graphs for {} done", current_ref_name);
-        if (i == 0 && merge_exact_contiguous_blocks_enabled) {
+        if (merge_exact_contiguous_blocks_enabled) {
             const size_t eliminated_boundaries =
                 multi_graph->mergeExactContiguousBlocks(current_ref_name);
             spdlog::info(
-                "[exact-block-merge] first-round optimization completed: "
-                "eliminated_boundaries={}",
-                eliminated_boundaries);
+                "[exact-block-merge] round={} reference={} optimization "
+                "completed: eliminated_boundaries={}",
+                i + 1, current_ref_name, eliminated_boundaries);
         }
 
         // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于
@@ -1028,9 +1028,11 @@ starAlignment(
     }
 
     if (merge_exact_contiguous_blocks_enabled && !reference_order.empty()) {
-        const SpeciesName& final_reference = reference_order[round - 1];
-        multi_graph->inspectExactContiguousBlockBoundaries(
-            final_reference, "final-round-post-alignment");
+        for (uint_t reference_index = 0; reference_index < round;
+             ++reference_index) {
+            multi_graph->inspectExactContiguousBlockBoundaries(
+                reference_order[reference_index], "final-graph-post-alignment");
+        }
     }
 
     // 所有轮次完成后，flush logger
