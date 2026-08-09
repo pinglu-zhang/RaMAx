@@ -33,6 +33,7 @@ public:
     FilePath mask_export_dir;
 
     RaMesh::WindowDetection::Options window_detection_options;
+    bool merge_exact_contiguous_blocks_enabled = false;
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

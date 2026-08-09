@@ -436,6 +436,14 @@ namespace RaMesh {
         void safeLink(SegPtr prev, SegPtr next);
 
         void mergeMultipleGraphs(const SpeciesName& ref_name, uint_t thread_num);
+        size_t mergeExactContiguousBlocks(
+            const SpeciesName& reference_species,
+            uint_t maximum_reference_span = 1000000);
+        void inspectExactContiguousBlockBoundaries(
+            const SpeciesName& reference_species,
+            const std::string& stage,
+            uint_t maximum_reference_span = 1000000) const;
+
 
         std::unordered_map<SpeciesName, RaMeshGenomeGraph> species_graphs; // guard: rw
         std::vector<WeakBlock>                             blocks;         // guard: rw

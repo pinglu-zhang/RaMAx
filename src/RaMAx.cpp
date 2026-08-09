@@ -68,6 +68,7 @@ struct CommonArgs {
 
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
+    bool merge_exact_contiguous_blocks = false;  // 仅在第一轮合并严格连续 Block
     bool one_round = false;                     // 是否只执行一轮处理流程
 
     // ========================
@@ -120,6 +121,8 @@ struct CommonArgs {
 };
 
 namespace {
+constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
+    "exact_block_merge_enabled";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
 
 // Window detection uses a separate optional config so older restart directories
@@ -274,6 +277,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Repeat masking        : {}", args.enable_repeat_masking ? "Enabled" : "Disabled");
     spdlog::info("  Tree root             ：{}", args.root_name);
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
+    spdlog::info("  Exact Block merge     : {}",
+        args.merge_exact_contiguous_blocks ? "Enabled" : "Disabled");
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
     if (args.detect_windows) {
@@ -445,6 +450,12 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* one_round_flag = cmd->add_flag("--one-round", args.one_round,
         "Only run one round for alignment.")
         ->group("Software Parameters");
+
+    auto* merge_exact_blocks_flag = cmd->add_flag(
+        "--merge-exact-contiguous-blocks",
+        args.merge_exact_contiguous_blocks,
+        "Merge strictly contiguous Blocks once after the first graph merge.")
+        ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -639,6 +650,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         min_span_opt,
         root_opt,
         ref_opt,
+        merge_exact_blocks_flag,
         one_round_flag,
         log_level_opt,
         detect_windows_flag,
@@ -757,6 +769,12 @@ static int runRestartMode(CommonArgs& common_args) {
     // 从 JSON 反序列化参数
     cereal::JSONInputArchive archive(is);
     archive(common_args);
+
+    common_args.merge_exact_contiguous_blocks = std::filesystem::exists(
+        common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
+    if (common_args.merge_exact_contiguous_blocks) {
+        spdlog::info("Exact Block merge restart marker loaded.");
+    }
     spdlog::info("CommonArgs loaded from {}", config_path.string());
 
     const FilePath window_config_path =
@@ -859,6 +877,20 @@ static int runNormalMode(CommonArgs& common_args) {
         window_archive(cereal::make_nvp("window_detection", window_config));
         spdlog::info("Window detection config saved to {}",
                      window_config_path.string());
+    }
+
+    if (common_args.merge_exact_contiguous_blocks) {
+        const FilePath merge_config_path =
+            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE;
+        std::ofstream merge_config_output(merge_config_path);
+        if (!merge_config_output) {
+            throw std::runtime_error(
+                "Failed to save exact Block merge restart marker: " +
+                merge_config_path.string());
+        }
+        merge_config_output << "enabled\n";
+        spdlog::info("Exact Block merge restart marker saved to {}",
+                     merge_config_path.string());
     }
 
     return 0;
@@ -1099,6 +1131,8 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.window_max_span;
     mra.window_detection_options.subset_search_budget =
         static_cast<size_t>(common_args.window_subset_search_budget);
+    mra.merge_exact_contiguous_blocks_enabled =
+        common_args.merge_exact_contiguous_blocks;
 
     // 计时：star alignment 总耗时
     auto t_start_align = std::chrono::steady_clock::now();

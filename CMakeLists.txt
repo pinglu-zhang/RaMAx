@@ -140,6 +140,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
+    "${GRAPH_DIR}/direct_block_merger.cpp"
     "${GRAPH_DIR}/window_detector.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"

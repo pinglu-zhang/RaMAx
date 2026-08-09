@@ -971,6 +971,14 @@ starAlignment(
         // 合并后再优化一次
         multi_graph->optimizeGraphStructure();
         spdlog::info("optimize graph genome graphs for {} done", current_ref_name);
+        if (i == 0 && merge_exact_contiguous_blocks_enabled) {
+            const size_t eliminated_boundaries =
+                multi_graph->mergeExactContiguousBlocks(current_ref_name);
+            spdlog::info(
+                "[exact-block-merge] first-round optimization completed: "
+                "eliminated_boundaries={}",
+                eliminated_boundaries);
+        }
 
         // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于
         // markAllExtended() 和本轮 addAlignedRegionsAsMask() 之前，避免检测逻辑
@@ -1017,6 +1025,12 @@ starAlignment(
         FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
         exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
         processed_reference_species.insert(current_ref_name);
+    }
+
+    if (merge_exact_contiguous_blocks_enabled && !reference_order.empty()) {
+        const SpeciesName& final_reference = reference_order[round - 1];
+        multi_graph->inspectExactContiguousBlockBoundaries(
+            final_reference, "final-round-post-alignment");
     }
 
     // 所有轮次完成后，flush logger
