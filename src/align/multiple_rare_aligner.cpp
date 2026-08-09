@@ -973,11 +973,13 @@ starAlignment(
         spdlog::info("optimize graph genome graphs for {} done", current_ref_name);
         if (merge_exact_contiguous_blocks_enabled) {
             const size_t eliminated_boundaries =
-                multi_graph->mergeExactContiguousBlocks(current_ref_name);
+                multi_graph->mergeExactContiguousBlocks(
+                    current_ref_name, 1000000, merge_query_gap_max);
             spdlog::info(
                 "[exact-block-merge] round={} reference={} optimization "
-                "completed: eliminated_boundaries={}",
-                i + 1, current_ref_name, eliminated_boundaries);
+                "completed: eliminated_boundaries={} max_query_gap={}",
+                i + 1, current_ref_name, eliminated_boundaries,
+                merge_query_gap_max);
         }
 
         // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于

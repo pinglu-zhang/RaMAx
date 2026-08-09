@@ -7,6 +7,7 @@
 #include "index.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
+#include "align.h"
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
@@ -68,7 +69,8 @@ struct CommonArgs {
 
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
-    bool merge_exact_contiguous_blocks = false;  // 仅在第一轮合并严格连续 Block
+    bool merge_exact_contiguous_blocks = false;  // 每轮合并连续 Block
+    uint_t merge_query_gap_max = 0;              // query 正间隔上限；0=仅严格连续
     bool one_round = false;                     // 是否只执行一轮处理流程
 
     // ========================
@@ -123,6 +125,7 @@ struct CommonArgs {
 namespace {
 constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
     "exact_block_merge_enabled";
+constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
 
 // Window detection uses a separate optional config so older restart directories
@@ -279,6 +282,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
     spdlog::info("  Exact Block merge     : {}",
         args.merge_exact_contiguous_blocks ? "Enabled" : "Disabled");
+    spdlog::info("  Query-gap merge max   : {}",
+        args.merge_query_gap_max);
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
     if (args.detect_windows) {
@@ -454,8 +459,19 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* merge_exact_blocks_flag = cmd->add_flag(
         "--merge-exact-contiguous-blocks",
         args.merge_exact_contiguous_blocks,
-        "Merge strictly contiguous Blocks once after the first graph merge.")
+        "Merge contiguous Blocks after every graph-alignment round.")
         ->group("Graph Optimization");
+
+    auto* merge_query_gap_opt = cmd->add_option(
+        "--merge-query-gap-max",
+        args.merge_query_gap_max,
+        "Allow positive query gaps up to this length during Block merge; "
+        "gap insertions are aligned by /usr/local/bin/minipoa.")
+        ->default_val(0)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->needs(merge_exact_blocks_flag)
+        ->check(CLI::Range(0, 10000));
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -773,6 +789,16 @@ static int runRestartMode(CommonArgs& common_args) {
     common_args.merge_exact_contiguous_blocks = std::filesystem::exists(
         common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
     if (common_args.merge_exact_contiguous_blocks) {
+        std::ifstream merge_config_input(
+            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
+        uint64_t stored_query_gap = 0;
+        if (merge_config_input &&
+            (merge_config_input >> stored_query_gap)) {
+            common_args.merge_query_gap_max = static_cast<uint_t>(
+                std::min<uint64_t>(
+                    stored_query_gap,
+                    std::numeric_limits<uint_t>::max()));
+        }
         spdlog::info("Exact Block merge restart marker loaded.");
     }
     spdlog::info("CommonArgs loaded from {}", config_path.string());
@@ -888,7 +914,7 @@ static int runNormalMode(CommonArgs& common_args) {
                 "Failed to save exact Block merge restart marker: " +
                 merge_config_path.string());
         }
-        merge_config_output << "enabled\n";
+        merge_config_output << common_args.merge_query_gap_max << '\n';
         spdlog::info("Exact Block merge restart marker saved to {}",
                      merge_config_path.string());
     }
@@ -1133,6 +1159,15 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         static_cast<size_t>(common_args.window_subset_search_budget);
     mra.merge_exact_contiguous_blocks_enabled =
         common_args.merge_exact_contiguous_blocks;
+    mra.merge_query_gap_max = common_args.merge_query_gap_max;
+    if (mra.merge_query_gap_max > 0) {
+        if (!std::filesystem::exists(MINIPOA_EXECUTABLE)) {
+            throw std::runtime_error(
+                "Query-gap Block merge requires system minipoa at " +
+                std::string(MINIPOA_EXECUTABLE));
+        }
+        configureExternalInsertionMsa(MINIPOA_EXECUTABLE);
+    }
 
     // 计时：star alignment 总耗时
     auto t_start_align = std::chrono::steady_clock::now();

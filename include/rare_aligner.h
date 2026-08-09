@@ -34,6 +34,7 @@ public:
 
     RaMesh::WindowDetection::Options window_detection_options;
     bool merge_exact_contiguous_blocks_enabled = false;
+    uint_t merge_query_gap_max = 0;
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

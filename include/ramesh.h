@@ -438,7 +438,8 @@ namespace RaMesh {
         void mergeMultipleGraphs(const SpeciesName& ref_name, uint_t thread_num);
         size_t mergeExactContiguousBlocks(
             const SpeciesName& reference_species,
-            uint_t maximum_reference_span = 1000000);
+            uint_t maximum_reference_span = 1000000,
+            uint_t maximum_query_gap = 0);
         void inspectExactContiguousBlockBoundaries(
             const SpeciesName& reference_species,
             const std::string& stage,

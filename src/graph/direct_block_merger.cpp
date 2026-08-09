@@ -293,25 +293,53 @@ bool sameAnchorKeys(const BlockView& left, const BlockView& right) {
     return true;
 }
 
-bool segmentsAreDirectlyAdjacent(const SegPtr& left, const SegPtr& right) {
+int64_t segmentGapInReferenceOrder(const SegPtr& left,
+                                   const SegPtr& right) {
+    if (!left || !right || left->strand != right->strand) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    if (left->strand == Strand::FORWARD) {
+        return static_cast<int64_t>(right->start) -
+               static_cast<int64_t>(segmentEnd(left));
+    }
+    return static_cast<int64_t>(left->start) -
+           static_cast<int64_t>(segmentEnd(right));
+}
+
+bool segmentPathsAreDirectlyAdjacent(const SegPtr& left,
+                                     const SegPtr& right) {
     if (!left || !right || left->strand != right->strand) {
         return false;
     }
-
     if (left->strand == Strand::FORWARD) {
-        return segmentEnd(left) == right->start &&
-               left->primary_path.next.load(std::memory_order_acquire) == right &&
-               right->primary_path.prev.load(std::memory_order_acquire) == left;
+        return left->primary_path.next.load(std::memory_order_acquire) ==
+                   right &&
+               right->primary_path.prev.load(std::memory_order_acquire) ==
+                   left;
     }
+    return right->primary_path.next.load(std::memory_order_acquire) ==
+               left &&
+           left->primary_path.prev.load(std::memory_order_acquire) ==
+               right;
+}
 
-    return segmentEnd(right) == left->start &&
-           right->primary_path.next.load(std::memory_order_acquire) == left &&
-           left->primary_path.prev.load(std::memory_order_acquire) == right;
+bool segmentsAreMergeable(const SegPtr& left,
+                          const SegPtr& right,
+                          uint_t maximum_gap) {
+    const int64_t gap = segmentGapInReferenceOrder(left, right);
+    return gap >= 0 &&
+           static_cast<uint64_t>(gap) <= maximum_gap &&
+           segmentPathsAreDirectlyAdjacent(left, right);
+}
+
+bool segmentsAreDirectlyAdjacent(const SegPtr& left, const SegPtr& right) {
+    return segmentsAreMergeable(left, right, 0);
 }
 
 bool canMergePair(const BlockView& left,
                   const BlockView& right,
-                  const SpeciesName& reference_species) {
+                  const SpeciesName& reference_species,
+                  uint_t maximum_query_gap) {
     if (!left.block || !right.block || left.block == right.block ||
         left.block->ref_chr != right.block->ref_chr ||
         !sameAnchorKeys(left, right)) {
@@ -333,8 +361,11 @@ bool canMergePair(const BlockView& left,
 
     for (const auto& [key, left_segment] : left.anchors) {
         const auto right_it = right.anchors.find(key);
+        const uint_t allowed_gap =
+            key == reference_key ? 0 : maximum_query_gap;
         if (right_it == right.anchors.end() ||
-            !segmentsAreDirectlyAdjacent(left_segment, right_it->second)) {
+            !segmentsAreMergeable(
+                left_segment, right_it->second, allowed_gap)) {
             return false;
         }
 
@@ -386,6 +417,7 @@ PreparedChain prepareChain(const CandidateChain& candidate,
         path.old_segments.reserve(candidate.views.size());
 
         uint64_t merged_start = std::numeric_limits<uint64_t>::max();
+        uint64_t merged_end = 0;
         uint64_t merged_length = 0;
         Cigar_t merged_cigar;
         Strand strand = Strand::FORWARD;
@@ -405,6 +437,26 @@ PreparedChain prepareChain(const CandidateChain& candidate,
                     "Candidate chain changed strand while being prepared");
             }
 
+            if (index > 0) {
+                const auto previous_it =
+                    candidate.views[index - 1]->anchors.find(key);
+                if (previous_it ==
+                    candidate.views[index - 1]->anchors.end()) {
+                    throw std::runtime_error(
+                        "Candidate chain lost its previous Segment");
+                }
+                const int64_t gap =
+                    segmentGapInReferenceOrder(previous_it->second, segment);
+                if (gap < 0 ||
+                    static_cast<uint64_t>(gap) >
+                        kMaximumCigarOperationLength) {
+                    throw std::runtime_error(
+                        "Candidate chain contains an invalid query gap");
+                }
+                appendCigarOp(
+                    merged_cigar, 'I', static_cast<uint32_t>(gap));
+                merged_length += static_cast<uint64_t>(gap);
+            }
             Cigar_t normalized;
             if (!normalizeAndValidateCigar(
                     segment, view->reference_segment->length, normalized) ||
@@ -415,12 +467,15 @@ PreparedChain prepareChain(const CandidateChain& candidate,
 
             path.old_segments.push_back(segment);
             merged_start = std::min<uint64_t>(merged_start, segment->start);
+            merged_end = std::max<uint64_t>(
+                merged_end, segmentEnd(segment));
             merged_length += segment->length;
         }
 
         if (merged_start > std::numeric_limits<uint_t>::max() ||
             merged_length == 0 ||
-            merged_length > std::numeric_limits<uint_t>::max()) {
+            merged_length > std::numeric_limits<uint_t>::max() ||
+            merged_end - merged_start != merged_length) {
             throw std::runtime_error(
                 "Merged Segment coordinates exceed the graph coordinate type");
         }
@@ -916,7 +971,8 @@ void RaMeshMultiGenomeGraph::inspectExactContiguousBlockBoundaries(
 
 size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     const SpeciesName& reference_species,
-    uint_t maximum_reference_span) {
+    uint_t maximum_reference_span,
+    uint_t maximum_query_gap) {
     if (maximum_reference_span == 0) {
         throw std::invalid_argument(
             "maximum_reference_span must be greater than zero");
@@ -992,7 +1048,7 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
                     next_view->species_count != candidate.species_count ||
                     !canMergePair(
                         *candidate.views.back(), *next_view,
-                        reference_species)) {
+                        reference_species, maximum_query_gap)) {
                     break;
                 }
 
@@ -1254,10 +1310,10 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     spdlog::info(
         "[exact-block-merge] reference={} candidates={} old_blocks={} "
         "eliminated_boundaries={} blocks_before={} blocks_after={} "
-        "longest_chain={} max_reference_span={}",
+        "longest_chain={} max_reference_span={} max_query_gap={}",
         reference_species, candidates.size(), merged_old_blocks,
         eliminated_boundaries, active_blocks_before, active_blocks_after,
-        longest_chain, maximum_reference_span);
+        longest_chain, maximum_reference_span, maximum_query_gap);
     for (const auto& [species_count, stats] : by_species_count) {
         spdlog::info(
             "[exact-block-merge] participants={} chains={} eliminated_boundaries={}",

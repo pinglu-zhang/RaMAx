@@ -1,5 +1,252 @@
 #include "align.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+#include <spdlog/spdlog.h>
+
+namespace {
+
+std::string external_insertion_msa_executable;
+std::atomic<uint64_t> external_msa_file_counter{0};
+std::atomic<uint64_t> external_msa_completed{0};
+
+std::string shellQuote(const std::string& value) {
+    std::string quoted = "'";
+    for (const char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string ungappedUpper(std::string sequence) {
+    sequence.erase(
+        std::remove_if(
+            sequence.begin(), sequence.end(),
+            [](unsigned char c) {
+                return c == '-' || std::isspace(c);
+            }),
+        sequence.end());
+    std::transform(
+        sequence.begin(), sequence.end(), sequence.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+        });
+    return sequence;
+}
+
+class TemporaryMsaFiles {
+public:
+    std::filesystem::path input;
+    std::filesystem::path output;
+
+    ~TemporaryMsaFiles() {
+        std::error_code error;
+        if (!input.empty()) {
+            std::filesystem::remove(input, error);
+        }
+        error.clear();
+        if (!output.empty()) {
+            std::filesystem::remove(output, error);
+        }
+    }
+};
+
+bool runExternalInsertionMsa(
+    std::unordered_map<ChrName, std::string>& sequences) {
+    if (external_insertion_msa_executable.empty() ||
+        sequences.size() < 2) {
+        return false;
+    }
+
+    std::vector<ChrName> keys;
+    keys.reserve(sequences.size());
+    for (const auto& [key, unused] : sequences) {
+        (void)unused;
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    const uint64_t serial =
+        external_msa_file_counter.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t stamp = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto prefix =
+        std::filesystem::temp_directory_path() /
+        ("ramax-insertion-msa-" + std::to_string(stamp) + "-" +
+         std::to_string(serial));
+
+    TemporaryMsaFiles temporary{
+        prefix.string() + ".input.fa",
+        prefix.string() + ".output.fa"};
+
+    {
+        std::ofstream input(temporary.input, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                "Cannot create external MSA input: " +
+                temporary.input.string());
+        }
+        for (size_t index = 0; index < keys.size(); ++index) {
+            input << ">s" << index << "\n"
+                  << sequences.at(keys[index]) << "\n";
+        }
+    }
+
+    const std::string command =
+        shellQuote(external_insertion_msa_executable) +
+        " -r 1 -t 1 " + shellQuote(temporary.input.string()) +
+        " > " + shellQuote(temporary.output.string());
+    if (std::system(command.c_str()) != 0) {
+        spdlog::warn(
+            "[external-msa] command failed; falling back to KSW2: {}",
+            external_insertion_msa_executable);
+        return false;
+    }
+
+    std::ifstream output(temporary.output, std::ios::binary);
+    if (!output) {
+        spdlog::warn(
+            "[external-msa] output is unavailable; falling back to KSW2");
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> aligned_by_id;
+    std::string current_id;
+    std::string line;
+    while (std::getline(output, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (!line.empty() && line.front() == '>') {
+            std::istringstream header(line.substr(1));
+            header >> current_id;
+            if (current_id.empty() ||
+                !aligned_by_id.emplace(current_id, std::string{}).second) {
+                spdlog::warn(
+                    "[external-msa] invalid FASTA header; falling back to KSW2");
+                return false;
+            }
+            continue;
+        }
+        if (current_id.empty()) {
+            if (line.empty()) {
+                continue;
+            }
+            spdlog::warn(
+                "[external-msa] sequence before FASTA header; "
+                "falling back to KSW2");
+            return false;
+        }
+        for (const unsigned char c : line) {
+            if (!std::isspace(c)) {
+                aligned_by_id[current_id].push_back(
+                    static_cast<char>(c));
+            }
+        }
+    }
+
+    size_t aligned_length = 0;
+    std::vector<std::string> aligned(keys.size());
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const std::string id = "s" + std::to_string(index);
+        const auto aligned_it = aligned_by_id.find(id);
+        if (aligned_it == aligned_by_id.end() ||
+            ungappedUpper(aligned_it->second) !=
+                ungappedUpper(sequences.at(keys[index]))) {
+            spdlog::warn(
+                "[external-msa] output sequence validation failed; "
+                "falling back to KSW2");
+            return false;
+        }
+        if (index == 0) {
+            aligned_length = aligned_it->second.size();
+        } else if (aligned_it->second.size() != aligned_length) {
+            spdlog::warn(
+                "[external-msa] output rows have unequal lengths; "
+                "falling back to KSW2");
+            return false;
+        }
+        aligned[index] = aligned_it->second;
+    }
+
+    for (size_t index = 0; index < keys.size(); ++index) {
+        sequences[keys[index]] = std::move(aligned[index]);
+    }
+
+    const uint64_t completed =
+        external_msa_completed.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (completed % 1000 == 0) {
+        spdlog::info(
+            "[external-msa] completed {} insertion MSAs with {}",
+            completed, external_insertion_msa_executable);
+    }
+    return true;
+}
+
+}  // namespace
+
+void configureExternalInsertionMsa(const std::string& executable) {
+    external_insertion_msa_executable = executable;
+    if (!executable.empty()) {
+        spdlog::info(
+            "[external-msa] insertion aligner configured: {}",
+            executable);
+    }
+}
+
+void InsertInfo::alignSeqs() {
+    if (aligned || seqs.empty()) {
+        return;
+    }
+
+    if (seqs.size() == 1) {
+        ref_name = seqs.begin()->first;
+        total_length = seqs.begin()->second.size();
+        aligned = true;
+        return;
+    }
+
+    if (runExternalInsertionMsa(seqs)) {
+        ref_name = seqs.begin()->first;
+        total_length = seqs.begin()->second.size();
+        aligned = true;
+        return;
+    }
+
+    size_t max_len = 0;
+    ChrName longest_key;
+    for (const auto& [key, sequence] : seqs) {
+        if (sequence.size() > max_len) {
+            max_len = sequence.size();
+            longest_key = key;
+        }
+    }
+    ref_name = longest_key;
+
+    std::unordered_map<ChrName, Cigar_t> cigars;
+    for (const auto& [key, sequence] : seqs) {
+        (void)sequence;
+        if (key == ref_name) {
+            continue;
+        }
+        cigars[key] = globalAlignKSW2(seqs[ref_name], seqs.at(key));
+    }
+    total_length = mergeAlignmentByRef(ref_name, seqs, cigars);
+    aligned = true;
+}
+
 KSW2AlignConfig makeDefaultKSW2Config() {
     static int8_t simple_dna_mat[25];
     static bool initialized = false;
