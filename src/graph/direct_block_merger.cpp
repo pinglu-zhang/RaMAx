@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <exception>
 #include <numeric>
 #include <limits>
 #include <map>
@@ -1669,7 +1671,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
         seqpro_managers,
     const std::string& msa_executable,
-    uint_t maximum_span) {
+    uint_t maximum_span,
+    uint_t parallel_threads) {
     if (maximum_span == 0) {
         throw std::invalid_argument(
             "species-mismatch realignment maximum_span must be positive");
@@ -1697,6 +1700,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     size_t scanned_triples = 0;
     size_t structural_candidates = 0;
     std::map<SpeciesName, size_t> accepted_by_missing_species;
+    std::vector<MissingWindowCandidate> candidate_slots;
     std::vector<MissingWindowCandidate> accepted_candidates;
     std::vector<PreparedChain> prepared;
     std::unordered_set<const Block*> accepted_middle_blocks;
@@ -1737,34 +1741,99 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             }
 
             ++structural_candidates;
-            MissingWindowReject prepare_result =
-                MissingWindowReject::COUNT;
-            auto prepared_candidate = prepareMissingWindow(
-                candidate, reference_species, seqpro_managers,
-                msa_executable, prepare_result);
-            if (!prepared_candidate.has_value()) {
-                if (prepare_result == MissingWindowReject::COUNT) {
-                    prepare_result = MissingWindowReject::MSA_INVALID;
-                }
-                ++rejections[static_cast<size_t>(prepare_result)];
-                left_reference = middle_reference;
-                continue;
-            }
-            if (!accepted_middle_blocks.insert(
-                    candidate.middle.block.get()).second) {
-                throw std::runtime_error(
-                    "Species-mismatch realignment produced overlapping "
-                    "middle Blocks");
-            }
-
-            ++accepted_by_missing_species[
-                candidate.missing_species];
-            accepted_candidates.push_back(std::move(candidate));
-            prepared.push_back(
-                std::move(*prepared_candidate));
+            candidate_slots.push_back(std::move(candidate));
             left_reference = right_reference;
         }
     }
+
+    const uint_t effective_threads = static_cast<uint_t>(
+        std::max<size_t>(
+            1,
+            std::min<size_t>(
+                std::max<uint_t>(1, parallel_threads),
+                candidate_slots.empty() ? 1 : candidate_slots.size())));
+    std::vector<std::optional<PreparedChain>> prepared_slots(
+        candidate_slots.size());
+    std::vector<MissingWindowReject> prepare_results(
+        candidate_slots.size(), MissingWindowReject::COUNT);
+    std::vector<std::exception_ptr> prepare_exceptions(
+        candidate_slots.size());
+
+    const auto prepare_start = std::chrono::steady_clock::now();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(effective_threads)
+    for (std::int64_t candidate_index = 0;
+         candidate_index <
+             static_cast<std::int64_t>(candidate_slots.size());
+         ++candidate_index) {
+        const size_t index = static_cast<size_t>(candidate_index);
+        try {
+            MissingWindowReject prepare_result =
+                MissingWindowReject::COUNT;
+            auto prepared_candidate = prepareMissingWindow(
+                candidate_slots[index], reference_species,
+                seqpro_managers, msa_executable, prepare_result);
+            if (!prepared_candidate.has_value() &&
+                prepare_result == MissingWindowReject::COUNT) {
+                prepare_result = MissingWindowReject::MSA_INVALID;
+            }
+            prepare_results[index] = prepare_result;
+            prepared_slots[index] = std::move(prepared_candidate);
+        } catch (...) {
+            prepare_exceptions[index] = std::current_exception();
+        }
+    }
+    const double prepare_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prepare_start)
+            .count();
+
+    for (size_t index = 0; index < prepare_exceptions.size(); ++index) {
+        if (prepare_exceptions[index]) {
+            spdlog::error(
+                "[species-mismatch-realign] parallel preparation failed "
+                "at candidate_index={}",
+                index);
+            std::rethrow_exception(prepare_exceptions[index]);
+        }
+    }
+
+    accepted_candidates.reserve(candidate_slots.size());
+    prepared.reserve(candidate_slots.size());
+    for (size_t index = 0; index < candidate_slots.size(); ++index) {
+        if (!prepared_slots[index].has_value()) {
+            auto prepare_result = prepare_results[index];
+            if (prepare_result == MissingWindowReject::COUNT) {
+                prepare_result = MissingWindowReject::MSA_INVALID;
+            }
+            ++rejections[static_cast<size_t>(prepare_result)];
+            continue;
+        }
+
+        auto& candidate = candidate_slots[index];
+        if (!accepted_middle_blocks.insert(
+                candidate.middle.block.get()).second) {
+            throw std::runtime_error(
+                "Species-mismatch realignment produced overlapping "
+                "middle Blocks");
+        }
+        ++accepted_by_missing_species[candidate.missing_species];
+        accepted_candidates.push_back(std::move(candidate));
+        prepared.push_back(std::move(*prepared_slots[index]));
+    }
+
+    const size_t attempted_msa = candidate_slots.size();
+    const size_t successful_msa = prepared.size();
+    const size_t failed_msa = attempted_msa - successful_msa;
+    const double windows_per_second =
+        prepare_seconds > 0.0
+            ? static_cast<double>(attempted_msa) / prepare_seconds
+            : 0.0;
+    spdlog::info(
+        "[species-mismatch-realign] preparation parallel_threads={} "
+        "attempted={} succeeded={} failed={} wall_seconds={:.3f} "
+        "windows_per_second={:.3f}",
+        effective_threads, attempted_msa, successful_msa, failed_msa,
+        prepare_seconds, windows_per_second);
 
     spdlog::info(
         "[species-mismatch-realign] reference={} scanned_triples={} "

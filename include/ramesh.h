@@ -445,7 +445,8 @@ namespace RaMesh {
             const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
                 seqpro_managers,
             const std::string& msa_executable,
-            uint_t maximum_span = 10000);
+            uint_t maximum_span = 10000,
+            uint_t parallel_threads = 1);
         void inspectExactContiguousBlockBoundaries(
             const SpeciesName& reference_species,
             const std::string& stage,
