@@ -7,7 +7,6 @@
 #include "index.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
-#include "align.h"
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
@@ -125,7 +124,6 @@ struct CommonArgs {
 namespace {
 constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
     "exact_block_merge_enabled";
-constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
 
 // Window detection uses a separate optional config so older restart directories
@@ -466,7 +464,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         "--merge-query-gap-max",
         args.merge_query_gap_max,
         "Allow positive query gaps up to this length during Block merge; "
-        "gap insertions are aligned by /usr/local/bin/minipoa.")
+        "gap insertions are aligned during MAF export.")
         ->default_val(0)
         ->capture_default_str()
         ->group("Graph Optimization")
@@ -1160,14 +1158,6 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     mra.merge_exact_contiguous_blocks_enabled =
         common_args.merge_exact_contiguous_blocks;
     mra.merge_query_gap_max = common_args.merge_query_gap_max;
-    if (mra.merge_query_gap_max > 0) {
-        if (!std::filesystem::exists(MINIPOA_EXECUTABLE)) {
-            throw std::runtime_error(
-                "Query-gap Block merge requires system minipoa at " +
-                std::string(MINIPOA_EXECUTABLE));
-        }
-        configureExternalInsertionMsa(MINIPOA_EXECUTABLE);
-    }
 
     // 计时：star alignment 总耗时
     auto t_start_align = std::chrono::steady_clock::now();
