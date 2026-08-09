@@ -440,6 +440,12 @@ namespace RaMesh {
             const SpeciesName& reference_species,
             uint_t maximum_reference_span = 1000000,
             uint_t maximum_query_gap = 0);
+        size_t realignSingleMissingSpeciesWindows(
+            const SpeciesName& reference_species,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const std::string& msa_executable,
+            uint_t maximum_span = 10000);
         void inspectExactContiguousBlockBoundaries(
             const SpeciesName& reference_species,
             const std::string& stage,

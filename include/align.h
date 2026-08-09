@@ -352,6 +352,10 @@ uint_t mergeAlignmentByRef(
     std::unordered_map<ChrName, std::string>& seqs,
     const std::unordered_map<ChrName, Cigar_t>& cigars);
 
+bool alignSequencesWithExternalMsa(
+    const std::string& executable,
+    std::unordered_map<ChrName, std::string>& sequences);
+
 void configureExternalInsertionMsa(const std::string& executable);
 
 struct InsertInfo {

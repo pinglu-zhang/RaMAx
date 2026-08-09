@@ -77,6 +77,8 @@ struct CommonArgs {
     // ========================
 
     bool detect_windows = false;
+    bool realign_single_missing_species = false;
+    uint_t species_mismatch_realign_max_span = 3000;
     std::string window_detection_mode = "each-round";
     std::filesystem::path window_report_dir = "";
     std::string window_threshold_profile = "alignathon-v1";
@@ -124,6 +126,9 @@ struct CommonArgs {
 namespace {
 constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
     "exact_block_merge_enabled";
+constexpr const char* SINGLE_MISSING_SPECIES_CONFIG_FILE =
+    "single_missing_species_realign_enabled";
+constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
 
 // Window detection uses a separate optional config so older restart directories
@@ -282,6 +287,12 @@ inline void printRunConfiguration(const CommonArgs& args) {
         args.merge_exact_contiguous_blocks ? "Enabled" : "Disabled");
     spdlog::info("  Query-gap merge max   : {}",
         args.merge_query_gap_max);
+    spdlog::info("  Missing-species POA   : {}",
+        args.realign_single_missing_species ? "Enabled" : "Disabled");
+    if (args.realign_single_missing_species) {
+        spdlog::info("  Missing-species span  : {}",
+            args.species_mismatch_realign_max_span);
+    }
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
     if (args.detect_windows) {
@@ -470,6 +481,25 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->group("Graph Optimization")
         ->needs(merge_exact_blocks_flag)
         ->check(CLI::Range(0, 10000));
+
+    auto* realign_missing_species_flag = cmd->add_flag(
+        "--realign-single-missing-species",
+        args.realign_single_missing_species,
+        "In the first round, realign n-(n-1)-n windows with "
+        "/usr/local/bin/minipoa before masking.")
+        ->group("Graph Optimization")
+        ->needs(merge_exact_blocks_flag);
+
+    auto* realign_missing_species_span_opt = cmd->add_option(
+        "--species-mismatch-realign-max-span",
+        args.species_mismatch_realign_max_span,
+        "Maximum per-species interior span for single-missing-species "
+        "realignment.")
+        ->default_val(3000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->needs(realign_missing_species_flag)
+        ->check(CLI::Range(1, 3000));
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -799,6 +829,25 @@ static int runRestartMode(CommonArgs& common_args) {
         }
         spdlog::info("Exact Block merge restart marker loaded.");
     }
+
+    const FilePath missing_species_config_path =
+        common_args.work_dir_path /
+        SINGLE_MISSING_SPECIES_CONFIG_FILE;
+    common_args.realign_single_missing_species =
+        std::filesystem::exists(missing_species_config_path);
+    if (common_args.realign_single_missing_species) {
+        std::ifstream missing_species_input(
+            missing_species_config_path);
+        uint64_t stored_max_span = 3000;
+        if (missing_species_input &&
+            (missing_species_input >> stored_max_span)) {
+            common_args.species_mismatch_realign_max_span =
+                static_cast<uint_t>(std::clamp<uint64_t>(
+                    stored_max_span, 1, 3000));
+        }
+        spdlog::info(
+            "Single-missing-species restart marker loaded.");
+    }
     spdlog::info("CommonArgs loaded from {}", config_path.string());
 
     const FilePath window_config_path =
@@ -916,6 +965,25 @@ static int runNormalMode(CommonArgs& common_args) {
         spdlog::info("Exact Block merge restart marker saved to {}",
                      merge_config_path.string());
     }
+    if (common_args.realign_single_missing_species) {
+        const FilePath missing_species_config_path =
+            common_args.work_dir_path /
+            SINGLE_MISSING_SPECIES_CONFIG_FILE;
+        std::ofstream missing_species_output(
+            missing_species_config_path);
+        if (!missing_species_output) {
+            throw std::runtime_error(
+                "Failed to save single-missing-species restart marker: " +
+                missing_species_config_path.string());
+        }
+        missing_species_output
+            << common_args.species_mismatch_realign_max_span
+            << '\n';
+        spdlog::info(
+            "Single-missing-species restart marker saved to {}",
+            missing_species_config_path.string());
+    }
+
 
     return 0;
 }
@@ -1160,6 +1228,19 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     mra.merge_query_gap_max = common_args.merge_query_gap_max;
 
     // 计时：star alignment 总耗时
+    mra.realign_single_missing_species_enabled =
+        common_args.realign_single_missing_species;
+    mra.species_mismatch_realign_max_span =
+        common_args.species_mismatch_realign_max_span;
+    mra.species_mismatch_msa_executable =
+        MINIPOA_EXECUTABLE;
+    if (mra.realign_single_missing_species_enabled &&
+        !std::filesystem::exists(
+            mra.species_mismatch_msa_executable)) {
+        throw std::runtime_error(
+            "Single-missing-species realignment requires minipoa at " +
+            mra.species_mismatch_msa_executable);
+    }
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）

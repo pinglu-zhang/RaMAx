@@ -63,9 +63,10 @@ public:
     }
 };
 
-bool runExternalInsertionMsa(
+bool runExternalMsa(
+    const std::string& executable,
     std::unordered_map<ChrName, std::string>& sequences) {
-    if (external_insertion_msa_executable.empty() ||
+    if (executable.empty() ||
         sequences.size() < 2) {
         return false;
     }
@@ -105,20 +106,20 @@ bool runExternalInsertionMsa(
     }
 
     const std::string command =
-        shellQuote(external_insertion_msa_executable) +
+        shellQuote(executable) +
         " -r 1 -t 1 " + shellQuote(temporary.input.string()) +
         " > " + shellQuote(temporary.output.string());
     if (std::system(command.c_str()) != 0) {
         spdlog::warn(
-            "[external-msa] command failed; falling back to KSW2: {}",
-            external_insertion_msa_executable);
+            "[external-msa] command failed: {}",
+            executable);
         return false;
     }
 
     std::ifstream output(temporary.output, std::ios::binary);
     if (!output) {
         spdlog::warn(
-            "[external-msa] output is unavailable; falling back to KSW2");
+            "[external-msa] output is unavailable");
         return false;
     }
 
@@ -135,7 +136,7 @@ bool runExternalInsertionMsa(
             if (current_id.empty() ||
                 !aligned_by_id.emplace(current_id, std::string{}).second) {
                 spdlog::warn(
-                    "[external-msa] invalid FASTA header; falling back to KSW2");
+                    "[external-msa] invalid FASTA header");
                 return false;
             }
             continue;
@@ -145,8 +146,7 @@ bool runExternalInsertionMsa(
                 continue;
             }
             spdlog::warn(
-                "[external-msa] sequence before FASTA header; "
-                "falling back to KSW2");
+                "[external-msa] sequence before FASTA header");
             return false;
         }
         for (const unsigned char c : line) {
@@ -155,6 +155,11 @@ bool runExternalInsertionMsa(
                     static_cast<char>(c));
             }
         }
+    }
+
+    if (aligned_by_id.size() != keys.size()) {
+        spdlog::warn("[external-msa] output row count mismatch");
+        return false;
     }
 
     size_t aligned_length = 0;
@@ -166,16 +171,14 @@ bool runExternalInsertionMsa(
             ungappedUpper(aligned_it->second) !=
                 ungappedUpper(sequences.at(keys[index]))) {
             spdlog::warn(
-                "[external-msa] output sequence validation failed; "
-                "falling back to KSW2");
+                "[external-msa] output sequence validation failed");
             return false;
         }
         if (index == 0) {
             aligned_length = aligned_it->second.size();
         } else if (aligned_it->second.size() != aligned_length) {
             spdlog::warn(
-                "[external-msa] output rows have unequal lengths; "
-                "falling back to KSW2");
+                "[external-msa] output rows have unequal lengths");
             return false;
         }
         aligned[index] = aligned_it->second;
@@ -189,13 +192,19 @@ bool runExternalInsertionMsa(
         external_msa_completed.fetch_add(1, std::memory_order_relaxed) + 1;
     if (completed % 1000 == 0) {
         spdlog::info(
-            "[external-msa] completed {} insertion MSAs with {}",
-            completed, external_insertion_msa_executable);
+            "[external-msa] completed {} MSAs with {}",
+            completed, executable);
     }
     return true;
 }
 
 }  // namespace
+
+bool alignSequencesWithExternalMsa(
+    const std::string& executable,
+    std::unordered_map<ChrName, std::string>& sequences) {
+    return runExternalMsa(executable, sequences);
+}
 
 void configureExternalInsertionMsa(const std::string& executable) {
     external_insertion_msa_executable = executable;
@@ -218,7 +227,8 @@ void InsertInfo::alignSeqs() {
         return;
     }
 
-    if (runExternalInsertionMsa(seqs)) {
+    if (runExternalMsa(
+            external_insertion_msa_executable, seqs)) {
         ref_name = seqs.begin()->first;
         total_length = seqs.begin()->second.size();
         aligned = true;

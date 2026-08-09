@@ -35,6 +35,10 @@ public:
     RaMesh::WindowDetection::Options window_detection_options;
     bool merge_exact_contiguous_blocks_enabled = false;
     uint_t merge_query_gap_max = 0;
+    bool realign_single_missing_species_enabled = false;
+    uint_t species_mismatch_realign_max_span = 3000;
+    std::string species_mismatch_msa_executable =
+        "/usr/local/bin/minipoa";
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(
@@ -139,5 +143,4 @@ public:
 
 
 #endif
-
 
