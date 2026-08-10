@@ -988,7 +988,8 @@ starAlignment(
                     current_ref_name, seqpro_managers,
                     species_mismatch_msa_executable,
                     species_mismatch_realign_max_span,
-                    thread_num);
+                    thread_num,
+                    species_mismatch_zero_gap_max_span);
             size_t eliminated_after_realign = 0;
             if (replaced_windows > 0) {
                 eliminated_after_realign =

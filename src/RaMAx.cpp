@@ -79,6 +79,7 @@ struct CommonArgs {
     bool detect_windows = false;
     bool realign_single_missing_species = false;
     uint_t species_mismatch_realign_max_span = 3000;
+    uint_t species_mismatch_zero_gap_max_span = 200;
     std::string window_detection_mode = "each-round";
     std::filesystem::path window_report_dir = "";
     std::string window_threshold_profile = "alignathon-v1";
@@ -292,6 +293,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
     if (args.realign_single_missing_species) {
         spdlog::info("  Missing-species span  : {}",
             args.species_mismatch_realign_max_span);
+        spdlog::info("  Zero-gap merge span   : {}",
+            args.species_mismatch_zero_gap_max_span);
     }
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
@@ -496,6 +499,17 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         "Maximum per-species interior span for single-missing-species "
         "realignment.")
         ->default_val(3000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->needs(realign_missing_species_flag)
+        ->check(CLI::Range(1, 3000));
+
+    auto* zero_gap_merge_span_opt = cmd->add_option(
+        "--species-mismatch-zero-gap-max-span",
+        args.species_mismatch_zero_gap_max_span,
+        "Maximum non-missing-species span for deletion-aware merging "
+        "when the missing species has a zero-length interval.")
+        ->default_val(200)
         ->capture_default_str()
         ->group("Graph Optimization")
         ->needs(realign_missing_species_flag)
@@ -839,11 +853,17 @@ static int runRestartMode(CommonArgs& common_args) {
         std::ifstream missing_species_input(
             missing_species_config_path);
         uint64_t stored_max_span = 3000;
+        uint64_t stored_zero_gap_max_span = 200;
         if (missing_species_input &&
             (missing_species_input >> stored_max_span)) {
             common_args.species_mismatch_realign_max_span =
                 static_cast<uint_t>(std::clamp<uint64_t>(
                     stored_max_span, 1, 3000));
+            if (missing_species_input >> stored_zero_gap_max_span) {
+                common_args.species_mismatch_zero_gap_max_span =
+                    static_cast<uint_t>(std::clamp<uint64_t>(
+                        stored_zero_gap_max_span, 1, 3000));
+            }
         }
         spdlog::info(
             "Single-missing-species restart marker loaded.");
@@ -978,6 +998,8 @@ static int runNormalMode(CommonArgs& common_args) {
         }
         missing_species_output
             << common_args.species_mismatch_realign_max_span
+            << ' '
+            << common_args.species_mismatch_zero_gap_max_span
             << '\n';
         spdlog::info(
             "Single-missing-species restart marker saved to {}",
@@ -1232,6 +1254,8 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.realign_single_missing_species;
     mra.species_mismatch_realign_max_span =
         common_args.species_mismatch_realign_max_span;
+    mra.species_mismatch_zero_gap_max_span =
+        common_args.species_mismatch_zero_gap_max_span;
     mra.species_mismatch_msa_executable =
         MINIPOA_EXECUTABLE;
     if (mra.realign_single_missing_species_enabled &&

@@ -260,4 +260,12 @@ if(RAMAX_BUILD_TESTS)
     configure_rama_target(ramax_window_detector_test)
     add_dependencies(ramax_window_detector_test hal_library)
     add_test(NAME ramax_window_detector COMMAND ramax_window_detector_test)
+
+    add_executable(ramax_zero_gap_missing_species_merge_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp"
+        ${RAMA_COMMON_SOURCES})
+    configure_rama_target(ramax_zero_gap_missing_species_merge_test)
+    add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
+    add_test(NAME ramax_zero_gap_missing_species_merge
+        COMMAND ramax_zero_gap_missing_species_merge_test)
 endif()
