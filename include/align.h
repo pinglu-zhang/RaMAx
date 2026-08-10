@@ -352,34 +352,19 @@ uint_t mergeAlignmentByRef(
     std::unordered_map<ChrName, std::string>& seqs,
     const std::unordered_map<ChrName, Cigar_t>& cigars);
 
+bool alignSequencesWithExternalMsa(
+    const std::string& executable,
+    std::unordered_map<ChrName, std::string>& sequences);
+
+void configureExternalInsertionMsa(const std::string& executable);
+
 struct InsertInfo {
     bool aligned = false;
     uint_t total_length = 0;
 	ChrName ref_name = ""; // 参考序列名称
     std::unordered_map<ChrName, std::string> seqs = {}; // key -> CIGAR (query 侧)
 
-    void alignSeqs() {
-		if (aligned) return; // 已经对齐过了
-		if (seqs.empty()) return; // 没有序列可对齐
-
-        size_t max_len = 0;
-        ChrName longest_key;
-        for (const auto& [key, s] : seqs) {
-            if (s.size() > max_len) {
-                max_len = s.size();
-                longest_key = key;
-            }
-        }
-        ref_name = longest_key;
-
-        std::unordered_map<ChrName, Cigar_t> cigars;
-        for (const auto& [key, s] : seqs) {
-			if (key == ref_name) continue;
-			cigars[key] = globalAlignKSW2(seqs[ref_name], s);
-        }
-        total_length = mergeAlignmentByRef(ref_name, seqs, cigars);
-        aligned = true;
-    }
+    void alignSeqs();
 };
 
 using RefAlignInfo = std::map<uint_t, InsertInfo>;

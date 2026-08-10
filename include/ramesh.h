@@ -17,6 +17,7 @@
 
 #include "config.hpp"
 #include "anchor.h"
+#include "softmask_index.h"
 
 // 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
 class NewickParser;
@@ -435,6 +436,23 @@ namespace RaMesh {
         void safeLink(SegPtr prev, SegPtr next);
 
         void mergeMultipleGraphs(const SpeciesName& ref_name, uint_t thread_num);
+        size_t mergeExactContiguousBlocks(
+            const SpeciesName& reference_species,
+            uint_t maximum_reference_span = 1000000,
+            uint_t maximum_query_gap = 0);
+        size_t realignSingleMissingSpeciesWindows(
+            const SpeciesName& reference_species,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const std::string& msa_executable,
+            uint_t maximum_span = 10000,
+            uint_t parallel_threads = 1,
+            uint_t zero_gap_maximum_span = 200);
+        void inspectExactContiguousBlockBoundaries(
+            const SpeciesName& reference_species,
+            const std::string& stage,
+            uint_t maximum_reference_span = 1000000) const;
+
 
         std::unordered_map<SpeciesName, RaMeshGenomeGraph> species_graphs; // guard: rw
         std::vector<WeakBlock>                             blocks;         // guard: rw
@@ -450,14 +468,16 @@ namespace RaMesh {
                         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                         const std::string& newick_tree = "",
                         bool only_primary = true,
-                        const std::string& root_name = "root") const;
+                        const std::string& root_name = "root",
+                        const SoftMask::PathMap& softmask_paths = {}) const;
 
         // 重载：直接复用已解析的 NewickParser，避免重复读取导致子树选择失效
         void exportToHal(const FilePath& hal_path,
                         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                         const NewickParser& parser,
                         bool only_primary = true,
-                        const std::string& root_name = "root") const;
+                        const std::string& root_name = "root",
+                        const SoftMask::PathMap& softmask_paths = {}) const;
 
         
         // ――― high-performance deletion methods ―――

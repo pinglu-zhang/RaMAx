@@ -17,6 +17,7 @@
 
 #include "ramesh.h"
 #include "SeqPro.h"
+#include "softmask_index.h"
 #include "data_process.h"  // 使用现有的NewickParser
 
 // 前向声明
@@ -186,6 +187,7 @@ namespace hal_converter {
         const std::vector<AncestorNode>& ancestor_nodes,
         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
         const std::vector<std::pair<std::string, std::string>>& reconstruction_plan,
+        const SoftMask::IndexMap& softmask_indexes,
         hal::AlignmentPtr alignment = nullptr);
 
     // ========================================
@@ -201,7 +203,8 @@ namespace hal_converter {
     std::pair<std::unordered_map<std::string, std::string>, std::unordered_map<ChrName, Cigar_t>>
     extractSequencesAndCigarsFromBlock(
         BlockPtr block,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers);
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap* softmask_indexes = nullptr);
 
     /**
      * 按列投票重建祖先序列
@@ -223,7 +226,8 @@ namespace hal_converter {
     std::string reconstructSegmentByVoting(
         const AncestorSegmentInfo& segment,
         const AncestorNode& ancestor,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers);
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes);
 
     /**
      * 使用投票法构建完整的祖先序列，同时创建祖先segment并加入到对应的block中
@@ -237,6 +241,7 @@ namespace hal_converter {
         const AncestorReconstructionData& data,
         const AncestorNode& ancestor,
         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes,
         const std::string& chr_name);
 
     /**
@@ -289,7 +294,8 @@ namespace hal_converter {
      */
     void setupLeafGenomesWithRealDNA(
         hal::AlignmentPtr alignment,
-        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers);
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        const SoftMask::IndexMap& softmask_indexes);
 
 
 

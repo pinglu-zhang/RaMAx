@@ -971,6 +971,56 @@ starAlignment(
         // 合并后再优化一次
         multi_graph->optimizeGraphStructure();
         spdlog::info("optimize graph genome graphs for {} done", current_ref_name);
+        if (merge_exact_contiguous_blocks_enabled) {
+            const size_t eliminated_boundaries =
+                multi_graph->mergeExactContiguousBlocks(
+                    current_ref_name, 1000000, merge_query_gap_max);
+            spdlog::info(
+                "[exact-block-merge] round={} reference={} optimization "
+                "completed: eliminated_boundaries={} max_query_gap={}",
+                i + 1, current_ref_name, eliminated_boundaries,
+                merge_query_gap_max);
+        }
+        if (i == 0 &&
+            realign_single_missing_species_enabled) {
+            const size_t replaced_windows =
+                multi_graph->realignSingleMissingSpeciesWindows(
+                    current_ref_name, seqpro_managers,
+                    species_mismatch_msa_executable,
+                    species_mismatch_realign_max_span,
+                    thread_num,
+                    species_mismatch_zero_gap_max_span);
+            size_t eliminated_after_realign = 0;
+            if (replaced_windows > 0) {
+                eliminated_after_realign =
+                    multi_graph->mergeExactContiguousBlocks(
+                        current_ref_name, 1000000,
+                        merge_query_gap_max);
+            }
+            spdlog::info(
+                "[species-mismatch-realign] round={} reference={} "
+                "replaced_windows={} post_realign_eliminated_boundaries={}",
+                i + 1, current_ref_name, replaced_windows,
+                eliminated_after_realign);
+        }
+
+        // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于
+        // markAllExtended() 和本轮 addAlignedRegionsAsMask() 之前，避免检测逻辑
+        // 改变现有图或遮蔽流程。
+        const bool detect_this_round =
+            window_detection_options.enabled &&
+            (window_detection_options.mode ==
+                 RaMesh::WindowDetection::DetectionMode::EACH_ROUND ||
+             i + 1 == round);
+        if (detect_this_round) {
+            spdlog::info(
+                "[window-detection] Snapshotting merged graph for round {} "
+                "with reference {}",
+                i, current_ref_name);
+            RaMesh::WindowDetection::detectAndWriteProblemWindows(
+                *multi_graph, seqpro_managers, i, current_ref_name,
+                window_detection_options);
+        }
 
         // 标记所有节点已扩展
         multi_graph->markAllExtended();
@@ -999,6 +1049,14 @@ starAlignment(
         FilePath mask_export_dir = work_dir / "mask_interval" / std::to_string(i);
         exportMaskIntervalsToDirectory(mask_export_dir, seqpro_managers);
         processed_reference_species.insert(current_ref_name);
+    }
+
+    if (merge_exact_contiguous_blocks_enabled && !reference_order.empty()) {
+        for (uint_t reference_index = 0; reference_index < round;
+             ++reference_index) {
+            multi_graph->inspectExactContiguousBlockBoundaries(
+                reference_order[reference_index], "final-graph-post-alignment");
+        }
     }
 
     // 所有轮次完成后，flush logger

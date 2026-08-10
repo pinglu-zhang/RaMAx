@@ -282,6 +282,66 @@ bool cleanRawDataset(const FilePath workdir_path,
 }
 
 // -----------------------------
+// HAL-only cleaning: alignment input remains uppercase, while original
+// lowercase runs are stored in a compact sidecar that is not opened until
+// HAL export.
+// -----------------------------
+bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
+    SpeciesPathMap& species_path_map,
+    SoftMask::PathMap& softmask_path_map,
+    int thread_num) {
+    try {
+        const FilePath clean_data_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
+        std::filesystem::create_directories(clean_data_dir);
+        spdlog::info("HAL soft-mask preprocessing directory: {}", clean_data_dir.string());
+
+        struct CleanResult {
+            SpeciesName species;
+            FilePath fasta;
+            FilePath index;
+        };
+
+        ThreadPool pool(std::max(1, thread_num));
+        std::vector<std::future<CleanResult>> futures;
+        futures.reserve(species_path_map.size());
+
+        for (const auto& [species, raw_path] : species_path_map) {
+            futures.emplace_back(pool.enqueue([species, raw_path, clean_data_dir]() -> CleanResult {
+                const FilePath out_fasta = clean_data_dir / (species + ".align-v2.fasta");
+                const FilePath out_index = clean_data_dir / (species + ".softmask-v1.bin");
+                const FilePath marker = clean_data_dir / (species + ".softmask-v1.complete.json");
+
+                SoftMask::ensureUppercaseFastaAndIndex(raw_path, out_fasta, out_index, marker);
+                return {species, out_fasta, out_index};
+            }));
+        }
+
+        // Publish maps only after each task has completed successfully. This
+        // avoids concurrent writes to unordered_map/map and propagates worker
+        // exceptions instead of silently swallowing them.
+        for (auto& future : futures) {
+            CleanResult result = future.get();
+            species_path_map[result.species] = result.fasta;
+            softmask_path_map[result.species] = result.index;
+            spdlog::info("Species {} alignment FASTA: {}; HAL soft-mask index: {}",
+                result.species, result.fasta.string(), result.index.string());
+        }
+        pool.waitAllTasksDone();
+
+        if (softmask_path_map.size() != species_path_map.size()) {
+            throw std::runtime_error("Not every species received a HAL soft-mask index");
+        }
+        spdlog::info("All uppercase alignment FASTAs and HAL soft-mask indexes are ready.");
+        return true;
+    }
+    catch (const std::exception& error) {
+        spdlog::error("Error during HAL soft-mask preprocessing: {}", error.what());
+        throw std::runtime_error("Failed to prepare uppercase FASTA and HAL soft-mask index: " +
+            std::string(error.what()));
+    }
+}
+
+// -----------------------------
 // 运行 WindowMasker 对 FASTA 文件进行处理
 // -----------------------------
 std::map<SpeciesName, FilePath>

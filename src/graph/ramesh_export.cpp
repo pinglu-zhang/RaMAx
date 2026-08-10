@@ -21,6 +21,22 @@
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现
 // ============================================================
+static bool isMafReferenceCompatibleCigar(
+    const Cigar_t& cigar,
+    size_t sequence_length) {
+    size_t consumed = 0;
+    for (const auto unit : cigar) {
+        uint32_t length = 0;
+        char operation = '\0';
+        intToCigar(unit, operation, length);
+        if (operation != 'M' && operation != '=' && operation != 'X') {
+            return false;
+        }
+        consumed += length;
+    }
+    return consumed == sequence_length;
+}
+
 static bool emitMafBlock(std::ostream& os,
     const RaMesh::BlockPtr& blk,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs,
@@ -44,13 +60,38 @@ static bool emitMafBlock(std::ostream& os,
     }
     if (recs.size() < 2 || (!allow_reverse && have_reverse)) return false;
 
-    // ---------- 2. 决定首行 ----------
+    // ---------- 2. 选择对齐参考并决定首行 ----------
+    // ref_chr does not identify a species.  When several genomes use the
+    // same chromosome name, unordered anchor iteration must not choose a
+    // deletion-only hybrid row as the reference backbone.
+    auto alignment_ref = std::find_if(
+        recs.begin(), recs.end(), [&](const Rec& record) {
+            return record.chr == blk->ref_chr &&
+                isMafReferenceCompatibleCigar(
+                    record.seg->cigar, record.seg->length);
+        });
+    if (alignment_ref == recs.end()) {
+        alignment_ref = std::find_if(
+            recs.begin(), recs.end(),
+            [&](const Rec& record) {
+                return record.chr == blk->ref_chr;
+            });
+    }
+    if (alignment_ref == recs.end()) {
+        alignment_ref = recs.begin();
+    }
+    const SpeciesName alignment_ref_species = alignment_ref->sp;
+    const ChrName alignment_ref_chr = alignment_ref->chr;
+
     if (first_sp) {
         auto it_first = std::find_if(recs.begin(), recs.end(),
             [&](auto& r) { return r.sp == *first_sp; });
         if (it_first == recs.end()) {
             auto it_ref = std::find_if(recs.begin(), recs.end(),
-                [&](auto& r) { return r.chr == blk->ref_chr; });
+                [&](auto& r) {
+                    return r.sp == alignment_ref_species &&
+                        r.chr == alignment_ref_chr;
+                });
             if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
         }
         else {
@@ -60,7 +101,10 @@ static bool emitMafBlock(std::ostream& os,
     }
     else {
         auto it_ref = std::find_if(recs.begin(), recs.end(),
-            [&](auto& r) { return r.chr == blk->ref_chr; });
+            [&](auto& r) {
+                return r.sp == alignment_ref_species &&
+                    r.chr == alignment_ref_chr;
+            });
         if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
     }
 
@@ -103,15 +147,9 @@ static bool emitMafBlock(std::ostream& os,
     if (seqs.empty()) return false;
 
     // ---------- 5. 归并对齐 ----------
-    ChrName ref_key = blk->ref_chr;
-    if (pairwise_mode) {
-        ref_key = blk->ref_chr;
-    }
-    else {
-        auto& rr = *std::find_if(recs.begin(), recs.end(),
-            [&](auto& r) { return r.chr == blk->ref_chr; });
-        ref_key = rr.sp + "." + rr.chr;
-    }
+    const ChrName ref_key = pairwise_mode
+        ? alignment_ref_chr
+        : alignment_ref_species + "." + alignment_ref_chr;
     try {
         mergeAlignmentByRef(ref_key, seqs, cigars);
     }
@@ -209,7 +247,8 @@ namespace RaMesh {
                                             const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                                             const std::string& newick_tree,
                                             bool only_primary,
-                                            const std::string& root_name) const
+                                            const std::string& root_name,
+                                            const SoftMask::PathMap& softmask_paths) const
     {
         auto __now = []() { return std::chrono::steady_clock::now(); };
         auto __ms = [](auto a, auto b) { return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
@@ -225,6 +264,19 @@ namespace RaMesh {
         if (seqpro_managers.empty()) {
             throw std::runtime_error("No sequence managers provided for HAL export");
         }
+
+        if (softmask_paths.size() != seqpro_managers.size()) {
+            throw std::runtime_error("HAL export requires one soft-mask index per leaf genome");
+        }
+        for (const auto& [species, unused_manager] : seqpro_managers) {
+            (void)unused_manager;
+            if (!softmask_paths.contains(species)) {
+                throw std::runtime_error("Missing HAL soft-mask index for species: " + species);
+            }
+        }
+        // Sidecars are deliberately opened only after alignment has completed
+        // and HAL export has begun.
+        const SoftMask::IndexMap softmask_indexes = SoftMask::loadIndexes(softmask_paths);
 
         if (blocks.empty()) {
             spdlog::warn("No alignment blocks found - creating HAL with genomes only");
@@ -305,7 +357,8 @@ namespace RaMesh {
                 spdlog::info("  Created genomes from phylogeny (topology only)");
                 // 为所有叶基因组设置真实维度与DNA
                 auto __t13a_start = __now();
-                hal_converter::setupLeafGenomesWithRealDNA(alignment, seqpro_managers);
+                hal_converter::setupLeafGenomesWithRealDNA(
+                    alignment, seqpro_managers, softmask_indexes);
                 spdlog::info("  Set up leaf genomes with real DNA");
                 auto __t13_end = __now();
                 spdlog::debug("  Phase 1.3 (create topology) took {} ms; leaves DNA took {} ms",
@@ -364,7 +417,8 @@ namespace RaMesh {
                 spdlog::info("  Phase 2.3: Building ancestor sequences using voting method...");
 
                 ancestor_sequences = hal_converter::buildAllAncestorSequencesByVoting(
-                    ancestor_reconstruction_data, ancestor_nodes, seqpro_managers, reconstruction_plan, alignment);
+                    ancestor_reconstruction_data, ancestor_nodes, seqpro_managers,
+                    reconstruction_plan, softmask_indexes, alignment);
                 auto __t23_end = __now();
                 spdlog::debug("  Phase 2.3 completed successfully ({} ms)", __ms(__t23_start, __t23_end));
 
@@ -458,13 +512,15 @@ namespace RaMesh {
                                             const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
                                             const NewickParser& parser,
                                             bool only_primary,
-                                            const std::string& root_name) const
+                                            const std::string& root_name,
+                                            const SoftMask::PathMap& softmask_paths) const
     {
         // 通过重建 Newick 字符串委托给字符串版本，避免重复读取原始文件，保留子树裁剪
         std::string rebuilt_newick = hal_converter::reconstructNewickFromParser(parser);
         if (rebuilt_newick.empty()) {
             throw std::runtime_error("exportToHal: reconstructed Newick from parser is empty");
         }
-        exportToHal(hal_path, seqpro_managers, rebuilt_newick, only_primary, root_name);
+        exportToHal(hal_path, seqpro_managers, rebuilt_newick, only_primary,
+                    root_name, softmask_paths);
     }
 } // namespace RaMesh

@@ -17,6 +17,7 @@
 #include <limits>
 #include <unordered_map>
 #include <cstdint>
+#include "softmask_index.h"
 
 class FastaManager;
 // 初始化 kseq 使用 gzFile 类型
@@ -383,6 +384,13 @@ bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map, 
 
 // 清洗原始数据集，并更新路径映射
 bool cleanRawDataset(const FilePath workdir_path, SpeciesPathMap& species_path_map, int thread_num);
+
+// HAL-only preprocessing: keep the existing all-uppercase alignment FASTA and
+// record original lowercase runs in a separate export-only sidecar.
+bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
+    SpeciesPathMap& species_path_map,
+    SoftMask::PathMap& softmask_path_map,
+    int thread_num);
 
 // 运行 WindowMasker 生成重复区域的 interval 文件
 std::map<SpeciesName, FilePath> repeatSeqMasking(const FilePath workdir_path, const SpeciesPathMap& species_path_map, int thread_num);
