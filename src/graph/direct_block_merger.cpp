@@ -967,6 +967,8 @@ enum class MissingWindowReject : size_t {
     ANCHOR_MISMATCH,
     PATH_MISMATCH,
     INTERVAL_INVALID,
+    ANCHOR_ORDER_MISMATCH,
+    MIXED_ZERO_NONZERO_INTERVAL,
     ZERO_GAP_SPAN_EXCEEDED,
     ZERO_GAP_NOT_EXACT_CONTIGUOUS,
     ZERO_GAP_PREPARATION_INVALID,
@@ -989,6 +991,10 @@ const char* missingWindowRejectName(MissingWindowReject reason) {
             return "path_mismatch";
         case MissingWindowReject::INTERVAL_INVALID:
             return "interval_invalid";
+        case MissingWindowReject::ANCHOR_ORDER_MISMATCH:
+            return "anchor_order_mismatch";
+        case MissingWindowReject::MIXED_ZERO_NONZERO_INTERVAL:
+            return "mixed_zero_nonzero_interval";
         case MissingWindowReject::ZERO_GAP_SPAN_EXCEEDED:
             return "zero_gap_span_exceeded";
         case MissingWindowReject::ZERO_GAP_NOT_EXACT_CONTIGUOUS:
@@ -1012,7 +1018,7 @@ const char* missingWindowRejectName(MissingWindowReject reason) {
 struct MissingWindowPathContext {
     SpeciesChrPair key;
     SegPtr left_anchor;
-    SegPtr middle_segment;
+    std::vector<SegPtr> interior_segments;
     SegPtr right_anchor;
     uint_t interval_start = 0;
     uint_t interval_length = 0;
@@ -1021,13 +1027,47 @@ struct MissingWindowPathContext {
 
 struct MissingWindowCandidate {
     BlockView left;
-    BlockView middle;
+    std::vector<BlockView> interiors;
     BlockView right;
-    SpeciesName missing_species;
+    std::set<SpeciesName> missing_species;
     ChrName reference_chromosome;
     std::vector<MissingWindowPathContext> paths;
+    std::string participant_pattern;
     bool zero_gap_deletion = false;
 };
+
+bool buildRealignBlockView(const BlockPtr& block,
+                           const SpeciesName& reference_species,
+                           BlockView& view) {
+    if (!block) {
+        return false;
+    }
+    view = BlockView{};
+    view.block = block;
+    std::set<SpeciesName> species;
+    std::shared_lock block_lock(block->rw);
+    if (block->ref_chr.empty() || block->anchors.empty()) {
+        return false;
+    }
+    view.declared_reference_chromosome = block->ref_chr;
+    for (const auto& [key, segment] : block->anchors) {
+        if (!segment || !segment->isSegment() || !segment->isPrimary() ||
+            segment->length == 0 || segment->parent_block.get() != block.get() ||
+            !species.insert(key.first).second) {
+            return false;
+        }
+        view.anchors.emplace(key, segment);
+    }
+    const SpeciesChrPair reference_key{reference_species, block->ref_chr};
+    const auto reference_it = view.anchors.find(reference_key);
+    if (reference_it == view.anchors.end() ||
+        reference_it->second->strand != Strand::FORWARD) {
+        return false;
+    }
+    view.reference_segment = reference_it->second;
+    view.species_count = species.size();
+    return true;
+}
 
 bool participantSpeciesAreSubset(const BlockView& subset,
                                  const BlockView& superset) {
@@ -1042,55 +1082,56 @@ bool participantSpeciesAreSubset(const BlockView& subset,
 
 MissingWindowReject buildMissingWindowCandidate(
     const BlockPtr& left_block,
-    const BlockPtr& middle_block,
+    const std::vector<BlockPtr>& interior_blocks,
     const BlockPtr& right_block,
     const SpeciesName& reference_species,
     const ChrName& reference_chromosome,
     size_t expected_species_count,
     uint_t maximum_span,
     uint_t zero_gap_maximum_span,
+    bool zero_gap_phase,
     MissingWindowCandidate& candidate) {
     candidate = MissingWindowCandidate{};
     if (!buildBlockView(left_block, reference_species, candidate.left) ||
-        !buildBlockView(middle_block, reference_species, candidate.middle) ||
-        !buildBlockView(right_block, reference_species, candidate.right)) {
+        !buildBlockView(right_block, reference_species, candidate.right) ||
+        interior_blocks.empty()) {
         return MissingWindowReject::INVALID_BLOCK;
     }
+    candidate.interiors.reserve(interior_blocks.size());
+    for (const auto& block : interior_blocks) {
+        BlockView view;
+        if (!buildRealignBlockView(block, reference_species, view)) {
+            return MissingWindowReject::INVALID_BLOCK;
+        }
+        candidate.interiors.push_back(std::move(view));
+    }
     if (candidate.left.declared_reference_chromosome !=
-            reference_chromosome ||
-        candidate.middle.declared_reference_chromosome !=
             reference_chromosome ||
         candidate.right.declared_reference_chromosome !=
             reference_chromosome ||
         candidate.left.species_count != expected_species_count ||
         candidate.right.species_count != expected_species_count ||
-        candidate.middle.species_count + 1 != expected_species_count ||
-        !sameAnchorKeys(candidate.left, candidate.right) ||
-        !participantSpeciesAreSubset(
-            candidate.middle, candidate.left)) {
+        !sameAnchorKeys(candidate.left, candidate.right)) {
         return MissingWindowReject::PARTICIPANT_PATTERN;
     }
-
-    std::optional<SpeciesName> missing_species;
-    for (const auto& [key, unused] : candidate.left.anchors) {
-        (void)unused;
-        if (candidate.middle.anchors.find(key) ==
-            candidate.middle.anchors.end()) {
-            if (missing_species.has_value()) {
-                return MissingWindowReject::PARTICIPANT_PATTERN;
-            }
-            missing_species = key.first;
+    if (zero_gap_phase && candidate.interiors.size() != 1) {
+        return MissingWindowReject::PARTICIPANT_PATTERN;
+    }
+    candidate.participant_pattern =
+        std::to_string(expected_species_count);
+    for (const auto& interior : candidate.interiors) {
+        if (interior.declared_reference_chromosome != reference_chromosome ||
+            interior.species_count >= expected_species_count ||
+            !participantSpeciesAreSubset(interior, candidate.left)) {
+            return MissingWindowReject::PARTICIPANT_PATTERN;
         }
+        candidate.participant_pattern +=
+            "-" + std::to_string(interior.species_count);
     }
-    if (!missing_species.has_value()) {
-        return MissingWindowReject::PARTICIPANT_PATTERN;
-    }
-
-    candidate.missing_species = *missing_species;
+    candidate.participant_pattern +=
+        "-" + std::to_string(expected_species_count);
     candidate.reference_chromosome = reference_chromosome;
     candidate.paths.reserve(expected_species_count);
-    int64_t missing_interval_length =
-        std::numeric_limits<int64_t>::min();
 
     for (const auto& [key, left_segment] : candidate.left.anchors) {
         const auto right_it = candidate.right.anchors.find(key);
@@ -1102,15 +1143,13 @@ MissingWindowReject buildMissingWindowCandidate(
         const auto& right_segment = right_it->second;
         const int64_t interval_length =
             segmentGapInReferenceOrder(left_segment, right_segment);
-        if (interval_length < 0 ||
-            static_cast<uint64_t>(interval_length) >
-                std::numeric_limits<uint_t>::max()) {
+        if (interval_length < 0) {
+            return MissingWindowReject::ANCHOR_ORDER_MISMATCH;
+        }
+        if (static_cast<uint64_t>(interval_length) >
+            std::numeric_limits<uint_t>::max()) {
             return MissingWindowReject::INTERVAL_INVALID;
         }
-        if (key.first == candidate.missing_species) {
-            missing_interval_length = interval_length;
-        }
-
         MissingWindowPathContext path;
         path.key = key;
         path.left_anchor = left_segment;
@@ -1123,51 +1162,58 @@ MissingWindowReject buildMissingWindowCandidate(
                 ? static_cast<uint_t>(segmentEnd(left_segment))
                 : static_cast<uint_t>(segmentEnd(right_segment));
 
-        const auto middle_it = candidate.middle.anchors.find(key);
-        if (middle_it == candidate.middle.anchors.end()) {
-            if (key.first != candidate.missing_species ||
-                !segmentPathsAreDirectlyAdjacent(
-                    left_segment, right_segment)) {
+        SegPtr previous = left_segment;
+        for (const auto& interior : candidate.interiors) {
+            const auto interior_it = interior.anchors.find(key);
+            if (interior_it == interior.anchors.end()) {
+                candidate.missing_species.insert(key.first);
+                continue;
+            }
+            const auto& segment = interior_it->second;
+            if (!segment || segment->strand != path.strand ||
+                segmentGapInReferenceOrder(previous, segment) < 0 ||
+                !segmentPathsAreDirectlyAdjacent(previous, segment)) {
                 return MissingWindowReject::PATH_MISMATCH;
             }
-        } else {
-            const auto& middle_segment = middle_it->second;
-            if (!middle_segment ||
-                middle_segment->strand != path.strand ||
-                segmentGapInReferenceOrder(
-                    left_segment, middle_segment) < 0 ||
-                segmentGapInReferenceOrder(
-                    middle_segment, right_segment) < 0 ||
-                !segmentPathsAreDirectlyAdjacent(
-                    left_segment, middle_segment) ||
-                !segmentPathsAreDirectlyAdjacent(
-                    middle_segment, right_segment)) {
-                return MissingWindowReject::PATH_MISMATCH;
-            }
-            path.middle_segment = middle_segment;
+            path.interior_segments.push_back(segment);
+            previous = segment;
+        }
+        if (segmentGapInReferenceOrder(previous, right_segment) < 0 ||
+            !segmentPathsAreDirectlyAdjacent(previous, right_segment)) {
+            return MissingWindowReject::PATH_MISMATCH;
         }
         candidate.paths.push_back(std::move(path));
     }
-
-    if (missing_interval_length ==
-        std::numeric_limits<int64_t>::min()) {
+    if (candidate.missing_species.empty()) {
         return MissingWindowReject::PARTICIPANT_PATTERN;
     }
 
-    candidate.zero_gap_deletion = missing_interval_length == 0;
-    if (!candidate.zero_gap_deletion) {
+    if (!zero_gap_phase) {
+        bool any_zero = false;
+        bool any_nonzero = false;
         for (const auto& path : candidate.paths) {
-            if (path.interval_length == 0 ||
-                path.interval_length > maximum_span) {
+            any_zero = any_zero || path.interval_length == 0;
+            any_nonzero = any_nonzero || path.interval_length != 0;
+            if (path.interval_length > maximum_span) {
                 return MissingWindowReject::INTERVAL_INVALID;
             }
+        }
+        if (any_zero) {
+            return any_nonzero
+                       ? MissingWindowReject::MIXED_ZERO_NONZERO_INTERVAL
+                       : MissingWindowReject::INTERVAL_INVALID;
         }
         return MissingWindowReject::COUNT;
     }
 
+    candidate.zero_gap_deletion = true;
+    bool missing_zero = false;
+    bool missing_nonzero = false;
     for (const auto& path : candidate.paths) {
-        if (path.key.first == candidate.missing_species) {
-            if (path.interval_length != 0 ||
+        if (path.interior_segments.empty()) {
+            missing_zero = missing_zero || path.interval_length == 0;
+            missing_nonzero = missing_nonzero || path.interval_length != 0;
+            if (path.interval_length == 0 &&
                 !segmentsAreDirectlyAdjacent(
                     path.left_anchor, path.right_anchor)) {
                 return MissingWindowReject::ZERO_GAP_NOT_EXACT_CONTIGUOUS;
@@ -1179,13 +1225,19 @@ MissingWindowReject buildMissingWindowCandidate(
             path.interval_length > zero_gap_maximum_span) {
             return MissingWindowReject::ZERO_GAP_SPAN_EXCEEDED;
         }
-        if (!path.middle_segment ||
+        if (path.interior_segments.size() != 1 ||
             !segmentsAreDirectlyAdjacent(
-                path.left_anchor, path.middle_segment) ||
+                path.left_anchor, path.interior_segments.front()) ||
             !segmentsAreDirectlyAdjacent(
-                path.middle_segment, path.right_anchor)) {
+                path.interior_segments.front(), path.right_anchor)) {
             return MissingWindowReject::ZERO_GAP_NOT_EXACT_CONTIGUOUS;
         }
+    }
+
+    if (missing_nonzero) {
+        return missing_zero
+                   ? MissingWindowReject::MIXED_ZERO_NONZERO_INTERVAL
+                   : MissingWindowReject::INTERVAL_INVALID;
     }
 
     return MissingWindowReject::COUNT;
@@ -1254,21 +1306,24 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
     const SpeciesName& reference_species,
     MissingWindowReject& rejection) {
     rejection = MissingWindowReject::ZERO_GAP_PREPARATION_INVALID;
-    if (!candidate.zero_gap_deletion || candidate.paths.empty() ||
+    if (!candidate.zero_gap_deletion || candidate.interiors.size() != 1 ||
+        candidate.paths.empty() ||
         !candidate.left.reference_segment ||
-        !candidate.middle.reference_segment ||
+        !candidate.interiors.front().reference_segment ||
         !candidate.right.reference_segment) {
         return std::nullopt;
     }
 
+    const auto& middle = candidate.interiors.front();
+
     const uint64_t reference_length =
         static_cast<uint64_t>(candidate.left.reference_segment->length) +
-        candidate.middle.reference_segment->length +
+        middle.reference_segment->length +
         candidate.right.reference_segment->length;
     if (reference_length == 0 ||
         reference_length > std::numeric_limits<uint_t>::max() ||
         candidate.left.reference_segment->strand != Strand::FORWARD ||
-        candidate.middle.reference_segment->strand != Strand::FORWARD ||
+        middle.reference_segment->strand != Strand::FORWARD ||
         candidate.right.reference_segment->strand != Strand::FORWARD ||
         segmentEnd(candidate.right.reference_segment) -
                 candidate.left.reference_segment->start !=
@@ -1279,7 +1334,7 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
     PreparedChain prepared;
     prepared.candidate.blocks = {
         candidate.left.block,
-        candidate.middle.block,
+        middle.block,
         candidate.right.block};
     prepared.candidate.reference_chromosome =
         candidate.reference_chromosome;
@@ -1300,8 +1355,8 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
         PathReplacement path;
         path.key = context.key;
         path.old_segments.push_back(context.left_anchor);
-        if (context.middle_segment) {
-            path.old_segments.push_back(context.middle_segment);
+        if (!context.interior_segments.empty()) {
+            path.old_segments.push_back(context.interior_segments.front());
         }
         path.old_segments.push_back(context.right_anchor);
 
@@ -1315,10 +1370,10 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
             return reject_prepared();
         }
 
-        if (context.middle_segment) {
+        if (!context.interior_segments.empty()) {
             if (!normalizeAndValidateCigar(
-                    context.middle_segment,
-                    candidate.middle.reference_segment->length,
+                    context.interior_segments.front(),
+                    middle.reference_segment->length,
                     normalized) ||
                 !appendCigarChecked(merged_cigar, normalized)) {
                 return reject_prepared();
@@ -1326,7 +1381,7 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
         } else {
             appendCigarOp(
                 merged_cigar, 'D',
-                candidate.middle.reference_segment->length);
+                middle.reference_segment->length);
         }
 
         if (!normalizeAndValidateCigar(
@@ -1432,7 +1487,9 @@ std::optional<PreparedChain> prepareMissingWindow(
     }
 
     PreparedChain prepared;
-    prepared.candidate.blocks.push_back(candidate.middle.block);
+    for (const auto& interior : candidate.interiors) {
+        prepared.candidate.blocks.push_back(interior.block);
+    }
     prepared.candidate.reference_chromosome =
         candidate.reference_chromosome;
     prepared.candidate.species_count = candidate.paths.size();
@@ -1467,20 +1524,17 @@ std::optional<PreparedChain> prepareMissingWindow(
 
         PathReplacement path;
         path.key = context.key;
-        if (context.middle_segment) {
-            path.old_segments.push_back(
-                context.middle_segment);
-        }
+        path.old_segments = context.interior_segments;
         path.merged_segment = Segment::create(
             context.interval_start, context.interval_length,
             context.strand, std::move(cigar),
             AlignRole::PRIMARY, SegmentRole::SEGMENT,
             prepared.merged_block);
-        if (context.middle_segment) {
+        if (!context.interior_segments.empty()) {
             path.merged_segment->left_extend =
-                context.middle_segment->left_extend;
+                context.interior_segments.front()->left_extend;
             path.merged_segment->right_extend =
-                context.middle_segment->right_extend;
+                context.interior_segments.back()->right_extend;
         }
         prepared.merged_block->anchors.emplace(
             context.key, path.merged_segment);
@@ -2164,13 +2218,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
     RejectionCounts zero_gap_rejections{};
     std::map<SpeciesName, size_t> zero_gap_accepted_by_missing_species;
+    std::map<std::string, size_t> zero_gap_pattern_counts;
     size_t zero_gap_scan_count = 0;
     size_t zero_gap_candidate_events = 0;
     size_t zero_gap_prepared_events = 0;
     size_t zero_gap_overlap_events = 0;
     size_t zero_gap_replaced_windows = 0;
     size_t zero_gap_replaced_old_blocks = 0;
-    size_t initial_deferred_minipoa_candidates = 0;
     double zero_gap_prepare_seconds = 0.0;
     const size_t zero_gap_iteration_limit = blocks.size() + 1;
 
@@ -2184,7 +2238,6 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
         size_t scanned_this_iteration = 0;
         size_t structural_this_iteration = 0;
-        size_t deferred_this_iteration = 0;
         std::vector<MissingWindowCandidate> zero_gap_candidates;
         for (auto& [chromosome, genome_end] :
              reference_graph_it->second.chr2end) {
@@ -2210,11 +2263,12 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 const auto candidate_result =
                     buildMissingWindowCandidate(
                         left_reference->parent_block,
-                        middle_reference->parent_block,
+                        std::vector<BlockPtr>{
+                            middle_reference->parent_block},
                         right_reference->parent_block,
                         reference_species, chromosome,
                         seqpro_managers.size(), maximum_span,
-                        zero_gap_maximum_span, candidate);
+                        zero_gap_maximum_span, true, candidate);
                 if (candidate_result != MissingWindowReject::COUNT) {
                     ++zero_gap_rejections[
                         static_cast<size_t>(candidate_result)];
@@ -2225,15 +2279,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 ++structural_this_iteration;
                 if (candidate.zero_gap_deletion) {
                     zero_gap_candidates.push_back(std::move(candidate));
-                } else {
-                    ++deferred_this_iteration;
                 }
                 left_reference = right_reference;
             }
-        }
-        if (zero_gap_scan_count == 1) {
-            initial_deferred_minipoa_candidates =
-                deferred_this_iteration;
         }
         zero_gap_candidate_events += zero_gap_candidates.size();
 
@@ -2241,9 +2289,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             spdlog::info(
                 "[species-mismatch-realign][zero-gap] iteration={} "
                 "scanned_triples={} structural_candidates={} candidates=0 "
-                "deferred_minipoa={} status=stable",
+                "status=stable",
                 zero_gap_scan_count, scanned_this_iteration,
-                structural_this_iteration, deferred_this_iteration);
+                structural_this_iteration);
             break;
         }
 
@@ -2338,7 +2386,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             auto& candidate = zero_gap_candidates[index];
             const std::array<const Block*, 3> read_blocks = {
                 candidate.left.block.get(),
-                candidate.middle.block.get(),
+                candidate.interiors.front().block.get(),
                 candidate.right.block.get()};
             const bool overlaps = std::any_of(
                 read_blocks.begin(), read_blocks.end(),
@@ -2376,8 +2424,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     reserved_read_blocks.insert(block);
                 }
             }
-            ++zero_gap_accepted_by_missing_species[
-                candidate.missing_species];
+            for (const auto& species : candidate.missing_species) {
+                ++zero_gap_accepted_by_missing_species[species];
+            }
+            ++zero_gap_pattern_counts[candidate.participant_pattern];
             accepted_candidates.push_back(std::move(candidate));
             prepared.push_back(std::move(*prepared_slots[index]));
         }
@@ -2388,12 +2438,12 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             spdlog::warn(
                 "[species-mismatch-realign][zero-gap] iteration={} "
                 "scanned_triples={} structural_candidates={} candidates={} "
-                "deferred_minipoa={} prepared={} selected=0 failed={} "
+                "prepared={} selected=0 failed={} "
                 "overlap={} parallel_threads={} wall_seconds={:.3f} "
                 "status=stalled",
                 zero_gap_scan_count, scanned_this_iteration,
                 structural_this_iteration, zero_gap_candidates.size(),
-                deferred_this_iteration, prepared_this_iteration,
+                prepared_this_iteration,
                 zero_gap_candidates.size() - prepared_this_iteration,
                 overlap_this_iteration, zero_gap_threads,
                 prepare_seconds);
@@ -2408,14 +2458,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         spdlog::info(
             "[species-mismatch-realign][zero-gap] iteration={} "
             "scanned_triples={} structural_candidates={} candidates={} "
-            "deferred_minipoa={} prepared={} selected={} failed={} "
+            "prepared={} selected={} failed={} "
             "overlap={} parallel_threads={} wall_seconds={:.3f} "
             "replaced_old_blocks={} blocks_before={} blocks_after={} "
             "status=committed",
             zero_gap_scan_count, scanned_this_iteration,
             structural_this_iteration, zero_gap_candidates.size(),
-            deferred_this_iteration, prepared_this_iteration,
-            commit.replaced_windows,
+            prepared_this_iteration, commit.replaced_windows,
             zero_gap_candidates.size() - prepared_this_iteration,
             overlap_this_iteration, zero_gap_threads, prepare_seconds,
             commit.replaced_old_blocks, commit.blocks_before,
@@ -2425,9 +2474,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     std::array<size_t, rejection_count> rejections{};
     size_t scanned_triples = 0;
     size_t structural_candidates = 0;
-    size_t deferred_zero_gap_candidates = 0;
     std::map<SpeciesName, size_t> accepted_by_missing_species =
         zero_gap_accepted_by_missing_species;
+    std::map<std::string, size_t> minipoa_pattern_counts;
     std::vector<MissingWindowCandidate> candidate_slots;
     std::vector<MissingWindowCandidate> accepted_candidates;
     std::vector<PreparedChain> prepared;
@@ -2439,42 +2488,63 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             genome_end.head->primary_path.next.load(
                 std::memory_order_acquire);
         while (left_reference && !left_reference->isTail()) {
-            const auto middle_reference =
-                left_reference->primary_path.next.load(
+            BlockView left_view;
+            if (!buildBlockView(
+                    left_reference->parent_block, reference_species,
+                    left_view) ||
+                left_view.species_count != seqpro_managers.size()) {
+                left_reference = left_reference->primary_path.next.load(
                     std::memory_order_acquire);
-            if (!middle_reference || middle_reference->isTail()) {
+                continue;
+            }
+
+            std::vector<BlockPtr> interior_blocks;
+            auto cursor = left_reference->primary_path.next.load(
+                std::memory_order_acquire);
+            SegPtr right_reference;
+            while (cursor && !cursor->isTail()) {
+                BlockView cursor_view;
+                if (!buildRealignBlockView(
+                        cursor->parent_block, reference_species,
+                        cursor_view)) {
+                    interior_blocks.push_back(cursor->parent_block);
+                    cursor = cursor->primary_path.next.load(
+                        std::memory_order_acquire);
+                    continue;
+                }
+                if (cursor_view.species_count ==
+                    seqpro_managers.size()) {
+                    right_reference = cursor;
+                    break;
+                }
+                interior_blocks.push_back(cursor->parent_block);
+                cursor = cursor->primary_path.next.load(
+                    std::memory_order_acquire);
+            }
+            if (!right_reference) {
                 break;
             }
-            const auto right_reference =
-                middle_reference->primary_path.next.load(
-                    std::memory_order_acquire);
-            if (!right_reference || right_reference->isTail()) {
-                break;
+            if (interior_blocks.empty()) {
+                left_reference = right_reference;
+                continue;
             }
 
             ++scanned_triples;
             MissingWindowCandidate candidate;
             const auto candidate_result =
                 buildMissingWindowCandidate(
-                    left_reference->parent_block,
-                    middle_reference->parent_block,
+                    left_reference->parent_block, interior_blocks,
                     right_reference->parent_block,
                     reference_species, chromosome,
                     seqpro_managers.size(), maximum_span,
-                    zero_gap_maximum_span,
-                    candidate);
+                    zero_gap_maximum_span, false, candidate);
             if (candidate_result != MissingWindowReject::COUNT) {
                 ++rejections[static_cast<size_t>(candidate_result)];
-                left_reference = middle_reference;
+                left_reference = right_reference;
                 continue;
             }
 
             ++structural_candidates;
-            if (candidate.zero_gap_deletion) {
-                ++deferred_zero_gap_candidates;
-                left_reference = right_reference;
-                continue;
-            }
             candidate_slots.push_back(std::move(candidate));
             left_reference = right_reference;
         }
@@ -2575,7 +2645,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     "replacement Blocks");
             }
         }
-        ++accepted_by_missing_species[candidate.missing_species];
+        for (const auto& species : candidate.missing_species) {
+            ++accepted_by_missing_species[species];
+        }
+        ++minipoa_pattern_counts[candidate.participant_pattern];
         accepted_candidates.push_back(std::move(candidate));
         prepared.push_back(std::move(*prepared_slots[index]));
     }
@@ -2585,31 +2658,26 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         prepare_seconds > 0.0
             ? static_cast<double>(attempted_msa) / prepare_seconds
             : 0.0;
-    const int64_t ordinary_candidate_delta =
-        static_cast<int64_t>(attempted_msa) -
-        static_cast<int64_t>(initial_deferred_minipoa_candidates);
     spdlog::info(
         "[species-mismatch-realign][minipoa] reference={} "
         "rescanned_triples={} structural_candidates={} "
-        "deferred_zero_gap={} attempted={} succeeded={} failed={} "
+        "attempted={} succeeded={} failed={} "
         "selected={} parallel_threads={} wall_seconds={:.3f} "
-        "windows_per_second={:.3f} candidate_delta_after_zero_gap={} "
-        "maximum_span={}",
+        "windows_per_second={:.3f} maximum_span={}",
         reference_species, scanned_triples, structural_candidates,
-        deferred_zero_gap_candidates, attempted_msa, successful_msa,
-        failed_msa, prepared.size(), effective_threads, prepare_seconds,
-        windows_per_second, ordinary_candidate_delta, maximum_span);
+        attempted_msa, successful_msa, failed_msa, prepared.size(),
+        effective_threads, prepare_seconds, windows_per_second,
+        maximum_span);
     spdlog::info(
         "[species-mismatch-realign][zero-gap] reference={} scans={} "
         "candidate_events={} prepared_events={} selected={} "
         "overlap_events={} replaced_old_blocks={} "
-        "prepare_wall_seconds={:.3f} zero_gap_maximum_span={} "
-        "initial_deferred_minipoa={}",
+        "prepare_wall_seconds={:.3f} zero_gap_maximum_span={}",
         reference_species, zero_gap_scan_count,
         zero_gap_candidate_events, zero_gap_prepared_events,
         zero_gap_replaced_windows, zero_gap_overlap_events,
         zero_gap_replaced_old_blocks, zero_gap_prepare_seconds,
-        zero_gap_maximum_span, initial_deferred_minipoa_candidates);
+        zero_gap_maximum_span);
 
     for (size_t index = 0; index < rejection_count; ++index) {
         if (zero_gap_rejections[index] != 0) {
@@ -2634,6 +2702,16 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         spdlog::info(
             "[species-mismatch-realign] missing_species={} committed={}",
             species, count);
+    }
+    for (const auto& [pattern, count] : zero_gap_pattern_counts) {
+        spdlog::info(
+            "[species-mismatch-realign][zero-gap] pattern={} committed={}",
+            pattern, count);
+    }
+    for (const auto& [pattern, count] : minipoa_pattern_counts) {
+        spdlog::info(
+            "[species-mismatch-realign][minipoa] pattern={} committed={}",
+            pattern, count);
     }
 
     if (prepared.empty()) {

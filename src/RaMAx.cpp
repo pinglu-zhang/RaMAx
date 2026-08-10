@@ -488,8 +488,9 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* realign_missing_species_flag = cmd->add_flag(
         "--realign-single-missing-species",
         args.realign_single_missing_species,
-        "In the first round, realign n-(n-1)-n windows with "
-        "/usr/local/bin/minipoa before masking.")
+        "In the first round, merge bounded zero-gap subset windows and "
+        "realign variable partial-Block chains with /usr/local/bin/minipoa "
+        "before masking.")
         ->group("Graph Optimization")
         ->needs(merge_exact_blocks_flag);
 
