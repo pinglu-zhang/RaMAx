@@ -490,15 +490,17 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         args.realign_single_missing_species,
         "In the first round, merge bounded zero-gap subset windows and "
         "realign variable partial-Block chains with /usr/local/bin/minipoa "
-        "before masking.")
+        "before masking. Species with an empty interior interval are omitted "
+        "from minipoa and represented by deletion columns in the merged "
+        "window.")
         ->group("Graph Optimization")
         ->needs(merge_exact_blocks_flag);
 
     auto* realign_missing_species_span_opt = cmd->add_option(
         "--species-mismatch-realign-max-span",
         args.species_mismatch_realign_max_span,
-        "Maximum per-species interior span for single-missing-species "
-        "realignment.")
+        "Maximum per-species interior span for ordinary and empty-interval "
+        "partial-Block-chain realignment.")
         ->default_val(3000)
         ->capture_default_str()
         ->group("Graph Optimization")
@@ -508,8 +510,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* zero_gap_merge_span_opt = cmd->add_option(
         "--species-mismatch-zero-gap-max-span",
         args.species_mismatch_zero_gap_max_span,
-        "Maximum non-missing-species span for deletion-aware merging "
-        "when the missing species has a zero-length interval.")
+        "Maximum participating-species span for deletion-aware merging "
+        "when all missing species have zero-length intervals.")
         ->default_val(200)
         ->capture_default_str()
         ->group("Graph Optimization")

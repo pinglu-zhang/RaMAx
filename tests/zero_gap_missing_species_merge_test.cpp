@@ -215,6 +215,48 @@ void populateInteriorChain(
     graph.blocks.push_back(right);
 }
 
+void populateConflictingOrdinaryHybridWindows(
+    RaMesh::RaMeshMultiGenomeGraph& graph) {
+    auto a = Block::createEmpty("chr1", 4);
+    auto b1 = Block::createEmpty("chr1", 3);
+    auto b2 = Block::createEmpty("chr1", 3);
+    auto c = Block::createEmpty("chr1", 4);
+    auto d1 = Block::createEmpty("chr1", 3);
+    auto d2 = Block::createEmpty("chr1", 3);
+    auto e = Block::createEmpty("chr1", 4);
+    const std::vector<std::string> species_names = {
+        "simChimp", "simGorilla", "simHuman", "simOrang"};
+    for (size_t species_index = 0;
+         species_index < species_names.size(); ++species_index) {
+        const auto& species = species_names[species_index];
+        const uint_t base = static_cast<uint_t>(species_index * 200);
+        std::vector<SegPtr> path;
+        path.push_back(addSegment(
+            a, species, base, 10, Strand::FORWARD));
+        if (species != "simOrang") {
+            path.push_back(addSegment(
+                b1, species, base + 10, 10, Strand::FORWARD));
+            path.push_back(addSegment(
+                b2, species, base + 20, 10, Strand::FORWARD));
+        }
+        path.push_back(addSegment(
+            c, species, base + 40, 10, Strand::FORWARD));
+        if (species != "simHuman") {
+            path.push_back(addSegment(
+                d1, species, base + 50, 10, Strand::FORWARD));
+            path.push_back(addSegment(
+                d2, species, base + 60, 10, Strand::FORWARD));
+        }
+        path.push_back(addSegment(
+            e, species,
+            species == "simHuman" ? base + 50 : base + 80,
+            10, Strand::FORWARD));
+        linkPath(
+            graph.species_graphs.at(species).chr2end.at("chr1"), path);
+    }
+    graph.blocks = {a, b1, b2, c, d1, d2, e};
+}
+
 void populateFiveBlockWindows(
     RaMesh::RaMeshMultiGenomeGraph& graph,
     bool invalidate_first_window,
@@ -295,6 +337,52 @@ void writeCapturingMsa(const std::filesystem::path& executable,
            << "exec /bin/cat \"$5\"\n";
     if (!script) {
         throw std::runtime_error("cannot write capturing MSA script");
+    }
+    script.close();
+    std::filesystem::permissions(
+        executable,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+}
+
+void writeFailOnceMsa(const std::filesystem::path& executable,
+                      const std::filesystem::path& counter,
+                      const std::filesystem::path& marker) {
+    std::ofstream script(executable);
+    script << "#!/bin/sh\n"
+           << "printf x >> '" << counter.string() << "'\n"
+           << "if [ ! -e '" << marker.string() << "' ]; then\n"
+           << "  : > '" << marker.string() << "'\n"
+           << "  exit 1\n"
+           << "fi\n"
+           << "exec /bin/cat \"$5\"\n";
+    if (!script) {
+        throw std::runtime_error("cannot write fail-once MSA script");
+    }
+    script.close();
+    std::filesystem::permissions(
+        executable,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+}
+
+void writeReferenceInsertionMsa(const std::filesystem::path& executable) {
+    std::ofstream script(executable);
+    script << "#!/bin/sh\n"
+           << "cat <<'EOF'\n"
+           << ">s0\n"
+           << "AAAAAAAAAAAAAAA-AAAAAAAAAAAAAAA\n"
+           << ">s1\n"
+           << "AAAAAAAAAAAAAAAA-AAAAAAAAAAAAAA\n"
+           << ">s2\n"
+           << "AAAAAAAAAAAAAAAA-AAAAAAAAAAAAAA\n"
+           << "EOF\n";
+    if (!script) {
+        throw std::runtime_error("cannot write insertion MSA script");
     }
     script.close();
     std::filesystem::permissions(
@@ -514,6 +602,176 @@ int main() {
             {"simChimp", "simGorilla"},
             {"simChimp", "simHuman", "simOrang"},
             {"simChimp", "simGorilla"}};
+
+        const auto hybrid_capturing_msa =
+            temp / "hybrid-capturing-minipoa.sh";
+        const auto hybrid_capturing_counter =
+            temp / "hybrid-capturing-minipoa.calls";
+        const auto hybrid_captured_input =
+            temp / "hybrid-captured-minipoa.input.fa";
+        writeCapturingMsa(
+            hybrid_capturing_msa, hybrid_capturing_counter,
+            hybrid_captured_input);
+        const std::vector<std::vector<std::string>> pattern_4334 = {
+            {"simChimp", "simGorilla", "simHuman"},
+            {"simChimp", "simGorilla", "simHuman"}};
+        RaMesh::RaMeshMultiGenomeGraph hybrid_graph(managers);
+        populateInteriorChain(hybrid_graph, pattern_4334);
+        const auto hybrid_right = hybrid_graph.blocks.back().lock();
+        require(hybrid_right != nullptr,
+                "hybrid right boundary is unavailable");
+        hybrid_right->anchors.at({"simOrang", "chr1"})->start = 310;
+        require(hybrid_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers,
+                    hybrid_capturing_msa.string(),
+                    3000, 4, 200) == 1,
+                "hybrid empty-sequence window was not realigned");
+        std::ifstream hybrid_captured(hybrid_captured_input);
+        const std::string hybrid_captured_text(
+            (std::istreambuf_iterator<char>(hybrid_captured)),
+            std::istreambuf_iterator<char>());
+        require(hybrid_captured_text.find(">simOrang") ==
+                    std::string::npos,
+                "empty species was written to the minipoa FASTA");
+        const auto hybrid_block = onlyActiveBlock(hybrid_graph);
+        const auto hybrid_orang = hybrid_block->anchors.at(
+            {"simOrang", "chr1"});
+        require(hybrid_orang->start == 300 &&
+                    hybrid_orang->length == 20 &&
+                    cigarToString(hybrid_orang->cigar) == "10M30D10M",
+                "hybrid empty species did not receive the expected gaps");
+        for (const auto& [key, segment] : hybrid_block->anchors) {
+            (void)key;
+            require(segment && segment->length != 0,
+                    "hybrid preparation created a zero-length Segment");
+        }
+        require(hybrid_graph.verifyGraphCorrectness(false),
+                "hybrid empty-sequence graph verification failed");
+
+        RaMesh::RaMeshMultiGenomeGraph serial_hybrid_graph(managers);
+        populateInteriorChain(serial_hybrid_graph, pattern_4334);
+        const auto serial_hybrid_right =
+            serial_hybrid_graph.blocks.back().lock();
+        require(serial_hybrid_right != nullptr,
+                "serial hybrid right boundary is unavailable");
+        serial_hybrid_right->anchors.at({"simOrang", "chr1"})->start = 310;
+        require(serial_hybrid_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers,
+                    hybrid_capturing_msa.string(),
+                    3000, 1, 200) == 1,
+                "serial hybrid window was not realigned");
+        require(graphSignature(serial_hybrid_graph) ==
+                    graphSignature(hybrid_graph),
+                "serial and parallel hybrid graph signatures diverged");
+
+        const auto insertion_msa = temp / "reference-insertion-minipoa.sh";
+        writeReferenceInsertionMsa(insertion_msa);
+        RaMesh::RaMeshMultiGenomeGraph insertion_graph(managers);
+        populateInteriorChain(insertion_graph, pattern_4334);
+        const auto insertion_right = insertion_graph.blocks.back().lock();
+        require(insertion_right != nullptr,
+                "reference-insertion right boundary is unavailable");
+        insertion_right->anchors.at({"simOrang", "chr1"})->start = 310;
+        require(insertion_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, insertion_msa.string(),
+                    3000, 4, 200) == 1,
+                "hybrid reference-insertion window was not realigned");
+        const auto insertion_maf = temp / "hybrid-reference-insertion.maf";
+        insertion_graph.exportToMaf(
+            insertion_maf, managers, true, false);
+        std::ifstream insertion_maf_input(insertion_maf);
+        const std::string insertion_maf_text(
+            (std::istreambuf_iterator<char>(insertion_maf_input)),
+            std::istreambuf_iterator<char>());
+        require(insertion_maf_text.find(
+                    "AAAAAAAAAA-------------------------------AAAAAAAAAA") !=
+                    std::string::npos,
+                "empty species did not remain gap-only across an MSA "
+                "reference-insertion column");
+
+        const std::vector<std::vector<std::string>>
+            reverse_empty_pattern = {
+                {"simChimp", "simHuman", "simOrang"},
+                {"simChimp", "simHuman", "simOrang"}};
+        RaMesh::RaMeshMultiGenomeGraph reverse_empty_graph(managers);
+        populateInteriorChain(
+            reverse_empty_graph, reverse_empty_pattern,
+            "simGorilla");
+        const auto reverse_empty_left =
+            reverse_empty_graph.blocks.front().lock();
+        require(reverse_empty_left != nullptr,
+                "reverse hybrid left boundary is unavailable");
+        reverse_empty_left->anchors.at(
+            {"simGorilla", "chr1"})->start = 110;
+        require(reverse_empty_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers,
+                    hybrid_capturing_msa.string(),
+                    3000, 4, 200) == 1,
+                "reverse empty-sequence hybrid window was not realigned");
+        const auto reverse_empty_block =
+            onlyActiveBlock(reverse_empty_graph);
+        const auto reverse_empty_gorilla =
+            reverse_empty_block->anchors.at(
+                {"simGorilla", "chr1"});
+        require(reverse_empty_gorilla->start == 100 &&
+                    reverse_empty_gorilla->length == 20 &&
+                    reverse_empty_gorilla->strand == Strand::REVERSE &&
+                    cigarToString(reverse_empty_gorilla->cigar) ==
+                        "10M30D10M",
+                "reverse empty species coordinates or CIGAR changed");
+        require(reverse_empty_graph.verifyGraphCorrectness(false),
+                "reverse hybrid graph verification failed");
+
+        const std::vector<std::vector<std::string>> pattern_4114 = {
+            {"simChimp"}, {"simChimp"}};
+        RaMesh::RaMeshMultiGenomeGraph reference_only_graph(managers);
+        populateInteriorChain(reference_only_graph, pattern_4114);
+        const auto reference_only_right =
+            reference_only_graph.blocks.back().lock();
+        require(reference_only_right != nullptr,
+                "reference-only right boundary is unavailable");
+        reference_only_right->anchors.at({"simGorilla", "chr1"})->start =
+            110;
+        reference_only_right->anchors.at({"simHuman", "chr1"})->start =
+            210;
+        reference_only_right->anchors.at({"simOrang", "chr1"})->start =
+            310;
+        require(reference_only_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 4, 200) == 1,
+                "reference-only hybrid window did not bypass minipoa");
+        const auto reference_only_block =
+            onlyActiveBlock(reference_only_graph);
+        for (const std::string species :
+             {"simGorilla", "simHuman", "simOrang"}) {
+            require(cigarToString(reference_only_block->anchors.at(
+                        {species, "chr1"})->cigar) == "10M30D10M",
+                    "reference-only empty species CIGAR is incorrect");
+        }
+        require(reference_only_graph.verifyGraphCorrectness(false),
+                "reference-only hybrid graph verification failed");
+
+        const auto fail_once_msa = temp / "fail-once-minipoa.sh";
+        const auto fail_once_counter = temp / "fail-once-minipoa.calls";
+        const auto fail_once_marker = temp / "fail-once-minipoa.marker";
+        writeFailOnceMsa(
+            fail_once_msa, fail_once_counter, fail_once_marker);
+        RaMesh::RaMeshMultiGenomeGraph conflict_graph(managers);
+        populateConflictingOrdinaryHybridWindows(conflict_graph);
+        require(conflict_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, fail_once_msa.string(),
+                    3000, 4, 200) == 2,
+                "unified fallback did not recover the conflicting windows");
+        std::ifstream fail_once_counter_input(fail_once_counter);
+        std::string fail_once_calls;
+        fail_once_counter_input >> fail_once_calls;
+        require(fail_once_calls == "xxx",
+                "ordinary failure did not trigger same-snapshot hybrid "
+                "fallback followed by fixed-point ordinary retry");
+        require(conflict_graph.blocks.size() == 3 &&
+                    conflict_graph.verifyGraphCorrectness(false),
+                "unified ordinary/hybrid fixed-point graph is invalid");
+
         RaMesh::RaMeshMultiGenomeGraph reverse_multiblock_graph(managers);
         populateInteriorChain(
             reverse_multiblock_graph, pattern_42324, "simGorilla");

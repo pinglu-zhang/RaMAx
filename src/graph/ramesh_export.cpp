@@ -21,6 +21,22 @@
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现
 // ============================================================
+static bool isMafReferenceCompatibleCigar(
+    const Cigar_t& cigar,
+    size_t sequence_length) {
+    size_t consumed = 0;
+    for (const auto unit : cigar) {
+        uint32_t length = 0;
+        char operation = '\0';
+        intToCigar(unit, operation, length);
+        if (operation != 'M' && operation != '=' && operation != 'X') {
+            return false;
+        }
+        consumed += length;
+    }
+    return consumed == sequence_length;
+}
+
 static bool emitMafBlock(std::ostream& os,
     const RaMesh::BlockPtr& blk,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs,
@@ -44,13 +60,38 @@ static bool emitMafBlock(std::ostream& os,
     }
     if (recs.size() < 2 || (!allow_reverse && have_reverse)) return false;
 
-    // ---------- 2. 决定首行 ----------
+    // ---------- 2. 选择对齐参考并决定首行 ----------
+    // ref_chr does not identify a species.  When several genomes use the
+    // same chromosome name, unordered anchor iteration must not choose a
+    // deletion-only hybrid row as the reference backbone.
+    auto alignment_ref = std::find_if(
+        recs.begin(), recs.end(), [&](const Rec& record) {
+            return record.chr == blk->ref_chr &&
+                isMafReferenceCompatibleCigar(
+                    record.seg->cigar, record.seg->length);
+        });
+    if (alignment_ref == recs.end()) {
+        alignment_ref = std::find_if(
+            recs.begin(), recs.end(),
+            [&](const Rec& record) {
+                return record.chr == blk->ref_chr;
+            });
+    }
+    if (alignment_ref == recs.end()) {
+        alignment_ref = recs.begin();
+    }
+    const SpeciesName alignment_ref_species = alignment_ref->sp;
+    const ChrName alignment_ref_chr = alignment_ref->chr;
+
     if (first_sp) {
         auto it_first = std::find_if(recs.begin(), recs.end(),
             [&](auto& r) { return r.sp == *first_sp; });
         if (it_first == recs.end()) {
             auto it_ref = std::find_if(recs.begin(), recs.end(),
-                [&](auto& r) { return r.chr == blk->ref_chr; });
+                [&](auto& r) {
+                    return r.sp == alignment_ref_species &&
+                        r.chr == alignment_ref_chr;
+                });
             if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
         }
         else {
@@ -60,7 +101,10 @@ static bool emitMafBlock(std::ostream& os,
     }
     else {
         auto it_ref = std::find_if(recs.begin(), recs.end(),
-            [&](auto& r) { return r.chr == blk->ref_chr; });
+            [&](auto& r) {
+                return r.sp == alignment_ref_species &&
+                    r.chr == alignment_ref_chr;
+            });
         if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
     }
 
@@ -103,15 +147,9 @@ static bool emitMafBlock(std::ostream& os,
     if (seqs.empty()) return false;
 
     // ---------- 5. 归并对齐 ----------
-    ChrName ref_key = blk->ref_chr;
-    if (pairwise_mode) {
-        ref_key = blk->ref_chr;
-    }
-    else {
-        auto& rr = *std::find_if(recs.begin(), recs.end(),
-            [&](auto& r) { return r.chr == blk->ref_chr; });
-        ref_key = rr.sp + "." + rr.chr;
-    }
+    const ChrName ref_key = pairwise_mode
+        ? alignment_ref_chr
+        : alignment_ref_species + "." + alignment_ref_chr;
     try {
         mergeAlignmentByRef(ref_key, seqs, cigars);
     }
