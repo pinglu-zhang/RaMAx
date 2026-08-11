@@ -488,8 +488,9 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* realign_missing_species_flag = cmd->add_flag(
         "--realign-single-missing-species",
         args.realign_single_missing_species,
-        "In the first round, merge bounded zero-gap subset windows and "
-        "realign K-species partial-Block chains (2 <= K <= N) with "
+        "After every graph-alignment round, merge bounded zero-gap subset "
+        "windows and adjacent K-0-K pairs, then realign K-species "
+        "partial-Block chains (2 <= K <= N) with "
         "/usr/local/bin/minipoa before masking. Species with an empty "
         "interior interval are omitted from minipoa and represented by "
         "deletion columns in the merged window.")
@@ -511,7 +512,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         "--species-mismatch-zero-gap-max-span",
         args.species_mismatch_zero_gap_max_span,
         "Maximum participating-species span for deletion-aware merging "
-        "of K-(K-1)-K windows with one zero-length missing species.")
+        "of K-(K-m)-K windows with one or more zero-length missing "
+        "species.")
         ->default_val(200)
         ->capture_default_str()
         ->group("Graph Optimization")

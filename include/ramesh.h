@@ -447,7 +447,8 @@ namespace RaMesh {
             const std::string& msa_executable,
             uint_t maximum_span = 10000,
             uint_t parallel_threads = 1,
-            uint_t zero_gap_maximum_span = 200);
+            uint_t zero_gap_maximum_span = 200,
+            uint_t adjacent_pair_gap_max = 0);
         void inspectExactContiguousBlockBoundaries(
             const SpeciesName& reference_species,
             const std::string& stage,

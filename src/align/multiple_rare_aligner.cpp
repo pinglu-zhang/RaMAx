@@ -981,15 +981,15 @@ starAlignment(
                 i + 1, current_ref_name, eliminated_boundaries,
                 merge_query_gap_max);
         }
-        if (i == 0 &&
-            realign_single_missing_species_enabled) {
+        if (realign_single_missing_species_enabled) {
             const size_t replaced_windows =
                 multi_graph->realignSingleMissingSpeciesWindows(
                     current_ref_name, seqpro_managers,
                     species_mismatch_msa_executable,
                     species_mismatch_realign_max_span,
                     thread_num,
-                    species_mismatch_zero_gap_max_span);
+                    species_mismatch_zero_gap_max_span,
+                    merge_query_gap_max);
             size_t eliminated_after_realign = 0;
             if (replaced_windows > 0) {
                 eliminated_after_realign =

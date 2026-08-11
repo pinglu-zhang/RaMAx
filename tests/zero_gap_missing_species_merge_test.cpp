@@ -160,6 +160,31 @@ void populateSubsetZeroGapWindow(
     graph.blocks = {left, middle, right};
 }
 
+void populateAdjacentPair(
+    RaMesh::RaMeshMultiGenomeGraph& graph,
+    const std::vector<std::string>& participants,
+    const std::map<std::string, uint_t>& gaps) {
+    auto left = Block::createEmpty("chr1", participants.size());
+    auto right = Block::createEmpty("chr1", participants.size());
+    for (size_t species_index = 0;
+         species_index < participants.size(); ++species_index) {
+        const auto& species = participants[species_index];
+        const uint_t base = static_cast<uint_t>(species_index * 100);
+        const uint_t gap = gaps.count(species) != 0
+                               ? gaps.at(species)
+                               : 0;
+        const auto left_segment = addSegment(
+            left, species, base, 10, Strand::FORWARD);
+        const auto right_segment = addSegment(
+            right, species, base + 10 + gap, 10,
+            Strand::FORWARD);
+        linkPath(
+            graph.species_graphs.at(species).chr2end.at("chr1"),
+            {left_segment, right_segment});
+    }
+    graph.blocks = {left, right};
+}
+
 void populateInteriorChain(
     RaMesh::RaMeshMultiGenomeGraph& graph,
     const std::vector<std::vector<std::string>>& participants,
@@ -515,6 +540,54 @@ int main() {
         require(three_missing_graph.verifyGraphCorrectness(false),
                 "graph verification failed after 4-1-4 merge");
 
+        RaMesh::RaMeshMultiGenomeGraph query_insertion_pair_graph(managers);
+        populateAdjacentPair(
+            query_insertion_pair_graph,
+            {"simChimp", "simGorilla"},
+            {{"simGorilla", 5}});
+        require(query_insertion_pair_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 2, 200, 50) == 1,
+                "single-query-gap 2-0-2 pair was not merged directly");
+        const auto query_insertion_pair =
+            onlyActiveBlock(query_insertion_pair_graph);
+        require(cigarToString(query_insertion_pair->anchors.at(
+                    {"simChimp", "chr1"})->cigar) == "20M" &&
+                    cigarToString(query_insertion_pair->anchors.at(
+                    {"simGorilla", "chr1"})->cigar) == "10M5I10M",
+                "single-query-gap 2-0-2 CIGAR is incorrect");
+        require(query_insertion_pair_graph.verifyGraphCorrectness(false),
+                "single-query-gap 2-0-2 graph verification failed");
+
+        RaMesh::RaMeshMultiGenomeGraph reference_gap_pair_graph(managers);
+        populateAdjacentPair(
+            reference_gap_pair_graph,
+            {"simChimp", "simGorilla"},
+            {{"simChimp", 5}});
+        require(reference_gap_pair_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 2, 200, 50) == 1,
+                "single-reference-gap 2-0-2 pair was not merged directly");
+        const auto reference_gap_pair =
+            onlyActiveBlock(reference_gap_pair_graph);
+        require(cigarToString(reference_gap_pair->anchors.at(
+                    {"simChimp", "chr1"})->cigar) == "25M" &&
+                    cigarToString(reference_gap_pair->anchors.at(
+                    {"simGorilla", "chr1"})->cigar) == "10M5D10M",
+                "single-reference-gap 2-0-2 CIGAR is incorrect");
+
+        RaMesh::RaMeshMultiGenomeGraph oversized_pair_graph(managers);
+        populateAdjacentPair(
+            oversized_pair_graph,
+            {"simChimp", "simGorilla"},
+            {{"simGorilla", 51}});
+        require(oversized_pair_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 1, 200, 50) == 0,
+                "single-query-gap 2-0-2 exceeded the configured limit");
+        require(oversized_pair_graph.blocks.size() == 2,
+                "rejected 2-0-2 pair changed the Block pool");
+
         RaMesh::RaMeshMultiGenomeGraph mixed_gap_graph(managers);
         populateSubsetZeroGapWindow(
             mixed_gap_graph, {"simChimp", "simGorilla"}, "simHuman");
@@ -567,6 +640,49 @@ int main() {
         const auto passthrough_msa = temp / "passthrough-minipoa.sh";
         const auto msa_counter = temp / "passthrough-minipoa.calls";
         writePassthroughMsa(passthrough_msa, msa_counter);
+
+        const auto pair_msa = temp / "pair-minipoa.sh";
+        const auto pair_msa_counter = temp / "pair-minipoa.calls";
+        writePassthroughMsa(pair_msa, pair_msa_counter);
+        RaMesh::RaMeshMultiGenomeGraph empty_reference_pair_graph(managers);
+        populateAdjacentPair(
+            empty_reference_pair_graph,
+            {"simChimp", "simGorilla", "simHuman"},
+            {{"simGorilla", 5}, {"simHuman", 5}});
+        require(empty_reference_pair_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, pair_msa.string(),
+                    3000, 3, 200, 50) == 1,
+                "multi-query K-0-K pair with empty reference was not aligned");
+        const auto empty_reference_pair =
+            onlyActiveBlock(empty_reference_pair_graph);
+        require(cigarToString(empty_reference_pair->anchors.at(
+                    {"simChimp", "chr1"})->cigar) == "20M" &&
+                    cigarToString(empty_reference_pair->anchors.at(
+                    {"simGorilla", "chr1"})->cigar) == "10M5I10M" &&
+                    cigarToString(empty_reference_pair->anchors.at(
+                    {"simHuman", "chr1"})->cigar) == "10M5I10M",
+                "empty-reference K-0-K insertion CIGAR is incorrect");
+        require(empty_reference_pair_graph.verifyGraphCorrectness(false),
+                "empty-reference K-0-K graph verification failed");
+
+        RaMesh::RaMeshMultiGenomeGraph full_k_pair_graph(managers);
+        populateAdjacentPair(
+            full_k_pair_graph,
+            {"simChimp", "simGorilla", "simHuman", "simOrang"},
+            {{"simChimp", 5}, {"simGorilla", 5},
+             {"simHuman", 5}, {"simOrang", 5}});
+        require(full_k_pair_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, pair_msa.string(),
+                    3000, 4, 200, 50) == 1,
+                "full-K ordinary K-0-K pair did not use Block reduction");
+        require(full_k_pair_graph.blocks.size() == 1 &&
+                    full_k_pair_graph.verifyGraphCorrectness(false),
+                "full-K K-0-K replacement is invalid");
+        std::ifstream pair_counter_input(pair_msa_counter);
+        std::string pair_calls;
+        pair_counter_input >> pair_calls;
+        require(pair_calls == "xx",
+                "K-0-K minipoa call count is incorrect");
 
         const std::vector<std::vector<std::string>> pattern_4324 = {
             {"simChimp", "simGorilla", "simHuman"},
