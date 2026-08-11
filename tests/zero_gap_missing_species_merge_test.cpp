@@ -185,6 +185,34 @@ void populateAdjacentPair(
     graph.blocks = {left, right};
 }
 
+void populateFullKTriple(
+    RaMesh::RaMeshMultiGenomeGraph& graph,
+    const std::vector<std::string>& participants,
+    uint_t left_gap = 2,
+    uint_t right_gap = 3) {
+    auto left = Block::createEmpty("chr1", participants.size());
+    auto middle = Block::createEmpty("chr1", participants.size());
+    auto right = Block::createEmpty("chr1", participants.size());
+    for (size_t species_index = 0;
+         species_index < participants.size(); ++species_index) {
+        const auto& species = participants[species_index];
+        const uint_t base = static_cast<uint_t>(species_index * 100);
+        const auto left_segment = addSegment(
+            left, species, base, 10, Strand::FORWARD);
+        const auto middle_segment = addSegment(
+            middle, species, base + 10 + left_gap, 10,
+            Strand::FORWARD);
+        const auto right_segment = addSegment(
+            right, species,
+            base + 20 + left_gap + right_gap, 10,
+            Strand::FORWARD);
+        linkPath(
+            graph.species_graphs.at(species).chr2end.at("chr1"),
+            {left_segment, middle_segment, right_segment});
+    }
+    graph.blocks = {left, middle, right};
+}
+
 void populateInteriorChain(
     RaMesh::RaMeshMultiGenomeGraph& graph,
     const std::vector<std::vector<std::string>>& participants,
@@ -408,6 +436,22 @@ void writeReferenceInsertionMsa(const std::filesystem::path& executable) {
            << "EOF\n";
     if (!script) {
         throw std::runtime_error("cannot write insertion MSA script");
+    }
+    script.close();
+    std::filesystem::permissions(
+        executable,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+}
+
+void writeMalformedMsa(const std::filesystem::path& executable) {
+    std::ofstream script(executable);
+    script << "#!/bin/sh\n"
+           << "printf '>s0\\nAAAA\\n'\n";
+    if (!script) {
+        throw std::runtime_error("cannot write malformed MSA script");
     }
     script.close();
     std::filesystem::permissions(
@@ -664,6 +708,8 @@ int main() {
                 "empty-reference K-0-K insertion CIGAR is incorrect");
         require(empty_reference_pair_graph.verifyGraphCorrectness(false),
                 "empty-reference K-0-K graph verification failed");
+        require(!std::filesystem::exists(pair_msa_counter),
+                "empty-reference K-0-K unexpectedly invoked minipoa");
 
         RaMesh::RaMeshMultiGenomeGraph full_k_pair_graph(managers);
         populateAdjacentPair(
@@ -681,8 +727,115 @@ int main() {
         std::ifstream pair_counter_input(pair_msa_counter);
         std::string pair_calls;
         pair_counter_input >> pair_calls;
-        require(pair_calls == "xx",
+        require(pair_calls == "x",
                 "K-0-K minipoa call count is incorrect");
+
+        const auto triple_msa = temp / "triple-minipoa.sh";
+        const auto triple_counter = temp / "triple-minipoa.calls";
+        writePassthroughMsa(triple_msa, triple_counter);
+        const std::vector<std::vector<std::string>> triple_participants = {
+            {"simChimp", "simGorilla"},
+            {"simChimp", "simGorilla", "simHuman"},
+            {"simChimp", "simGorilla", "simHuman", "simOrang"}};
+        for (const auto& participants : triple_participants) {
+            RaMesh::RaMeshMultiGenomeGraph triple_graph(managers);
+            populateFullKTriple(triple_graph, participants);
+            const auto original_left = triple_graph.blocks.front().lock();
+            const auto original_right = triple_graph.blocks.back().lock();
+            require(original_left && original_right,
+                    "full-K triple boundaries are unavailable");
+            require(triple_graph.realignSingleMissingSpeciesWindows(
+                        "simChimp", managers, triple_msa.string(),
+                        3000, 4, 200, 50) == 1,
+                    "full-K triple was not jointly realigned");
+            require(triple_graph.blocks.size() == 3,
+                    "full-K triple changed the Block count");
+            require(triple_graph.blocks.front().lock() == original_left &&
+                        triple_graph.blocks.back().lock() == original_right,
+                    "full-K triple replaced a read-only boundary");
+            const auto replacement =
+                triple_graph.blocks.at(1).lock();
+            require(replacement &&
+                        replacement->anchors.size() ==
+                            participants.size(),
+                    "full-K triple replacement participant set changed");
+            for (const auto& species : participants) {
+                const auto segment = replacement->anchors.at(
+                    {species, "chr1"});
+                require(segment->length == 15 &&
+                            cigarToString(segment->cigar) == "15M",
+                        "full-K triple did not cover both boundary gaps");
+            }
+            require(triple_graph.verifyGraphCorrectness(false),
+                    "full-K triple graph verification failed");
+        }
+        std::ifstream triple_counter_input(triple_counter);
+        std::string triple_calls;
+        triple_counter_input >> triple_calls;
+        require(triple_calls == "xxx",
+                "K=2/3/4 full-K triples did not each invoke one MSA");
+
+        RaMesh::RaMeshMultiGenomeGraph triple_span_graph(managers);
+        populateFullKTriple(
+            triple_span_graph,
+            {"simChimp", "simGorilla", "simHuman", "simOrang"},
+            3001, 3001);
+        require(triple_span_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 4, 200, 50) == 0 &&
+                    triple_span_graph.blocks.size() == 3,
+                "oversized full-K triple was accepted");
+
+        RaMesh::RaMeshMultiGenomeGraph triple_strand_graph(managers);
+        populateFullKTriple(
+            triple_strand_graph,
+            {"simChimp", "simGorilla", "simHuman", "simOrang"});
+        const auto triple_strand_middle =
+            triple_strand_graph.blocks.at(1).lock();
+        require(triple_strand_middle != nullptr,
+                "strand-test full-K middle Block is unavailable");
+        triple_strand_middle->anchors.at(
+            {"simGorilla", "chr1"})->strand = Strand::REVERSE;
+        require(triple_strand_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, "/bin/false",
+                    3000, 4, 200, 50) == 0 &&
+                    triple_strand_graph.blocks.size() == 3,
+                "strand-mismatched full-K triple was accepted");
+
+        const auto malformed_msa = temp / "malformed-minipoa.sh";
+        writeMalformedMsa(malformed_msa);
+        std::unordered_map<ChrName, std::string> malformed_sequences{
+            {"simChimp", "AAAA"}, {"simGorilla", "AAAA"}};
+        const auto original_malformed_sequences = malformed_sequences;
+        require(!alignSequencesWithExternalMsa(
+                    malformed_msa.string(), malformed_sequences) &&
+                    malformed_sequences == original_malformed_sequences,
+                "malformed spawned MSA output was accepted or mutated input");
+
+        const auto triple_fail_msa =
+            temp / "triple-fail-once-minipoa.sh";
+        const auto triple_fail_counter =
+            temp / "triple-fail-once-minipoa.calls";
+        const auto triple_fail_marker =
+            temp / "triple-fail-once-minipoa.marker";
+        writeFailOnceMsa(
+            triple_fail_msa, triple_fail_counter,
+            triple_fail_marker);
+        RaMesh::RaMeshMultiGenomeGraph triple_fallback_graph(managers);
+        populateFullKTriple(
+            triple_fallback_graph,
+            {"simChimp", "simGorilla", "simHuman", "simOrang"});
+        require(triple_fallback_graph.realignSingleMissingSpeciesWindows(
+                    "simChimp", managers, triple_fail_msa.string(),
+                    3000, 4, 200, 50) == 2,
+                "failed full-K triple did not fall back to K-0-K pairs");
+        std::ifstream triple_fail_counter_input(triple_fail_counter);
+        std::string triple_fail_calls;
+        triple_fail_counter_input >> triple_fail_calls;
+        require(triple_fail_calls == "xxx" &&
+                    triple_fallback_graph.blocks.size() == 1 &&
+                    triple_fallback_graph.verifyGraphCorrectness(false),
+                "full-K triple fallback sequence is incorrect");
 
         const std::vector<std::vector<std::string>> pattern_4324 = {
             {"simChimp", "simGorilla", "simHuman"},

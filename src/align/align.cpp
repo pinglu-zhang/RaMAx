@@ -2,32 +2,46 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
-#include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <spawn.h>
 #include <sstream>
+#include <system_error>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/memfd.h>
+#include <sys/syscall.h>
+#endif
 
 #include <spdlog/spdlog.h>
+
+extern char** environ;
 
 namespace {
 
 std::string external_insertion_msa_executable;
 std::atomic<uint64_t> external_msa_file_counter{0};
 std::atomic<uint64_t> external_msa_completed{0};
+std::atomic<uint64_t> external_msa_input_nanoseconds{0};
+std::atomic<uint64_t> external_msa_process_nanoseconds{0};
+std::atomic<uint64_t> external_msa_parse_nanoseconds{0};
+std::atomic<uint64_t> external_msa_memfd_inputs{0};
+std::atomic<uint64_t> external_msa_file_inputs{0};
 
-std::string shellQuote(const std::string& value) {
-    std::string quoted = "'";
-    for (const char c : value) {
-        if (c == '\'') {
-            quoted += "'\\''";
-        } else {
-            quoted += c;
-        }
-    }
-    quoted += "'";
-    return quoted;
+uint64_t elapsedNanoseconds(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point finish) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            finish - start)
+            .count());
 }
 
 std::string ungappedUpper(std::string sequence) {
@@ -46,22 +60,108 @@ std::string ungappedUpper(std::string sequence) {
     return sequence;
 }
 
-class TemporaryMsaFiles {
+class ScopedFd {
 public:
-    std::filesystem::path input;
-    std::filesystem::path output;
-
-    ~TemporaryMsaFiles() {
-        std::error_code error;
-        if (!input.empty()) {
-            std::filesystem::remove(input, error);
+    ScopedFd() = default;
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd_(other.release()) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
         }
-        error.clear();
-        if (!output.empty()) {
-            std::filesystem::remove(output, error);
+        return *this;
+    }
+    ~ScopedFd() { reset(); }
+
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+    int release() {
+        const int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+    void reset(int fd = -1) {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+class TemporaryMsaInput {
+public:
+    std::filesystem::path path;
+
+    ~TemporaryMsaInput() {
+        std::error_code error;
+        if (!path.empty()) {
+            std::filesystem::remove(path, error);
         }
     }
 };
+
+bool writeAll(int fd, const std::string& contents) {
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        const ssize_t written = ::write(
+            fd, contents.data() + offset, contents.size() - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+ScopedFd createMsaMemfd(const std::string& contents) {
+#if defined(__linux__) && defined(SYS_memfd_create)
+    const int fd = static_cast<int>(
+        ::syscall(SYS_memfd_create, "ramax-minipoa-input", MFD_CLOEXEC));
+    if (fd >= 0) {
+        ScopedFd result(fd);
+        if (writeAll(fd, contents) && ::lseek(fd, 0, SEEK_SET) == 0) {
+            return result;
+        }
+    }
+#else
+    (void)contents;
+#endif
+    return {};
+}
+
+bool readAll(int fd, std::string& contents) {
+    std::array<char, 8192> buffer{};
+    while (true) {
+        const ssize_t count = ::read(fd, buffer.data(), buffer.size());
+        if (count == 0) {
+            return true;
+        }
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        contents.append(buffer.data(), static_cast<size_t>(count));
+    }
+}
+
+bool waitForChild(pid_t pid, int& status) {
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool runExternalMsa(
     const std::string& executable,
@@ -70,6 +170,7 @@ bool runExternalMsa(
         sequences.size() < 2) {
         return false;
     }
+    const auto input_start = std::chrono::steady_clock::now();
 
     std::vector<ChrName> keys;
     keys.reserve(sequences.size());
@@ -79,49 +180,145 @@ bool runExternalMsa(
     }
     std::sort(keys.begin(), keys.end());
 
-    const uint64_t serial =
-        external_msa_file_counter.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t stamp = static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    const auto prefix =
-        std::filesystem::temp_directory_path() /
-        ("ramax-insertion-msa-" + std::to_string(stamp) + "-" +
-         std::to_string(serial));
+    std::ostringstream fasta_stream;
+    for (size_t index = 0; index < keys.size(); ++index) {
+        fasta_stream << ">s" << index << "\n"
+                     << sequences.at(keys[index]) << "\n";
+    }
+    const std::string fasta = fasta_stream.str();
 
-    TemporaryMsaFiles temporary{
-        prefix.string() + ".input.fa",
-        prefix.string() + ".output.fa"};
-
-    {
-        std::ofstream input(temporary.input, std::ios::binary);
-        if (!input) {
+    ScopedFd input_fd = createMsaMemfd(fasta);
+    TemporaryMsaInput temporary;
+    std::string input_path;
+    if (!input_fd) {
+        external_msa_file_inputs.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t serial = external_msa_file_counter.fetch_add(
+            1, std::memory_order_relaxed);
+        const uint64_t stamp = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        temporary.path =
+            std::filesystem::temp_directory_path() /
+            ("ramax-insertion-msa-" + std::to_string(stamp) + "-" +
+             std::to_string(serial) + ".input.fa");
+        std::ofstream input(temporary.path, std::ios::binary);
+        if (!input || !(input << fasta)) {
             throw std::runtime_error(
                 "Cannot create external MSA input: " +
-                temporary.input.string());
+                temporary.path.string());
         }
-        for (size_t index = 0; index < keys.size(); ++index) {
-            input << ">s" << index << "\n"
-                  << sequences.at(keys[index]) << "\n";
-        }
+        input_path = temporary.path.string();
+    } else {
+        external_msa_memfd_inputs.fetch_add(1, std::memory_order_relaxed);
     }
 
-    const std::string command =
-        shellQuote(executable) +
-        " -r 1 -t 1 " + shellQuote(temporary.input.string()) +
-        " > " + shellQuote(temporary.output.string());
-    if (std::system(command.c_str()) != 0) {
+    int output_pipe[2] = {-1, -1};
+#if defined(__linux__)
+    const int pipe_result = ::pipe2(output_pipe, O_CLOEXEC);
+#else
+    const int pipe_result = ::pipe(output_pipe);
+#endif
+    if (pipe_result != 0) {
+        throw std::system_error(
+            errno, std::generic_category(), "Cannot create MSA output pipe");
+    }
+    ScopedFd output_read(output_pipe[0]);
+    ScopedFd output_write(output_pipe[1]);
+#if !defined(__linux__)
+    for (const int fd : output_pipe) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "Cannot mark MSA output pipe close-on-exec");
+        }
+    }
+#endif
+
+    int child_input_fd = 100;
+    while (child_input_fd == input_fd.get() ||
+           child_input_fd == output_read.get() ||
+           child_input_fd == output_write.get()) {
+        ++child_input_fd;
+    }
+    if (input_fd) {
+        input_path =
+            "/proc/self/fd/" + std::to_string(child_input_fd);
+    }
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        throw std::runtime_error("Cannot initialize MSA spawn actions");
+    }
+    const auto destroy_actions = [&]() {
+        posix_spawn_file_actions_destroy(&actions);
+    };
+    int action_error = 0;
+    if (input_fd) {
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, input_fd.get(), child_input_fd);
+    }
+    if (action_error == 0) {
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, output_write.get(), STDOUT_FILENO);
+    }
+    if (action_error == 0) {
+        action_error = posix_spawn_file_actions_addclose(
+            &actions, output_read.get());
+    }
+    if (action_error == 0 && output_write.get() != STDOUT_FILENO) {
+        action_error = posix_spawn_file_actions_addclose(
+            &actions, output_write.get());
+    }
+    if (action_error != 0) {
+        destroy_actions();
+        throw std::system_error(
+            action_error, std::generic_category(),
+            "Cannot configure MSA spawn actions");
+    }
+
+    std::vector<char*> arguments{
+        const_cast<char*>(executable.c_str()),
+        const_cast<char*>("-r"),
+        const_cast<char*>("1"),
+        const_cast<char*>("-t"),
+        const_cast<char*>("1"),
+        input_path.data(),
+        nullptr};
+    pid_t pid = -1;
+    const auto process_start = std::chrono::steady_clock::now();
+    external_msa_input_nanoseconds.fetch_add(
+        elapsedNanoseconds(input_start, process_start),
+        std::memory_order_relaxed);
+    const int spawn_error = posix_spawnp(
+        &pid, executable.c_str(), &actions, nullptr,
+        arguments.data(), environ);
+    destroy_actions();
+    if (spawn_error != 0) {
+        spdlog::warn(
+            "[external-msa] cannot spawn {}: {}",
+            executable, std::generic_category().message(spawn_error));
+        return false;
+    }
+    output_write.reset();
+
+    std::string output_text;
+    const bool output_read_ok = readAll(output_read.get(), output_text);
+    output_read.reset();
+    int child_status = 0;
+    const bool waited = waitForChild(pid, child_status);
+    if (!output_read_ok || !waited || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
         spdlog::warn(
             "[external-msa] command failed: {}",
             executable);
         return false;
     }
 
-    std::ifstream output(temporary.output, std::ios::binary);
-    if (!output) {
-        spdlog::warn(
-            "[external-msa] output is unavailable");
-        return false;
-    }
+    const auto parse_start = std::chrono::steady_clock::now();
+    external_msa_process_nanoseconds.fetch_add(
+        elapsedNanoseconds(process_start, parse_start),
+        std::memory_order_relaxed);
+    std::istringstream output(output_text);
 
     std::unordered_map<std::string, std::string> aligned_by_id;
     std::string current_id;
@@ -188,12 +385,31 @@ bool runExternalMsa(
         sequences[keys[index]] = std::move(aligned[index]);
     }
 
+    const auto parse_finish = std::chrono::steady_clock::now();
+    external_msa_parse_nanoseconds.fetch_add(
+        elapsedNanoseconds(parse_start, parse_finish),
+        std::memory_order_relaxed);
+
     const uint64_t completed =
         external_msa_completed.fetch_add(1, std::memory_order_relaxed) + 1;
     if (completed % 1000 == 0) {
+        constexpr double kNanosecondsPerSecond = 1.0e9;
         spdlog::info(
-            "[external-msa] completed {} MSAs with {}",
-            completed, executable);
+            "[external-msa] completed={} executable={} input_seconds={:.3f} "
+            "process_seconds={:.3f} parse_seconds={:.3f} memfd_inputs={} "
+            "file_inputs={}",
+            completed, executable,
+            external_msa_input_nanoseconds.load(
+                std::memory_order_relaxed) /
+                kNanosecondsPerSecond,
+            external_msa_process_nanoseconds.load(
+                std::memory_order_relaxed) /
+                kNanosecondsPerSecond,
+            external_msa_parse_nanoseconds.load(
+                std::memory_order_relaxed) /
+                kNanosecondsPerSecond,
+            external_msa_memfd_inputs.load(std::memory_order_relaxed),
+            external_msa_file_inputs.load(std::memory_order_relaxed));
     }
     return true;
 }
@@ -564,8 +780,4 @@ AlignCount countAlignedBases(const Cigar_t& cigar) {
     }
     return cnt;
 }
-
-
-
-
 
