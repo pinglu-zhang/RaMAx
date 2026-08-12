@@ -1003,6 +1003,27 @@ starAlignment(
                 i + 1, current_ref_name, replaced_windows,
                 eliminated_after_realign);
         }
+        if (structural_break_repair_options.enabled) {
+            auto repair_options = structural_break_repair_options;
+            repair_options.parallel_threads = thread_num;
+            const auto repair =
+                RaMesh::StructuralBreakRepair::repairAnchorBoundedStructuralBreaks(
+                    *multi_graph, current_ref_name, seqpro_managers,
+                    repair_options);
+            size_t eliminated_after_repair = 0;
+            if (repair.committed > 0 &&
+                merge_exact_contiguous_blocks_enabled) {
+                eliminated_after_repair =
+                    multi_graph->mergeExactContiguousBlocks(
+                        current_ref_name, 1000000,
+                        merge_query_gap_max);
+            }
+            spdlog::info(
+                "[structural-break-repair] round={} reference={} "
+                "committed={} post_repair_eliminated_boundaries={}",
+                i + 1, current_ref_name, repair.committed,
+                eliminated_after_repair);
+        }
 
         // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于
         // markAllExtended() 和本轮 addAlignedRegionsAsMask() 之前，避免检测逻辑

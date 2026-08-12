@@ -60,7 +60,8 @@ private:
 };
 
 enum class LocalRepairKind : uint8_t {
-    ExistingMissingWindow
+    ExistingMissingWindow,
+    StructuralBreak
 };
 
 struct StablePriorityKey {
@@ -102,6 +103,10 @@ struct PreparedPathReplacement {
 
 struct PreparedGraphReplacement {
     BlockPtr provisional_block;
+    // Structural-break repair can detach an invalid homology edge while
+    // retaining the original genomic Segment in a residual singleton Block.
+    // Missing-window transactions leave this vector empty.
+    std::vector<BlockPtr> residual_blocks;
     std::vector<PreparedPathReplacement> paths;
     std::vector<BlockPtr> replaced_blocks;
     std::vector<SpeciesChrPair> audit_scope;

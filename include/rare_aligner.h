@@ -9,6 +9,7 @@
 #include "threadpool.h"
 #include "ramesh.h"
 #include "window_detector.h"
+#include "structural_break_repair.h"
 
 // 多基因组比对核心调度类
 class MultipleRareAligner {
@@ -40,6 +41,7 @@ public:
     uint_t species_mismatch_zero_gap_max_span = 200;
     std::string species_mismatch_msa_executable =
         "/usr/local/bin/minipoa";
+    RaMesh::StructuralBreakRepair::Options structural_break_repair_options;
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

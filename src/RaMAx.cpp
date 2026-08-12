@@ -80,6 +80,8 @@ struct CommonArgs {
     bool realign_single_missing_species = false;
     uint_t species_mismatch_realign_max_span = 3000;
     uint_t species_mismatch_zero_gap_max_span = 200;
+    bool repair_structural_breaks = false;
+    uint_t structural_break_max_span = 1000;
     std::string window_detection_mode = "each-round";
     std::filesystem::path window_report_dir = "";
     std::string window_threshold_profile = "alignathon-v1";
@@ -131,6 +133,18 @@ constexpr const char* SINGLE_MISSING_SPECIES_CONFIG_FILE =
     "single_missing_species_realign_enabled";
 constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
+constexpr const char* STRUCTURAL_BREAK_CONFIG_FILE =
+    "structural_break_repair_config.json";
+
+struct StructuralBreakConfigFile {
+    bool enabled = false;
+    uint64_t maximum_span = 1000;
+
+    template<class Archive>
+    void serialize(Archive& ar) {
+        ar(CEREAL_NVP(enabled), CEREAL_NVP(maximum_span));
+    }
+};
 
 // Window detection uses a separate optional config so older restart directories
 // remain readable by newer RaMAx binaries. The historical CommonArgs JSON schema
@@ -295,6 +309,12 @@ inline void printRunConfiguration(const CommonArgs& args) {
             args.species_mismatch_realign_max_span);
         spdlog::info("  Zero-gap merge span   : {}",
             args.species_mismatch_zero_gap_max_span);
+    }
+    spdlog::info("  Structural-break repair: {}",
+        args.repair_structural_breaks ? "Enabled" : "Disabled");
+    if (args.repair_structural_breaks) {
+        spdlog::info("  Structural-break span: {}",
+                     args.structural_break_max_span);
     }
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
@@ -520,6 +540,23 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->needs(realign_missing_species_flag)
         ->check(CLI::Range(1, 3000));
 
+    auto* structural_break_repair_flag = cmd->add_flag(
+        "--repair-structural-breaks",
+        args.repair_structural_breaks,
+        "Repair precision-filtered, anchor-bounded target/strand/order "
+        "discontinuities with counterfactual minipoa before masking.")
+        ->group("Graph Optimization");
+
+    auto* structural_break_span_opt = cmd->add_option(
+        "--structural-break-max-span",
+        args.structural_break_max_span,
+        "Maximum reference and query interval for structural-break repair.")
+        ->default_val(1000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->needs(structural_break_repair_flag)
+        ->check(CLI::Range(1, 1000));
+
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
         "Use slow but more accurate index building method.")
@@ -714,6 +751,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         root_opt,
         ref_opt,
         merge_exact_blocks_flag,
+        structural_break_repair_flag,
+        structural_break_span_opt,
         one_round_flag,
         log_level_opt,
         detect_windows_flag,
@@ -893,6 +932,26 @@ static int runRestartMode(CommonArgs& common_args) {
     } else {
         common_args.detect_windows = false;
     }
+    const FilePath structural_break_config_path =
+        common_args.work_dir_path / STRUCTURAL_BREAK_CONFIG_FILE;
+    if (std::filesystem::exists(structural_break_config_path)) {
+        std::ifstream structural_input(structural_break_config_path);
+        if (!structural_input) {
+            throw std::runtime_error(
+                "Failed to open structural-break restart config: " +
+                structural_break_config_path.string());
+        }
+        StructuralBreakConfigFile structural_config;
+        cereal::JSONInputArchive structural_archive(structural_input);
+        structural_archive(structural_config);
+        common_args.repair_structural_breaks = structural_config.enabled;
+        common_args.structural_break_max_span = static_cast<uint_t>(
+            std::clamp<uint64_t>(structural_config.maximum_span, 1, 1000));
+        spdlog::info("Structural-break config loaded from {}",
+                     structural_break_config_path.string());
+    } else {
+        common_args.repair_structural_breaks = false;
+    }
     finalizeWindowConfig(common_args);
 
     return 0;
@@ -975,6 +1034,23 @@ static int runNormalMode(CommonArgs& common_args) {
         window_archive(cereal::make_nvp("window_detection", window_config));
         spdlog::info("Window detection config saved to {}",
                      window_config_path.string());
+    }
+    if (common_args.repair_structural_breaks) {
+        const FilePath structural_break_config_path =
+            common_args.work_dir_path / STRUCTURAL_BREAK_CONFIG_FILE;
+        std::ofstream structural_output(structural_break_config_path);
+        if (!structural_output) {
+            throw std::runtime_error(
+                "Failed to save structural-break config: " +
+                structural_break_config_path.string());
+        }
+        StructuralBreakConfigFile structural_config{
+            true, common_args.structural_break_max_span};
+        cereal::JSONOutputArchive structural_archive(structural_output);
+        structural_archive(cereal::make_nvp(
+            "structural_break_repair", structural_config));
+        spdlog::info("Structural-break config saved to {}",
+                     structural_break_config_path.string());
     }
 
     if (common_args.merge_exact_contiguous_blocks) {
@@ -1263,11 +1339,20 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.species_mismatch_zero_gap_max_span;
     mra.species_mismatch_msa_executable =
         MINIPOA_EXECUTABLE;
-    if (mra.realign_single_missing_species_enabled &&
+    mra.structural_break_repair_options.enabled =
+        common_args.repair_structural_breaks;
+    mra.structural_break_repair_options.maximum_span =
+        common_args.structural_break_max_span;
+    mra.structural_break_repair_options.parallel_threads =
+        common_args.thread_num;
+    mra.structural_break_repair_options.msa_executable =
+        MINIPOA_EXECUTABLE;
+    if ((mra.realign_single_missing_species_enabled ||
+         mra.structural_break_repair_options.enabled) &&
         !std::filesystem::exists(
             mra.species_mismatch_msa_executable)) {
         throw std::runtime_error(
-            "Single-missing-species realignment requires minipoa at " +
+            "Graph realignment requires minipoa at " +
             mra.species_mismatch_msa_executable);
     }
     auto t_start_align = std::chrono::steady_clock::now();
