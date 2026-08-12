@@ -1,45 +1,22 @@
 #include "align.h"
+#include "cross_anchor_repair.h"
+#include "external_msa_runner.h"
+#include "reference_profile_merger.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
-#include <cctype>
-#include <fcntl.h>
-#include <filesystem>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
-#include <spawn.h>
 #include <sstream>
-#include <system_error>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#if defined(__linux__)
-#include <linux/memfd.h>
-#include <sys/syscall.h>
-#endif
 
 #include <spdlog/spdlog.h>
 
-extern char** environ;
-
 namespace {
-
-std::string external_insertion_msa_executable;
-std::atomic<uint64_t> external_msa_file_counter{0};
-std::atomic<uint64_t> external_msa_completed{0};
-std::atomic<uint64_t> external_msa_input_nanoseconds{0};
-std::atomic<uint64_t> external_msa_process_nanoseconds{0};
-std::atomic<uint64_t> external_msa_parse_nanoseconds{0};
-std::atomic<uint64_t> external_msa_memfd_inputs{0};
-std::atomic<uint64_t> external_msa_file_inputs{0};
 
 constexpr uint32_t kCrossAnchorMinimumInsertion = 10;
 constexpr uint32_t kCrossAnchorMaximumDistance = 5;
@@ -48,35 +25,13 @@ constexpr double kCrossAnchorMinimumCoverage = 0.70;
 constexpr double kCrossAnchorMinimumIdentity = 0.60;
 constexpr size_t kCrossAnchorCacheLimit = 1024;
 
-struct CrossAnchorRepairConfiguration {
-    std::string executable;
-    uint_t maximum_window_span = 3000;
-};
+using RaMesh::Alignment::CrossAnchorRepairConfiguration;
 
-CrossAnchorRepairConfiguration cross_anchor_configuration;
-std::mutex cross_anchor_configuration_mutex;
-std::mutex cross_anchor_cache_mutex;
-std::unordered_map<
-    std::string,
-    std::vector<std::pair<ChrName, std::string>>>
-    cross_anchor_msa_cache;
-
-struct CrossAnchorRepairCounters {
-    std::atomic<uint64_t> blocks_scanned{0};
-    std::atomic<uint64_t> cigar_candidates{0};
-    std::atomic<uint64_t> short_insertions_skipped{0};
-    std::atomic<uint64_t> same_anchor_skipped{0};
-    std::atomic<uint64_t> distance_skipped{0};
-    std::atomic<uint64_t> similarity_pairs{0};
-    std::atomic<uint64_t> ksw2_repairs{0};
-    std::atomic<uint64_t> minipoa_calls{0};
-    std::atomic<uint64_t> cache_hits{0};
-    std::atomic<uint64_t> accepted{0};
-    std::atomic<uint64_t> fallback{0};
-    std::atomic<uint64_t> nanoseconds{0};
-};
-
-CrossAnchorRepairCounters cross_anchor_counters;
+auto& cross_anchor_session =
+    RaMesh::Alignment::CrossAnchorInsertionRepairSession::instance();
+auto& cross_anchor_cache_mutex = cross_anchor_session.cache_mutex;
+auto& cross_anchor_msa_cache = cross_anchor_session.msa_cache;
+auto& cross_anchor_counters = cross_anchor_session.counters;
 
 uint64_t elapsedNanoseconds(
     std::chrono::steady_clock::time_point start,
@@ -87,439 +42,7 @@ uint64_t elapsedNanoseconds(
             .count());
 }
 
-std::string ungappedUpper(std::string sequence) {
-    sequence.erase(
-        std::remove_if(
-            sequence.begin(), sequence.end(),
-            [](unsigned char c) {
-                return c == '-' || std::isspace(c);
-            }),
-        sequence.end());
-    std::transform(
-        sequence.begin(), sequence.end(), sequence.begin(),
-        [](unsigned char c) {
-            return static_cast<char>(std::toupper(c));
-        });
-    return sequence;
-}
-
-class ScopedFd {
-public:
-    ScopedFd() = default;
-    explicit ScopedFd(int fd) : fd_(fd) {}
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-    ScopedFd(ScopedFd&& other) noexcept : fd_(other.release()) {}
-    ScopedFd& operator=(ScopedFd&& other) noexcept {
-        if (this != &other) {
-            reset(other.release());
-        }
-        return *this;
-    }
-    ~ScopedFd() { reset(); }
-
-    int get() const { return fd_; }
-    explicit operator bool() const { return fd_ >= 0; }
-    int release() {
-        const int fd = fd_;
-        fd_ = -1;
-        return fd;
-    }
-    void reset(int fd = -1) {
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
-        fd_ = fd;
-    }
-
-private:
-    int fd_ = -1;
-};
-
-class TemporaryMsaInput {
-public:
-    std::filesystem::path path;
-
-    ~TemporaryMsaInput() {
-        std::error_code error;
-        if (!path.empty()) {
-            std::filesystem::remove(path, error);
-        }
-    }
-};
-
-bool writeAll(int fd, const std::string& contents) {
-    size_t offset = 0;
-    while (offset < contents.size()) {
-        const ssize_t written = ::write(
-            fd, contents.data() + offset, contents.size() - offset);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        offset += static_cast<size_t>(written);
-    }
-    return true;
-}
-
-ScopedFd createMsaMemfd(const std::string& contents) {
-#if defined(__linux__) && defined(SYS_memfd_create)
-    const int fd = static_cast<int>(
-        ::syscall(SYS_memfd_create, "ramax-minipoa-input", MFD_CLOEXEC));
-    if (fd >= 0) {
-        ScopedFd result(fd);
-        if (writeAll(fd, contents) && ::lseek(fd, 0, SEEK_SET) == 0) {
-            return result;
-        }
-    }
-#else
-    (void)contents;
-#endif
-    return {};
-}
-
-bool readAll(int fd, std::string& contents) {
-    std::array<char, 8192> buffer{};
-    while (true) {
-        const ssize_t count = ::read(fd, buffer.data(), buffer.size());
-        if (count == 0) {
-            return true;
-        }
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        contents.append(buffer.data(), static_cast<size_t>(count));
-    }
-}
-
-bool waitForChild(pid_t pid, int& status) {
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool runExternalMsa(
-    const std::string& executable,
-    std::unordered_map<ChrName, std::string>& sequences) {
-    if (executable.empty() ||
-        sequences.size() < 2) {
-        return false;
-    }
-    const auto input_start = std::chrono::steady_clock::now();
-
-    std::vector<ChrName> keys;
-    keys.reserve(sequences.size());
-    for (const auto& [key, unused] : sequences) {
-        (void)unused;
-        keys.push_back(key);
-    }
-    std::sort(keys.begin(), keys.end());
-
-    std::ostringstream fasta_stream;
-    for (size_t index = 0; index < keys.size(); ++index) {
-        fasta_stream << ">s" << index << "\n"
-                     << sequences.at(keys[index]) << "\n";
-    }
-    const std::string fasta = fasta_stream.str();
-
-    ScopedFd input_fd = createMsaMemfd(fasta);
-    TemporaryMsaInput temporary;
-    std::string input_path;
-    if (!input_fd) {
-        external_msa_file_inputs.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t serial = external_msa_file_counter.fetch_add(
-            1, std::memory_order_relaxed);
-        const uint64_t stamp = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        temporary.path =
-            std::filesystem::temp_directory_path() /
-            ("ramax-insertion-msa-" + std::to_string(stamp) + "-" +
-             std::to_string(serial) + ".input.fa");
-        std::ofstream input(temporary.path, std::ios::binary);
-        if (!input || !(input << fasta)) {
-            throw std::runtime_error(
-                "Cannot create external MSA input: " +
-                temporary.path.string());
-        }
-        input_path = temporary.path.string();
-    } else {
-        external_msa_memfd_inputs.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    int output_pipe[2] = {-1, -1};
-#if defined(__linux__)
-    const int pipe_result = ::pipe2(output_pipe, O_CLOEXEC);
-#else
-    const int pipe_result = ::pipe(output_pipe);
-#endif
-    if (pipe_result != 0) {
-        throw std::system_error(
-            errno, std::generic_category(), "Cannot create MSA output pipe");
-    }
-    ScopedFd output_read(output_pipe[0]);
-    ScopedFd output_write(output_pipe[1]);
-#if !defined(__linux__)
-    for (const int fd : output_pipe) {
-        const int flags = ::fcntl(fd, F_GETFD);
-        if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
-            throw std::system_error(
-                errno, std::generic_category(),
-                "Cannot mark MSA output pipe close-on-exec");
-        }
-    }
-#endif
-
-    int child_input_fd = 100;
-    while (child_input_fd == input_fd.get() ||
-           child_input_fd == output_read.get() ||
-           child_input_fd == output_write.get()) {
-        ++child_input_fd;
-    }
-    if (input_fd) {
-        input_path =
-            "/proc/self/fd/" + std::to_string(child_input_fd);
-    }
-
-    posix_spawn_file_actions_t actions;
-    if (posix_spawn_file_actions_init(&actions) != 0) {
-        throw std::runtime_error("Cannot initialize MSA spawn actions");
-    }
-    const auto destroy_actions = [&]() {
-        posix_spawn_file_actions_destroy(&actions);
-    };
-    int action_error = 0;
-    if (input_fd) {
-        action_error = posix_spawn_file_actions_adddup2(
-            &actions, input_fd.get(), child_input_fd);
-    }
-    if (action_error == 0) {
-        action_error = posix_spawn_file_actions_adddup2(
-            &actions, output_write.get(), STDOUT_FILENO);
-    }
-    if (action_error == 0) {
-        action_error = posix_spawn_file_actions_addclose(
-            &actions, output_read.get());
-    }
-    if (action_error == 0 && output_write.get() != STDOUT_FILENO) {
-        action_error = posix_spawn_file_actions_addclose(
-            &actions, output_write.get());
-    }
-    if (action_error != 0) {
-        destroy_actions();
-        throw std::system_error(
-            action_error, std::generic_category(),
-            "Cannot configure MSA spawn actions");
-    }
-
-    std::vector<char*> arguments{
-        const_cast<char*>(executable.c_str()),
-        const_cast<char*>("-r"),
-        const_cast<char*>("1"),
-        const_cast<char*>("-t"),
-        const_cast<char*>("1"),
-        input_path.data(),
-        nullptr};
-    pid_t pid = -1;
-    const auto process_start = std::chrono::steady_clock::now();
-    external_msa_input_nanoseconds.fetch_add(
-        elapsedNanoseconds(input_start, process_start),
-        std::memory_order_relaxed);
-    const int spawn_error = posix_spawnp(
-        &pid, executable.c_str(), &actions, nullptr,
-        arguments.data(), environ);
-    destroy_actions();
-    if (spawn_error != 0) {
-        spdlog::warn(
-            "[external-msa] cannot spawn {}: {}",
-            executable, std::generic_category().message(spawn_error));
-        return false;
-    }
-    output_write.reset();
-
-    std::string output_text;
-    const bool output_read_ok = readAll(output_read.get(), output_text);
-    output_read.reset();
-    int child_status = 0;
-    const bool waited = waitForChild(pid, child_status);
-    if (!output_read_ok || !waited || !WIFEXITED(child_status) ||
-        WEXITSTATUS(child_status) != 0) {
-        spdlog::warn(
-            "[external-msa] command failed: {}",
-            executable);
-        return false;
-    }
-
-    const auto parse_start = std::chrono::steady_clock::now();
-    external_msa_process_nanoseconds.fetch_add(
-        elapsedNanoseconds(process_start, parse_start),
-        std::memory_order_relaxed);
-    std::istringstream output(output_text);
-
-    std::unordered_map<std::string, std::string> aligned_by_id;
-    std::string current_id;
-    std::string line;
-    while (std::getline(output, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (!line.empty() && line.front() == '>') {
-            std::istringstream header(line.substr(1));
-            header >> current_id;
-            if (current_id.empty() ||
-                !aligned_by_id.emplace(current_id, std::string{}).second) {
-                spdlog::warn(
-                    "[external-msa] invalid FASTA header");
-                return false;
-            }
-            continue;
-        }
-        if (current_id.empty()) {
-            if (line.empty()) {
-                continue;
-            }
-            spdlog::warn(
-                "[external-msa] sequence before FASTA header");
-            return false;
-        }
-        for (const unsigned char c : line) {
-            if (!std::isspace(c)) {
-                aligned_by_id[current_id].push_back(
-                    static_cast<char>(c));
-            }
-        }
-    }
-
-    if (aligned_by_id.size() != keys.size()) {
-        spdlog::warn("[external-msa] output row count mismatch");
-        return false;
-    }
-
-    size_t aligned_length = 0;
-    std::vector<std::string> aligned(keys.size());
-    for (size_t index = 0; index < keys.size(); ++index) {
-        const std::string id = "s" + std::to_string(index);
-        const auto aligned_it = aligned_by_id.find(id);
-        if (aligned_it == aligned_by_id.end() ||
-            ungappedUpper(aligned_it->second) !=
-                ungappedUpper(sequences.at(keys[index]))) {
-            spdlog::warn(
-                "[external-msa] output sequence validation failed");
-            return false;
-        }
-        if (index == 0) {
-            aligned_length = aligned_it->second.size();
-        } else if (aligned_it->second.size() != aligned_length) {
-            spdlog::warn(
-                "[external-msa] output rows have unequal lengths");
-            return false;
-        }
-        aligned[index] = aligned_it->second;
-    }
-
-    for (size_t index = 0; index < keys.size(); ++index) {
-        sequences[keys[index]] = std::move(aligned[index]);
-    }
-
-    const auto parse_finish = std::chrono::steady_clock::now();
-    external_msa_parse_nanoseconds.fetch_add(
-        elapsedNanoseconds(parse_start, parse_finish),
-        std::memory_order_relaxed);
-
-    const uint64_t completed =
-        external_msa_completed.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (completed % 1000 == 0) {
-        constexpr double kNanosecondsPerSecond = 1.0e9;
-        spdlog::info(
-            "[external-msa] completed={} executable={} input_seconds={:.3f} "
-            "process_seconds={:.3f} parse_seconds={:.3f} memfd_inputs={} "
-            "file_inputs={}",
-            completed, executable,
-            external_msa_input_nanoseconds.load(
-                std::memory_order_relaxed) /
-                kNanosecondsPerSecond,
-            external_msa_process_nanoseconds.load(
-                std::memory_order_relaxed) /
-                kNanosecondsPerSecond,
-            external_msa_parse_nanoseconds.load(
-                std::memory_order_relaxed) /
-                kNanosecondsPerSecond,
-            external_msa_memfd_inputs.load(std::memory_order_relaxed),
-            external_msa_file_inputs.load(std::memory_order_relaxed));
-    }
-    return true;
-}
-
 }  // namespace
-
-static uint_t mergeAlignmentByRefCore(
-    const ChrName& ref_name,
-    std::unordered_map<ChrName, std::string>& seqs,
-    const std::unordered_map<ChrName, Cigar_t>& cigars);
-
-bool alignSequencesWithExternalMsa(
-    const std::string& executable,
-    std::unordered_map<ChrName, std::string>& sequences) {
-    return runExternalMsa(executable, sequences);
-}
-
-void configureExternalInsertionMsa(const std::string& executable) {
-    external_insertion_msa_executable = executable;
-    if (!executable.empty()) {
-        spdlog::info(
-            "[external-msa] insertion aligner configured: {}",
-            executable);
-    }
-}
-
-void InsertInfo::alignSeqs() {
-    if (aligned || seqs.empty()) {
-        return;
-    }
-
-    if (seqs.size() == 1) {
-        ref_name = seqs.begin()->first;
-        total_length = seqs.begin()->second.size();
-        aligned = true;
-        return;
-    }
-
-    if (runExternalMsa(
-            external_insertion_msa_executable, seqs)) {
-        ref_name = seqs.begin()->first;
-        total_length = seqs.begin()->second.size();
-        aligned = true;
-        return;
-    }
-
-    size_t max_len = 0;
-    ChrName longest_key;
-    for (const auto& [key, sequence] : seqs) {
-        if (sequence.size() > max_len) {
-            max_len = sequence.size();
-            longest_key = key;
-        }
-    }
-    ref_name = longest_key;
-
-    std::unordered_map<ChrName, Cigar_t> cigars;
-    for (const auto& [key, sequence] : seqs) {
-        (void)sequence;
-        if (key == ref_name) {
-            continue;
-        }
-        cigars[key] = globalAlignKSW2(seqs[ref_name], seqs.at(key));
-    }
-    total_length = mergeAlignmentByRefCore(ref_name, seqs, cigars);
-    aligned = true;
-}
 
 KSW2AlignConfig makeDefaultKSW2Config() {
     static int8_t simple_dna_mat[25];
@@ -705,92 +228,6 @@ Cigar_t extendAlignKSW2(const std::string& ref,
 
     free(ez.cigar);                    // ksw2 使用 malloc
     return cigar;                      // 返回的 CIGAR 即延伸片段
-}
-
-/* ──────────── 合并成 MSA (就地修改 seqs) ──────────── */
-static uint_t mergeAlignmentByRefCore(
-    const ChrName& ref_name,
-    std::unordered_map<ChrName, std::string>& seqs,
-    const std::unordered_map<ChrName, Cigar_t>& cigars)
-{
-    auto ref_it = seqs.find(ref_name);
-    if (ref_it == seqs.end())
-        throw std::invalid_argument("mergeAlignmentByRef: ref not found");
-
-    std::string& ref_raw = ref_it->second;
-    uint_t total_aligned_length = ref_raw.size();
-	RefAlignInfo insert_info;
-
-    for (const auto& [key, cigar] : cigars) {
-        if (key == ref_name) continue;
-        auto q_it = seqs.find(key);
-        if (q_it == seqs.end()) {
-            throw std::invalid_argument("mergeAlignmentByRef: seq missing");
-        }
-
-		std::string& qry_raw = q_it->second;
-
-		uint_t ref_pos = 0;
-		uint_t qry_pos = 0;
-        for (auto& unit : cigar) {
-            uint32_t len;
-            char op;
-			intToCigar(unit, op, len);
-
-            if (op == 'D') {
-				qry_raw.insert(qry_pos, len, '-');
-                ref_pos += len;
-                qry_pos += len;
-            }
-            else if (op == 'I') {
-                std::string ins = qry_raw.substr(qry_pos, len);
-
-                // 2) 在 insert_info 里插入或更新
-                auto it = insert_info.find(ref_pos);
-                if (it != insert_info.end()) {
-                    it->second.seqs[key] = ins;
-                }
-                else {
-                    InsertInfo info;
-                    info.seqs[key] = ins;
-                    insert_info[ref_pos] = std::move(info);
-                }
-
-                // 3) 从原始 query 序列里移除这段已“消费”的子串
-                qry_raw.erase(qry_pos, len);
-            }
-            else {
-                ref_pos += len;
-                qry_pos += len;
-            }
-        }
-    }
-
-    uint_t offset = 0;
-	for (auto& [ref_pos, info] : insert_info) {
-		info.alignSeqs(); // 对齐所有插入序列
-		if (info.ref_name.empty()) continue; // 没有参考序列，跳过
-		for (auto& [sp_name, seq] : seqs) {
-			auto it = info.seqs.find(sp_name);
-            if (it != info.seqs.end()) {
-				seq.insert(ref_pos + offset, it->second); // 在 ref_pos 位置插入
-            }
-            else {
-                seq.insert(ref_pos + offset, info.total_length, '-');   // 直接用 string::insert 重载
-            }
-		}
-        offset += info.total_length; // 更新总长度
-        total_aligned_length += info.total_length;
-	}
-
-    for (auto& [chr, seq] : seqs) {
-        if (seq.size() != total_aligned_length) {
-            std::cout << "";
-        }
-    }
-
-    return total_aligned_length;
-
 }
 
 namespace {
@@ -1263,7 +700,8 @@ bool alignLocalAlleles(
         }
         cross_anchor_counters.minipoa_calls.fetch_add(
             1, std::memory_order_relaxed);
-        if (!runExternalMsa(configuration.executable, aligned)) {
+        if (!RaMesh::Alignment::ExternalMsaRunner::instance().align(
+                configuration.executable, aligned)) {
             return false;
         }
         std::vector<std::pair<ChrName, std::string>> cached_rows;
@@ -1299,7 +737,8 @@ bool alignLocalAlleles(
         }
     }
     try {
-        mergeAlignmentByRefCore(longest->first, aligned, local_cigars);
+        RaMesh::Alignment::mergeReferenceProfile(
+            longest->first, aligned, local_cigars);
     } catch (const std::exception&) {
         return false;
     }
@@ -1683,51 +1122,11 @@ bool repairCrossAnchorGroups(
 void configureCrossAnchorInsertionRepair(
     const std::string& executable,
     uint_t maximum_window_span) {
-    {
-        std::lock_guard lock(cross_anchor_configuration_mutex);
-        cross_anchor_configuration.executable = executable;
-        cross_anchor_configuration.maximum_window_span =
-            std::max<uint_t>(1, maximum_window_span);
-    }
-    {
-        std::lock_guard lock(cross_anchor_cache_mutex);
-        cross_anchor_msa_cache.clear();
-    }
-    cross_anchor_counters.blocks_scanned.store(0);
-    cross_anchor_counters.cigar_candidates.store(0);
-    cross_anchor_counters.short_insertions_skipped.store(0);
-    cross_anchor_counters.same_anchor_skipped.store(0);
-    cross_anchor_counters.distance_skipped.store(0);
-    cross_anchor_counters.similarity_pairs.store(0);
-    cross_anchor_counters.ksw2_repairs.store(0);
-    cross_anchor_counters.minipoa_calls.store(0);
-    cross_anchor_counters.cache_hits.store(0);
-    cross_anchor_counters.accepted.store(0);
-    cross_anchor_counters.fallback.store(0);
-    cross_anchor_counters.nanoseconds.store(0);
+    cross_anchor_session.configure(executable, maximum_window_span);
 }
 
 void logCrossAnchorInsertionRepairStats() {
-    constexpr double kNanosecondsPerSecond = 1.0e9;
-    spdlog::info(
-        "[cross-anchor-insertion] blocks_scanned={} cigar_candidates={} "
-        "short_insertions_skipped={} same_anchor_skipped={} "
-        "distance_skipped={} similar_pairs={} ksw2_repaired={} "
-        "minipoa_calls={} cache_hits={} accepted={} fallback={} "
-        "wall_seconds={:.3f}",
-        cross_anchor_counters.blocks_scanned.load(),
-        cross_anchor_counters.cigar_candidates.load(),
-        cross_anchor_counters.short_insertions_skipped.load(),
-        cross_anchor_counters.same_anchor_skipped.load(),
-        cross_anchor_counters.distance_skipped.load(),
-        cross_anchor_counters.similarity_pairs.load(),
-        cross_anchor_counters.ksw2_repairs.load(),
-        cross_anchor_counters.minipoa_calls.load(),
-        cross_anchor_counters.cache_hits.load(),
-        cross_anchor_counters.accepted.load(),
-        cross_anchor_counters.fallback.load(),
-        cross_anchor_counters.nanoseconds.load() /
-            kNanosecondsPerSecond);
+    cross_anchor_session.logStats();
 }
 
 uint_t mergeAlignmentByRef(
@@ -1745,14 +1144,11 @@ uint_t mergeAlignmentByRef(
     const auto events = collectInsertionEvents(ref_name, seqs, cigars);
     auto groups = buildCrossAnchorGroups(events, seqs);
 
-    const uint_t legacy_length = mergeAlignmentByRefCore(
+    const uint_t legacy_length = RaMesh::Alignment::mergeReferenceProfile(
         ref_name, seqs, cigars);
     if (!groups.empty()) {
-        CrossAnchorRepairConfiguration configuration;
-        {
-            std::lock_guard lock(cross_anchor_configuration_mutex);
-            configuration = cross_anchor_configuration;
-        }
+        const CrossAnchorRepairConfiguration configuration =
+            cross_anchor_session.configurationSnapshot();
         repairCrossAnchorGroups(
             ref_name, raw_reference_length, events,
             std::move(groups), configuration, seqs);

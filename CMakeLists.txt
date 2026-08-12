@@ -134,6 +134,9 @@ set(RAMA_COMMON_SOURCES
     "${ANCHOR_DIR}/cluster.cpp"
     "${ANCHOR_DIR}/xxhash.c"
     "${ALIGN_DIR}/align.cpp"
+    "${ALIGN_DIR}/cross_anchor_repair.cpp"
+    "${ALIGN_DIR}/external_msa_runner.cpp"
+    "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"
     "${ALIGN_DIR}/pair_rare_aligner.cpp"
@@ -141,6 +144,7 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
     "${GRAPH_DIR}/direct_block_merger.cpp"
+    "${GRAPH_DIR}/realignment_internal.cpp"
     "${GRAPH_DIR}/window_detector.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
@@ -191,27 +195,38 @@ function(configure_rama_target target)
     # 确保在构建目标前先构建libdivsufsort（生成头文件）
     add_dependencies(${target} divsufsort divsufsort64)
 
-    target_compile_definitions(${target} PRIVATE M64 SPDLOG_HEADER_ONLY)
+    target_compile_definitions(${target} PRIVATE M64)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_definitions(${target} PRIVATE _DEBUG_)
     endif()
 
-    target_compile_options(${target} PRIVATE -Wall -g)
+    target_compile_options(${target} PRIVATE -g)
     if(RAMAX_NATIVE_ARCH)
         target_compile_options(${target} PRIVATE -march=native)
     endif()
 
 endfunction()
 
-# add_compile_definitions(KSW_CPU_DISPATCH)
-add_compile_options(-w)
+# Legacy sources remain warning-suppressed while the newly extracted modules
+# are compiled with project warnings enabled below.
+set_source_files_properties(${RAMA_COMMON_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(
+    "${ALIGN_DIR}/cross_anchor_repair.cpp"
+    "${ALIGN_DIR}/external_msa_runner.cpp"
+    "${ALIGN_DIR}/reference_profile_merger.cpp"
+    "${GRAPH_DIR}/realignment_internal.cpp"
+    PROPERTIES COMPILE_OPTIONS
+        "-Wall;-Wextra;-Wno-unused-parameter;-Wno-deprecated-declarations;-Wno-builtin-macro-redefined")
 
-# ================= 创建两个可执行文件 =================
-# add_executable(RaMA-G ${MAIN_G} ${RAMA_COMMON_SOURCES})
-# clonfigure_rama_target(RaMA-G)
+# ================= shared RaMAx core =================
+add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
+configure_rama_target(ramax_core)
+add_dependencies(ramax_core hal_library)
 
-add_executable(ramax ${MAIN_X} ${RAMA_COMMON_SOURCES})
+add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
+target_link_libraries(ramax PRIVATE ramax_core)
 
 # 如需确保先有 HAL 工具，再编你的程序：
 #add_dependencies(RaMA-G hal_tools)
@@ -247,25 +262,34 @@ if(RAMAX_BUILD_TESTS)
         COMMAND ramax_hal_softmask_roundtrip_test)
 
     add_executable(ramax_hal_softmask_export_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp"
-        ${RAMA_COMMON_SOURCES})
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp")
     configure_rama_target(ramax_hal_softmask_export_test)
+    target_link_libraries(ramax_hal_softmask_export_test PRIVATE ramax_core)
     add_dependencies(ramax_hal_softmask_export_test hal_library)
     add_test(NAME ramax_hal_softmask_export
         COMMAND ramax_hal_softmask_export_test)
 
     add_executable(ramax_window_detector_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/window_detector_test.cpp"
-        ${RAMA_COMMON_SOURCES})
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/window_detector_test.cpp")
     configure_rama_target(ramax_window_detector_test)
+    target_link_libraries(ramax_window_detector_test PRIVATE ramax_core)
     add_dependencies(ramax_window_detector_test hal_library)
     add_test(NAME ramax_window_detector COMMAND ramax_window_detector_test)
 
     add_executable(ramax_zero_gap_missing_species_merge_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp"
-        ${RAMA_COMMON_SOURCES})
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp")
     configure_rama_target(ramax_zero_gap_missing_species_merge_test)
+    target_link_libraries(ramax_zero_gap_missing_species_merge_test PRIVATE
+        ramax_core)
     add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
     add_test(NAME ramax_zero_gap_missing_species_merge
         COMMAND ramax_zero_gap_missing_species_merge_test)
+
+    add_executable(ramax_realignment_internal_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/realignment_internal_test.cpp")
+    configure_rama_target(ramax_realignment_internal_test)
+    target_link_libraries(ramax_realignment_internal_test PRIVATE ramax_core)
+    add_dependencies(ramax_realignment_internal_test hal_library)
+    add_test(NAME ramax_realignment_internal
+        COMMAND ramax_realignment_internal_test)
 endif()

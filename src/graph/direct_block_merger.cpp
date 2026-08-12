@@ -1,5 +1,6 @@
 #include "ramesh.h"
 #include "align.h"
+#include "realignment_internal.h"
 
 #include <spdlog/spdlog.h>
 
@@ -28,16 +29,9 @@ namespace {
 
 using OrderedAnchors = std::map<SpeciesChrPair, SegPtr>;
 
-struct BlockView {
-    BlockPtr block;
-    OrderedAnchors anchors;
-    SegPtr reference_segment;
-    ChrName declared_reference_chromosome;
-    size_t species_count = 0;
-};
+using BlockView = Realignment::BlockView;
 
-using BlockViewCache =
-    std::unordered_map<const Block*, std::optional<BlockView>>;
+using BlockViewCache = Realignment::BlockViewBuilder;
 
 struct CandidateChain {
     std::vector<BlockView*> views;
@@ -247,43 +241,9 @@ bool appendCigarChecked(Cigar_t& destination, const Cigar_t& source) {
 bool buildBlockView(const BlockPtr& block,
                     const SpeciesName& reference_species,
                     BlockView& view) {
-    if (!block) {
-        return false;
-    }
-
-    view = BlockView{};
-    view.block = block;
-
-    std::set<SpeciesName> species;
-    {
-        std::shared_lock block_lock(block->rw);
-        if (block->ref_chr.empty() || block->anchors.size() < 2) {
-            return false;
-        }
-
-        view.declared_reference_chromosome = block->ref_chr;
-        for (const auto& [key, segment] : block->anchors) {
-            if (!segment || !segment->isSegment() || !segment->isPrimary() ||
-                segment->length == 0 || segment->parent_block.get() != block.get()) {
-                return false;
-            }
-            if (!species.insert(key.first).second) {
-                return false;
-            }
-            view.anchors.emplace(key, segment);
-        }
-
-        const SpeciesChrPair reference_key{reference_species, block->ref_chr};
-        const auto reference_it = view.anchors.find(reference_key);
-        if (reference_it == view.anchors.end() ||
-            reference_it->second->strand != Strand::FORWARD) {
-            return false;
-        }
-        view.reference_segment = reference_it->second;
-    }
-
-    view.species_count = species.size();
-    return view.species_count >= 2;
+    Realignment::BlockViewBuilder builder(reference_species);
+    return builder.build(block, Realignment::BlockViewProfile::ExactMerge,
+                         view);
 }
 
 bool sameAnchorKeys(const BlockView& left, const BlockView& right) {
@@ -654,45 +614,33 @@ void detachPreparedBlocks(std::vector<PreparedChain>& prepared) {
     }
 }
 
+class PreparedReplacementOwner {
+public:
+    explicit PreparedReplacementOwner(std::vector<PreparedChain>& prepared)
+        : prepared_(&prepared) {}
+    PreparedReplacementOwner(const PreparedReplacementOwner&) = delete;
+    PreparedReplacementOwner& operator=(const PreparedReplacementOwner&) =
+        delete;
+    ~PreparedReplacementOwner() {
+        if (prepared_) {
+            detachPreparedBlocks(*prepared_);
+        }
+    }
+
+    void release() noexcept { prepared_ = nullptr; }
+
+private:
+    std::vector<PreparedChain>* prepared_;
+};
+
 bool buildDiagnosticBlockView(const BlockPtr& block,
                               const SpeciesName& reference_species,
                               const ChrName& reference_chromosome,
                               BlockView& view) {
-    if (!block) {
-        return false;
-    }
-
-    view = BlockView{};
-    view.block = block;
-
-    std::set<SpeciesName> species;
-    std::shared_lock block_lock(block->rw);
-    if (block->anchors.size() < 2) {
-        return false;
-    }
-
-    view.declared_reference_chromosome = block->ref_chr;
-    for (const auto& [key, segment] : block->anchors) {
-        if (!segment || !segment->isSegment() || !segment->isPrimary() ||
-            segment->length == 0 ||
-            segment->parent_block.get() != block.get() ||
-            !species.insert(key.first).second) {
-            return false;
-        }
-        view.anchors.emplace(key, segment);
-    }
-
-    const SpeciesChrPair reference_key{
-        reference_species, reference_chromosome};
-    const auto reference_it = view.anchors.find(reference_key);
-    if (reference_it == view.anchors.end() ||
-        reference_it->second->strand != Strand::FORWARD) {
-        return false;
-    }
-
-    view.reference_segment = reference_it->second;
-    view.species_count = species.size();
-    return view.species_count >= 2;
+    Realignment::BlockViewBuilder builder(reference_species);
+    return builder.build(
+        block, Realignment::BlockViewProfile::Diagnostics, view,
+        reference_chromosome);
 }
 
 bool sameParticipantSpecies(const BlockView& left,
@@ -1100,34 +1048,9 @@ private:
 bool buildRealignBlockView(const BlockPtr& block,
                            const SpeciesName& reference_species,
                            BlockView& view) {
-    if (!block) {
-        return false;
-    }
-    view = BlockView{};
-    view.block = block;
-    std::set<SpeciesName> species;
-    std::shared_lock block_lock(block->rw);
-    if (block->ref_chr.empty() || block->anchors.empty()) {
-        return false;
-    }
-    view.declared_reference_chromosome = block->ref_chr;
-    for (const auto& [key, segment] : block->anchors) {
-        if (!segment || !segment->isSegment() || !segment->isPrimary() ||
-            segment->length == 0 || segment->parent_block.get() != block.get() ||
-            !species.insert(key.first).second) {
-            return false;
-        }
-        view.anchors.emplace(key, segment);
-    }
-    const SpeciesChrPair reference_key{reference_species, block->ref_chr};
-    const auto reference_it = view.anchors.find(reference_key);
-    if (reference_it == view.anchors.end() ||
-        reference_it->second->strand != Strand::FORWARD) {
-        return false;
-    }
-    view.reference_segment = reference_it->second;
-    view.species_count = species.size();
-    return true;
+    Realignment::BlockViewBuilder builder(reference_species);
+    return builder.build(
+        block, Realignment::BlockViewProfile::MissingWindow, view);
 }
 
 bool getCachedRealignBlockView(
@@ -1138,25 +1061,8 @@ bool getCachedRealignBlockView(
     if (!cache) {
         return buildRealignBlockView(block, reference_species, view);
     }
-    if (!block) {
-        return false;
-    }
-    const auto cached = cache->find(block.get());
-    if (cached != cache->end()) {
-        if (!cached->second.has_value()) {
-            return false;
-        }
-        view = *cached->second;
-        return true;
-    }
-    BlockView built;
-    if (!buildRealignBlockView(block, reference_species, built)) {
-        cache->emplace(block.get(), std::nullopt);
-        return false;
-    }
-    view = built;
-    cache->emplace(block.get(), std::move(built));
-    return true;
+    return cache->build(
+        block, Realignment::BlockViewProfile::MissingWindow, view);
 }
 
 bool participantSpeciesAreSubset(const BlockView& subset,
@@ -2178,6 +2084,7 @@ MissingWindowCommitResult commitPreparedMissingWindows(
         throw std::runtime_error(
             "Species-mismatch prepared candidate vectors changed size");
     }
+    PreparedReplacementOwner provisional_owner(prepared);
 
     size_t replaced_old_blocks = 0;
     std::unordered_map<const Block*, size_t> old_to_prepared;
@@ -2458,7 +2365,6 @@ MissingWindowCommitResult commitPreparedMissingWindows(
             (void)key;
             snapshot.genome_end->sample_vec.swap(snapshot.sample_vec);
         }
-        detachPreparedBlocks(prepared);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         spdlog::error(
             "[species-mismatch-realign][{}] commit failed; phase "
@@ -2478,6 +2384,8 @@ MissingWindowCommitResult commitPreparedMissingWindows(
             }
         }
     }
+
+    provisional_owner.release();
 
     return MissingWindowCommitResult{
         prepared.size(), replaced_old_blocks,
@@ -2918,7 +2826,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         size_t scanned_this_iteration = 0;
         size_t structural_this_iteration = 0;
         std::vector<MissingWindowCandidate> zero_gap_candidates;
-        BlockViewCache zero_gap_view_cache;
+        BlockViewCache zero_gap_view_cache(
+            reference_species, zero_gap_scan_count);
         const auto scan_zero_gap_start =
             [&](const ChrName& chromosome,
                 const SegPtr& left_reference) {
@@ -3348,7 +3257,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         size_t ordinary_this_round = 0;
         size_t hybrid_this_round = 0;
         std::vector<MissingWindowCandidate> candidate_slots;
-        BlockViewCache minipoa_view_cache;
+        BlockViewCache minipoa_view_cache(
+            reference_species, minipoa_rounds);
         const auto scan_minipoa_start =
             [&](const ChrName& chromosome,
                 const SegPtr& left_reference) {
@@ -3613,34 +3523,28 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             return result;
         };
 
+        std::vector<Realignment::PlannerConflictFootprint> footprints;
+        footprints.reserve(candidate_slots.size());
+        for (const auto& candidate : candidate_slots) {
+            footprints.push_back(
+                {read_blocks(candidate), write_blocks(candidate)});
+        }
+
         while (!remaining.empty()) {
-            std::unordered_set<const Block*> batch_reads =
-                reserved_read_blocks;
-            std::unordered_set<const Block*> batch_writes =
-                reserved_write_blocks;
-            std::vector<size_t> batch;
+            const std::vector<const Block*> reserved_reads(
+                reserved_read_blocks.begin(), reserved_read_blocks.end());
+            const std::vector<const Block*> reserved_writes(
+                reserved_write_blocks.begin(), reserved_write_blocks.end());
+            const std::vector<size_t> batch =
+                Realignment::MissingWindowPlanner::selectConflictFreeBatch(
+                    remaining, footprints, reserved_reads, reserved_writes);
+            const std::unordered_set<size_t> selected_indices(
+                batch.begin(), batch.end());
             std::vector<size_t> deferred;
             for (const size_t index : remaining) {
-                const auto reads = read_blocks(candidate_slots[index]);
-                const auto writes = write_blocks(candidate_slots[index]);
-                const bool conflict =
-                    std::any_of(
-                        writes.begin(), writes.end(),
-                        [&](const Block* block) {
-                            return !block || batch_reads.count(block) != 0;
-                        }) ||
-                    std::any_of(
-                        reads.begin(), reads.end(),
-                        [&](const Block* block) {
-                            return !block || batch_writes.count(block) != 0;
-                        });
-                if (conflict) {
+                if (selected_indices.count(index) == 0) {
                     deferred.push_back(index);
-                    continue;
                 }
-                batch.push_back(index);
-                batch_reads.insert(reads.begin(), reads.end());
-                batch_writes.insert(writes.begin(), writes.end());
             }
             if (batch.empty()) {
                 conflict_deferred_total += deferred.size();
