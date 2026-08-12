@@ -11,6 +11,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -462,6 +464,31 @@ void writeMalformedMsa(const std::filesystem::path& executable) {
         std::filesystem::perm_options::replace);
 }
 
+void writeFixedMsa(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& counter,
+    const std::vector<std::string>& aligned_rows) {
+    std::ofstream script(executable);
+    script << "#!/bin/sh\n"
+           << "printf x >> '" << counter.string() << "'\n"
+           << "cat <<'EOF'\n";
+    for (size_t index = 0; index < aligned_rows.size(); ++index) {
+        script << ">s" << index << '\n'
+               << aligned_rows[index] << '\n';
+    }
+    script << "EOF\n";
+    if (!script) {
+        throw std::runtime_error("cannot write fixed MSA script");
+    }
+    script.close();
+    std::filesystem::permissions(
+        executable,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+}
+
 BlockPtr onlyActiveBlock(RaMesh::RaMeshMultiGenomeGraph& graph) {
     BlockPtr active;
     for (const auto& weak_block : graph.blocks) {
@@ -496,6 +523,85 @@ std::string graphSignature(RaMesh::RaMeshMultiGenomeGraph& graph) {
             std::memory_order_acquire);
     }
     return signature;
+}
+
+struct CrossAnchorAlignmentCase {
+    std::unordered_map<ChrName, std::string> rows;
+    std::string reference_key;
+};
+
+CrossAnchorAlignmentCase runCrossAnchorAlignmentCase(
+    const std::vector<std::tuple<ChrName, uint32_t, std::string>>&
+        insertions,
+    const std::string& msa_executable = "/bin/false",
+    bool reset_configuration = true) {
+    const std::string reference =
+        "TTGACCTGAAAGCCGTTAGGCATTCGGAACCTGGTACCAA";
+    CrossAnchorAlignmentCase result;
+    result.reference_key = "ref";
+    result.rows.emplace(result.reference_key, reference);
+    result.rows.emplace("control", reference);
+
+    std::unordered_map<ChrName, Cigar_t> cigars;
+    cigars.emplace("control", Cigar_t{
+        cigarToInt('M', static_cast<uint32_t>(reference.size()))});
+    for (const auto& [key, position, insertion] : insertions) {
+        require(position <= reference.size(),
+                "cross-anchor test insertion is outside the reference");
+        result.rows.emplace(
+            key,
+            reference.substr(0, position) + insertion +
+                reference.substr(position));
+        Cigar_t cigar;
+        if (position != 0) {
+            appendCigarOp(cigar, 'M', position);
+        }
+        appendCigarOp(
+            cigar, 'I', static_cast<uint32_t>(insertion.size()));
+        if (position != reference.size()) {
+            appendCigarOp(
+                cigar, 'M',
+                static_cast<uint32_t>(reference.size() - position));
+        }
+        cigars.emplace(key, std::move(cigar));
+    }
+
+    std::unordered_map<ChrName, std::string> expected_ungapped = result.rows;
+    if (reset_configuration) {
+        configureCrossAnchorInsertionRepair(msa_executable, 3000);
+    }
+    mergeAlignmentByRef(result.reference_key, result.rows, cigars);
+    const size_t aligned_length = result.rows.at(result.reference_key).size();
+    for (const auto& [key, row] : result.rows) {
+        require(row.size() == aligned_length,
+                "cross-anchor test produced unequal MAF rows");
+        std::string ungapped;
+        for (const char base : row) {
+            if (base != '-') {
+                ungapped.push_back(base);
+            }
+        }
+        require(ungapped == expected_ungapped.at(key),
+                "cross-anchor repair changed an ungapped sequence");
+    }
+    return result;
+}
+
+size_t sharedInsertionColumns(
+    const CrossAnchorAlignmentCase& alignment,
+    const ChrName& left,
+    const ChrName& right) {
+    const auto& reference = alignment.rows.at(alignment.reference_key);
+    const auto& left_row = alignment.rows.at(left);
+    const auto& right_row = alignment.rows.at(right);
+    size_t shared = 0;
+    for (size_t column = 0; column < reference.size(); ++column) {
+        if (reference[column] == '-' &&
+            left_row[column] != '-' && right_row[column] != '-') {
+            ++shared;
+        }
+    }
+    return shared;
 }
 
 }  // namespace
@@ -1142,6 +1248,97 @@ int main() {
                 "failed minipoa phase changed the committed zero-gap graph");
         require(retained_zero_graph.verifyGraphCorrectness(false),
                 "graph verification failed after retained zero-gap commit");
+
+        const std::string insertion_a =
+            "CGAGATGGCCATGTGTGATCCTTGTAAG";
+        const std::string insertion_b =
+            "CGAGATGGGCATGTGTGATCCTTGTGGGGAG";
+        const auto user_example = runCrossAnchorAlignmentCase({
+            {"left_insert", 10, insertion_a},
+            {"right_insert", 12, insertion_b}});
+        require(sharedInsertionColumns(
+                    user_example, "left_insert", "right_insert") >= 10,
+                "nearby homologous insertions were not realigned");
+
+        const auto distance_five = runCrossAnchorAlignmentCase({
+            {"left_insert", 10, insertion_a},
+            {"right_insert", 15, insertion_b}});
+        require(sharedInsertionColumns(
+                    distance_five, "left_insert", "right_insert") >= 10,
+                "5 bp insertion-anchor boundary was rejected");
+
+        const auto distance_six = runCrossAnchorAlignmentCase({
+            {"left_insert", 10, insertion_a},
+            {"right_insert", 16, insertion_b}});
+        require(sharedInsertionColumns(
+                    distance_six, "left_insert", "right_insert") == 0,
+                "6 bp insertion-anchor distance triggered repair");
+
+        const auto short_insertions = runCrossAnchorAlignmentCase({
+            {"left_insert", 10, "ACGTACGTA"},
+            {"right_insert", 11, "ACGTACGTT"}});
+        require(sharedInsertionColumns(
+                    short_insertions,
+                    "left_insert", "right_insert") == 0,
+                "9 bp insertions triggered cross-anchor repair");
+
+        const auto dissimilar_insertions = runCrossAnchorAlignmentCase({
+            {"left_insert", 10, std::string(20, 'A')},
+            {"right_insert", 12, std::string(20, 'C')}});
+        require(sharedInsertionColumns(
+                    dissimilar_insertions,
+                    "left_insert", "right_insert") == 0,
+                "nearby dissimilar insertions were incorrectly realigned");
+
+        const auto bounded_component = runCrossAnchorAlignmentCase({
+            {"insert_0", 10, insertion_a},
+            {"insert_5", 15, insertion_a},
+            {"insert_10", 20, insertion_a}},
+            "/bin/false");
+        require(sharedInsertionColumns(
+                    bounded_component, "insert_0", "insert_5") >= 10,
+                "0/5/10 test did not repair the selected 5 bp pair");
+        require(sharedInsertionColumns(
+                    bounded_component, "insert_0", "insert_10") == 0,
+                "0/5/10 positions were transitively merged across 10 bp");
+
+        const auto cross_anchor_msa = temp / "cross-anchor-minipoa.sh";
+        const auto cross_anchor_counter = temp / "cross-anchor.calls";
+        const std::string local_reference =
+            "TTGACCTGAAAGCCGTTAGGCATTCGGAA";
+        const std::string prefix = local_reference.substr(0, 10);
+        const std::string bridge = local_reference.substr(10, 2);
+        const std::string suffix = local_reference.substr(12);
+        writeFixedMsa(
+            cross_anchor_msa, cross_anchor_counter,
+            {
+                prefix + "--" + insertion_a + bridge + suffix,
+                prefix + bridge.substr(0, 1) + "-" + insertion_a +
+                    "-" + bridge.substr(1, 1) + suffix,
+                prefix + bridge + insertion_a + "--" + suffix,
+                prefix + bridge +
+                    std::string(insertion_a.size() + 2, '-') + suffix
+            });
+        const std::vector<std::tuple<ChrName, uint32_t, std::string>>
+            three_insertions = {
+                {"a_insert", 10, insertion_a},
+                {"b_insert", 11, insertion_a},
+                {"c_insert", 12, insertion_a}};
+        const auto three_species_first = runCrossAnchorAlignmentCase(
+            three_insertions, cross_anchor_msa.string(), true);
+        require(sharedInsertionColumns(
+                    three_species_first, "a_insert", "c_insert") >= 10,
+                "three-species minipoa repair was not applied");
+        const auto three_species_cached = runCrossAnchorAlignmentCase(
+            three_insertions, cross_anchor_msa.string(), false);
+        require(sharedInsertionColumns(
+                    three_species_cached, "a_insert", "c_insert") >= 10,
+                "cached three-species repair changed the result");
+        std::ifstream cross_anchor_counter_input(cross_anchor_counter);
+        std::string cross_anchor_calls;
+        cross_anchor_counter_input >> cross_anchor_calls;
+        require(cross_anchor_calls == "x",
+                "three-species HAL-style repeat did not reuse MSA cache");
 
         std::filesystem::remove_all(temp);
         return 0;

@@ -1309,6 +1309,13 @@ static void exportResults(
     // 清理遮蔽区间（导出前）
     clearAllMaskedRegions(seqpro_managers);
 
+    // Both direct MAF export and HAL construction reconstruct multiway
+    // columns through mergeAlignmentByRef().  Configure the shared repair
+    // once so the two output paths make the same local insertion decisions.
+    configureCrossAnchorInsertionRepair(
+        MINIPOA_EXECUTABLE,
+        common_args.species_mismatch_realign_max_span);
+
     // 根据输出格式选择导出方法
     switch (common_args.output_format) {
     case MultipleGenomeOutputFormat::MAF:
@@ -1333,6 +1340,7 @@ static void exportResults(
     default:
         throw std::runtime_error("Unsupported output format for multiple genome alignment");
     }
+    logCrossAnchorInsertionRepairStats();
 }
 
 // ------------------------------

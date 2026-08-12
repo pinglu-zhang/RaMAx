@@ -358,6 +358,16 @@ bool alignSequencesWithExternalMsa(
 
 void configureExternalInsertionMsa(const std::string& executable);
 
+// Configure the export-time repair for homologous insertions whose CIGAR
+// anchors differ by only a few reference bases.  The 10 bp insertion and
+// 5 bp anchor-distance thresholds are intentionally fixed internally; only
+// the existing realignment span and executable are supplied by the caller.
+void configureCrossAnchorInsertionRepair(
+    const std::string& executable,
+    uint_t maximum_window_span);
+
+void logCrossAnchorInsertionRepairStats();
+
 struct InsertInfo {
     bool aligned = false;
     uint_t total_length = 0;
@@ -369,5 +379,4 @@ struct InsertInfo {
 
 using RefAlignInfo = std::map<uint_t, InsertInfo>;
 #endif
-
 
