@@ -34,7 +34,7 @@ public:
 
     RaMesh::WindowDetection::Options window_detection_options;
     bool merge_exact_contiguous_blocks_enabled = false;
-    uint_t merge_query_gap_max = 0;
+    uint_t merge_query_gap_max = 100;
     bool realign_single_missing_species_enabled = false;
     uint_t species_mismatch_realign_max_span = 3000;
     uint_t species_mismatch_zero_gap_max_span = 200;

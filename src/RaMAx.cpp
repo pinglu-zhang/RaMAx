@@ -69,7 +69,7 @@ struct CommonArgs {
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
     bool merge_exact_contiguous_blocks = false;  // 每轮合并连续 Block
-    uint_t merge_query_gap_max = 0;              // query 正间隔上限；0=仅严格连续
+    uint_t merge_query_gap_max = 100;            // query 正间隔上限；0=仅严格连续
     bool one_round = false;                     // 是否只执行一轮处理流程
 
     // ========================
@@ -479,7 +479,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         args.merge_query_gap_max,
         "Allow positive query gaps up to this length during Block merge; "
         "gap insertions are aligned during MAF export.")
-        ->default_val(0)
+        ->default_val(100)
         ->capture_default_str()
         ->group("Graph Optimization")
         ->needs(merge_exact_blocks_flag)
@@ -506,7 +506,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->capture_default_str()
         ->group("Graph Optimization")
         ->needs(realign_missing_species_flag)
-        ->check(CLI::Range(1, 3000));
+        ->check(CLI::Range(1, 10000));
 
     auto* zero_gap_merge_span_opt = cmd->add_option(
         "--species-mismatch-zero-gap-max-span",
