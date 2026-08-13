@@ -82,6 +82,7 @@ struct CommonArgs {
     uint_t species_mismatch_zero_gap_max_span = 200;
     bool repair_structural_breaks = false;
     uint_t structural_break_max_span = 1000;
+    bool repair_short_blocks = false;
     std::string window_detection_mode = "each-round";
     std::filesystem::path window_report_dir = "";
     std::string window_threshold_profile = "alignathon-v1";
@@ -135,6 +136,8 @@ constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
 constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
 constexpr const char* STRUCTURAL_BREAK_CONFIG_FILE =
     "structural_break_repair_config.json";
+constexpr const char* SHORT_BLOCK_REPAIR_CONFIG_FILE =
+    "short_block_repair_enabled";
 
 struct StructuralBreakConfigFile {
     bool enabled = false;
@@ -316,6 +319,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
         spdlog::info("  Structural-break span: {}",
                      args.structural_break_max_span);
     }
+    spdlog::info("  Short-Block repair     : {}",
+        args.repair_short_blocks ? "Enabled" : "Disabled");
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
     if (args.detect_windows) {
@@ -557,6 +562,13 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->needs(structural_break_repair_flag)
         ->check(CLI::Range(1, 1000));
 
+    auto* short_block_repair_flag = cmd->add_flag(
+        "--repair-short-blocks",
+        args.repair_short_blocks,
+        "At final graph, fill missing species in <=50 bp Blocks with "
+        "banded KSW2, merge when possible, otherwise delete the Block.")
+        ->group("Graph Optimization");
+
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
         "Use slow but more accurate index building method.")
@@ -753,6 +765,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         merge_exact_blocks_flag,
         structural_break_repair_flag,
         structural_break_span_opt,
+        short_block_repair_flag,
         one_round_flag,
         log_level_opt,
         detect_windows_flag,
@@ -952,6 +965,8 @@ static int runRestartMode(CommonArgs& common_args) {
     } else {
         common_args.repair_structural_breaks = false;
     }
+    common_args.repair_short_blocks = std::filesystem::exists(
+        common_args.work_dir_path / SHORT_BLOCK_REPAIR_CONFIG_FILE);
     finalizeWindowConfig(common_args);
 
     return 0;
@@ -1051,6 +1066,17 @@ static int runNormalMode(CommonArgs& common_args) {
             "structural_break_repair", structural_config));
         spdlog::info("Structural-break config saved to {}",
                      structural_break_config_path.string());
+    }
+    if (common_args.repair_short_blocks) {
+        const FilePath marker =
+            common_args.work_dir_path / SHORT_BLOCK_REPAIR_CONFIG_FILE;
+        std::ofstream output(marker);
+        if (!output) {
+            throw std::runtime_error(
+                "Failed to save short-Block repair restart marker: " +
+                marker.string());
+        }
+        output << "1\n";
     }
 
     if (common_args.merge_exact_contiguous_blocks) {
@@ -1347,6 +1373,12 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.thread_num;
     mra.structural_break_repair_options.msa_executable =
         MINIPOA_EXECUTABLE;
+    mra.short_block_repair_options.enabled =
+        common_args.repair_short_blocks;
+    mra.short_block_repair_options.maximum_query_gap =
+        common_args.merge_query_gap_max;
+    mra.short_block_repair_options.parallel_threads =
+        common_args.thread_num;
     if ((mra.realign_single_missing_species_enabled ||
          mra.structural_break_repair_options.enabled) &&
         !std::filesystem::exists(

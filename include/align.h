@@ -335,6 +335,8 @@ KSW2AlignConfig makeDefaultKSW2Config();
 
 Cigar_t globalAlignKSW2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2_2(const std::string& ref, const std::string& query);
+Cigar_t globalAlignKSW2BandedPublic(const std::string& ref,
+                                    const std::string& query);
 // Cigar_t globalAlignWFA2(const std::string& ref, const std::string& query);
 //
 // Cigar_t extendAlignWFA2(const std::string& ref,

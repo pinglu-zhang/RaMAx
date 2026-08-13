@@ -146,6 +146,7 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/direct_block_merger.cpp"
     "${GRAPH_DIR}/realignment_internal.cpp"
     "${GRAPH_DIR}/structural_break_repair.cpp"
+    "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/window_detector.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
@@ -218,6 +219,7 @@ set_source_files_properties(
     "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${GRAPH_DIR}/realignment_internal.cpp"
     "${GRAPH_DIR}/structural_break_repair.cpp"
+    "${GRAPH_DIR}/short_block_repair.cpp"
     PROPERTIES COMPILE_OPTIONS
         "-Wall;-Wextra;-Wno-unused-parameter;-Wno-deprecated-declarations;-Wno-builtin-macro-redefined")
 
@@ -302,4 +304,12 @@ if(RAMAX_BUILD_TESTS)
     add_dependencies(ramax_structural_break_repair_test hal_library)
     add_test(NAME ramax_structural_break_repair
         COMMAND ramax_structural_break_repair_test)
+
+    add_executable(ramax_short_block_repair_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/short_block_repair_test.cpp")
+    configure_rama_target(ramax_short_block_repair_test)
+    target_link_libraries(ramax_short_block_repair_test PRIVATE ramax_core)
+    add_dependencies(ramax_short_block_repair_test hal_library)
+    add_test(NAME ramax_short_block_repair
+        COMMAND ramax_short_block_repair_test)
 endif()

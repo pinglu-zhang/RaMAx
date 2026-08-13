@@ -1119,6 +1119,11 @@ bool repairCrossAnchorGroups(
 
 }  // namespace
 
+Cigar_t globalAlignKSW2BandedPublic(const std::string& reference,
+                                    const std::string& query) {
+    return globalAlignKSW2Banded(reference, query);
+}
+
 void configureCrossAnchorInsertionRepair(
     const std::string& executable,
     uint_t maximum_window_span) {

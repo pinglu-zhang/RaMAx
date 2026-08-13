@@ -1080,6 +1080,19 @@ starAlignment(
         }
     }
 
+    if (short_block_repair_options.enabled) {
+        auto options = short_block_repair_options;
+        options.parallel_threads = thread_num;
+        options.maximum_query_gap = merge_query_gap_max;
+        const auto repaired =
+            RaMesh::ShortBlockRepair::repairFinalShortBlocks(
+                *multi_graph, reference_order, seqpro_managers, options);
+        spdlog::info(
+            "[short-block-repair] final merged={} deleted={} total_seconds={:.3f}",
+            repaired.left_merged + repaired.right_merged,
+            repaired.deleted_blocks, repaired.total_seconds);
+    }
+
     // 所有轮次完成后，flush logger
     spdlog::default_logger()->flush();
 
