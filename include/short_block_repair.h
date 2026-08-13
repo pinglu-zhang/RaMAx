@@ -17,7 +17,8 @@ namespace RaMesh::ShortBlockRepair {
 
 struct Options {
     bool enabled = false;
-    uint_t maximum_short_length = 50;
+    uint_t maximum_short_length = 500;
+    uint_t maximum_delete_length = 50;
     uint_t maximum_missing_span = 200;
     double minimum_coverage = 0.70;
     double minimum_identity = 0.60;
@@ -51,9 +52,11 @@ struct Result {
     uint64_t blocks_le_10_before = 0;
     uint64_t blocks_le_50_before = 0;
     uint64_t blocks_le_100_before = 0;
+    uint64_t blocks_le_500_before = 0;
     uint64_t blocks_le_10_after = 0;
     uint64_t blocks_le_50_after = 0;
     uint64_t blocks_le_100_after = 0;
+    uint64_t blocks_le_500_after = 0;
     double scan_seconds = 0.0;
     double ksw2_seconds = 0.0;
     double transaction_seconds = 0.0;

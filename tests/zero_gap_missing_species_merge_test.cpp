@@ -587,6 +587,31 @@ CrossAnchorAlignmentCase runCrossAnchorAlignmentCase(
     return result;
 }
 
+void testInvalidPairwiseCigarFallback() {
+    std::unordered_map<ChrName, std::string> rows{
+        {"simChimp.simChimp.chrA", std::string(115, 'T')},
+        {"simOrang.simOrang.chrE", std::string(142, 'T')},
+        {"simHuman.simHuman.chrA", std::string(142, 'T')}};
+    std::unordered_map<ChrName, Cigar_t> cigars{
+        {"simChimp.simChimp.chrA", Cigar_t{cigarToInt('M', 115)}},
+        {"simOrang.simOrang.chrE", Cigar_t{cigarToInt('M', 142)}},
+        {"simHuman.simHuman.chrA", Cigar_t{cigarToInt('M', 142)}}};
+    const auto ungapped = rows;
+    mergeAlignmentByRef("simChimp.simChimp.chrA", rows, cigars);
+    const size_t aligned_length = rows.at("simChimp.simChimp.chrA").size();
+    require(aligned_length == 142,
+            "invalid pairwise CIGAR fallback did not preserve insertions");
+    for (const auto& [key, row] : rows) {
+        require(row.size() == aligned_length,
+                "invalid pairwise CIGAR fallback produced unequal rows");
+        std::string sequence;
+        std::copy_if(row.begin(), row.end(), std::back_inserter(sequence),
+                     [](char base) { return base != '-'; });
+        require(sequence == ungapped.at(key),
+                "invalid pairwise CIGAR fallback changed sequence content");
+    }
+}
+
 size_t sharedInsertionColumns(
     const CrossAnchorAlignmentCase& alignment,
     const ChrName& left,
@@ -613,6 +638,7 @@ int main() {
     std::filesystem::create_directories(temp);
 
     try {
+        testInvalidPairwiseCigarFallback();
         std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
         for (const std::string species :
              {"simChimp", "simGorilla", "simHuman", "simOrang"}) {

@@ -565,8 +565,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* short_block_repair_flag = cmd->add_flag(
         "--repair-short-blocks",
         args.repair_short_blocks,
-        "At final graph, fill missing species in <=50 bp Blocks with "
-        "banded KSW2, merge when possible, otherwise delete the Block.")
+        "At final graph, try to merge <=500 bp Blocks with banded KSW2; "
+        "delete only failed Blocks <=50 bp.")
         ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式

@@ -21,7 +21,7 @@ void require(bool condition, const std::string& message) {
 
 void writeFasta(const std::filesystem::path& path) {
     std::ofstream output(path);
-    output << ">chr1\n" << std::string(1000, 'A') << '\n';
+    output << ">chr1\n" << std::string(5000, 'A') << '\n';
     require(static_cast<bool>(output), "cannot write short-Block FASTA");
 }
 
@@ -74,12 +74,12 @@ Fixture baseFixture(RaMeshMultiGenomeGraph& graph) {
     fixture.left = Block::createEmpty("chr1", 2);
     fixture.small = Block::createEmpty("chr1", 2);
     fixture.right = Block::createEmpty("chr1", 2);
-    fixture.ref_left = add(fixture.left, {"ref", "chr1"}, 0, 100);
-    fixture.ref_small = add(fixture.small, {"ref", "chr1"}, 100, 20);
-    fixture.ref_right = add(fixture.right, {"ref", "chr1"}, 120, 80);
-    fixture.q1_left = add(fixture.left, {"q1", "chr1"}, 0, 100);
-    fixture.q1_small = add(fixture.small, {"q1", "chr1"}, 100, 20);
-    fixture.q1_right = add(fixture.right, {"q1", "chr1"}, 120, 80);
+    fixture.ref_left = add(fixture.left, {"ref", "chr1"}, 0, 600);
+    fixture.ref_small = add(fixture.small, {"ref", "chr1"}, 600, 20);
+    fixture.ref_right = add(fixture.right, {"ref", "chr1"}, 620, 600);
+    fixture.q1_left = add(fixture.left, {"q1", "chr1"}, 0, 600);
+    fixture.q1_small = add(fixture.small, {"q1", "chr1"}, 600, 20);
+    fixture.q1_right = add(fixture.right, {"q1", "chr1"}, 620, 600);
     link(graph.species_graphs.at("ref").chr2end.at("chr1"),
          {fixture.ref_left, fixture.ref_small, fixture.ref_right});
     link(graph.species_graphs.at("q1").chr2end.at("chr1"),
@@ -131,7 +131,7 @@ int main() {
             const auto merged = graph.species_graphs.at("ref")
                                     .chr2end.at("chr1")
                                     .head->primary_path.next.load();
-            require(merged && merged->length == 120 &&
+            require(merged && merged->length == 620 &&
                         merged->parent_block->anchors.size() == 2,
                     "zero-KSW merged Block is invalid");
         }
@@ -139,8 +139,8 @@ int main() {
         {
             RaMeshMultiGenomeGraph graph(managers);
             auto fixture = baseFixture(graph);
-            const auto q2_left = add(fixture.left, {"q2", "chr1"}, 0, 100);
-            const auto q2_right = add(fixture.right, {"q2", "chr1"}, 120, 80);
+            const auto q2_left = add(fixture.left, {"q2", "chr1"}, 0, 600);
+            const auto q2_right = add(fixture.right, {"q2", "chr1"}, 620, 600);
             link(graph.species_graphs.at("q2").chr2end.at("chr1"),
                  {q2_left, q2_right});
             ShortBlockRepair::Options options;
@@ -154,8 +154,8 @@ int main() {
             const auto q2_merged = graph.species_graphs.at("q2")
                                        .chr2end.at("chr1")
                                        .head->primary_path.next.load();
-            require(q2_merged && q2_merged->length == 120 &&
-                        q2_merged->primary_path.next.load()->length == 80,
+            require(q2_merged && q2_merged->length == 620 &&
+                        q2_merged->primary_path.next.load()->length == 600,
                     "KSW2-filled query interval was not inserted");
         }
 
@@ -165,12 +165,12 @@ int main() {
             BlockPtr first = Block::createEmpty("chr1", 2);
             BlockPtr second = Block::createEmpty("chr1", 2);
             BlockPtr right = Block::createEmpty("chr1", 1);
-            const auto ref_left = add(left, {"ref", "chr1"}, 0, 100);
-            const auto ref_first = add(first, {"ref", "chr1"}, 100, 20);
-            const auto ref_second = add(second, {"ref", "chr1"}, 120, 20);
-            const auto ref_right = add(right, {"ref", "chr1"}, 140, 100);
-            const auto q_first = add(first, {"q1", "chr1"}, 100, 20);
-            const auto q_second = add(second, {"q1", "chr1"}, 120, 20);
+            const auto ref_left = add(left, {"ref", "chr1"}, 0, 600);
+            const auto ref_first = add(first, {"ref", "chr1"}, 600, 20);
+            const auto ref_second = add(second, {"ref", "chr1"}, 620, 20);
+            const auto ref_right = add(right, {"ref", "chr1"}, 640, 600);
+            const auto q_first = add(first, {"q1", "chr1"}, 600, 20);
+            const auto q_second = add(second, {"q1", "chr1"}, 620, 20);
             link(graph.species_graphs.at("ref").chr2end.at("chr1"),
                  {ref_left, ref_first, ref_second, ref_right});
             link(graph.species_graphs.at("q1").chr2end.at("chr1"),
@@ -195,6 +195,33 @@ int main() {
                         q_first->parent_block == nullptr &&
                         q_second->parent_block == nullptr,
                     "original consecutive short Segments survived deletion");
+        }
+
+
+        {
+            RaMeshMultiGenomeGraph graph(managers);
+            BlockPtr left = Block::createEmpty("chr1", 1);
+            BlockPtr medium = Block::createEmpty("chr1", 2);
+            BlockPtr right = Block::createEmpty("chr1", 1);
+            const auto ref_left = add(left, {"ref", "chr1"}, 0, 600);
+            const auto ref_medium = add(medium, {"ref", "chr1"}, 600, 80);
+            const auto ref_right = add(right, {"ref", "chr1"}, 680, 600);
+            const auto q_medium = add(medium, {"q1", "chr1"}, 600, 80);
+            link(graph.species_graphs.at("ref").chr2end.at("chr1"),
+                 {ref_left, ref_medium, ref_right});
+            link(graph.species_graphs.at("q1").chr2end.at("chr1"),
+                 {q_medium});
+            graph.blocks = {left, medium, right};
+            ShortBlockRepair::Options options;
+            options.enabled = true;
+            const auto result = ShortBlockRepair::repairFinalShortBlocks(
+                graph, {"ref"}, managers, options);
+            require(result.left_merged == 0 && result.right_merged == 0 &&
+                        result.deleted_blocks == 0 && activeBlocks(graph) == 3,
+                    "failed 51-500 bp Block was incorrectly deleted");
+            require(ref_medium->parent_block == medium &&
+                        q_medium->parent_block == medium,
+                    "retained 51-500 bp Block was modified");
         }
     } catch (...) {
         std::filesystem::remove_all(temporary);

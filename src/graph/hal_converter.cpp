@@ -2151,31 +2151,10 @@ namespace hal_converter {
             spdlog::debug("Using fallback reference sequence: {}", ref_key);
         }
 
-        // 3. 对叶子序列进行多序列比对
-        //    注意：mergeAlignmentByRef 依赖 cigar 与 ref/qry 序列长度一致，否则可能出现越界异常。
-        //    科研软件必须严格：一旦发现不一致，直接报错，避免生成错误 HAL。
-        const size_t ref_len = leaf_sequences.at(ref_key).size();
-        for (const auto& [species, cigar] : leaf_cigars) {
-            if (species == ref_key) {
-                continue;
-            }
-            auto seq_it = leaf_sequences.find(species);
-            if (seq_it == leaf_sequences.end()) {
-                throw std::runtime_error(
-                    "HAL构建失败：Block(ref_chr=" + block_ref_chr +
-                    ") 中 cigar 物种 '" + species + "' 未找到对应序列，无法进行多序列对齐");
-            }
-            AlignCount cnt = countAlignedBases(cigar);
-            const size_t qry_len = seq_it->second.size();
-            if (cnt.ref_bases != ref_len || cnt.query_bases != qry_len) {
-                throw std::runtime_error(
-                    "HAL构建失败：Block(ref_chr=" + block_ref_chr + ") 中 cigar 长度与序列长度不一致：species='" +
-                    species + "' cigar(ref=" + std::to_string(cnt.ref_bases) + ",qry=" +
-                    std::to_string(cnt.query_bases) + ") seq(ref=" + std::to_string(ref_len) + ",qry=" +
-                    std::to_string(qry_len) + ")");
-            }
-        }
-
+        // 3. 对叶子序列进行多序列比对。共享入口会先验证每条
+        //    pairwise CIGAR；若它不能完整消费当前参考和 query，
+        //    仅对该异常行用带状 KSW2 重建。重建后仍不合法则抛错，
+        //    因而 HAL 与直接 MAF 导出使用相同的严格保护。
         try {
             mergeAlignmentByRef(ref_key, leaf_sequences, leaf_cigars);
             // spdlog::debug("Multi-sequence alignment completed for {} leaf sequences", leaf_sequences.size());

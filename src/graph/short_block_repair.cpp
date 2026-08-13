@@ -755,8 +755,9 @@ void countBlocks(const RaMeshMultiGenomeGraph& graph,
                  uint64_t& total,
                  uint64_t& le10,
                  uint64_t& le50,
-                 uint64_t& le100) {
-    total = le10 = le50 = le100 = 0;
+                 uint64_t& le100,
+                 uint64_t& le500) {
+    total = le10 = le50 = le100 = le500 = 0;
     std::unordered_set<SpeciesName> references(reference_order.begin(),
                                                reference_order.end());
     for (const auto& weak : graph.blocks) {
@@ -772,6 +773,7 @@ void countBlocks(const RaMeshMultiGenomeGraph& graph,
         if (minimum <= 10) ++le10;
         if (minimum <= 50) ++le50;
         if (minimum <= 100) ++le100;
+        if (minimum <= 500) ++le500;
     }
 }
 
@@ -785,6 +787,8 @@ Result repairFinalShortBlocks(
     Result result;
     if (!options.enabled) return result;
     if (reference_order.empty() || options.maximum_short_length == 0 ||
+        options.maximum_delete_length == 0 ||
+        options.maximum_delete_length > options.maximum_short_length ||
         options.maximum_missing_span == 0 || options.parallel_threads == 0) {
         throw std::invalid_argument("invalid short-Block repair options");
     }
@@ -792,7 +796,7 @@ Result repairFinalShortBlocks(
     std::unique_lock graph_lock(graph.rw);
     countBlocks(graph, reference_order, result.blocks_before,
                 result.blocks_le_10_before, result.blocks_le_50_before,
-                result.blocks_le_100_before);
+                result.blocks_le_100_before, result.blocks_le_500_before);
 
     std::unordered_map<SpeciesName, size_t> ranks;
     for (size_t index = 0; index < reference_order.size(); ++index) {
@@ -938,7 +942,7 @@ Result repairFinalShortBlocks(
             for (auto current = end.head->primary_path.next.load();
                  current && !current->isTail();
                  current = current->primary_path.next.load()) {
-                if (current->length <= options.maximum_short_length &&
+                if (current->length <= options.maximum_delete_length &&
                     current->parent_block &&
                     delete_seen.insert(current->parent_block.get()).second) {
                     delete_blocks.push_back(current->parent_block);
@@ -953,7 +957,7 @@ Result repairFinalShortBlocks(
     result.transaction_seconds += secondsSince(delete_start);
     countBlocks(graph, reference_order, result.blocks_after,
                 result.blocks_le_10_after, result.blocks_le_50_after,
-                result.blocks_le_100_after);
+                result.blocks_le_100_after, result.blocks_le_500_after);
     result.total_seconds = secondsSince(total_start);
     spdlog::info(
         "[short-block-repair] references={} scanned={} unique_short={} "
@@ -961,8 +965,9 @@ Result repairFinalShortBlocks(
         "{}/{}/{}/{}/{} ksw2(calls/pass/fail)={}/{}/{} "
         "merged(left/right)={}/{} generations={} deleted(blocks/segments)="
         "{}/{} rollbacks={} blocks(before/after)={}/{} "
-        "short<=10/50/100(before)={}/{}/{} short<=10/50/100(after)="
-        "{}/{}/{} time(scan/ksw2/transaction/total)="
+        "short<=10/50/100/500(before)={}/{}/{}/{} "
+        "short<=10/50/100/500(after)={}/{}/{}/{} "
+        "time(scan/ksw2/transaction/total)="
         "{:.3f}/{:.3f}/{:.3f}/{:.3f}s",
         result.reference_paths, result.scanned_blocks,
         result.unique_short_blocks, result.left_candidates,
@@ -974,8 +979,9 @@ Result repairFinalShortBlocks(
         result.deleted_segments, result.transaction_rollbacks,
         result.blocks_before, result.blocks_after,
         result.blocks_le_10_before, result.blocks_le_50_before,
-        result.blocks_le_100_before, result.blocks_le_10_after,
-        result.blocks_le_50_after, result.blocks_le_100_after,
+        result.blocks_le_100_before, result.blocks_le_500_before,
+        result.blocks_le_10_after, result.blocks_le_50_after,
+        result.blocks_le_100_after, result.blocks_le_500_after,
         result.scan_seconds, result.ksw2_seconds,
         result.transaction_seconds, result.total_seconds);
     for (const auto& [species, bases] : result.deleted_bases_by_species) {
