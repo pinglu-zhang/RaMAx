@@ -618,7 +618,8 @@ void FM_Index::bisectAnchors(const std::string& query, ChrIndex query_chr_index,
     bool same_as_right = (right.pos + right.len == mid + mid_len);
 
     // 如果 mid_is_mum 为 false 写入；如果为 true，则要求与左右都不同才写入（保持原逻辑）
-    if ((regs.size() == 1 || allow_MEM) && !mid_is_mum || (!same_as_left && !same_as_right)) {
+    if (((regs.size() == 1 || allow_MEM) && !mid_is_mum) ||
+        (!same_as_left && !same_as_right)) {
 
         Coord_t qry_start;
         if (strand == Strand::FORWARD) {

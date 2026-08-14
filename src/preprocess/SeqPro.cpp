@@ -183,7 +183,7 @@ Position MaskManager::mapToOriginalPositionSeparated(SequenceId seq_id, Position
   for (const auto &interval : intervals) {
       cur_interval_len = interval.start - last_unmasked_interval_end + 1;
       accumulated_unmasked += cur_interval_len;
-      if (origin_pos < accumulated_unmasked) {
+      if (static_cast<long long>(origin_pos) < accumulated_unmasked) {
           accumulated_unmasked -= cur_interval_len;
           break;
       }
@@ -1543,7 +1543,6 @@ void MaskedSequenceManager::addMaskIntervals(SequenceId seq_id,
   for (const auto& interval : intervals) {
     // MaskInterval original_interval = convertMaskedToOriginalInterval(seq_id, interval);
     //if (original_interval.start > 1000000) {
-    //    std::cout << "";
     //}
     original_intervals.push_back(interval);
   }
@@ -1695,7 +1694,6 @@ Position MaskedSequenceManager::convertSeparatedToMaskedPosition(SequenceId seq_
     return separated_pos;
   }
 
-  Position masked_pos = separated_pos;
   Position separator_count_before = 0;
 
   // 遍历遮蔽区间，计算在当前位置之前有多少个间隔符需要减去
@@ -1733,7 +1731,6 @@ Position MaskedSequenceManager::convertMaskedToSeparatedPosition(SequenceId seq_
     return masked_pos;
   }
 
-  Position separated_pos = masked_pos;
   Position separator_count_before = 0;
 
   // 遍历遮蔽区间，计算在当前位置之前有多少个间隔符需要加上

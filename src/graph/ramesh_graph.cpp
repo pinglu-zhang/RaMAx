@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstdint>
 #include <curl/curl.h>
-#include <iomanip>
 #include <shared_mutex>
 #include <spdlog/spdlog.h>
 #include <unordered_set>
@@ -25,50 +24,6 @@ RaMeshGenomeGraph::RaMeshGenomeGraph(const SpeciesName &sp,
   chr2end.reserve(chrs.size());
   for (const auto &c : chrs)
     chr2end.try_emplace(c);
-}
-
-size_t RaMeshGenomeGraph::debugPrint(bool show_detail) const {
-  std::shared_lock lg(rw);
-  size_t total_idx = 0;
-
-  std::cout << "=== GenomeGraph <" << species_name << "> ===\n";
-
-  for (const auto &[chr, end] : chr2end) {
-    SegPtr first = end.head->primary_path.next.load(std::memory_order_acquire);
-
-    /*----------- 统计这一条染色体的段数 -----------*/
-    size_t chr_count = 0;
-    for (SegPtr p = first; p && !p->isTail();
-         p = p->primary_path.next.load(std::memory_order_acquire))
-      ++chr_count;
-
-    std::cout << "\n[Chromosome " << chr << "]\n";
-
-    if (show_detail) {
-      /*----------- 打印表头 -----------*/
-      std::cout << std::left << std::setw(6) << "Idx" << std::setw(12)
-                << "Start" << std::setw(12) << "End" << std::setw(10) << "Len"
-                << std::setw(4) << "Str" << std::setw(6) << "Role"
-                << std::setw(14) << "Ptr" << '\n';
-
-      /*----------- 打印明细 -----------*/
-      size_t idx = 0;
-      for (SegPtr p = first; p && !p->isTail();
-           p = p->primary_path.next.load(std::memory_order_acquire)) {
-        std::cout << std::setw(6) << idx++ << std::setw(12) << p->start
-                  << std::setw(12) << (p->start + p->length - 1)
-                  << std::setw(10) << p->length << std::setw(4)
-                  << (p->strand == Strand::FORWARD ? "+" : "-") << std::setw(6)
-                  << (p->isPrimary() ? "Pri" : "Sec") << '\n';
-      }
-    }
-
-    std::cout << "Total segments: " << chr_count << '\n';
-    total_idx += chr_count;
-  }
-
-  std::cout << "=== End of Graph ===\n";
-  return total_idx;
 }
 
 /* =============================================================
@@ -238,40 +193,6 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
     }
   }
   return;
-}
-
-/* ==============================================================
- * 4.  debugPrint (multi-genome)  -- 新版，参数改为 show_detail
- * ==============================================================*/
-void RaMeshMultiGenomeGraph::debugPrint(bool show_detail) const {
-  std::shared_lock gLock(rw);
-
-  /*------------- 页眉 -------------*/
-  std::cout << "\n********  Multi-Genome Graph  ********\n";
-
-  /*------------- 逐物种打印 + 计数 -------------*/
-  std::vector<std::pair<std::string, size_t>> per_species; // {species, seg_cnt}
-  size_t grand_total = 0;
-
-  for (const auto &[sp, g] : species_graphs) {
-    // 假设 g.debugPrint 有重载：size_t debugPrint(std::ostream&, bool
-    // show_detail) const
-    size_t seg_cnt = g.debugPrint(show_detail);
-    per_species.emplace_back(sp, seg_cnt);
-    grand_total += seg_cnt;
-  }
-
-  /*------------- 汇总区 -------------*/
-  std::cout << "\n----------  Summary  ----------\n";
-  for (const auto &[sp, cnt] : per_species) {
-    std::cout << std::left << std::setw(15) << sp << ": " << cnt
-              << " segments\n";
-  }
-  std::cout << "--------------------------------\n";
-  std::cout << "Grand total  : " << grand_total << " segments in "
-            << per_species.size() << " genome(s)\n";
-
-  std::cout << "********  End of Graphs  ********\n";
 }
 
 /* ==============================================================
@@ -962,10 +883,8 @@ void RaMeshMultiGenomeGraph::verifyBlockConsistency(
                 current->primary_path.next.load(std::memory_order_acquire);
           }
 
-          bool found_reference = false;
           while (current && !current->isTail()) {
             if (current->isSegment() && current->parent_block == block_ptr) {
-              found_reference = true;
               SpeciesChrPair key{species_name, chr_name};
               referenced_species_chrs.insert(key);
 
@@ -1368,7 +1287,7 @@ void RaMeshMultiGenomeGraph::verifyPerformanceIssues(
   }
 }
 
-// ✂ BEGIN: safeLink 实现
+// Safe path-linking implementation.
 void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
   if (!prev || !next)
     return;
@@ -1383,8 +1302,6 @@ void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
   /* 3) 发布内存屏障，保证两侧对所有线程可见 */
   std::atomic_thread_fence(std::memory_order_release);
 }
-
-// ✂ END
 
 /* =============================================================
  * 6.  Merge multiple graphs (public API)
@@ -1881,11 +1798,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // ═══════════════════════════════════════════════════════════
               progress.recordMerge();
 
-              // 处理合并
-              // 确定重叠区间
-              if (prev_seg->cigar.size() != 0 || curr_seg->cigar.size() != 0) {
-                std::cout << "";
-              }
+              // 处理合并并确定重叠区间。
               uint_t overlap_start = std::max(prev_seg->start, curr_seg->start);
               uint_t overlap_end = std::min(prev_seg->start + prev_seg->length,
                                             curr_seg->start + curr_seg->length);
@@ -1982,8 +1895,6 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                   block_creation_end - block_creation_start);
 
               TimePoint cigar_processing_start = HighResClock::now();
-              TimePoint segment_creation_start = HighResClock::now();
-
               // 准备开始处理对应的query，首先处理prev_block，然后处理current_block
               // 1. 处理prev_block
               // 遍历prev_block非ref的anchors
@@ -3273,7 +3184,6 @@ void RaMeshMultiGenomeGraph::clearAllGraphs() {
 size_t RaMeshMultiGenomeGraph::compactBlockPool() {
   std::unique_lock graph_lock(rw);
 
-  size_t original_size = blocks.size();
   size_t compacted = removeExpiredBlocks();
 
   // 可以在这里添加更多的内存优化逻辑
@@ -3751,126 +3661,6 @@ inline std::string getSubSeq(const SeqPro::ManagerVariant& mv,
             throw std::runtime_error("Unsupported ManagerVariant type in getSubSeq()");
         }
         }, mv);
-}
-
-inline std::string applyCigarToQuery(const std::string& qry, const Cigar_t& cigar)
-{
-    std::string aligned;
-    aligned.reserve(qry.size() * 2); // 预留空间
-
-    size_t qpos = 0;
-    for (auto c : cigar) {
-        char op; uint32_t len;
-        intToCigar(c, op, len);
-
-        switch (op) {
-        case 'M': case '=': case 'X':
-            for (uint32_t i = 0; i < len && qpos < qry.size(); ++i)
-                aligned.push_back(qry[qpos++]);
-            break;
-        case 'I': // 插入：直接保留
-            for (uint32_t i = 0; i < len && qpos < qry.size(); ++i)
-                aligned.push_back(qry[qpos++]);
-            break;
-        case 'D': // 缺口：在 query 里表现为 '-'
-            aligned.append(len, '-');
-            break;
-        default:
-            break;
-        }
-    }
-}
-
-void reportUnalignedRegions(const GenomeEnd& end,
-    const SeqPro::SharedManagerVariant& mgr,
-    const ChrName& chr_name)
-{
-    std::vector<std::pair<uint_t, uint_t>> covered;
-
-    // 1) 收集所有 segment 的区间
-    SegPtr cur = end.head->primary_path.next.load(std::memory_order_acquire);
-
-    while (cur && !cur->isTail()) {
-   //     if (cur->start == 212285) {
-   //         // 打印出比对的序列，可以不用管参考序列
-
-			//std::string seq = getSubSeq((*mgr), chr_name, cur->start, cur->length);
-   //         Cigar_t c = cur->cigar;
-
-   //         //std::string aligned_query = applyCigarToQuery(seq, c);
-
-   //         //spdlog::info("=== Alignment at pos {} ===", cur->start);
-   //         //spdlog::info("Raw query  (len={}): {}", seq.size(), seq);
-   //         //spdlog::info("Aligned qry (len={}): {}", aligned_query.size(), aligned_query);
-   //         spdlog::info("CIGAR: {}", cigarToString(c));
-   //         std::cout << "";
-
-   //     }
-        covered.emplace_back(cur->start, cur->start + cur->length);
-        cur = cur->primary_path.next.load(std::memory_order_acquire);
-    }
-
-    // 2) 排序 & 合并
-    std::sort(covered.begin(), covered.end());
-    std::vector<std::pair<uint_t, uint_t>> merged;
-    for (auto& iv : covered) {
-        if (merged.empty() || iv.first > merged.back().second) {
-            merged.push_back(iv);
-        }
-        else {
-            merged.back().second = std::max(merged.back().second, iv.second);
-        }
-    }
-
-    //// 打开文件（覆盖写）
-    //std::ofstream ofs("/mnt/d/code/RaMAx/unaligned.txt");
-    //if (!ofs) {
-    //    std::cerr << "Error: cannot open output file." << std::endl;
-    //    return;
-    //}
-
-    // 3) 求补集（未覆盖区间）
-    uint_t chr_len = std::visit([&](auto& p) { return p->getSequenceLength(chr_name); }, *mgr);
-    uint_t prev = 0;
-    std::vector<double> lens;  // 只存 >1000 的区间长度
-
-    for (auto& iv : merged) {
-        if (iv.first > prev) {
-            uint_t len = iv.first - prev;
-            //ofs << chr_name << "\t" << prev << "\t" << len << "\n";  // ✅ 文件写所有区间
-            if (len > 1000) {
-				std::cout << chr_name << "\t" << prev << "\t" << len << "\n"; // ✅ 控制台打印 >1000
-            }
-            lens.push_back(static_cast<double>(len));            // ✅ 统计只收集 >1000
-        }
-        prev = iv.second;
-    }
-    if (prev < chr_len) {
-        uint_t len = chr_len - prev;
-        //ofs << chr_name << "\t" << prev << "\t" << len << "\n";      // ✅ 文件写所有区间
-        if (len > 1000) {
-            std::cout << chr_name << "\t" << prev << "\t" << len << "\n"; // ✅ 控制台打印 >1000
-        }
-        lens.push_back(static_cast<double>(len));                // ✅ 统计只收集 >1000
-    }
-
-    // 4) 打印统计信息（只针对 >1000 的区间）
-    if (!lens.empty()) {
-        double sum = std::accumulate(lens.begin(), lens.end(), 0.0);
-        double mean = sum / lens.size();
-        double sq_sum = 0.0;
-        for (double x : lens) sq_sum += (x - mean) * (x - mean);
-        double variance = sq_sum / lens.size();
-
-        std::cout << "Unaligned regions (>1000 bp) in " << chr_name
-            << " - count: " << lens.size()
-            << ", sum length: " << sum
-            << ", mean length: " << mean
-            << ", variance: " << variance << "\n";
-    }
-    else {
-        std::cout << "No unaligned regions (>1000 bp) found in " << chr_name << ".\n";
-    }
 }
 
 } // namespace RaMesh

@@ -98,7 +98,7 @@ RegionVec preAllocateChunksBySequence(const SeqPro::ManagerVariant& seq_manager)
             return manager_ptr->getSequenceId(seq_name);
             }, seq_manager);
 
-        chunks.push_back({ seq_id, 0, static_cast<uint_t>(seq_length) });
+        chunks.push_back({ seq_id, 0, static_cast<Coord_t>(seq_length) });
     }
 
     spdlog::info("Generated {} chunks by sequence (one chunk per sequence)", chunks.size());
@@ -184,7 +184,7 @@ void normalSizeBasedChunking(RegionVec& chunks, const std::string& seq_name,
 
     // 如果序列长度小于等于chunk_size或min_chunk_size，则只生成一个不重叠chunk
     if (seq_length <= chunk_size || seq_length <= min_chunk_size) {
-        chunks.push_back({ seq_id, 0, static_cast<uint_t>(seq_length) });
+        chunks.push_back({ seq_id, 0, static_cast<Coord_t>(seq_length) });
         return;
     }
 
@@ -193,7 +193,7 @@ void normalSizeBasedChunking(RegionVec& chunks, const std::string& seq_name,
     while (start < seq_length) {
         // 本chunk的实际长度（最后一块可能不足chunk_size）
         uint64_t this_len = std::min<uint64_t>(chunk_size, seq_length - start);
-        chunks.push_back({ seq_id, static_cast<uint_t>(start), static_cast<uint_t>(this_len) });
+        chunks.push_back({ seq_id, static_cast<Coord_t>(start), static_cast<Coord_t>(this_len) });
 
         // 计算下一个chunk的起始位置：前进chunk_size，然后回退overlap_size
         if (start + this_len >= seq_length) {
@@ -280,7 +280,7 @@ void chunkUnmaskedRegion(RegionVec& chunks, const std::string& seq_name,
 
     // 如果区域太小，直接作为一个chunk
     if (region_length <= chunk_size) {
-        chunks.push_back({ seq_id, static_cast<uint_t>(region_start), static_cast<uint_t>(region_length) });
+        chunks.push_back({ seq_id, static_cast<Coord_t>(region_start), static_cast<Coord_t>(region_length) });
         return;
     }
 
@@ -288,7 +288,7 @@ void chunkUnmaskedRegion(RegionVec& chunks, const std::string& seq_name,
     uint64_t start = region_start;
     while (start < region_end) {
         uint64_t this_len = std::min<uint64_t>(chunk_size, region_end - start);
-        chunks.push_back({ seq_id, static_cast<uint_t>(start), static_cast<uint_t>(this_len) });
+        chunks.push_back({ seq_id, static_cast<Coord_t>(start), static_cast<Coord_t>(this_len) });
 
         // 计算下一个chunk的起始位置
         if (start + this_len >= region_end) {

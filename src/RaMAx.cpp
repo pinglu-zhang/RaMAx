@@ -1,18 +1,23 @@
-﻿// RaMAx.cpp: 定义应用程序的入口点。
+// RaMAx.cpp: 定义应用程序的入口点。
 // 主程序：负责解析命令行参数，初始化配置，执行多基因组比对流程
 
 #include "SeqPro.h"
 #include "data_process.h"
 #include "config.hpp"
 #include "index.h"
+#include "minipoa_locator.h"
+#include "ramax_version.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
+#include "external_msa_runner.h"
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
 // 用于控制基因组比对 / 搜索 / 组装相关流程的全局参数
 // ------------------------------------------------------------------
 struct CommonArgs {
+
+    uint32_t schema_version = 1;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -68,30 +73,16 @@ struct CommonArgs {
 
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
-    bool merge_exact_contiguous_blocks = false;  // 每轮合并连续 Block
-    uint_t merge_query_gap_max = 0;              // query 正间隔上限；0=仅严格连续
+    bool merge_exact_contiguous_blocks = true;   // 每轮合并连续 Block
+    uint_t merge_query_gap_max = 100;            // query 正间隔上限；0=仅严格连续
     bool one_round = false;                     // 是否只执行一轮处理流程
 
-    // ========================
-    // 第一阶段问题窗口识别
-    // ========================
-
-    bool detect_windows = false;
-    bool realign_single_missing_species = false;
+    bool realign_single_missing_species = true;
     uint_t species_mismatch_realign_max_span = 3000;
     uint_t species_mismatch_zero_gap_max_span = 200;
-    std::string window_detection_mode = "each-round";
-    std::filesystem::path window_report_dir = "";
-    std::string window_threshold_profile = "alignathon-v1";
-    uint64_t window_micro_block = 10;
-    uint64_t window_short_block = 100;
-    uint64_t window_primary_gap = 100;
-    uint64_t window_extended_gap = 500;
-    uint64_t window_hard_boundary = 1000;
-    uint64_t window_anchor_min = 100;
-    uint64_t window_strong_anchor = 500;
-    uint64_t window_max_span = 100000;
-    uint64_t window_subset_search_budget = 100000;
+    bool repair_structural_breaks = true;
+    uint_t structural_break_max_span = 1000;
+    bool repair_short_blocks = true;
 
     // ========================
     // cereal 序列化支持
@@ -100,6 +91,7 @@ struct CommonArgs {
     template<class Archive>
     void serialize(Archive& ar) {
         ar(
+            CEREAL_NVP(schema_version),
             CEREAL_NVP(input_path),
             CEREAL_NVP(output_path),
             CEREAL_NVP(work_dir_path),
@@ -119,134 +111,32 @@ struct CommonArgs {
             CEREAL_NVP(quiet),
             CEREAL_NVP(root_name),
             CEREAL_NVP(ref_name),
-            CEREAL_NVP(one_round)
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks)
         );
     }
 };
 
 namespace {
-constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
-    "exact_block_merge_enabled";
-constexpr const char* SINGLE_MISSING_SPECIES_CONFIG_FILE =
-    "single_missing_species_realign_enabled";
-constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
-constexpr const char* WINDOW_CONFIG_FILE = "window_detection_config.json";
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
 
-// Window detection uses a separate optional config so older restart directories
-// remain readable by newer RaMAx binaries. The historical CommonArgs JSON schema
-// is intentionally unchanged.
-struct WindowDetectionConfigFile {
-    bool enabled = false;
-    std::string mode = "each-round";
-    std::filesystem::path report_dir;
-    std::string threshold_profile = "alignathon-v1";
-    uint64_t micro_block = 10;
-    uint64_t short_block = 100;
-    uint64_t primary_gap = 100;
-    uint64_t extended_gap = 500;
-    uint64_t hard_boundary = 1000;
-    uint64_t anchor_min = 100;
-    uint64_t strong_anchor = 500;
-    uint64_t max_span = 100000;
-    uint64_t subset_search_budget = 100000;
-
-    template<class Archive>
-    void serialize(Archive& ar) {
-        ar(CEREAL_NVP(enabled), CEREAL_NVP(mode), CEREAL_NVP(report_dir),
-           CEREAL_NVP(threshold_profile), CEREAL_NVP(micro_block),
-           CEREAL_NVP(short_block), CEREAL_NVP(primary_gap),
-           CEREAL_NVP(extended_gap), CEREAL_NVP(hard_boundary),
-           CEREAL_NVP(anchor_min), CEREAL_NVP(strong_anchor),
-           CEREAL_NVP(max_span), CEREAL_NVP(subset_search_budget));
+std::string requiredMinipoaExecutable() {
+    const auto executable =
+        RaMesh::Alignment::locateMinipoaExecutable();
+    if (executable.empty()) {
+        throw std::runtime_error(
+            "minipoa is required but was not found next to ramax or in PATH");
     }
-};
-
-WindowDetectionConfigFile windowConfigFromArgs(const CommonArgs& args) {
-    return {args.detect_windows,
-            args.window_detection_mode,
-            args.window_report_dir,
-            args.window_threshold_profile,
-            args.window_micro_block,
-            args.window_short_block,
-            args.window_primary_gap,
-            args.window_extended_gap,
-            args.window_hard_boundary,
-            args.window_anchor_min,
-            args.window_strong_anchor,
-            args.window_max_span,
-            args.window_subset_search_budget};
+    return executable.string();
 }
 
-void applyWindowConfig(CommonArgs& args,
-                       const WindowDetectionConfigFile& config) {
-    args.detect_windows = config.enabled;
-    args.window_detection_mode = config.mode;
-    args.window_report_dir = config.report_dir;
-    args.window_threshold_profile = config.threshold_profile;
-    args.window_micro_block = config.micro_block;
-    args.window_short_block = config.short_block;
-    args.window_primary_gap = config.primary_gap;
-    args.window_extended_gap = config.extended_gap;
-    args.window_hard_boundary = config.hard_boundary;
-    args.window_anchor_min = config.anchor_min;
-    args.window_strong_anchor = config.strong_anchor;
-    args.window_max_span = config.max_span;
-    args.window_subset_search_budget = config.subset_search_budget;
-}
-
-void finalizeWindowConfig(CommonArgs& args) {
-    if (args.detect_windows && args.window_report_dir.empty() &&
-        !args.output_path.empty()) {
-        args.window_report_dir = args.output_path.string() + ".window_detection";
-    }
-    if (args.window_micro_block > args.window_short_block) {
-        throw std::runtime_error(
-            "--window-micro-block must be <= --window-short-block");
-    }
-    if (args.window_primary_gap > args.window_extended_gap) {
-        throw std::runtime_error(
-            "--window-primary-gap must be <= --window-extended-gap");
-    }
-    if (args.window_extended_gap > args.window_hard_boundary) {
-        throw std::runtime_error(
-            "--window-extended-gap must be <= --window-hard-boundary");
-    }
-    if (args.window_anchor_min > args.window_strong_anchor) {
-        throw std::runtime_error(
-            "--window-anchor-min must be <= --window-strong-anchor");
-    }
-    if (args.window_subset_search_budget == 0) {
-        throw std::runtime_error(
-            "--window-subset-search-budget must be greater than zero");
-    }
-    (void)RaMesh::WindowDetection::detectionModeFromString(
-        args.window_detection_mode);
-    if (args.detect_windows) {
-        const auto report =
-            std::filesystem::absolute(args.window_report_dir).lexically_normal();
-        const auto work =
-            std::filesystem::absolute(args.work_dir_path).lexically_normal();
-        auto report_it = report.begin();
-        auto work_it = work.begin();
-        while (report_it != report.end() && work_it != work.end() &&
-               *report_it == *work_it) {
-            ++report_it;
-            ++work_it;
-        }
-        if (work_it == work.end()) {
-            throw std::runtime_error(
-                "--window-report-dir must be outside --workdir because the "
-                "work directory is removed after a successful run");
-        }
-        if (std::filesystem::exists(report) &&
-            !std::filesystem::is_directory(report)) {
-            throw std::runtime_error(
-                "--window-report-dir exists but is not a directory: " +
-                report.string());
-        }
-        args.window_report_dir = report;
-    }
-}
 }  // namespace
 
 
@@ -296,22 +186,15 @@ inline void printRunConfiguration(const CommonArgs& args) {
         spdlog::info("  Zero-gap merge span   : {}",
             args.species_mismatch_zero_gap_max_span);
     }
-    spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
-    spdlog::info("  Window detection      : {}", args.detect_windows ? "Enabled" : "Disabled");
-    if (args.detect_windows) {
-        spdlog::info("  Window mode           : {}", args.window_detection_mode);
-        spdlog::info("  Window report dir     : {}", args.window_report_dir.string());
-        spdlog::info("  Window profile        : {}", args.window_threshold_profile);
-        spdlog::info(
-            "  Window thresholds     : micro={}, short={}, gap={}/{}/{}, "
-            "anchor={}/{}, max_span={}",
-            args.window_micro_block, args.window_short_block,
-            args.window_primary_gap, args.window_extended_gap,
-            args.window_hard_boundary, args.window_anchor_min,
-            args.window_strong_anchor, args.window_max_span);
-        spdlog::info("  Subset search budget  : {}",
-                     args.window_subset_search_budget);
+    spdlog::info("  Structural-break repair: {}",
+        args.repair_structural_breaks ? "Enabled" : "Disabled");
+    if (args.repair_structural_breaks) {
+        spdlog::info("  Structural-break span: {}",
+                     args.structural_break_max_span);
     }
+    spdlog::info("  Short-Block repair     : {}",
+        args.repair_short_blocks ? "Enabled" : "Disabled");
+    spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("");
 
 
@@ -348,7 +231,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 版本信息参数（-v / --version）
     cmd->set_version_flag("-v,--version",
-        std::string("RaMAx version ") + VERSION);
+        std::string("RaMAx version ") + RAMAX_VERSION);
 
     // ========================
     // 输入 / 输出路径参数
@@ -468,55 +351,74 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         "Only run one round for alignment.")
         ->group("Software Parameters");
 
+    auto* optimize_blocks_flag = cmd->add_flag(
+        "--optimize-blocks",
+        "Explicitly enable the default Block optimizations (enabled by default).")
+        ->group("Graph Optimization");
+
     auto* merge_exact_blocks_flag = cmd->add_flag(
-        "--merge-exact-contiguous-blocks",
+        "--merge-blocks",
         args.merge_exact_contiguous_blocks,
-        "Merge contiguous Blocks after every graph-alignment round.")
+        "Merge compatible neighboring Blocks.")
         ->group("Graph Optimization");
 
     auto* merge_query_gap_opt = cmd->add_option(
-        "--merge-query-gap-max",
+        "--merge-gap",
         args.merge_query_gap_max,
-        "Allow positive query gaps up to this length during Block merge; "
-        "gap insertions are aligned during MAF export.")
-        ->default_val(0)
+        "Maximum query gap allowed when merging Blocks (bp).")
+        ->default_val(100)
         ->capture_default_str()
         ->group("Graph Optimization")
-        ->needs(merge_exact_blocks_flag)
+        ->type_name("<bp>")
         ->check(CLI::Range(0, 10000));
 
     auto* realign_missing_species_flag = cmd->add_flag(
-        "--realign-single-missing-species",
+        "--realign-missing",
         args.realign_single_missing_species,
-        "In the first round, merge bounded zero-gap subset windows and "
-        "realign variable partial-Block chains with /usr/local/bin/minipoa "
-        "before masking. Species with an empty interior interval are omitted "
-        "from minipoa and represented by deletion columns in the merged "
-        "window.")
-        ->group("Graph Optimization")
-        ->needs(merge_exact_blocks_flag);
+        "Realign bounded windows with missing sequences.")
+        ->group("Graph Optimization");
 
     auto* realign_missing_species_span_opt = cmd->add_option(
-        "--species-mismatch-realign-max-span",
+        "--realign-span",
         args.species_mismatch_realign_max_span,
-        "Maximum per-species interior span for ordinary and empty-interval "
-        "partial-Block-chain realignment.")
+        "Maximum span for missing-sequence realignment (bp).")
         ->default_val(3000)
         ->capture_default_str()
         ->group("Graph Optimization")
-        ->needs(realign_missing_species_flag)
-        ->check(CLI::Range(1, 3000));
+        ->type_name("<bp>")
+        ->check(CLI::Range(1, 10000));
 
     auto* zero_gap_merge_span_opt = cmd->add_option(
-        "--species-mismatch-zero-gap-max-span",
+        "--zero-gap-span",
         args.species_mismatch_zero_gap_max_span,
-        "Maximum participating-species span for deletion-aware merging "
-        "when all missing species have zero-length intervals.")
+        "Maximum span for zero-gap missing windows (bp).")
         ->default_val(200)
         ->capture_default_str()
         ->group("Graph Optimization")
-        ->needs(realign_missing_species_flag)
+        ->type_name("<bp>")
         ->check(CLI::Range(1, 3000));
+
+    auto* structural_break_repair_flag = cmd->add_flag(
+        "--repair-breaks",
+        args.repair_structural_breaks,
+        "Repair high-confidence structural discontinuities.")
+        ->group("Graph Optimization");
+
+    auto* structural_break_span_opt = cmd->add_option(
+        "--break-span",
+        args.structural_break_max_span,
+        "Maximum structural-break repair span (bp).")
+        ->default_val(1000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->type_name("<bp>")
+        ->check(CLI::Range(1, 1000));
+
+    auto* short_block_repair_flag = cmd->add_flag(
+        "--merge-short-blocks",
+        args.repair_short_blocks,
+        "Try to merge short Blocks with banded KSW2.")
+        ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -551,91 +453,6 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
     //     "Enable repeat sequence masking.")
     //     ->group("Software Parameters");
-
-    // ========================
-    // 第一阶段问题窗口识别
-    // ========================
-
-    auto* detect_windows_flag = cmd->add_flag(
-        "--detect-windows", args.detect_windows,
-        "Detect and export suspicious graph windows without modifying the graph.")
-        ->group("Window Detection");
-
-    auto* window_mode_opt = cmd->add_option(
-        "--window-detection-mode", args.window_detection_mode,
-        "Window detection mode: each-round or final-only (default: each-round).")
-        ->default_val("each-round")
-        ->capture_default_str()
-        ->group("Window Detection")
-        ->transform(CLI::CheckedTransformer(
-            std::map<std::string, std::string>{
-                {"each-round", "each-round"},
-                {"final-only", "final-only"}},
-            CLI::ignore_case));
-
-    auto* window_report_dir_opt = cmd->add_option(
-        "--window-report-dir", args.window_report_dir,
-        "Persistent window report directory (default: <output>.window_detection).")
-        ->group("Window Detection")
-        ->type_name("<path>")
-        ->transform(trim_whitespace);
-
-    auto* window_profile_opt = cmd->add_option(
-        "--window-threshold-profile", args.window_threshold_profile,
-        "Window threshold profile name recorded in the report.")
-        ->default_val("alignathon-v1")
-        ->capture_default_str()
-        ->group("Window Detection")
-        ->type_name("<string>")
-        ->transform(trim_whitespace);
-
-    auto add_window_threshold = [&](const std::string& name, uint64_t& value,
-                                    const std::string& description,
-                                    uint64_t default_value) {
-        return cmd->add_option(name, value, description)
-            ->default_val(default_value)
-            ->capture_default_str()
-            ->group("Window Detection")
-            ->check(CLI::Range(static_cast<uint64_t>(0),
-                               static_cast<uint64_t>(1000000000)))
-            ->type_name("<bp>")
-            ->transform(trim_whitespace);
-    };
-
-    auto* window_micro_opt = add_window_threshold(
-        "--window-micro-block", args.window_micro_block,
-        "Maximum micro-Block length (bp).", 10);
-    auto* window_short_opt = add_window_threshold(
-        "--window-short-block", args.window_short_block,
-        "Maximum short-Block length (bp).", 100);
-    auto* window_primary_gap_opt = add_window_threshold(
-        "--window-primary-gap", args.window_primary_gap,
-        "Maximum primary short gap (bp).", 100);
-    auto* window_extended_gap_opt = add_window_threshold(
-        "--window-extended-gap", args.window_extended_gap,
-        "Maximum extended gap (bp).", 500);
-    auto* window_hard_boundary_opt = add_window_threshold(
-        "--window-hard-boundary", args.window_hard_boundary,
-        "Gap above which ordinary windows cannot expand (bp).", 1000);
-    auto* window_anchor_min_opt = add_window_threshold(
-        "--window-anchor-min", args.window_anchor_min,
-        "Minimum reliable anchor length (bp).", 100);
-    auto* window_strong_anchor_opt = add_window_threshold(
-        "--window-strong-anchor", args.window_strong_anchor,
-        "Strong anchor length recorded for calibration (bp).", 500);
-    auto* window_max_span_opt = add_window_threshold(
-        "--window-max-span", args.window_max_span,
-        "Maximum ordinary candidate-window span (bp).", 100000);
-    auto* window_subset_budget_opt = cmd->add_option(
-        "--window-subset-search-budget", args.window_subset_search_budget,
-        "Maximum branch-and-bound nodes per n-to-k compatibility search.")
-        ->default_val(100000)
-        ->capture_default_str()
-        ->group("Window Detection")
-        ->check(CLI::Range(static_cast<uint64_t>(1),
-                           static_cast<uint64_t>(1000000000)))
-        ->type_name("<int>")
-        ->transform(trim_whitespace);
 
     // ========================
     // 性能相关参数
@@ -711,22 +528,17 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         min_span_opt,
         root_opt,
         ref_opt,
+        optimize_blocks_flag,
         merge_exact_blocks_flag,
+        merge_query_gap_opt,
+        realign_missing_species_flag,
+        realign_missing_species_span_opt,
+        zero_gap_merge_span_opt,
+        structural_break_repair_flag,
+        structural_break_span_opt,
+        short_block_repair_flag,
         one_round_flag,
-        log_level_opt,
-        detect_windows_flag,
-        window_mode_opt,
-        window_report_dir_opt,
-        window_profile_opt,
-        window_micro_opt,
-        window_short_opt,
-        window_primary_gap_opt,
-        window_extended_gap_opt,
-        window_hard_boundary_opt,
-        window_anchor_min_opt,
-        window_strong_anchor_opt,
-        window_max_span_opt,
-        window_subset_budget_opt
+        log_level_opt
     );
 
     // verbose 与 quiet 互斥
@@ -743,6 +555,36 @@ static inline void applySlowBuildFlag(const CLI::App& app, CommonArgs& common_ar
     // 若用户指定 --slow-build，则关闭 fast_build
     if (app.count("--slow-build")) {
         common_args.fast_build = false;
+    }
+}
+
+static inline void applyGraphOptimizationOptions(
+    const CLI::App& app, CommonArgs& args) {
+    if (app.count("--optimize-blocks") != 0) {
+        args.merge_exact_contiguous_blocks = true;
+        args.realign_single_missing_species = true;
+        args.repair_structural_breaks = true;
+        args.repair_short_blocks = true;
+    }
+
+    const bool merge_enabled = args.merge_exact_contiguous_blocks;
+    const bool realign_enabled = args.realign_single_missing_species;
+    const bool break_enabled = args.repair_structural_breaks;
+    if (realign_enabled && !merge_enabled) {
+        throw CLI::ValidationError(
+            "--realign-missing requires --merge-blocks");
+    }
+    if (app.count("--merge-gap") != 0 && !merge_enabled) {
+        throw CLI::ValidationError("--merge-gap requires --merge-blocks");
+    }
+    if ((app.count("--realign-span") != 0 ||
+         app.count("--zero-gap-span") != 0) &&
+        !realign_enabled) {
+        throw CLI::ValidationError(
+            "--realign-span and --zero-gap-span require --realign-missing");
+    }
+    if (app.count("--break-span") != 0 && !break_enabled) {
+        throw CLI::ValidationError("--break-span requires --repair-breaks");
     }
 }
 
@@ -815,7 +657,8 @@ static int runRestartMode(CommonArgs& common_args) {
 
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
-    spdlog::info("RaMAx version {}", VERSION);
+    configureLogLevel(common_args);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Restart mode enabled.");
 
@@ -827,72 +670,26 @@ static int runRestartMode(CommonArgs& common_args) {
         return 1;
     }
 
-    // 从 JSON 反序列化参数
-    cereal::JSONInputArchive archive(is);
-    archive(common_args);
-
-    common_args.merge_exact_contiguous_blocks = std::filesystem::exists(
-        common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
-    if (common_args.merge_exact_contiguous_blocks) {
-        std::ifstream merge_config_input(
-            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
-        uint64_t stored_query_gap = 0;
-        if (merge_config_input &&
-            (merge_config_input >> stored_query_gap)) {
-            common_args.merge_query_gap_max = static_cast<uint_t>(
-                std::min<uint64_t>(
-                    stored_query_gap,
-                    std::numeric_limits<uint_t>::max()));
-        }
-        spdlog::info("Exact Block merge restart marker loaded.");
+    try {
+        cereal::JSONInputArchive archive(is);
+        archive(cereal::make_nvp("common_args", common_args));
+    } catch (const std::exception& error) {
+        spdlog::error(
+            "Restart configuration is incompatible with RaMAx {}: {}",
+            RAMAX_VERSION, error.what());
+        return 1;
     }
-
-    const FilePath missing_species_config_path =
-        common_args.work_dir_path /
-        SINGLE_MISSING_SPECIES_CONFIG_FILE;
-    common_args.realign_single_missing_species =
-        std::filesystem::exists(missing_species_config_path);
-    if (common_args.realign_single_missing_species) {
-        std::ifstream missing_species_input(
-            missing_species_config_path);
-        uint64_t stored_max_span = 3000;
-        uint64_t stored_zero_gap_max_span = 200;
-        if (missing_species_input &&
-            (missing_species_input >> stored_max_span)) {
-            common_args.species_mismatch_realign_max_span =
-                static_cast<uint_t>(std::clamp<uint64_t>(
-                    stored_max_span, 1, 3000));
-            if (missing_species_input >> stored_zero_gap_max_span) {
-                common_args.species_mismatch_zero_gap_max_span =
-                    static_cast<uint_t>(std::clamp<uint64_t>(
-                        stored_zero_gap_max_span, 1, 3000));
-            }
-        }
-        spdlog::info(
-            "Single-missing-species restart marker loaded.");
+    if (common_args.schema_version != CONFIG_SCHEMA_VERSION) {
+        spdlog::error(
+            "Unsupported restart schema version {} (expected {}). Old work "
+            "directories are not compatible with RaMAx {}.",
+            common_args.schema_version, CONFIG_SCHEMA_VERSION,
+            RAMAX_VERSION);
+        return 1;
     }
+    common_args.restart = true;
+    configureLogLevel(common_args);
     spdlog::info("CommonArgs loaded from {}", config_path.string());
-
-    const FilePath window_config_path =
-        common_args.work_dir_path / WINDOW_CONFIG_FILE;
-    if (std::filesystem::exists(window_config_path)) {
-        std::ifstream window_input(window_config_path);
-        if (!window_input) {
-            throw std::runtime_error(
-                "Failed to open window detection restart config: " +
-                window_config_path.string());
-        }
-        WindowDetectionConfigFile window_config;
-        cereal::JSONInputArchive window_archive(window_input);
-        window_archive(window_config);
-        applyWindowConfig(common_args, window_config);
-        spdlog::info("Window detection config loaded from {}",
-                     window_config_path.string());
-    } else {
-        common_args.detect_windows = false;
-    }
-    finalizeWindowConfig(common_args);
-
     return 0;
 }
 
@@ -930,7 +727,8 @@ static int runNormalMode(CommonArgs& common_args) {
 
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
-    spdlog::info("RaMAx version {}", VERSION);
+    configureLogLevel(common_args);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
@@ -945,9 +743,7 @@ static int runNormalMode(CommonArgs& common_args) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
 
-    finalizeWindowConfig(common_args);
-
-    // 保存参数配置文件（用于 --restart）
+    common_args.schema_version = CONFIG_SCHEMA_VERSION;
     FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
     std::ofstream os(config_path);
     if (!os) {
@@ -958,57 +754,6 @@ static int runNormalMode(CommonArgs& common_args) {
     cereal::JSONOutputArchive archive(os);
     archive(cereal::make_nvp("common_args", common_args));
     spdlog::info("Configuration saved to {}", config_path.string());
-
-    if (common_args.detect_windows) {
-        const FilePath window_config_path =
-            common_args.work_dir_path / WINDOW_CONFIG_FILE;
-        std::ofstream window_output(window_config_path);
-        if (!window_output) {
-            throw std::runtime_error(
-                "Failed to save window detection config: " +
-                window_config_path.string());
-        }
-        auto window_config = windowConfigFromArgs(common_args);
-        cereal::JSONOutputArchive window_archive(window_output);
-        window_archive(cereal::make_nvp("window_detection", window_config));
-        spdlog::info("Window detection config saved to {}",
-                     window_config_path.string());
-    }
-
-    if (common_args.merge_exact_contiguous_blocks) {
-        const FilePath merge_config_path =
-            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE;
-        std::ofstream merge_config_output(merge_config_path);
-        if (!merge_config_output) {
-            throw std::runtime_error(
-                "Failed to save exact Block merge restart marker: " +
-                merge_config_path.string());
-        }
-        merge_config_output << common_args.merge_query_gap_max << '\n';
-        spdlog::info("Exact Block merge restart marker saved to {}",
-                     merge_config_path.string());
-    }
-    if (common_args.realign_single_missing_species) {
-        const FilePath missing_species_config_path =
-            common_args.work_dir_path /
-            SINGLE_MISSING_SPECIES_CONFIG_FILE;
-        std::ofstream missing_species_output(
-            missing_species_config_path);
-        if (!missing_species_output) {
-            throw std::runtime_error(
-                "Failed to save single-missing-species restart marker: " +
-                missing_species_config_path.string());
-        }
-        missing_species_output
-            << common_args.species_mismatch_realign_max_span
-            << ' '
-            << common_args.species_mismatch_zero_gap_max_span
-            << '\n';
-        spdlog::info(
-            "Single-missing-species restart marker saved to {}",
-            missing_species_config_path.string());
-    }
-
 
     return 0;
 }
@@ -1211,6 +956,11 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     SeqPro::Length reference_min_seq_length,
     double& align_seconds_out
 ) {
+    const std::string minipoa_executable = requiredMinipoaExecutable();
+    RaMesh::Alignment::ExternalMsaRunner::instance()
+        .configureScratchDirectory(
+            common_args.work_dir_path / "minipoa_tmp");
+
     // 初始化比对器
     MultipleRareAligner mra(
         common_args.work_dir_path,
@@ -1223,31 +973,6 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.max_anchor_frequency
     );
 
-    mra.window_detection_options.enabled = common_args.detect_windows;
-    mra.window_detection_options.mode =
-        RaMesh::WindowDetection::detectionModeFromString(
-            common_args.window_detection_mode);
-    mra.window_detection_options.report_dir = common_args.window_report_dir;
-    mra.window_detection_options.threshold_profile =
-        common_args.window_threshold_profile;
-    mra.window_detection_options.micro_block_max_bp =
-        common_args.window_micro_block;
-    mra.window_detection_options.short_block_max_bp =
-        common_args.window_short_block;
-    mra.window_detection_options.primary_gap_max_bp =
-        common_args.window_primary_gap;
-    mra.window_detection_options.extended_gap_max_bp =
-        common_args.window_extended_gap;
-    mra.window_detection_options.hard_boundary_gap_bp =
-        common_args.window_hard_boundary;
-    mra.window_detection_options.anchor_min_segment_bp =
-        common_args.window_anchor_min;
-    mra.window_detection_options.strong_anchor_bp =
-        common_args.window_strong_anchor;
-    mra.window_detection_options.max_window_span_bp =
-        common_args.window_max_span;
-    mra.window_detection_options.subset_search_budget =
-        static_cast<size_t>(common_args.window_subset_search_budget);
     mra.merge_exact_contiguous_blocks_enabled =
         common_args.merge_exact_contiguous_blocks;
     mra.merge_query_gap_max = common_args.merge_query_gap_max;
@@ -1259,15 +984,20 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.species_mismatch_realign_max_span;
     mra.species_mismatch_zero_gap_max_span =
         common_args.species_mismatch_zero_gap_max_span;
-    mra.species_mismatch_msa_executable =
-        MINIPOA_EXECUTABLE;
-    if (mra.realign_single_missing_species_enabled &&
-        !std::filesystem::exists(
-            mra.species_mismatch_msa_executable)) {
-        throw std::runtime_error(
-            "Single-missing-species realignment requires minipoa at " +
-            mra.species_mismatch_msa_executable);
-    }
+    mra.species_mismatch_msa_executable = minipoa_executable;
+    mra.structural_break_repair_options.enabled =
+        common_args.repair_structural_breaks;
+    mra.structural_break_repair_options.maximum_span =
+        common_args.structural_break_max_span;
+    mra.structural_break_repair_options.parallel_threads =
+        common_args.thread_num;
+    mra.structural_break_repair_options.msa_executable = minipoa_executable;
+    mra.short_block_repair_options.enabled =
+        common_args.repair_short_blocks;
+    mra.short_block_repair_options.maximum_query_gap =
+        common_args.merge_query_gap_max;
+    mra.short_block_repair_options.parallel_threads =
+        common_args.thread_num;
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）
@@ -1307,11 +1037,17 @@ static void exportResults(
     // 清理遮蔽区间（导出前）
     clearAllMaskedRegions(seqpro_managers);
 
+    // Both direct MAF export and HAL construction reconstruct multiway
+    // columns through mergeAlignmentByRef().  Configure the shared repair
+    // once so the two output paths make the same local insertion decisions.
+    configureCrossAnchorInsertionRepair(
+        requiredMinipoaExecutable(),
+        common_args.species_mismatch_realign_max_span);
+
     // 根据输出格式选择导出方法
     switch (common_args.output_format) {
     case MultipleGenomeOutputFormat::MAF:
         spdlog::info("Exporting to MAF format...");
-        // TODO：双基因组比对模式后续要改为 false；当前保留原代码逻辑（true/false 组合）
         graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
         break;
 
@@ -1331,6 +1067,8 @@ static void exportResults(
     default:
         throw std::runtime_error("Unsupported output format for multiple genome alignment");
     }
+    logCrossAnchorInsertionRepairStats();
+    RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
 }
 
 // ------------------------------
@@ -1448,8 +1186,13 @@ int main(int argc, char** argv) {
     // 开始解析命令行参数
     CLI11_PARSE(app, argc, argv);
 
-    // 设置日志级别（quiet / verbose / log_level）
+    // Apply output policy before emitting deprecation warnings.
     configureLogLevel(common_args);
+    try {
+        applyGraphOptimizationOptions(app, common_args);
+    } catch (const CLI::Error& error) {
+        return app.exit(error);
+    }
 
     // 运行前准备：根据 restart 与否进行目录/参数/配置文件处理
     if (prepareRun(common_args) != 0) {
