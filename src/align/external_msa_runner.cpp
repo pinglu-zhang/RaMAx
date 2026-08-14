@@ -37,6 +37,7 @@ namespace {
 
 std::mutex configuration_mutex;
 std::string default_executable;
+std::filesystem::path scratch_directory;
 std::atomic<uint64_t> file_counter{0};
 std::atomic<uint64_t> completed{0};
 std::atomic<uint64_t> input_nanoseconds{0};
@@ -48,10 +49,14 @@ std::atomic<uint64_t> failures{0};
 std::atomic<uint64_t> cache_hits{0};
 std::atomic<uint64_t> cache_misses{0};
 std::atomic<uint64_t> cache_single_flight_hits{0};
+std::atomic<uint64_t> internal_temp_files_found{0};
+std::atomic<uint64_t> internal_temp_files_removed{0};
+std::atomic<uint64_t> internal_temp_cleanup_failures{0};
 std::atomic<uint32_t> progress_index{0};
 std::atomic_flag spawn_warning = ATOMIC_FLAG_INIT;
 std::atomic_flag command_warning = ATOMIC_FLAG_INIT;
 std::atomic_flag parse_warning = ATOMIC_FLAG_INIT;
+std::atomic_flag cleanup_warning = ATOMIC_FLAG_INIT;
 constexpr std::array<uint64_t, 10> progress_milestones{
     1000, 2000, 4000, 8000, 12000, 16000, 20000, 24000, 28000, 32000};
 constexpr size_t kCacheMaximumBytes = 64ULL * 1024ULL * 1024ULL;
@@ -92,9 +97,74 @@ struct ThreadBuffers {
 
 thread_local ThreadBuffers thread_buffers;
 
+bool isInternalTempFileName(std::string_view name) {
+    constexpr std::string_view prefix = "minipoa_paths_";
+    constexpr std::string_view suffix = ".tmp";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix) ||
+        name.size() <= prefix.size() + suffix.size()) {
+        return false;
+    }
+    name.remove_prefix(prefix.size());
+    name.remove_suffix(suffix.size());
+    return std::all_of(name.begin(), name.end(), [](unsigned char value) {
+        return std::isdigit(value) != 0;
+    });
+}
+
+void warnCleanupOnce(const std::filesystem::path& path,
+                     const std::error_code& error) {
+    internal_temp_cleanup_failures.fetch_add(1, std::memory_order_relaxed);
+    if (!cleanup_warning.test_and_set(std::memory_order_relaxed)) {
+        spdlog::warn(
+            "[external-msa] cannot remove internal minipoa temporary file "
+            "{}: {}; further cleanup failures are aggregated",
+            path.string(), error ? error.message() : "not a regular file");
+    }
+}
+
+void removeInternalTempFile(const std::filesystem::path& path) {
+    std::error_code status_error;
+    const auto status = std::filesystem::symlink_status(path, status_error);
+    if (status_error == std::errc::no_such_file_or_directory ||
+        status.type() == std::filesystem::file_type::not_found) {
+        return;
+    }
+    internal_temp_files_found.fetch_add(1, std::memory_order_relaxed);
+    if (status_error || !std::filesystem::is_regular_file(status)) {
+        warnCleanupOnce(path, status_error);
+        return;
+    }
+    std::error_code remove_error;
+    if (std::filesystem::remove(path, remove_error)) {
+        internal_temp_files_removed.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        warnCleanupOnce(path, remove_error);
+    }
+}
+
+void removeStaleInternalTempFiles(const std::filesystem::path& directory) {
+    std::error_code iteration_error;
+    std::filesystem::directory_iterator iterator(directory, iteration_error);
+    if (iteration_error) {
+        throw std::runtime_error(
+            "Cannot scan external MSA scratch directory: " +
+            directory.string() + ": " + iteration_error.message());
+    }
+    for (const auto& entry : iterator) {
+        if (isInternalTempFileName(entry.path().filename().string())) {
+            removeInternalTempFile(entry.path());
+        }
+    }
+}
+
 bool cacheEligible(const std::string& executable) {
     const char* disabled = std::getenv("RAMAX_DISABLE_EXTERNAL_MSA_CACHE");
-    return executable == "/usr/local/bin/minipoa" &&
+    const char* test_executable =
+        std::getenv("RAMAX_TEST_EXTERNAL_MSA_CACHE_EXECUTABLE");
+    const bool supported_executable =
+        executable == "/usr/local/bin/minipoa" ||
+        (test_executable && executable == test_executable);
+    return supported_executable &&
            !(disabled && *disabled == '1');
 }
 
@@ -146,15 +216,23 @@ CacheLookup lookupCache(const std::string& executable,
             return result;
         }
     }
-    for (const auto& flight : in_flight) {
-        if (!exactKey(*flight, hash, executable, input)) continue;
-        flight->ready.wait(lock, [&] { return flight->finished; });
-        if (flight->success) {
+    std::shared_ptr<InFlight> pending;
+    for (const auto& candidate : in_flight) {
+        if (!exactKey(*candidate, hash, executable, input)) continue;
+        // Keep an owning copy before releasing cache_mutex in wait(). The
+        // owner removes its vector entry on completion, and other misses may
+        // reallocate the vector while this thread sleeps.
+        pending = candidate;
+        break;
+    }
+    if (pending) {
+        pending->ready.wait(lock, [&pending] { return pending->finished; });
+        if (pending->success) {
             ++cache_successful_hits;
             cache_hits.fetch_add(1, std::memory_order_relaxed);
             cache_single_flight_hits.fetch_add(1, std::memory_order_relaxed);
             result.hit = true;
-            result.output = flight->output;
+            result.output = pending->output;
         }
         return result;
     }
@@ -321,6 +399,25 @@ public:
     }
 };
 
+class InternalTempCleanup {
+public:
+    InternalTempCleanup() = default;
+    InternalTempCleanup(const std::filesystem::path& directory, pid_t pid) {
+        if (!directory.empty() && pid > 0) {
+            path_ = directory /
+                ("minipoa_paths_" + std::to_string(pid) + ".tmp");
+        }
+    }
+    InternalTempCleanup(const InternalTempCleanup&) = delete;
+    InternalTempCleanup& operator=(const InternalTempCleanup&) = delete;
+    ~InternalTempCleanup() {
+        if (!path_.empty()) removeInternalTempFile(path_);
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
 bool writeAll(int fd, const std::string& contents) {
     size_t offset = 0;
     while (offset < contents.size()) {
@@ -336,6 +433,9 @@ bool writeAll(int fd, const std::string& contents) {
 }
 
 ScopedFd createMemfd(const std::string& contents) {
+    const char* force_file =
+        std::getenv("RAMAX_FORCE_EXTERNAL_MSA_FILE_INPUT");
+    if (force_file && *force_file == '1') return {};
 #if defined(__linux__) && defined(SYS_memfd_create)
     const int fd = static_cast<int>(
         ::syscall(SYS_memfd_create, "ramax-minipoa-input", MFD_CLOEXEC));
@@ -458,6 +558,26 @@ void ExternalMsaRunner::configureDefaultExecutable(std::string executable) {
     default_executable = std::move(executable);
 }
 
+void ExternalMsaRunner::configureScratchDirectory(
+    std::filesystem::path directory) {
+    if (directory.empty()) {
+        throw std::invalid_argument(
+            "External MSA scratch directory must not be empty");
+    }
+    directory = std::filesystem::absolute(directory).lexically_normal();
+    std::error_code create_error;
+    std::filesystem::create_directories(directory, create_error);
+    if (create_error || !std::filesystem::is_directory(directory)) {
+        throw std::runtime_error(
+            "Cannot create external MSA scratch directory: " +
+            directory.string() +
+            (create_error ? ": " + create_error.message() : ""));
+    }
+    removeStaleInternalTempFiles(directory);
+    std::lock_guard lock(configuration_mutex);
+    scratch_directory = std::move(directory);
+}
+
 bool ExternalMsaRunner::alignWithDefault(
     std::unordered_map<ChrName, std::string>& sequences) {
     std::string executable;
@@ -472,6 +592,11 @@ bool ExternalMsaRunner::align(
     const std::string& executable,
     std::unordered_map<ChrName, std::string>& sequences) {
     if (executable.empty() || sequences.size() < 2) return false;
+    std::filesystem::path invocation_scratch;
+    {
+        std::lock_guard lock(configuration_mutex);
+        invocation_scratch = scratch_directory;
+    }
     const auto input_start = std::chrono::steady_clock::now();
 
     auto& keys = thread_buffers.keys;
@@ -517,9 +642,12 @@ bool ExternalMsaRunner::align(
         const uint64_t serial = file_counter.fetch_add(1);
         const uint64_t stamp = static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
-        temporary.path = std::filesystem::temp_directory_path() /
-            ("ramax-insertion-msa-" + std::to_string(stamp) + "-" +
-             std::to_string(serial) + ".input.fa");
+        const auto& input_directory = invocation_scratch.empty()
+            ? std::filesystem::temp_directory_path()
+            : invocation_scratch;
+        temporary.path = input_directory /
+            ("ramax-minipoa-input-" + std::to_string(stamp) + "-" +
+             std::to_string(serial) + ".fa");
         std::ofstream input(temporary.path, std::ios::binary);
         if (!input || !(input << input_text)) {
             throw std::runtime_error(
@@ -569,8 +697,18 @@ bool ExternalMsaRunner::align(
                                 "Cannot initialize MSA spawn actions");
     }
     int action_error = 0;
-    if (input_fd) action_error = posix_spawn_file_actions_adddup2(
-        &actions, input_fd.get(), child_input_fd);
+#if defined(__linux__)
+    if (!invocation_scratch.empty()) {
+        action_error = posix_spawn_file_actions_addchdir_np(
+            &actions, invocation_scratch.c_str());
+    }
+#else
+    if (!invocation_scratch.empty()) action_error = ENOTSUP;
+#endif
+    if (action_error == 0 && input_fd) {
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, input_fd.get(), child_input_fd);
+    }
     if (action_error == 0) action_error = posix_spawn_file_actions_adddup2(
         &actions, output_write.get(), STDOUT_FILENO);
     if (action_error == 0) action_error = posix_spawn_file_actions_addclose(
@@ -609,6 +747,7 @@ bool ExternalMsaRunner::align(
         }
         return false;
     }
+    InternalTempCleanup internal_temp_cleanup(invocation_scratch, pid);
     output_write.reset();
 
     auto& output_text = thread_buffers.output;
@@ -646,13 +785,17 @@ void ExternalMsaRunner::logSummary() const {
     spdlog::info(
         "[external-msa] completed={} failures={} input/process/parse="
         "{:.3f}/{:.3f}/{:.3f}s inputs(memfd/file)={}/{} "
-        "cache(hit/miss/single_flight)={}/{}/{} enabled={}",
+        "cache(hit/miss/single_flight)={}/{}/{} enabled={} "
+        "internal_temp(found/removed/cleanup_failed)={}/{}/{}",
         completed.load(), failures.load(),
         input_nanoseconds.load() / kNsPerSecond,
         process_nanoseconds.load() / kNsPerSecond,
         parse_nanoseconds.load() / kNsPerSecond, memfd_inputs.load(),
         file_inputs.load(), cache_hits.load(), cache_misses.load(),
-        cache_single_flight_hits.load(), cache_enabled.load());
+        cache_single_flight_hits.load(), cache_enabled.load(),
+        internal_temp_files_found.load(),
+        internal_temp_files_removed.load(),
+        internal_temp_cleanup_failures.load());
 }
 
 }  // namespace RaMesh::Alignment

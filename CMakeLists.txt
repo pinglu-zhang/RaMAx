@@ -289,6 +289,15 @@ if(RAMAX_BUILD_TESTS)
     add_test(NAME ramax_realignment_internal
         COMMAND ramax_realignment_internal_test)
 
+    add_executable(ramax_external_msa_runner_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/external_msa_runner_test.cpp")
+    configure_rama_target(ramax_external_msa_runner_test)
+    target_link_libraries(ramax_external_msa_runner_test PRIVATE ramax_core)
+    add_dependencies(ramax_external_msa_runner_test hal_library)
+    add_test(NAME ramax_external_msa_runner
+        COMMAND ramax_external_msa_runner_test)
+    set_tests_properties(ramax_external_msa_runner PROPERTIES TIMEOUT 15)
+
     add_executable(ramax_structural_break_repair_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/structural_break_repair_test.cpp")
     configure_rama_target(ramax_structural_break_repair_test)

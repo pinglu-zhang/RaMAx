@@ -1142,6 +1142,10 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     SeqPro::Length reference_min_seq_length,
     double& align_seconds_out
 ) {
+    RaMesh::Alignment::ExternalMsaRunner::instance()
+        .configureScratchDirectory(
+            common_args.work_dir_path / "minipoa_tmp");
+
     // 初始化比对器
     MultipleRareAligner mra(
         common_args.work_dir_path,
