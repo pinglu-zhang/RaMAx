@@ -28,9 +28,9 @@ private:
     std::unordered_map<std::string, std::string> failures_;
 };
 
-// Precision-first phase-2 defaults.  These values deliberately live outside
-// the phase-1 missing-window parameters: a structural discontinuity is only a
-// recall signal and never sufficient by itself to edit the graph.
+// Precision-first structural repair settings are independent of missing-window
+// settings: a structural discontinuity is only a recall signal and never
+// sufficient by itself to edit the graph.
 struct Options {
     bool enabled = false;
     uint_t maximum_span = 1000;
@@ -41,7 +41,7 @@ struct Options {
     double minimum_identity = 0.60;
     double maximum_anchor_identity_drop = 0.15;
     uint_t parallel_threads = 1;
-    std::string msa_executable = "/usr/local/bin/minipoa";
+    std::string msa_executable;
     std::shared_ptr<FailureCache> failure_cache =
         std::make_shared<FailureCache>();
 };
@@ -80,8 +80,8 @@ struct Result {
     std::map<std::string, uint64_t> rejection_reasons;
 };
 
-// Runs after phase-1 exact/zero-gap/minipoa cleanup and before masking.  The
-// graph is unchanged for every rejected or failed candidate.
+// Runs after exact/missing-window cleanup and before masking. The graph is
+// unchanged for every rejected or failed candidate.
 Result repairAnchorBoundedStructuralBreaks(
     RaMeshMultiGenomeGraph& graph,
     const SpeciesName& reference_species,

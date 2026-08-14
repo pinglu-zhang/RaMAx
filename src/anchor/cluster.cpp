@@ -146,20 +146,22 @@ void filterAndMergeMatches(MatchVec& matches) {
             else if (mi.qry_start == mj.qry_start &&
                      mi.qry_chr_index == mj.qry_chr_index) {
 
-                int overlap = mi.ref_start + mi.match_len() - mj.ref_start;
+                int64_t overlap = static_cast<int64_t>(mi.ref_start) +
+                                  static_cast<int64_t>(mi.match_len()) -
+                                  static_cast<int64_t>(mj.ref_start);
 
                 if (mi.match_len() < mj.match_len()) {
-                    if (overlap >= mi.match_len() / 2) {
+                    if (overlap >= static_cast<int64_t>(mi.match_len() / 2)) {
                         good[i] = false;
                         break;
                     }
                 }
                 else if (mj.match_len() < mi.match_len()) {
-                    if (overlap >= mj.match_len() / 2)
+                    if (overlap >= static_cast<int64_t>(mj.match_len() / 2))
                         good[j] = false;
                 }
                 else {
-                    if (overlap >= mi.match_len() / 2) {
+                    if (overlap >= static_cast<int64_t>(mi.match_len() / 2)) {
                         tentative[j] = true;
                         if (tentative[i]) {
                             good[i] = false;
@@ -285,11 +287,6 @@ MatchClusterVec buildClusters(MatchVec& unique_match,
             cid = it->second;
         }
 
-        // 保留原代码中的无意义分支（不改逻辑）
-        if (unique_match[idx].ref_chr_index > 0) {
-            std::cout << "";
-        }
-
         clusters[cid].push_back(std::move(unique_match[idx]));
     }
 
@@ -405,7 +402,6 @@ MatchVec bestChainDP(MatchVec& cluster, double diagfactor) {
             // query 维度必须不重叠（i 的 start2 需在 j 的末尾之后）
             if (start2(cluster[i]) <= start2(cluster[j]) + len2(cluster[j])) continue;
 
-            int_t sep = 0;
             int_t d = 0;
 
             if (strand == FORWARD) {
@@ -413,7 +409,6 @@ MatchVec bestChainDP(MatchVec& cluster, double diagfactor) {
                 int_t prev_endj = start1(cluster[j]) + len1(cluster[j]);
                 if (start1(cluster[i]) <= prev_endj) continue;
 
-                sep = start1(cluster[i]) - prev_endj;
                 d = std::abs(diag(cluster[i]) - diag(cluster[j]));
             }
             else {
@@ -421,7 +416,6 @@ MatchVec bestChainDP(MatchVec& cluster, double diagfactor) {
                 int_t prev_endi = start1(cluster[i]) + len1(cluster[i]);
                 if (prev_endi >= start1(cluster[j])) continue;
 
-                sep = start1(cluster[j]) - prev_endi;
                 d = std::abs(diag_reverse(cluster[i]) - diag_reverse(cluster[j]));
             }
 
@@ -484,7 +478,7 @@ MatchClusterVecPtr clusterChrMatch(MatchVec& unique_match,
             continue;
         }
 
-        int_t span = 0;
+        uint_t span = 0;
         // 遍历 best_chain 累加 span（保持原逻辑）
         for (auto& m : best_chain) {
             span += m.match_len();

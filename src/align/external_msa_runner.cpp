@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
-#include <cstdlib>
 #include <deque>
 #include <fcntl.h>
 #include <filesystem>
@@ -158,14 +157,7 @@ void removeStaleInternalTempFiles(const std::filesystem::path& directory) {
 }
 
 bool cacheEligible(const std::string& executable) {
-    const char* disabled = std::getenv("RAMAX_DISABLE_EXTERNAL_MSA_CACHE");
-    const char* test_executable =
-        std::getenv("RAMAX_TEST_EXTERNAL_MSA_CACHE_EXECUTABLE");
-    const bool supported_executable =
-        executable == "/usr/local/bin/minipoa" ||
-        (test_executable && executable == test_executable);
-    return supported_executable &&
-           !(disabled && *disabled == '1');
+    return !executable.empty();
 }
 
 size_t cacheHash(const std::string& executable, const std::string& input) {
@@ -433,9 +425,6 @@ bool writeAll(int fd, const std::string& contents) {
 }
 
 ScopedFd createMemfd(const std::string& contents) {
-    const char* force_file =
-        std::getenv("RAMAX_FORCE_EXTERNAL_MSA_FILE_INPUT");
-    if (force_file && *force_file == '1') return {};
 #if defined(__linux__) && defined(SYS_memfd_create)
     const int fd = static_cast<int>(
         ::syscall(SYS_memfd_create, "ramax-minipoa-input", MFD_CLOEXEC));

@@ -1,10 +1,12 @@
-﻿// RaMAx.cpp: 定义应用程序的入口点。
+// RaMAx.cpp: 定义应用程序的入口点。
 // 主程序：负责解析命令行参数，初始化配置，执行多基因组比对流程
 
 #include "SeqPro.h"
 #include "data_process.h"
 #include "config.hpp"
 #include "index.h"
+#include "minipoa_locator.h"
+#include "ramax_version.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
 #include "external_msa_runner.h"
@@ -14,6 +16,8 @@
 // 用于控制基因组比对 / 搜索 / 组装相关流程的全局参数
 // ------------------------------------------------------------------
 struct CommonArgs {
+
+    uint32_t schema_version = 1;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -69,16 +73,16 @@ struct CommonArgs {
 
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
-    bool merge_exact_contiguous_blocks = false;  // 每轮合并连续 Block
+    bool merge_exact_contiguous_blocks = true;   // 每轮合并连续 Block
     uint_t merge_query_gap_max = 100;            // query 正间隔上限；0=仅严格连续
     bool one_round = false;                     // 是否只执行一轮处理流程
 
-    bool realign_single_missing_species = false;
+    bool realign_single_missing_species = true;
     uint_t species_mismatch_realign_max_span = 3000;
     uint_t species_mismatch_zero_gap_max_span = 200;
-    bool repair_structural_breaks = false;
+    bool repair_structural_breaks = true;
     uint_t structural_break_max_span = 1000;
-    bool repair_short_blocks = false;
+    bool repair_short_blocks = true;
 
     // ========================
     // cereal 序列化支持
@@ -87,6 +91,7 @@ struct CommonArgs {
     template<class Archive>
     void serialize(Archive& ar) {
         ar(
+            CEREAL_NVP(schema_version),
             CEREAL_NVP(input_path),
             CEREAL_NVP(output_path),
             CEREAL_NVP(work_dir_path),
@@ -106,31 +111,31 @@ struct CommonArgs {
             CEREAL_NVP(quiet),
             CEREAL_NVP(root_name),
             CEREAL_NVP(ref_name),
-            CEREAL_NVP(one_round)
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks)
         );
     }
 };
 
 namespace {
-constexpr const char* EXACT_BLOCK_MERGE_CONFIG_FILE =
-    "exact_block_merge_enabled";
-constexpr const char* SINGLE_MISSING_SPECIES_CONFIG_FILE =
-    "single_missing_species_realign_enabled";
-constexpr const char* MINIPOA_EXECUTABLE = "/usr/local/bin/minipoa";
-constexpr const char* STRUCTURAL_BREAK_CONFIG_FILE =
-    "structural_break_repair_config.json";
-constexpr const char* SHORT_BLOCK_REPAIR_CONFIG_FILE =
-    "short_block_repair_enabled";
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
 
-struct StructuralBreakConfigFile {
-    bool enabled = false;
-    uint64_t maximum_span = 1000;
-
-    template<class Archive>
-    void serialize(Archive& ar) {
-        ar(CEREAL_NVP(enabled), CEREAL_NVP(maximum_span));
+std::string requiredMinipoaExecutable() {
+    const auto executable =
+        RaMesh::Alignment::locateMinipoaExecutable();
+    if (executable.empty()) {
+        throw std::runtime_error(
+            "minipoa is required but was not found next to ramax or in PATH");
     }
-};
+    return executable.string();
+}
 
 }  // namespace
 
@@ -226,7 +231,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 版本信息参数（-v / --version）
     cmd->set_version_flag("-v,--version",
-        std::string("RaMAx version ") + VERSION);
+        std::string("RaMAx version ") + RAMAX_VERSION);
 
     // ========================
     // 输入 / 输出路径参数
@@ -348,8 +353,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     auto* optimize_blocks_flag = cmd->add_flag(
         "--optimize-blocks",
-        "Enable Block merge, missing-sequence realignment, break repair, "
-        "and short-Block merge with their defaults.")
+        "Explicitly enable the default Block optimizations (enabled by default).")
         ->group("Graph Optimization");
 
     auto* merge_exact_blocks_flag = cmd->add_flag(
@@ -415,36 +419,6 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         args.repair_short_blocks,
         "Try to merge short Blocks with banded KSW2.")
         ->group("Graph Optimization");
-
-    // Hidden compatibility aliases. They intentionally share the resolved
-    // values with the visible options; post-parse validation rejects using
-    // both names for the same setting.
-    auto* legacy_merge_blocks_flag = cmd->add_flag(
-        "--merge-exact-contiguous-blocks", args.merge_exact_contiguous_blocks)
-        ->group("");
-    auto* legacy_merge_gap_opt = cmd->add_option(
-        "--merge-query-gap-max", args.merge_query_gap_max)
-        ->group("")->check(CLI::Range(0, 10000));
-    auto* legacy_realign_missing_flag = cmd->add_flag(
-        "--realign-single-missing-species", args.realign_single_missing_species)
-        ->group("");
-    auto* legacy_realign_span_opt = cmd->add_option(
-        "--species-mismatch-realign-max-span",
-        args.species_mismatch_realign_max_span)
-        ->group("")->check(CLI::Range(1, 10000));
-    auto* legacy_zero_gap_span_opt = cmd->add_option(
-        "--species-mismatch-zero-gap-max-span",
-        args.species_mismatch_zero_gap_max_span)
-        ->group("")->check(CLI::Range(1, 3000));
-    auto* legacy_repair_breaks_flag = cmd->add_flag(
-        "--repair-structural-breaks", args.repair_structural_breaks)
-        ->group("");
-    auto* legacy_break_span_opt = cmd->add_option(
-        "--structural-break-max-span", args.structural_break_max_span)
-        ->group("")->check(CLI::Range(1, 1000));
-    auto* legacy_short_blocks_flag = cmd->add_flag(
-        "--repair-short-blocks", args.repair_short_blocks)
-        ->group("");
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -563,14 +537,6 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         structural_break_repair_flag,
         structural_break_span_opt,
         short_block_repair_flag,
-        legacy_merge_blocks_flag,
-        legacy_merge_gap_opt,
-        legacy_realign_missing_flag,
-        legacy_realign_span_opt,
-        legacy_zero_gap_span_opt,
-        legacy_repair_breaks_flag,
-        legacy_break_span_opt,
-        legacy_short_blocks_flag,
         one_round_flag,
         log_level_opt
     );
@@ -594,22 +560,6 @@ static inline void applySlowBuildFlag(const CLI::App& app, CommonArgs& common_ar
 
 static inline void applyGraphOptimizationOptions(
     const CLI::App& app, CommonArgs& args) {
-    static const std::pair<const char*, const char*> conflicts[] = {
-        {"--merge-blocks", "--merge-exact-contiguous-blocks"},
-        {"--merge-gap", "--merge-query-gap-max"},
-        {"--realign-missing", "--realign-single-missing-species"},
-        {"--realign-span", "--species-mismatch-realign-max-span"},
-        {"--zero-gap-span", "--species-mismatch-zero-gap-max-span"},
-        {"--repair-breaks", "--repair-structural-breaks"},
-        {"--break-span", "--structural-break-max-span"},
-        {"--merge-short-blocks", "--repair-short-blocks"},
-    };
-    for (const auto& [current, legacy] : conflicts) {
-        if (app.count(current) != 0 && app.count(legacy) != 0) {
-            throw CLI::ValidationError(
-                std::string(current) + " cannot be combined with " + legacy);
-        }
-    }
     if (app.count("--optimize-blocks") != 0) {
         args.merge_exact_contiguous_blocks = true;
         args.realign_single_missing_species = true;
@@ -620,44 +570,21 @@ static inline void applyGraphOptimizationOptions(
     const bool merge_enabled = args.merge_exact_contiguous_blocks;
     const bool realign_enabled = args.realign_single_missing_species;
     const bool break_enabled = args.repair_structural_breaks;
-    const auto supplied = [&](const char* current, const char* legacy) {
-        return app.count(current) != 0 || app.count(legacy) != 0;
-    };
     if (realign_enabled && !merge_enabled) {
         throw CLI::ValidationError(
             "--realign-missing requires --merge-blocks");
     }
-    if (supplied("--merge-gap", "--merge-query-gap-max") &&
-        !merge_enabled) {
+    if (app.count("--merge-gap") != 0 && !merge_enabled) {
         throw CLI::ValidationError("--merge-gap requires --merge-blocks");
     }
-    if ((supplied("--realign-span",
-                  "--species-mismatch-realign-max-span") ||
-         supplied("--zero-gap-span",
-                  "--species-mismatch-zero-gap-max-span")) &&
+    if ((app.count("--realign-span") != 0 ||
+         app.count("--zero-gap-span") != 0) &&
         !realign_enabled) {
         throw CLI::ValidationError(
             "--realign-span and --zero-gap-span require --realign-missing");
     }
-    if (supplied("--break-span", "--structural-break-max-span") &&
-        !break_enabled) {
+    if (app.count("--break-span") != 0 && !break_enabled) {
         throw CLI::ValidationError("--break-span requires --repair-breaks");
-    }
-
-    static const std::pair<const char*, const char*> aliases[] = {
-        {"--merge-exact-contiguous-blocks", "--merge-blocks"},
-        {"--merge-query-gap-max", "--merge-gap"},
-        {"--realign-single-missing-species", "--realign-missing"},
-        {"--species-mismatch-realign-max-span", "--realign-span"},
-        {"--species-mismatch-zero-gap-max-span", "--zero-gap-span"},
-        {"--repair-structural-breaks", "--repair-breaks"},
-        {"--structural-break-max-span", "--break-span"},
-        {"--repair-short-blocks", "--merge-short-blocks"},
-    };
-    for (const auto& [legacy, current] : aliases) {
-        if (app.count(legacy) != 0) {
-            spdlog::warn("{} is deprecated; use {} instead.", legacy, current);
-        }
     }
 }
 
@@ -731,7 +658,7 @@ static int runRestartMode(CommonArgs& common_args) {
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
     configureLogLevel(common_args);
-    spdlog::info("RaMAx version {}", VERSION);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Restart mode enabled.");
 
@@ -743,75 +670,26 @@ static int runRestartMode(CommonArgs& common_args) {
         return 1;
     }
 
-    // 从 JSON 反序列化参数
-    cereal::JSONInputArchive archive(is);
-    archive(common_args);
+    try {
+        cereal::JSONInputArchive archive(is);
+        archive(cereal::make_nvp("common_args", common_args));
+    } catch (const std::exception& error) {
+        spdlog::error(
+            "Restart configuration is incompatible with RaMAx {}: {}",
+            RAMAX_VERSION, error.what());
+        return 1;
+    }
+    if (common_args.schema_version != CONFIG_SCHEMA_VERSION) {
+        spdlog::error(
+            "Unsupported restart schema version {} (expected {}). Old work "
+            "directories are not compatible with RaMAx {}.",
+            common_args.schema_version, CONFIG_SCHEMA_VERSION,
+            RAMAX_VERSION);
+        return 1;
+    }
+    common_args.restart = true;
     configureLogLevel(common_args);
-
-    common_args.merge_exact_contiguous_blocks = std::filesystem::exists(
-        common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
-    if (common_args.merge_exact_contiguous_blocks) {
-        std::ifstream merge_config_input(
-            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE);
-        uint64_t stored_query_gap = 0;
-        if (merge_config_input &&
-            (merge_config_input >> stored_query_gap)) {
-            common_args.merge_query_gap_max = static_cast<uint_t>(
-                std::min<uint64_t>(
-                    stored_query_gap,
-                    std::numeric_limits<uint_t>::max()));
-        }
-        spdlog::info("Exact Block merge restart marker loaded.");
-    }
-
-    const FilePath missing_species_config_path =
-        common_args.work_dir_path /
-        SINGLE_MISSING_SPECIES_CONFIG_FILE;
-    common_args.realign_single_missing_species =
-        std::filesystem::exists(missing_species_config_path);
-    if (common_args.realign_single_missing_species) {
-        std::ifstream missing_species_input(
-            missing_species_config_path);
-        uint64_t stored_max_span = 3000;
-        uint64_t stored_zero_gap_max_span = 200;
-        if (missing_species_input &&
-            (missing_species_input >> stored_max_span)) {
-            common_args.species_mismatch_realign_max_span =
-                static_cast<uint_t>(std::clamp<uint64_t>(
-                    stored_max_span, 1, 3000));
-            if (missing_species_input >> stored_zero_gap_max_span) {
-                common_args.species_mismatch_zero_gap_max_span =
-                    static_cast<uint_t>(std::clamp<uint64_t>(
-                        stored_zero_gap_max_span, 1, 3000));
-            }
-        }
-        spdlog::info(
-            "Single-missing-species restart marker loaded.");
-    }
     spdlog::info("CommonArgs loaded from {}", config_path.string());
-
-    const FilePath structural_break_config_path =
-        common_args.work_dir_path / STRUCTURAL_BREAK_CONFIG_FILE;
-    if (std::filesystem::exists(structural_break_config_path)) {
-        std::ifstream structural_input(structural_break_config_path);
-        if (!structural_input) {
-            throw std::runtime_error(
-                "Failed to open structural-break restart config: " +
-                structural_break_config_path.string());
-        }
-        StructuralBreakConfigFile structural_config;
-        cereal::JSONInputArchive structural_archive(structural_input);
-        structural_archive(structural_config);
-        common_args.repair_structural_breaks = structural_config.enabled;
-        common_args.structural_break_max_span = static_cast<uint_t>(
-            std::clamp<uint64_t>(structural_config.maximum_span, 1, 1000));
-        spdlog::info("Structural-break config loaded from {}",
-                     structural_break_config_path.string());
-    } else {
-        common_args.repair_structural_breaks = false;
-    }
-    common_args.repair_short_blocks = std::filesystem::exists(
-        common_args.work_dir_path / SHORT_BLOCK_REPAIR_CONFIG_FILE);
     return 0;
 }
 
@@ -850,7 +728,7 @@ static int runNormalMode(CommonArgs& common_args) {
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
     configureLogLevel(common_args);
-    spdlog::info("RaMAx version {}", VERSION);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
@@ -865,7 +743,7 @@ static int runNormalMode(CommonArgs& common_args) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
 
-    // 保存参数配置文件（用于 --restart）
+    common_args.schema_version = CONFIG_SCHEMA_VERSION;
     FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
     std::ofstream os(config_path);
     if (!os) {
@@ -876,70 +754,6 @@ static int runNormalMode(CommonArgs& common_args) {
     cereal::JSONOutputArchive archive(os);
     archive(cereal::make_nvp("common_args", common_args));
     spdlog::info("Configuration saved to {}", config_path.string());
-
-    if (common_args.repair_structural_breaks) {
-        const FilePath structural_break_config_path =
-            common_args.work_dir_path / STRUCTURAL_BREAK_CONFIG_FILE;
-        std::ofstream structural_output(structural_break_config_path);
-        if (!structural_output) {
-            throw std::runtime_error(
-                "Failed to save structural-break config: " +
-                structural_break_config_path.string());
-        }
-        StructuralBreakConfigFile structural_config{
-            true, common_args.structural_break_max_span};
-        cereal::JSONOutputArchive structural_archive(structural_output);
-        structural_archive(cereal::make_nvp(
-            "structural_break_repair", structural_config));
-        spdlog::info("Structural-break config saved to {}",
-                     structural_break_config_path.string());
-    }
-    if (common_args.repair_short_blocks) {
-        const FilePath marker =
-            common_args.work_dir_path / SHORT_BLOCK_REPAIR_CONFIG_FILE;
-        std::ofstream output(marker);
-        if (!output) {
-            throw std::runtime_error(
-                "Failed to save short-Block repair restart marker: " +
-                marker.string());
-        }
-        output << "1\n";
-    }
-
-    if (common_args.merge_exact_contiguous_blocks) {
-        const FilePath merge_config_path =
-            common_args.work_dir_path / EXACT_BLOCK_MERGE_CONFIG_FILE;
-        std::ofstream merge_config_output(merge_config_path);
-        if (!merge_config_output) {
-            throw std::runtime_error(
-                "Failed to save exact Block merge restart marker: " +
-                merge_config_path.string());
-        }
-        merge_config_output << common_args.merge_query_gap_max << '\n';
-        spdlog::info("Exact Block merge restart marker saved to {}",
-                     merge_config_path.string());
-    }
-    if (common_args.realign_single_missing_species) {
-        const FilePath missing_species_config_path =
-            common_args.work_dir_path /
-            SINGLE_MISSING_SPECIES_CONFIG_FILE;
-        std::ofstream missing_species_output(
-            missing_species_config_path);
-        if (!missing_species_output) {
-            throw std::runtime_error(
-                "Failed to save single-missing-species restart marker: " +
-                missing_species_config_path.string());
-        }
-        missing_species_output
-            << common_args.species_mismatch_realign_max_span
-            << ' '
-            << common_args.species_mismatch_zero_gap_max_span
-            << '\n';
-        spdlog::info(
-            "Single-missing-species restart marker saved to {}",
-            missing_species_config_path.string());
-    }
-
 
     return 0;
 }
@@ -1142,6 +956,7 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     SeqPro::Length reference_min_seq_length,
     double& align_seconds_out
 ) {
+    const std::string minipoa_executable = requiredMinipoaExecutable();
     RaMesh::Alignment::ExternalMsaRunner::instance()
         .configureScratchDirectory(
             common_args.work_dir_path / "minipoa_tmp");
@@ -1169,30 +984,20 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.species_mismatch_realign_max_span;
     mra.species_mismatch_zero_gap_max_span =
         common_args.species_mismatch_zero_gap_max_span;
-    mra.species_mismatch_msa_executable =
-        MINIPOA_EXECUTABLE;
+    mra.species_mismatch_msa_executable = minipoa_executable;
     mra.structural_break_repair_options.enabled =
         common_args.repair_structural_breaks;
     mra.structural_break_repair_options.maximum_span =
         common_args.structural_break_max_span;
     mra.structural_break_repair_options.parallel_threads =
         common_args.thread_num;
-    mra.structural_break_repair_options.msa_executable =
-        MINIPOA_EXECUTABLE;
+    mra.structural_break_repair_options.msa_executable = minipoa_executable;
     mra.short_block_repair_options.enabled =
         common_args.repair_short_blocks;
     mra.short_block_repair_options.maximum_query_gap =
         common_args.merge_query_gap_max;
     mra.short_block_repair_options.parallel_threads =
         common_args.thread_num;
-    if ((mra.realign_single_missing_species_enabled ||
-         mra.structural_break_repair_options.enabled) &&
-        !std::filesystem::exists(
-            mra.species_mismatch_msa_executable)) {
-        throw std::runtime_error(
-            "Graph realignment requires minipoa at " +
-            mra.species_mismatch_msa_executable);
-    }
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）
@@ -1236,14 +1041,13 @@ static void exportResults(
     // columns through mergeAlignmentByRef().  Configure the shared repair
     // once so the two output paths make the same local insertion decisions.
     configureCrossAnchorInsertionRepair(
-        MINIPOA_EXECUTABLE,
+        requiredMinipoaExecutable(),
         common_args.species_mismatch_realign_max_span);
 
     // 根据输出格式选择导出方法
     switch (common_args.output_format) {
     case MultipleGenomeOutputFormat::MAF:
         spdlog::info("Exporting to MAF format...");
-        // TODO：双基因组比对模式后续要改为 false；当前保留原代码逻辑（true/false 组合）
         graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
         break;
 

@@ -614,11 +614,7 @@ namespace RaMesh {
 					reverseComplement(query_seq);
                 }
 
-                // Cigar_t result = globalAlignWFA2(ref_seq, query_seq);
                 Cigar_t result = extendAlignKSW2(ref_seq, query_seq, zdrop);
-
-                //Cigar_t result = globalAlignKSW2_2(ref_seq, query_seq);
-				//if (checkGapCigarQuality(result, ref_len, query_len, 0.6)){
                 if (true) {
                     AlignCount cnt = countAlignedBases(result);
                     if (strand == REVERSE) {

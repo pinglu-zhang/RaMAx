@@ -337,11 +337,6 @@ Cigar_t globalAlignKSW2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2_2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2BandedPublic(const std::string& ref,
                                     const std::string& query);
-// Cigar_t globalAlignWFA2(const std::string& ref, const std::string& query);
-//
-// Cigar_t extendAlignWFA2(const std::string& ref,
-//     const std::string& query, int zdrop = 200);
-
 Cigar_t extendAlignKSW2(const std::string& ref,
     const std::string& query,
     int zdrop = 200);
@@ -381,4 +376,3 @@ struct InsertInfo {
 
 using RefAlignInfo = std::map<uint_t, InsertInfo>;
 #endif
-

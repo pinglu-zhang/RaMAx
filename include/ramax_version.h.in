@@ -1,0 +1,3 @@
+#pragma once
+
+#define RAMAX_VERSION "@PROJECT_VERSION@"

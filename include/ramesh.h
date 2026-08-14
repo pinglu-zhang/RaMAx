@@ -212,8 +212,6 @@ namespace RaMesh {
         explicit RaMeshGenomeGraph(const SpeciesName& sp);
         RaMeshGenomeGraph(const SpeciesName& sp, const std::vector<ChrName>& chrs);
 
-        size_t debugPrint(bool show_detail) const;
-
         SpeciesName                             species_name;
         std::unordered_map<ChrName, GenomeEnd>  chr2end;   // guard: rw
         mutable std::shared_mutex               rw;        // multi‑reader / single‑writer
@@ -256,7 +254,6 @@ namespace RaMesh {
 
 
 		void extendRefNodes(const SpeciesName& ref_name, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, int_t zdrop);
-        void debugPrint(bool show_detail) const;
         
         // 图正确性验证函数
         bool verifyGraphCorrectness(bool verbose = false, bool show_detailed_segments = false) const;
@@ -530,10 +527,6 @@ namespace RaMesh {
         // 优化的统一遍历函数
         void verifyWithUnifiedTraversal(VerificationResult& result, const VerificationOptions& options) const;
     };
-
-    void reportUnalignedRegions(const GenomeEnd& end,
-        const SeqPro::SharedManagerVariant& mgr,
-		const ChrName& chr_name);
 
 } // namespace RaMesh
 

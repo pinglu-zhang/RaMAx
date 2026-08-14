@@ -102,10 +102,10 @@ Cigar_t globalAlignKSW2(const std::string& ref,
     cfg.alphabet_size = 5;
     cfg.gap_open = 5;          // gap open penalty
     cfg.gap_extend = 2;        // gap extension penalty
-    cfg.end_bonus = 0;         // ❌ 不需要 ends-free 奖励
-    cfg.zdrop = -1;            // ❌ 禁用 z-drop（全局比对必须完整比完）
+    cfg.end_bonus = 0;         // No ends-free bonus.
+    cfg.zdrop = -1;            // Disable z-drop for complete global alignment.
     cfg.band_width = -1;       // 启用全矩阵（也可设 auto_band）
-    cfg.flag = KSW_EZ_RIGHT; // ✅ 通用矩阵 + gap右对齐
+    cfg.flag = KSW_EZ_RIGHT;
 
     /* ---------- 3. 调用 KSW2 ---------- */
     ksw_extz_t ez{};

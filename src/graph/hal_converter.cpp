@@ -2926,7 +2926,8 @@ namespace hal_converter {
                     "HAL构建失败：parent bottom segment 长度不一致：parent=" + parentGenome->getName() +
                     " parent_bidx=" + std::to_string(parentBottomSeg->getArrayIndex()));
             }
-            if (first.child_idx_in_parent >= parentBottomSeg->getNumChildren()) {
+            if (first.child_idx_in_parent >=
+                static_cast<size_t>(parentBottomSeg->getNumChildren())) {
                 throw std::runtime_error(
                     "HAL构建失败：child slot 超出 parent bottom segment children 数量：parent=" + parentGenome->getName() +
                     " parent_bidx=" + std::to_string(first.parent_bidx) +

@@ -435,3 +435,4 @@ bin/output.maf
 /.github/
 /recipe/
 submodule.zip
+/.clang-format
