@@ -15,7 +15,7 @@ binary.
 
 | Option | Type/default | Description |
 |---|---|---|
-| `-i`, `--input` | path; required for a new run | Cactus-compatible seqfile containing a Newick tree and genome mappings. |
+| `-i`, `--input` | path; required for a new run | Seqfile containing genome mappings. A Newick tree is required only for HAL output. |
 
 ## Output
 
@@ -23,7 +23,7 @@ binary.
 |---|---|---|
 | `-o`, `--output` | path; required for a new run | Output file. The suffix must be `.maf` or `.hal`. |
 | `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
-| `--root` | string; automatic | Preferred HAL root name. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
+| `--root` | string; automatic | Preferred HAL root name. Valid only for HAL output, which requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters
 

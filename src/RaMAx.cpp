@@ -239,7 +239,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 输入序列文件路径
     auto* input_opt = cmd->add_option("-i,--input", args.input_path,
-        "Path to a Cactus-compatible seqfile.")
+        "Seqfile path; a Newick tree is required only for HAL output.")
         ->group("Input Files")                      // 帮助信息分组
         ->type_name("<path>")                       // 参数类型显示名称
         ->transform(trim_whitespace);               // 去除首尾空白字符
@@ -275,7 +275,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // HAL 文件中的根基因组名称
     auto* root_opt = cmd->add_option("--root", args.root_name,
-        "Root genome name used in HAL (default: 'root')")
+        "HAL root genome name; valid only for HAL output.")
         ->group("Output")
         ->type_name("<string>")
         ->transform(trim_whitespace);
@@ -789,9 +789,20 @@ static int inputValidationPhase(
     NewickParser& newick_tree,
     SpeciesPathMap& species_path_map
 ) {
-    // 解析 seqfile：构建 Newick 树与物种-路径映射
+    if (common_args.output_format != MultipleGenomeOutputFormat::HAL &&
+        !common_args.root_name.empty()) {
+        throw std::runtime_error("--root is only supported for HAL output");
+    }
+
+    // HAL requires a species tree. Other output formats may use mappings only.
     std::string root = common_args.root_name;
-    parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
+    const bool has_tree =
+        parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
+    if (common_args.output_format == MultipleGenomeOutputFormat::HAL &&
+        !has_tree) {
+        throw std::runtime_error(
+            "HAL output requires a Newick tree as the first seqfile record");
+    }
 
     // 逐个校验输入基因组路径是否合法（URL 可达 / 本地文件存在）
     for (const auto& [species, path] : species_path_map) {
@@ -951,7 +962,6 @@ static void clearAllMaskedRegions(
 static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     const CommonArgs& common_args,
     SpeciesPathMap& species_path_map,
-    NewickParser& newick_tree,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     SeqPro::Length reference_min_seq_length,
     double& align_seconds_out
@@ -965,7 +975,6 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     MultipleRareAligner mra(
         common_args.work_dir_path,
         species_path_map,
-        newick_tree,
         common_args.thread_num,
         common_args.chunk_size,
         common_args.overlap_size,
@@ -1124,7 +1133,7 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // ------------------------------
         double align_seconds = 0.0;
         std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> graph =
-            runStarAlignment(common_args, species_path_map, newick_tree,
+            runStarAlignment(common_args, species_path_map,
                              seqpro_managers, reference_min_seq_length, align_seconds);
 
         spdlog::info("");

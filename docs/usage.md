@@ -2,9 +2,16 @@
 
 ## Input seqfile
 
-RaMAx accepts a Cactus-compatible seqfile. The first non-comment line is a
-Newick species tree. Each following non-empty line maps one leaf name to a
-local FASTA file or supported URL:
+A seqfile contains one genome name and local FASTA path or supported URL per
+non-empty line. MAF and other non-HAL outputs accept a mapping-only seqfile:
+
+```text
+human      /data/genomes/human.fa
+chimp      /data/genomes/chimp.fa
+orangutan  /data/genomes/orangutan.fa.gz
+```
+
+HAL output requires a Newick species tree as the first non-empty record:
 
 ```text
 ((human:0.005,chimp:0.005):0.02,orangutan:0.025);
@@ -13,9 +20,11 @@ chimp      /data/genomes/chimp.fa
 orangutan  /data/genomes/orangutan.fa.gz
 ```
 
-Every tree leaf must have exactly one genome mapping, and mapping names must
-match the tree leaves. Use absolute FASTA paths when jobs may be launched from
-different working directories.
+A tree may still be supplied for non-HAL output, but it does not control
+reference ordering. RaMAx selects references from assembly N50, total length,
+genome name, and an optional `--ref`. `--root` is valid only for HAL output.
+When a tree is present, its leaf names should match the genome mappings. Use
+absolute FASTA paths when jobs may be launched from different directories.
 
 ## Basic commands
 

@@ -31,7 +31,7 @@ Reference-empty windows use the same pairwise graph representation without an
 external MSA call. Other accepted windows invoke minipoa once with:
 
 ```text
-minipoa -r 1 -t 1 input.fa
+minipoa input.fa -S -f 0 -r1
 ```
 
 ## Ownership and graph transactions

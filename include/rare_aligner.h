@@ -18,7 +18,6 @@ public:
     FilePath index_dir;
 
     SpeciesPathMap species_path_map;
-    NewickParser newick_tree;
 
     uint_t chunk_size;
     uint_t overlap_size;
@@ -46,7 +45,6 @@ public:
     MultipleRareAligner(
         const FilePath& work_dir,
         SpeciesPathMap& species_path_map,
-        NewickParser& newick_tree,
         uint_t thread_num,
         uint_t chunk_size,
         uint_t overlap_size,

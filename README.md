@@ -1,8 +1,8 @@
 # RaMAx
 
 RaMAx aligns multiple genomes and writes whole-genome alignments in MAF or HAL
-format. It accepts the Cactus-style seqfile format: a Newick species tree
-followed by one genome name and FASTA path per line.
+format. A seqfile contains one genome name and FASTA path per line. HAL output
+additionally requires a Newick species tree as the first record.
 
 ## Install
 
@@ -90,6 +90,16 @@ See the [documentation index](docs/README.md) for the complete set.
 
 ## Input format
 
+MAF output accepts a mapping-only seqfile:
+
+```text
+human      /data/genomes/human.fa
+chimp      /data/genomes/chimp.fa
+orangutan  /data/genomes/orangutan.fa.gz
+```
+
+HAL output requires a Newick tree as the first record:
+
 ```text
 ((human:0.005,chimp:0.005):0.02,orangutan:0.025);
 human      /data/genomes/human.fa
@@ -97,7 +107,9 @@ chimp      /data/genomes/chimp.fa
 orangutan  /data/genomes/orangutan.fa.gz
 ```
 
-Leaf names in the tree must match the genome names below it.
+Tree input remains optional for MAF and other non-HAL formats. When a tree is
+provided, its leaf names should match the genome mappings. `--root` is valid
+only for HAL output.
 
 ## Restart compatibility
 

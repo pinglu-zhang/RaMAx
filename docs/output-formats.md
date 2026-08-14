@@ -8,6 +8,10 @@ RaMAx selects its exporter from the output filename suffix:
 
 ## MAF
 
+MAF output does not require a species tree. The seqfile may begin directly with
+genome-to-FASTA mappings. If a tree is supplied for compatibility, it does not
+control alignment reference ordering.
+
 Each MAF alignment Block begins with an `a` line followed by one or more `s`
 rows. RaMAx writes standard zero-based, half-open coordinates:
 
@@ -25,9 +29,11 @@ s source start size strand sourceSize alignedText
 ## HAL
 
 HAL output stores the same optimized graph in a hierarchy defined by the
-seqfile tree. RaMAx reconstructs ancestor sequences and writes leaf/ancestor
-segments without changing the source FASTA coordinates. `--root` controls the
-preferred artificial root name when one is required.
+seqfile tree. A valid Newick tree is therefore mandatory for HAL. RaMAx rejects
+a mapping-only seqfile before preprocessing begins. RaMAx reconstructs ancestor
+sequences and writes leaf/ancestor segments without changing the source FASTA
+coordinates. `--root` controls the preferred artificial root name and is valid
+only for HAL output.
 
 Validate a HAL file with the HAL utilities:
 

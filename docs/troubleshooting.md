@@ -3,7 +3,9 @@
 ## Input file or FASTA does not exist
 
 RaMAx validates the seqfile and every local genome path before preprocessing.
-Use absolute paths and verify that every Newick leaf has a matching mapping.
+Use absolute paths. MAF accepts mapping-only input; HAL requires a Newick tree
+as the first non-empty record. When a tree is present, verify that its leaves
+match the genome mappings.
 
 ```bash
 test -r /data/project/seqfile.txt
@@ -11,6 +13,12 @@ test -r /data/genomes/human.fa
 ```
 
 For URLs, verify network access from the environment that launches RaMAx.
+
+## HAL reports that the Newick tree is missing
+
+Only HAL requires a species tree. Add a valid Newick record before the genome
+mappings, or change the output suffix to a non-HAL format. `--root` is also
+HAL-only and is rejected for MAF and other non-HAL outputs.
 
 ## Work directory is not empty
 
