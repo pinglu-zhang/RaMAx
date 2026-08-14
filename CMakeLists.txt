@@ -147,7 +147,6 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/realignment_internal.cpp"
     "${GRAPH_DIR}/structural_break_repair.cpp"
     "${GRAPH_DIR}/short_block_repair.cpp"
-    "${GRAPH_DIR}/window_detector.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
 )
@@ -272,13 +271,6 @@ if(RAMAX_BUILD_TESTS)
     add_dependencies(ramax_hal_softmask_export_test hal_library)
     add_test(NAME ramax_hal_softmask_export
         COMMAND ramax_hal_softmask_export_test)
-
-    add_executable(ramax_window_detector_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/window_detector_test.cpp")
-    configure_rama_target(ramax_window_detector_test)
-    target_link_libraries(ramax_window_detector_test PRIVATE ramax_core)
-    add_dependencies(ramax_window_detector_test hal_library)
-    add_test(NAME ramax_window_detector COMMAND ramax_window_detector_test)
 
     add_executable(ramax_zero_gap_missing_species_merge_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp")

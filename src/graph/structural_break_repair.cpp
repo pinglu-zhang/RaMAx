@@ -1089,24 +1089,22 @@ Result repairAnchorBoundedStructuralBreaks(
         result.transaction_seconds += secondsSince(transaction_start);
     }
 
-    spdlog::info(
-        "[structural-break-repair] scanned={} candidates={} selected={} "
-        "deferred={} cache_hits={} prepared={} msa_calls={} msa_failed={} quality_rejected={} "
-        "transaction_rejected={} committed={} signals(target/strand/order)="
-        "{}/{}/{} rejects(anchor/span/ref_empty/interior/gap_only)="
-        "{}/{}/{}/{}/{} time(scan/sequence/msa/quality/transaction)="
-        "{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}s",
-        result.scanned_windows, result.structural_candidates,
-        selected.size(), result.conflict_deferred, result.failure_cache_hits,
-        result.sequence_prepared,
-        result.msa_calls, result.msa_failed, result.quality_rejected,
-        result.transaction_rejected, result.committed, result.target_switch,
-        result.strand_switch, result.order_break, result.outer_anchor_invalid,
-        result.span_exceeded, result.reference_empty,
-        result.too_many_interior_blocks, result.large_gap_only,
-        result.scan_seconds,
-        result.sequence_seconds, result.msa_seconds, result.quality_seconds,
-        result.transaction_seconds);
+    if (result.structural_candidates != 0 || result.committed != 0) {
+        spdlog::info(
+            "[structural-break-repair] scanned={} candidates={} selected={} "
+            "prepared={} msa_calls={} committed={} rejected(quality/transaction)="
+            "{}/{} total_seconds={:.3f}",
+            result.scanned_windows, result.structural_candidates,
+            selected.size(), result.sequence_prepared, result.msa_calls,
+            result.committed, result.quality_rejected,
+            result.transaction_rejected,
+            result.scan_seconds + result.sequence_seconds + result.msa_seconds +
+                result.quality_seconds + result.transaction_seconds);
+    } else {
+        spdlog::debug(
+            "[structural-break-repair] scanned={} candidates=0 committed=0",
+            result.scanned_windows);
+    }
     for (const auto& [reason, count] : result.rejection_reasons) {
         spdlog::debug("[structural-break-repair] rejection {}={}",
                       reason, count);

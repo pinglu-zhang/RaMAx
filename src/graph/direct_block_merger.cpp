@@ -2428,14 +2428,18 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
             reference_species);
     }
 
-    const auto diagnostics = collectBoundaryDiagnostics(
-        *this, reference_species, maximum_reference_span);
-    logBoundaryDiagnostics(
-        diagnostics, reference_species, "pre-merge-current-reference",
-        maximum_reference_span);
+    if (spdlog::should_log(spdlog::level::debug)) {
+        const auto diagnostics = collectBoundaryDiagnostics(
+            *this, reference_species, maximum_reference_span);
+        logBoundaryDiagnostics(
+            diagnostics, reference_species, "pre-merge-current-reference",
+            maximum_reference_span);
+    }
 
     std::unordered_map<const Block*, BlockView> view_cache;
     std::unordered_set<const Block*> invalid_views;
+    view_cache.reserve(blocks.size());
+    invalid_views.reserve(blocks.size() / 16 + 1);
     auto get_view = [&](const BlockPtr& block) -> BlockView* {
         if (!block) {
             return nullptr;
@@ -2457,6 +2461,7 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     };
 
     std::vector<CandidateChain> candidates;
+    candidates.reserve(blocks.size() / 8 + 1);
     for (auto& [chromosome, genome_end] :
          reference_graph_it->second.chr2end) {
         auto current =
@@ -2730,12 +2735,15 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     }
 
     std::map<size_t, std::pair<size_t, size_t>> by_species_count;
+    const bool detailed_stats = spdlog::should_log(spdlog::level::debug);
     size_t merged_old_blocks = 0;
     size_t longest_chain = 0;
     for (const auto& candidate : candidates) {
-        auto& stats = by_species_count[candidate.species_count];
-        ++stats.first;
-        stats.second += candidate.blocks.size() - 1;
+        if (detailed_stats) {
+            auto& stats = by_species_count[candidate.species_count];
+            ++stats.first;
+            stats.second += candidate.blocks.size() - 1;
+        }
         merged_old_blocks += candidate.blocks.size();
         longest_chain =
             std::max(longest_chain, candidate.blocks.size());
@@ -2828,6 +2836,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         size_t scanned_this_iteration = 0;
         size_t structural_this_iteration = 0;
         std::vector<MissingWindowCandidate> zero_gap_candidates;
+        zero_gap_candidates.reserve(
+            zero_gap_full_scan ? blocks.size() / 8 + 1
+                               : zero_gap_dirty_starts.size() * 4 + 1);
         BlockViewCache zero_gap_view_cache(
             reference_species, zero_gap_scan_count);
         const auto scan_zero_gap_start =
@@ -3263,6 +3274,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         size_t ordinary_this_round = 0;
         size_t hybrid_this_round = 0;
         std::vector<MissingWindowCandidate> candidate_slots;
+        candidate_slots.reserve(
+            minipoa_full_scan ? blocks.size() / 8 + 1
+                              : minipoa_dirty_starts.size() * 4 + 1);
         BlockViewCache minipoa_view_cache(
             reference_species, minipoa_rounds);
         const auto scan_minipoa_start =
@@ -3866,7 +3880,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         0.0, minipoa_task_seconds -
                  minipoa_sequence_fetch_seconds -
                  minipoa_msa_task_seconds);
-    spdlog::info(
+    spdlog::debug(
         "[species-mismatch-realign][minipoa-unified] reference={} "
         "rounds={} scanned_windows={} ordinary_candidates={} "
         "hybrid_candidates={} minipoa_calls={} "
@@ -3893,7 +3907,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         minipoa_msa_task_seconds, minipoa_cigar_task_seconds,
         legacy_minipoa_task_seconds, full_k_triple_task_seconds,
         windows_per_second, maximum_span);
-    spdlog::info(
+    spdlog::debug(
         "[species-mismatch-realign][zero-gap] reference={} scans={} "
         "candidate_events={} prepared_events={} selected={} "
         "adjacent_pair_direct={} overlap_events={} replaced_old_blocks={} "
@@ -3907,6 +3921,18 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         zero_gap_replaced_old_blocks, zero_gap_scan_seconds,
         zero_gap_prepare_seconds, zero_gap_commit_seconds,
         zero_gap_maximum_span, adjacent_pair_gap_max);
+    spdlog::info(
+        "[species-mismatch-realign] reference={} replaced={} "
+        "zero_gap={} minipoa={} calls={} bypass={} "
+        "time(scan/prepare/commit)={:.3f}/{:.3f}/{:.3f}s",
+        reference_species,
+        zero_gap_replaced_windows + minipoa_committed_total,
+        zero_gap_replaced_windows, minipoa_committed_total,
+        minipoa_invocations_total,
+        reference_only_bypass_total + reference_empty_bypass_total,
+        zero_gap_scan_seconds + minipoa_scan_seconds,
+        zero_gap_prepare_seconds + minipoa_prepare_seconds,
+        zero_gap_commit_seconds + minipoa_commit_seconds);
     spdlog::debug(
         "[species-mismatch-realign][adjacent-pair] reference={} "
         "minipoa_candidates={} minipoa_committed={} "

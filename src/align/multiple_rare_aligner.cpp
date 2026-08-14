@@ -1025,24 +1025,6 @@ starAlignment(
                 eliminated_after_repair);
         }
 
-        // 第一阶段窗口识别只读取合并、清理后的图。该调用必须位于
-        // markAllExtended() 和本轮 addAlignedRegionsAsMask() 之前，避免检测逻辑
-        // 改变现有图或遮蔽流程。
-        const bool detect_this_round =
-            window_detection_options.enabled &&
-            (window_detection_options.mode ==
-                 RaMesh::WindowDetection::DetectionMode::EACH_ROUND ||
-             i + 1 == round);
-        if (detect_this_round) {
-            spdlog::info(
-                "[window-detection] Snapshotting merged graph for round {} "
-                "with reference {}",
-                i, current_ref_name);
-            RaMesh::WindowDetection::detectAndWriteProblemWindows(
-                *multi_graph, seqpro_managers, i, current_ref_name,
-                window_detection_options);
-        }
-
         // 标记所有节点已扩展
         multi_graph->markAllExtended();
 

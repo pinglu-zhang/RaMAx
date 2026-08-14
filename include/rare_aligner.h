@@ -8,7 +8,6 @@
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
-#include "window_detector.h"
 #include "structural_break_repair.h"
 #include "short_block_repair.h"
 
@@ -34,7 +33,6 @@ public:
     bool mask_export_done = false;
     FilePath mask_export_dir;
 
-    RaMesh::WindowDetection::Options window_detection_options;
     bool merge_exact_contiguous_blocks_enabled = false;
     uint_t merge_query_gap_max = 100;
     bool realign_single_missing_species_enabled = false;
