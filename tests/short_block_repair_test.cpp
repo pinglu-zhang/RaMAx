@@ -57,6 +57,18 @@ size_t activeBlocks(const RaMeshMultiGenomeGraph& graph) {
     return result;
 }
 
+std::vector<uint_t> poolReferenceStarts(
+    const RaMeshMultiGenomeGraph& graph) {
+    std::vector<uint_t> starts;
+    for (const auto& weak : graph.blocks) {
+        const auto block = weak.lock();
+        require(static_cast<bool>(block), "expired Block in pool");
+        const auto found = block->anchors.find({"ref", "chr1"});
+        if (found != block->anchors.end()) starts.push_back(found->second->start);
+    }
+    return starts;
+}
+
 struct Fixture {
     BlockPtr left;
     BlockPtr small;
@@ -134,6 +146,9 @@ int main() {
             require(merged && merged->length == 620 &&
                         merged->parent_block->anchors.size() == 2,
                     "zero-KSW merged Block is invalid");
+            require(poolReferenceStarts(graph) ==
+                        std::vector<uint_t>({0, 620}),
+                    "stage transaction changed Block pool order");
         }
 
         {
@@ -178,6 +193,7 @@ int main() {
             graph.blocks = {left, first, second, right};
             ShortBlockRepair::Options options;
             options.enabled = true;
+            options.maximum_delete_length = 50;
             const auto result = ShortBlockRepair::repairFinalShortBlocks(
                 graph, {"ref"}, managers, options);
             require(result.right_merged == 1 &&
@@ -195,6 +211,9 @@ int main() {
                         q_first->parent_block == nullptr &&
                         q_second->parent_block == nullptr,
                     "original consecutive short Segments survived deletion");
+            require(poolReferenceStarts(graph) ==
+                        std::vector<uint_t>({0, 640}),
+                    "merge/delete changed stable Block pool order");
         }
 
 
@@ -204,9 +223,9 @@ int main() {
             BlockPtr medium = Block::createEmpty("chr1", 2);
             BlockPtr right = Block::createEmpty("chr1", 1);
             const auto ref_left = add(left, {"ref", "chr1"}, 0, 600);
-            const auto ref_medium = add(medium, {"ref", "chr1"}, 600, 80);
-            const auto ref_right = add(right, {"ref", "chr1"}, 680, 600);
-            const auto q_medium = add(medium, {"q1", "chr1"}, 600, 80);
+            const auto ref_medium = add(medium, {"ref", "chr1"}, 600, 20);
+            const auto ref_right = add(right, {"ref", "chr1"}, 620, 600);
+            const auto q_medium = add(medium, {"q1", "chr1"}, 600, 20);
             link(graph.species_graphs.at("ref").chr2end.at("chr1"),
                  {ref_left, ref_medium, ref_right});
             link(graph.species_graphs.at("q1").chr2end.at("chr1"),
@@ -218,10 +237,10 @@ int main() {
                 graph, {"ref"}, managers, options);
             require(result.left_merged == 0 && result.right_merged == 0 &&
                         result.deleted_blocks == 0 && activeBlocks(graph) == 3,
-                    "failed 51-500 bp Block was incorrectly deleted");
+                    "failed short Block was deleted with threshold zero");
             require(ref_medium->parent_block == medium &&
                         q_medium->parent_block == medium,
-                    "retained 51-500 bp Block was modified");
+                    "retained short Block was modified");
         }
     } catch (...) {
         std::filesystem::remove_all(temporary);

@@ -17,6 +17,7 @@ public:
                std::unordered_map<ChrName, std::string>& sequences);
     bool alignWithDefault(
         std::unordered_map<ChrName, std::string>& sequences);
+    void logSummary() const;
 
 private:
     ExternalMsaRunner() = default;

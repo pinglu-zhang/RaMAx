@@ -7,7 +7,6 @@
 #include <limits>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -62,6 +61,38 @@ struct PreparedMerge {
 struct WorkItem {
     SpeciesName reference_species;
     SegPtr reference_segment;
+};
+
+struct AttemptKey {
+    const Block* block = nullptr;
+    SpeciesName reference_species;
+    uint64_t generation = 0;
+
+    bool operator==(const AttemptKey&) const = default;
+};
+
+struct AttemptKeyHash {
+    size_t operator()(const AttemptKey& key) const noexcept {
+        size_t hash = std::hash<const Block*>{}(key.block);
+        hash ^= std::hash<SpeciesName>{}(key.reference_species) +
+                0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+        hash ^= std::hash<uint64_t>{}(key.generation) +
+                0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+        return hash;
+    }
+};
+
+struct PathSnapshot {
+    std::vector<SegPtr> segments;
+    std::vector<SegPtr> sampling;
+};
+
+struct StageTransaction {
+    std::vector<WeakBlock> original_pool;
+    std::map<SpeciesChrPair, PathSnapshot> paths;
+    std::vector<PreparedMerge> merges;
+    std::unordered_map<const Block*, size_t> lineage;
+    std::unordered_map<const Block*, BlockPtr> owners;
 };
 
 void detachPrepared(PreparedMerge& prepared) {
@@ -562,16 +593,51 @@ bool auditGraph(RaMeshMultiGenomeGraph& graph,
     return true;
 }
 
-bool commitMerge(RaMeshMultiGenomeGraph& graph,
-                 PreparedMerge& prepared,
-                 const std::unordered_set<const Block*>& active_blocks) {
+bool snapshotPath(RaMeshMultiGenomeGraph& graph,
+                  const SpeciesChrPair& key,
+                  StageTransaction& transaction) {
+    if (transaction.paths.contains(key)) return true;
+    auto* end = findEnd(graph, key);
+    if (!end) return false;
+    PathSnapshot snapshot;
+    snapshot.sampling = end->sample_vec;
+    for (auto current = end->head->primary_path.next.load();
+         current && !current->isTail();
+         current = current->primary_path.next.load()) {
+        snapshot.segments.push_back(current);
+    }
+    transaction.paths.emplace(key, std::move(snapshot));
+    return true;
+}
+
+void restoreStage(RaMeshMultiGenomeGraph& graph,
+                  StageTransaction& transaction) {
+    graph.blocks = transaction.original_pool;
+    for (auto& [key, snapshot] : transaction.paths) {
+        auto* end = findEnd(graph, key);
+        if (!end) continue;
+        auto previous = end->head;
+        for (const auto& segment : snapshot.segments) {
+            previous->primary_path.next.store(segment);
+            segment->primary_path.prev.store(previous);
+            previous = segment;
+        }
+        previous->primary_path.next.store(end->tail);
+        end->tail->primary_path.prev.store(previous);
+        end->sample_vec = snapshot.sampling;
+    }
+    for (auto& prepared : transaction.merges) detachPrepared(prepared);
+}
+
+bool applyMergeLocally(RaMeshMultiGenomeGraph& graph,
+                       PreparedMerge& prepared,
+                       const std::unordered_set<const Block*>& active_blocks,
+                       StageTransaction& transaction) {
     if (!prepared.short_block || !prepared.neighbor_block ||
         !active_blocks.contains(prepared.short_block.get()) ||
         !active_blocks.contains(prepared.neighbor_block.get())) {
         return false;
     }
-    std::set<SpeciesChrPair> affected;
-    std::map<SpeciesChrPair, std::vector<SegPtr>> sampling;
     for (auto& path : prepared.paths) {
         std::sort(path.old_segments.begin(), path.old_segments.end(),
                   [](const SegPtr& left, const SegPtr& right) {
@@ -586,77 +652,34 @@ bool commitMerge(RaMeshMultiGenomeGraph& graph,
             current = current->primary_path.next.load();
         }
         if (current != path.next) return false;
-        affected.insert(path.key);
+        if (!snapshotPath(graph, path.key, transaction)) return false;
     }
-    for (const auto& key : affected) {
-        auto* end = findEnd(graph, key);
-        if (!end) return false;
-        sampling.emplace(key, end->sample_vec);
+    const auto short_slot = transaction.lineage.find(prepared.short_block.get());
+    const auto neighbor_slot = transaction.lineage.find(prepared.neighbor_block.get());
+    if (short_slot == transaction.lineage.end() ||
+        neighbor_slot == transaction.lineage.end()) {
+        return false;
     }
-    const auto old_pool = graph.blocks;
-    std::vector<WeakBlock> new_pool;
-    new_pool.reserve(graph.blocks.size() - 1);
-    bool inserted = false;
-    for (const auto& weak : graph.blocks) {
-        const auto block = weak.lock();
-        if (!block) return false;
-        if (block == prepared.short_block || block == prepared.neighbor_block) {
-            if (!inserted) {
-                new_pool.emplace_back(prepared.merged_block);
-                inserted = true;
-            }
-        } else {
-            new_pool.emplace_back(block);
-        }
-    }
-    if (!inserted) return false;
+    const size_t merged_slot = std::min(short_slot->second,
+                                        neighbor_slot->second);
     for (auto& path : prepared.paths) {
         path.previous->primary_path.next.store(path.replacement);
         path.replacement->primary_path.prev.store(path.previous);
         path.replacement->primary_path.next.store(path.next);
         path.next->primary_path.prev.store(path.replacement);
     }
-    graph.blocks.swap(new_pool);
-    for (const auto& key : affected) rebuildSampling(*findEnd(graph, key));
-    if (!auditGraph(graph, affected)) {
-        graph.blocks = old_pool;
-        for (auto& path : prepared.paths) {
-            path.previous->primary_path.next.store(path.old_segments.front());
-            path.old_segments.front()->primary_path.prev.store(path.previous);
-            for (size_t index = 1; index < path.old_segments.size(); ++index) {
-                path.old_segments[index - 1]->primary_path.next.store(
-                    path.old_segments[index]);
-                path.old_segments[index]->primary_path.prev.store(
-                    path.old_segments[index - 1]);
-            }
-            path.old_segments.back()->primary_path.next.store(path.next);
-            path.next->primary_path.prev.store(path.old_segments.back());
-            path.replacement->primary_path.prev.store(nullptr);
-            path.replacement->primary_path.next.store(nullptr);
-        }
-        for (auto& [key, snapshot] : sampling) {
-            findEnd(graph, key)->sample_vec = std::move(snapshot);
-        }
-        return false;
-    }
-    for (auto& path : prepared.paths) {
-        for (auto& segment : path.old_segments) {
-            segment->primary_path.prev.store(nullptr);
-            segment->primary_path.next.store(nullptr);
-            segment->parent_block.reset();
-        }
-    }
-    prepared.short_block->anchors.clear();
-    prepared.neighbor_block->anchors.clear();
+    transaction.lineage.erase(short_slot);
+    transaction.lineage.erase(neighbor_slot);
+    transaction.lineage.emplace(prepared.merged_block.get(), merged_slot);
     return true;
 }
 
-bool commitDeleteBatch(RaMeshMultiGenomeGraph& graph,
-                       const std::vector<BlockPtr>& blocks,
-                       const std::unordered_set<const Block*>& active_blocks,
-                       Result& result) {
-    if (blocks.empty()) return true;
-    std::unordered_set<const Block*> targets;
+bool applyDeletesLocally(RaMeshMultiGenomeGraph& graph,
+                         const std::vector<BlockPtr>& blocks,
+                         const std::unordered_set<const Block*>& active_blocks,
+                         StageTransaction& transaction,
+                         std::unordered_set<const Block*>& targets) {
+    targets.clear();
     std::set<SpeciesChrPair> affected;
     for (const auto& block : blocks) {
         if (!block || !active_blocks.contains(block.get()) ||
@@ -668,84 +691,99 @@ bool commitDeleteBatch(RaMeshMultiGenomeGraph& graph,
             affected.insert(key);
         }
     }
-    if (targets.empty()) return true;
-    std::map<SpeciesChrPair, std::vector<SegPtr>> sampling;
-    std::map<SpeciesChrPair, std::vector<SegPtr>> old_paths;
+    for (const auto& key : affected) {
+        if (!snapshotPath(graph, key, transaction)) return false;
+    }
     for (const auto& key : affected) {
         auto* end = findEnd(graph, key);
-        if (!end) return false;
-        sampling.emplace(key, end->sample_vec);
-        auto& path = old_paths[key];
-        for (auto current = end->head->primary_path.next.load();
-             current && !current->isTail();
-             current = current->primary_path.next.load()) {
-            path.push_back(current);
-        }
-    }
-    const auto old_pool = graph.blocks;
-    std::vector<WeakBlock> new_pool;
-    new_pool.reserve(graph.blocks.size() - targets.size());
-    for (const auto& weak : graph.blocks) {
-        const auto block = weak.lock();
-        if (!block) return false;
-        if (!targets.contains(block.get())) new_pool.emplace_back(block);
-    }
-    for (const auto& [key, old_path] : old_paths) {
-        auto* end = findEnd(graph, key);
         auto previous = end->head;
-        for (const auto& segment : old_path) {
-            if (targets.contains(segment->parent_block.get())) continue;
-            previous->primary_path.next.store(segment);
-            segment->primary_path.prev.store(previous);
-            previous = segment;
-        }
-        previous->primary_path.next.store(end->tail);
-        end->tail->primary_path.prev.store(previous);
-    }
-    for (const auto& block : blocks) {
-        if (!targets.contains(block.get())) continue;
-        for (const auto& [key, segment] : block->anchors) {
-            (void)key;
-            segment->parent_block.reset();
-        }
-    }
-    graph.blocks.swap(new_pool);
-    for (const auto& key : affected) rebuildSampling(*findEnd(graph, key));
-    if (!auditGraph(graph, affected)) {
-        graph.blocks = old_pool;
-        for (const auto& block : blocks) {
-            if (!targets.contains(block.get())) continue;
-            for (const auto& [key, segment] : block->anchors) {
-                (void)key;
-                segment->parent_block = block;
-            }
-        }
-        for (const auto& [key, old_path] : old_paths) {
-            auto* end = findEnd(graph, key);
-            auto previous = end->head;
-            for (const auto& segment : old_path) {
+        for (auto segment = end->head->primary_path.next.load();
+             segment && !segment->isTail();) {
+            const auto next = segment->primary_path.next.load();
+            if (!targets.contains(segment->parent_block.get())) {
                 previous->primary_path.next.store(segment);
                 segment->primary_path.prev.store(previous);
                 previous = segment;
             }
-            previous->primary_path.next.store(end->tail);
-            end->tail->primary_path.prev.store(previous);
+            segment = next;
         }
-        for (auto& [key, saved] : sampling) {
-            findEnd(graph, key)->sample_vec = std::move(saved);
+        previous->primary_path.next.store(end->tail);
+        end->tail->primary_path.prev.store(previous);
+    }
+    return true;
+}
+
+bool finalizeStage(RaMeshMultiGenomeGraph& graph,
+                   StageTransaction& transaction,
+                   const std::unordered_set<const Block*>& active_blocks,
+                   const std::unordered_set<const Block*>& deleted,
+                   Result& result) {
+    for (const auto* block : deleted) {
+        transaction.lineage.erase(block);
+    }
+    std::vector<std::pair<size_t, BlockPtr>> ordered;
+    ordered.reserve(active_blocks.size());
+    for (const auto* block : active_blocks) {
+        if (deleted.contains(block)) continue;
+        const auto slot = transaction.lineage.find(block);
+        const auto owner = transaction.owners.find(block);
+        if (slot == transaction.lineage.end() ||
+            owner == transaction.owners.end()) {
+            return false;
         }
+        ordered.emplace_back(slot->second, owner->second);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto& left, const auto& right) {
+                         return left.first < right.first;
+                     });
+    std::vector<WeakBlock> final_pool;
+    final_pool.reserve(ordered.size());
+    for (const auto& [slot, block] : ordered) {
+        (void)slot;
+        final_pool.emplace_back(block);
+    }
+    graph.blocks.swap(final_pool);
+    std::set<SpeciesChrPair> affected;
+    for (const auto& [key, snapshot] : transaction.paths) {
+        (void)snapshot;
+        affected.insert(key);
+        auto* end = findEnd(graph, key);
+        if (!end) {
+            return false;
+        }
+        rebuildSampling(*end);
+    }
+    if (!auditGraph(graph, affected)) {
         return false;
     }
-    for (const auto& block : blocks) {
-        if (!targets.contains(block.get())) continue;
-        for (const auto& [key, segment] : block->anchors) {
+
+    for (const auto* target : deleted) {
+        const auto owner = transaction.owners.find(target);
+        if (owner == transaction.owners.end()) continue;
+        ++result.deleted_blocks;
+        for (const auto& [key, segment] : owner->second->anchors) {
             ++result.deleted_segments;
             result.deleted_bases_by_species[key.first] += segment->length;
+        }
+    }
+    std::unordered_set<const Block*> retired;
+    auto retire = [&](const BlockPtr& block) {
+        if (!block || active_blocks.contains(block.get()) ||
+            !retired.insert(block.get()).second) {
+            return;
+        }
+        for (auto& [key, segment] : block->anchors) {
+            (void)key;
             segment->primary_path.prev.store(nullptr);
             segment->primary_path.next.store(nullptr);
+            segment->parent_block.reset();
         }
         block->anchors.clear();
-        ++result.deleted_blocks;
+    };
+    for (const auto& weak : transaction.original_pool) retire(weak.lock());
+    for (const auto& prepared : transaction.merges) {
+        retire(prepared.merged_block);
     }
     return true;
 }
@@ -787,7 +825,6 @@ Result repairFinalShortBlocks(
     Result result;
     if (!options.enabled) return result;
     if (reference_order.empty() || options.maximum_short_length == 0 ||
-        options.maximum_delete_length == 0 ||
         options.maximum_delete_length > options.maximum_short_length ||
         options.maximum_missing_span == 0 || options.parallel_threads == 0) {
         throw std::invalid_argument("invalid short-Block repair options");
@@ -804,9 +841,18 @@ Result repairFinalShortBlocks(
     }
     std::unordered_set<const Block*> active_blocks;
     active_blocks.reserve(graph.blocks.size() * 2 + 1);
-    for (const auto& weak : graph.blocks) {
+    StageTransaction transaction;
+    transaction.original_pool = graph.blocks;
+    transaction.lineage.reserve(graph.blocks.size() * 2 + 1);
+    transaction.owners.reserve(graph.blocks.size() * 2 + 1);
+    for (size_t slot = 0; slot < graph.blocks.size(); ++slot) {
+        const auto& weak = graph.blocks[slot];
         const auto block = weak.lock();
-        if (block) active_blocks.insert(block.get());
+        if (block) {
+            active_blocks.insert(block.get());
+            transaction.lineage.emplace(block.get(), slot);
+            transaction.owners.emplace(block.get(), block);
+        }
     }
     std::deque<WorkItem> queue;
     std::unordered_set<const Block*> initial_short_blocks;
@@ -832,7 +878,7 @@ Result repairFinalShortBlocks(
     result.scan_seconds = secondsSince(scan_start);
 
     uint64_t generation = 0;
-    std::unordered_map<std::string, uint64_t> attempted;
+    std::unordered_set<AttemptKey, AttemptKeyHash> attempted;
     auto enqueueDirty = [&](const BlockPtr& block) {
         if (!block) return;
         for (const auto& reference_species : reference_order) {
@@ -864,11 +910,9 @@ Result repairFinalShortBlocks(
             }
         }
         if (!found_reference) continue;
-        std::ostringstream signature;
-        signature << block.get() << '|' << item.reference_species << '|'
-                  << generation;
-        if (attempted.contains(signature.str())) continue;
-        attempted.emplace(signature.str(), generation);
+        const AttemptKey attempt{block.get(), item.reference_species,
+                                 generation};
+        if (!attempted.insert(attempt).second) continue;
 
         std::optional<PreparedMerge> left;
         std::optional<PreparedMerge> right;
@@ -904,7 +948,7 @@ Result repairFinalShortBlocks(
             selected = std::move(*right);
         }
         const auto transaction_start = Clock::now();
-        if (!commitMerge(graph, selected, active_blocks)) {
+        if (!applyMergeLocally(graph, selected, active_blocks, transaction)) {
             ++result.transaction_rollbacks;
             result.transaction_seconds += secondsSince(transaction_start);
             detachPrepared(selected);
@@ -914,12 +958,16 @@ Result repairFinalShortBlocks(
         active_blocks.erase(selected.short_block.get());
         active_blocks.erase(selected.neighbor_block.get());
         active_blocks.insert(selected.merged_block.get());
+        transaction.owners.emplace(selected.merged_block.get(),
+                                   selected.merged_block);
+        transaction.merges.push_back(std::move(selected));
+        auto& committed = transaction.merges.back();
         ++generation;
         ++result.fixed_point_generations;
-        if (selected.side == Side::Left) ++result.left_merged;
+        if (committed.side == Side::Left) ++result.left_merged;
         else ++result.right_merged;
-        enqueueDirty(selected.merged_block);
-        for (const auto& [key, merged] : selected.merged_block->anchors) {
+        enqueueDirty(committed.merged_block);
+        for (const auto& [key, merged] : committed.merged_block->anchors) {
             (void)key;
             const auto dirty_previous = merged->primary_path.prev.load();
             const auto dirty_next = merged->primary_path.next.load();
@@ -934,25 +982,37 @@ Result repairFinalShortBlocks(
 
     std::unordered_set<const Block*> delete_seen;
     std::vector<BlockPtr> delete_blocks;
-    for (const auto& reference_species : reference_order) {
-        const auto species = graph.species_graphs.find(reference_species);
-        if (species == graph.species_graphs.end()) continue;
-        for (const auto& [chromosome, end] : species->second.chr2end) {
-            (void)chromosome;
-            for (auto current = end.head->primary_path.next.load();
-                 current && !current->isTail();
-                 current = current->primary_path.next.load()) {
-                if (current->length <= options.maximum_delete_length &&
-                    current->parent_block &&
-                    delete_seen.insert(current->parent_block.get()).second) {
-                    delete_blocks.push_back(current->parent_block);
+    if (options.maximum_delete_length > 0) {
+        for (const auto& [raw, block] : transaction.owners) {
+            if (!active_blocks.contains(raw)) continue;
+            for (const auto& [key, segment] : block->anchors) {
+                if (ranks.contains(key.first) &&
+                    segment->length <= options.maximum_delete_length &&
+                    delete_seen.insert(raw).second) {
+                    delete_blocks.push_back(block);
+                    break;
                 }
             }
         }
     }
     const auto delete_start = Clock::now();
-    if (!commitDeleteBatch(graph, delete_blocks, active_blocks, result)) {
+    std::unordered_set<const Block*> deleted;
+    bool stage_ok = applyDeletesLocally(graph, delete_blocks, active_blocks,
+                                        transaction, deleted);
+    if (stage_ok) {
+        for (const auto* block : deleted) active_blocks.erase(block);
+        stage_ok = finalizeStage(graph, transaction, active_blocks, deleted,
+                                 result);
+    }
+    if (!stage_ok) {
+        restoreStage(graph, transaction);
         ++result.transaction_rollbacks;
+        result.left_merged = 0;
+        result.right_merged = 0;
+        result.fixed_point_generations = 0;
+        result.deleted_blocks = 0;
+        result.deleted_segments = 0;
+        result.deleted_bases_by_species.clear();
     }
     result.transaction_seconds += secondsSince(delete_start);
     countBlocks(graph, reference_order, result.blocks_after,
@@ -985,8 +1045,8 @@ Result repairFinalShortBlocks(
         result.scan_seconds, result.ksw2_seconds,
         result.transaction_seconds, result.total_seconds);
     for (const auto& [species, bases] : result.deleted_bases_by_species) {
-        spdlog::info("[short-block-repair] deleted_species={} bases={}",
-                     species, bases);
+        spdlog::debug("[short-block-repair] deleted_species={} bases={}",
+                      species, bases);
     }
     return result;
 }

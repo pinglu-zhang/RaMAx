@@ -973,7 +973,12 @@ bool repairCrossAnchorGroups(
             return left.left_reference > right.left_reference;
         });
 
-    bool changed = false;
+    struct Replacement {
+        size_t start = 0;
+        size_t length = 0;
+        std::unordered_map<ChrName, std::string> rows;
+    };
+    std::vector<Replacement> replacements;
     for (const auto& group : selected) {
         const size_t start_column =
             reference_boundaries[group.left_reference];
@@ -1105,16 +1110,18 @@ bool repairCrossAnchorGroups(
             continue;
         }
 
-        for (auto& [key, sequence] : sequences) {
-            sequence.replace(
-                start_column, end_column - start_column,
-                new_local.at(key));
-        }
+        replacements.push_back(
+            {start_column, end_column - start_column, std::move(new_local)});
         cross_anchor_counters.accepted.fetch_add(
             1, std::memory_order_relaxed);
-        changed = true;
     }
-    return changed;
+    for (auto& replacement : replacements) {
+        for (auto& [key, sequence] : sequences) {
+            sequence.replace(replacement.start, replacement.length,
+                             replacement.rows.at(key));
+        }
+    }
+    return !replacements.empty();
 }
 
 bool validPairwiseProjection(
@@ -1176,15 +1183,23 @@ uint_t mergeAlignmentByRef(
         throw std::invalid_argument("mergeAlignmentByRef: ref not found");
     }
     const size_t raw_reference_length = reference_it->second.size();
-    std::unordered_map<ChrName, Cigar_t> normalized_cigars = cigars;
+    const std::unordered_map<ChrName, Cigar_t>* projection_cigars = &cigars;
+    std::optional<std::unordered_map<ChrName, Cigar_t>> repaired_cigars;
     for (const auto& [key, sequence] : seqs) {
         if (key == ref_name) continue;
-        auto& cigar = normalized_cigars[key];
+        const auto found = cigars.find(key);
+        const Cigar_t empty;
+        const Cigar_t& original = found == cigars.end() ? empty : found->second;
+        if (!original.empty() && validPairwiseProjection(
+                original, raw_reference_length, sequence.size())) {
+            continue;
+        }
+        if (!repaired_cigars) repaired_cigars.emplace(cigars);
+        auto& cigar = (*repaired_cigars)[key];
         if (cigar.empty() && sequence.size() == raw_reference_length) {
             appendCigarOp(
                 cigar, 'M', static_cast<uint32_t>(raw_reference_length));
-        } else if (!validPairwiseProjection(
-                       cigar, raw_reference_length, sequence.size())) {
+        } else {
             cigar = globalAlignKSW2Banded(reference_it->second, sequence);
         }
         if (!validPairwiseProjection(
@@ -1193,26 +1208,27 @@ uint_t mergeAlignmentByRef(
                 "mergeAlignmentByRef: cannot build a valid pairwise projection");
         }
     }
+    if (repaired_cigars) projection_cigars = &*repaired_cigars;
     const auto events = collectInsertionEvents(
-        ref_name, seqs, normalized_cigars);
+        ref_name, seqs, *projection_cigars);
     auto groups = buildCrossAnchorGroups(events, seqs);
     const uint_t legacy_length = RaMesh::Alignment::mergeReferenceProfile(
-        ref_name, seqs, normalized_cigars);
+        ref_name, seqs, *projection_cigars);
     if (!equalAlignedRows(seqs)) {
         throw std::runtime_error(
             "mergeAlignmentByRef: core produced unequal aligned rows");
     }
     if (!groups.empty()) {
-        const auto legacy_rows = seqs;
         const CrossAnchorRepairConfiguration configuration =
             cross_anchor_session.configurationSnapshot();
         repairCrossAnchorGroups(
             ref_name, raw_reference_length, events,
             std::move(groups), configuration, seqs);
         if (!equalAlignedRows(seqs)) {
-            seqs = legacy_rows;
             cross_anchor_counters.fallback.fetch_add(
                 1, std::memory_order_relaxed);
+            throw std::runtime_error(
+                "mergeAlignmentByRef: cross-anchor repair produced unequal rows");
         }
     }
     const auto finished = std::chrono::steady_clock::now();

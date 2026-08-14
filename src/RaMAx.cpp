@@ -7,6 +7,7 @@
 #include "index.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
+#include "external_msa_runner.h"
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
@@ -566,7 +567,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         "--repair-short-blocks",
         args.repair_short_blocks,
         "At final graph, try to merge <=500 bp Blocks with banded KSW2; "
-        "delete only failed Blocks <=50 bp.")
+        "Blocks that cannot be merged are retained.")
         ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式
@@ -1458,6 +1459,7 @@ static void exportResults(
         throw std::runtime_error("Unsupported output format for multiple genome alignment");
     }
     logCrossAnchorInsertionRepairStats();
+    RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
 }
 
 // ------------------------------

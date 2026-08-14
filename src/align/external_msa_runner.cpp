@@ -40,6 +40,13 @@ std::atomic<uint64_t> process_nanoseconds{0};
 std::atomic<uint64_t> parse_nanoseconds{0};
 std::atomic<uint64_t> memfd_inputs{0};
 std::atomic<uint64_t> file_inputs{0};
+std::atomic<uint64_t> failures{0};
+std::atomic<uint32_t> progress_index{0};
+std::atomic_flag spawn_warning = ATOMIC_FLAG_INIT;
+std::atomic_flag command_warning = ATOMIC_FLAG_INIT;
+std::atomic_flag parse_warning = ATOMIC_FLAG_INIT;
+constexpr std::array<uint64_t, 10> progress_milestones{
+    1000, 2000, 4000, 8000, 12000, 16000, 20000, 24000, 28000, 32000};
 
 uint64_t elapsedNanoseconds(
     std::chrono::steady_clock::time_point start,
@@ -49,18 +56,39 @@ uint64_t elapsedNanoseconds(
             finish - start).count());
 }
 
-std::string ungappedUpper(std::string sequence) {
-    sequence.erase(
-        std::remove_if(sequence.begin(), sequence.end(),
-                       [](unsigned char c) {
-                           return c == '-' || std::isspace(c);
-                       }),
-        sequence.end());
-    std::transform(sequence.begin(), sequence.end(), sequence.begin(),
-                   [](unsigned char c) {
-                       return static_cast<char>(std::toupper(c));
-                   });
-    return sequence;
+bool sameUngappedSequence(const std::string& aligned,
+                          const std::string& original) {
+    size_t left = 0;
+    size_t right = 0;
+    while (true) {
+        while (left < aligned.size() &&
+               (aligned[left] == '-' ||
+                std::isspace(static_cast<unsigned char>(aligned[left])))) {
+            ++left;
+        }
+        while (right < original.size() &&
+               (original[right] == '-' ||
+                std::isspace(static_cast<unsigned char>(original[right])))) {
+            ++right;
+        }
+        if (left == aligned.size() || right == original.size()) {
+            return left == aligned.size() && right == original.size();
+        }
+        if (std::toupper(static_cast<unsigned char>(aligned[left])) !=
+            std::toupper(static_cast<unsigned char>(original[right]))) {
+            return false;
+        }
+        ++left;
+        ++right;
+    }
+}
+
+void warnParseOnce(const char* message) {
+    failures.fetch_add(1, std::memory_order_relaxed);
+    if (!parse_warning.test_and_set(std::memory_order_relaxed)) {
+        spdlog::warn("[external-msa] {}; further parse failures are aggregated",
+                     message);
+    }
 }
 
 class ScopedFd {
@@ -162,14 +190,14 @@ bool parseOutput(
             header >> current_id;
             if (current_id.empty() ||
                 !aligned_by_id.emplace(current_id, std::string{}).second) {
-                spdlog::warn("[external-msa] invalid FASTA header");
+                warnParseOnce("invalid FASTA header");
                 return false;
             }
             continue;
         }
         if (current_id.empty()) {
             if (line.empty()) continue;
-            spdlog::warn("[external-msa] sequence before FASTA header");
+            warnParseOnce("sequence before FASTA header");
             return false;
         }
         for (const unsigned char c : line) {
@@ -179,7 +207,7 @@ bool parseOutput(
         }
     }
     if (aligned_by_id.size() != keys.size()) {
-        spdlog::warn("[external-msa] output row count mismatch");
+        warnParseOnce("output row count mismatch");
         return false;
     }
 
@@ -188,14 +216,14 @@ bool parseOutput(
     for (size_t index = 0; index < keys.size(); ++index) {
         const auto found = aligned_by_id.find("s" + std::to_string(index));
         if (found == aligned_by_id.end() ||
-            ungappedUpper(found->second) !=
-                ungappedUpper(sequences.at(keys[index]))) {
-            spdlog::warn("[external-msa] output sequence validation failed");
+            !sameUngappedSequence(found->second,
+                                  sequences.at(keys[index]))) {
+            warnParseOnce("output sequence validation failed");
             return false;
         }
         if (index == 0) aligned_length = found->second.size();
         else if (found->second.size() != aligned_length) {
-            spdlog::warn("[external-msa] output rows have unequal lengths");
+            warnParseOnce("output rows have unequal lengths");
             return false;
         }
         aligned[index] = found->second;
@@ -216,10 +244,6 @@ ExternalMsaRunner& ExternalMsaRunner::instance() {
 void ExternalMsaRunner::configureDefaultExecutable(std::string executable) {
     std::lock_guard lock(configuration_mutex);
     default_executable = std::move(executable);
-    if (!default_executable.empty()) {
-        spdlog::info("[external-msa] insertion aligner configured: {}",
-                     default_executable);
-    }
 }
 
 bool ExternalMsaRunner::alignWithDefault(
@@ -245,11 +269,17 @@ bool ExternalMsaRunner::align(
         keys.push_back(key);
     }
     std::sort(keys.begin(), keys.end());
-    std::ostringstream fasta;
+    size_t input_capacity = keys.size() * 8;
+    for (const auto& key : keys) input_capacity += sequences.at(key).size();
+    std::string input_text;
+    input_text.reserve(input_capacity);
     for (size_t index = 0; index < keys.size(); ++index) {
-        fasta << ">s" << index << '\n' << sequences.at(keys[index]) << '\n';
+        input_text += ">s";
+        input_text += std::to_string(index);
+        input_text.push_back('\n');
+        input_text += sequences.at(keys[index]);
+        input_text.push_back('\n');
     }
-    const std::string input_text = fasta.str();
 
     ScopedFd input_fd = createMemfd(input_text);
     TemporaryInput temporary;
@@ -340,8 +370,13 @@ bool ExternalMsaRunner::align(
         arguments.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     if (spawn_error != 0) {
-        spdlog::warn("[external-msa] cannot spawn {}: {}", executable,
-                     std::generic_category().message(spawn_error));
+        failures.fetch_add(1, std::memory_order_relaxed);
+        if (!spawn_warning.test_and_set(std::memory_order_relaxed)) {
+            spdlog::warn(
+                "[external-msa] cannot spawn {}: {}; further spawn failures "
+                "are aggregated", executable,
+                std::generic_category().message(spawn_error));
+        }
         return false;
     }
     output_write.reset();
@@ -353,7 +388,12 @@ bool ExternalMsaRunner::align(
     const bool waited = waitForChild(pid, child_status);
     if (!read_ok || !waited || !WIFEXITED(child_status) ||
         WEXITSTATUS(child_status) != 0) {
-        spdlog::warn("[external-msa] command failed: {}", executable);
+        failures.fetch_add(1, std::memory_order_relaxed);
+        if (!command_warning.test_and_set(std::memory_order_relaxed)) {
+            spdlog::warn(
+                "[external-msa] command failed: {}; further command failures "
+                "are aggregated", executable);
+        }
         return false;
     }
 
@@ -365,18 +405,28 @@ bool ExternalMsaRunner::align(
     parse_nanoseconds.fetch_add(elapsedNanoseconds(parse_start, parse_finish));
 
     const uint64_t current = completed.fetch_add(1) + 1;
-    if (current % 1000 == 0) {
-        constexpr double kNsPerSecond = 1.0e9;
-        spdlog::info(
-            "[external-msa] completed={} executable={} input_seconds={:.3f} "
-            "process_seconds={:.3f} parse_seconds={:.3f} memfd_inputs={} "
-            "file_inputs={}",
-            current, executable, input_nanoseconds.load() / kNsPerSecond,
-            process_nanoseconds.load() / kNsPerSecond,
-            parse_nanoseconds.load() / kNsPerSecond, memfd_inputs.load(),
-            file_inputs.load());
+    uint32_t milestone = progress_index.load(std::memory_order_relaxed);
+    while (milestone < progress_milestones.size() &&
+           current >= progress_milestones[milestone]) {
+        if (progress_index.compare_exchange_weak(
+                milestone, milestone + 1, std::memory_order_relaxed)) {
+            spdlog::info("[external-msa] progress completed={}", current);
+            break;
+        }
     }
     return true;
+}
+
+void ExternalMsaRunner::logSummary() const {
+    constexpr double kNsPerSecond = 1.0e9;
+    spdlog::info(
+        "[external-msa] completed={} failures={} input/process/parse="
+        "{:.3f}/{:.3f}/{:.3f}s inputs(memfd/file)={}/{}",
+        completed.load(), failures.load(),
+        input_nanoseconds.load() / kNsPerSecond,
+        process_nanoseconds.load() / kNsPerSecond,
+        parse_nanoseconds.load() / kNsPerSecond, memfd_inputs.load(),
+        file_inputs.load());
 }
 
 }  // namespace RaMesh::Alignment

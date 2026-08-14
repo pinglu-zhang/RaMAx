@@ -18,7 +18,8 @@ namespace RaMesh::ShortBlockRepair {
 struct Options {
     bool enabled = false;
     uint_t maximum_short_length = 500;
-    uint_t maximum_delete_length = 50;
+    // Zero disables deletion of Blocks that cannot be merged.
+    uint_t maximum_delete_length = 0;
     uint_t maximum_missing_span = 200;
     double minimum_coverage = 0.70;
     double minimum_identity = 0.60;

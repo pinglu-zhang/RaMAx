@@ -1112,7 +1112,7 @@ Result repairAnchorBoundedStructuralBreaks(
                       reason, count);
     }
     for (const auto& [participants, count] : result.candidates_by_k) {
-        spdlog::info(
+        spdlog::debug(
             "[structural-break-repair] K={} candidates={} prepared={} "
             "committed={}",
             participants, count, result.prepared_by_k[participants],

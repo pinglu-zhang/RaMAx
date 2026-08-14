@@ -859,7 +859,7 @@ void logBoundaryDiagnostics(const BoundaryDiagnostics& diagnostics,
         diagnostics.total_boundaries >= mergeable
             ? diagnostics.total_boundaries - mergeable
             : 0;
-    spdlog::info(
+    spdlog::debug(
         "[exact-block-scan] stage={} reference={} total_boundaries={} "
         "mergeable={} rejected={} max_reference_span={}",
         stage, reference_species, diagnostics.total_boundaries,
@@ -877,7 +877,7 @@ void logBoundaryDiagnostics(const BoundaryDiagnostics& diagnostics,
                 ? 0.0
                 : 100.0 * static_cast<double>(count) /
                       static_cast<double>(diagnostics.total_boundaries);
-        spdlog::info(
+        spdlog::debug(
             "[exact-block-scan] stage={} reason={} count={} percent={:.6f}",
             stage,
             boundaryReasonName(static_cast<BoundaryReason>(index)),
@@ -886,13 +886,13 @@ void logBoundaryDiagnostics(const BoundaryDiagnostics& diagnostics,
 
     for (size_t bin = 0; bin < kGapBinCount; ++bin) {
         if (diagnostics.reference_gap_bins[bin] != 0) {
-            spdlog::info(
+            spdlog::debug(
                 "[exact-block-scan] stage={} reference_gap_bin={} count={}",
                 stage, gapBinName(bin),
                 diagnostics.reference_gap_bins[bin]);
         }
         if (diagnostics.query_gap_bins[bin] != 0) {
-            spdlog::info(
+            spdlog::debug(
                 "[exact-block-scan] stage={} query_max_gap_bin={} count={}",
                 stage, gapBinName(bin),
                 diagnostics.query_gap_bins[bin]);
@@ -901,7 +901,7 @@ void logBoundaryDiagnostics(const BoundaryDiagnostics& diagnostics,
 
     for (const auto& [transition, count] :
          diagnostics.participant_transitions) {
-        spdlog::info(
+        spdlog::debug(
             "[exact-block-scan] stage={} participant_transition={}_to_{} "
             "count={}",
             stage, transition.first, transition.second, count);
@@ -2523,7 +2523,7 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
     }
 
     if (candidates.empty()) {
-        spdlog::info(
+        spdlog::debug(
             "[exact-block-merge] reference={} candidates=0 eliminated_boundaries=0",
             reference_species);
         return 0;
@@ -2751,7 +2751,7 @@ size_t RaMeshMultiGenomeGraph::mergeExactContiguousBlocks(
         eliminated_boundaries, active_blocks_before, active_blocks_after,
         longest_chain, maximum_reference_span, maximum_query_gap);
     for (const auto& [species_count, stats] : by_species_count) {
-        spdlog::info(
+        spdlog::debug(
             "[exact-block-merge] participants={} chains={} eliminated_boundaries={}",
             species_count, stats.first, stats.second);
     }
@@ -2777,7 +2777,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             "species-mismatch zero-gap maximum span must be positive");
     }
     if (seqpro_managers.size() < 2) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign] reference={} skipped: "
             "at least two species are required",
             reference_species);
@@ -2795,6 +2795,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
     constexpr size_t rejection_count =
         static_cast<size_t>(MissingWindowReject::COUNT);
+    const bool detailed_stats =
+        spdlog::should_log(spdlog::level::debug);
     using RejectionCounts = std::array<size_t, rejection_count>;
 
     RejectionCounts zero_gap_rejections{};
@@ -2956,7 +2958,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             });
 
         if (zero_gap_candidates.empty()) {
-            spdlog::info(
+            spdlog::debug(
                 "[species-mismatch-realign][zero-gap] iteration={} "
                 "scanned_triples={} structural_candidates={} candidates=0 "
                 "status=stable",
@@ -3101,15 +3103,17 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     reserved_read_blocks.insert(block);
                 }
             }
-            for (const auto& species : candidate.missing_species) {
-                ++zero_gap_accepted_by_missing_species[species];
+            if (detailed_stats) {
+                for (const auto& species : candidate.missing_species) {
+                    ++zero_gap_accepted_by_missing_species[species];
+                }
+                ++zero_gap_pattern_counts[candidate.participant_pattern];
+                ++zero_gap_boundary_k_counts[
+                    candidate.boundary_species_count];
             }
             if (candidate.adjacent_pair) {
                 ++zero_gap_adjacent_pair_windows;
             }
-            ++zero_gap_pattern_counts[candidate.participant_pattern];
-            ++zero_gap_boundary_k_counts[
-                candidate.boundary_species_count];
             accepted_candidates.push_back(std::move(candidate));
             prepared.push_back(std::move(*prepared_slots[index]));
         }
@@ -3165,7 +3169,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         zero_gap_full_scan = false;
         zero_gap_replaced_windows += commit.replaced_windows;
         zero_gap_replaced_old_blocks += commit.replaced_old_blocks;
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][zero-gap] iteration={} "
             "scanned_triples={} structural_candidates={} candidates={} "
             "prepared={} selected={} failed={} "
@@ -3182,8 +3186,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     }
 
     RejectionCounts rejections{};
-    std::map<SpeciesName, size_t> accepted_by_missing_species =
-        zero_gap_accepted_by_missing_species;
+    std::map<SpeciesName, size_t> accepted_by_missing_species;
+    if (detailed_stats) {
+        accepted_by_missing_species = zero_gap_accepted_by_missing_species;
+    }
     std::map<std::string, size_t> ordinary_pattern_counts;
     std::map<std::string, size_t> hybrid_pattern_counts;
     std::map<size_t, size_t> ordinary_candidates_by_k;
@@ -3312,9 +3318,11 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                                 MissingWindowReject::COUNT) {
                                 ++full_k_triple_candidates_total;
                                 ++ordinary_this_round;
-                                ++ordinary_candidates_by_k[
-                                    triple_candidate
-                                        .boundary_species_count];
+                                if (detailed_stats) {
+                                    ++ordinary_candidates_by_k[
+                                        triple_candidate
+                                            .boundary_species_count];
+                                }
                                 candidate_slots.push_back(
                                     std::move(triple_candidate));
                             } else {
@@ -3377,12 +3385,16 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 }
                 if (candidate.hybrid_empty) {
                     ++hybrid_this_round;
-                    ++hybrid_candidates_by_k[
-                        candidate.boundary_species_count];
+                    if (detailed_stats) {
+                        ++hybrid_candidates_by_k[
+                            candidate.boundary_species_count];
+                    }
                 } else {
                     ++ordinary_this_round;
-                    ++ordinary_candidates_by_k[
-                        candidate.boundary_species_count];
+                    if (detailed_stats) {
+                        ++ordinary_candidates_by_k[
+                            candidate.boundary_species_count];
+                    }
                 }
                 if (candidate.adjacent_pair) {
                     ++adjacent_pair_candidates_total;
@@ -3445,7 +3457,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         hybrid_candidates_total += hybrid_this_round;
 
         if (candidate_slots.empty()) {
-            spdlog::info(
+            spdlog::debug(
                 "[species-mismatch-realign][minipoa-unified] round={} "
                 "scanned_windows={} ordinary_candidates=0 "
                 "hybrid_candidates=0 status=stable",
@@ -3709,21 +3721,27 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                             "overlapping replacement Blocks");
                     }
                 }
-                for (const auto& species : candidate.missing_species) {
-                    ++accepted_by_missing_species[species];
+                if (detailed_stats) {
+                    for (const auto& species : candidate.missing_species) {
+                        ++accepted_by_missing_species[species];
+                    }
                 }
                 if (candidate.hybrid_empty) {
                     ++round_hybrid_committed;
-                    ++hybrid_committed_by_k[
-                        candidate.boundary_species_count];
-                    ++hybrid_pattern_counts[
-                        candidate.participant_pattern];
+                    if (detailed_stats) {
+                        ++hybrid_committed_by_k[
+                            candidate.boundary_species_count];
+                        ++hybrid_pattern_counts[
+                            candidate.participant_pattern];
+                    }
                 } else {
                     ++round_ordinary_committed;
-                    ++ordinary_committed_by_k[
-                        candidate.boundary_species_count];
-                    ++ordinary_pattern_counts[
-                        candidate.participant_pattern];
+                    if (detailed_stats) {
+                        ++ordinary_committed_by_k[
+                            candidate.boundary_species_count];
+                        ++ordinary_pattern_counts[
+                            candidate.participant_pattern];
+                    }
                 }
                 if (candidate.kind == MissingWindowKind::FULL_K_TRIPLE) {
                     ++full_k_triple_committed_total;
@@ -3819,7 +3837,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         ordinary_committed_total += round_ordinary_committed;
         hybrid_committed_total += round_hybrid_committed;
         minipoa_replaced_old_blocks += commit.replaced_old_blocks;
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][minipoa-unified] round={} "
             "scanned_windows={} ordinary_candidates={} "
             "hybrid_candidates={} batches={} minipoa_calls={} "
@@ -3889,14 +3907,14 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         zero_gap_replaced_old_blocks, zero_gap_scan_seconds,
         zero_gap_prepare_seconds, zero_gap_commit_seconds,
         zero_gap_maximum_span, adjacent_pair_gap_max);
-    spdlog::info(
+    spdlog::debug(
         "[species-mismatch-realign][adjacent-pair] reference={} "
         "minipoa_candidates={} minipoa_committed={} "
         "reference_empty_candidates={} maximum_span={}",
         reference_species, adjacent_pair_candidates_total,
         adjacent_pair_committed_total,
         adjacent_pair_reference_empty_total, maximum_span);
-    spdlog::info(
+    spdlog::debug(
         "[species-mismatch-realign][full-k-triple] reference={} "
         "candidates={} committed={} fallback_to_pair={} maximum_span={}",
         reference_species, full_k_triple_candidates_total,
@@ -3905,7 +3923,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
     for (size_t index = 0; index < rejection_count; ++index) {
         if (zero_gap_rejections[index] != 0) {
-            spdlog::info(
+            spdlog::debug(
                 "[species-mismatch-realign][zero-gap] "
                 "reject_reason={} count={}",
                 missingWindowRejectName(
@@ -3913,7 +3931,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 zero_gap_rejections[index]);
         }
         if (rejections[index] != 0) {
-            spdlog::info(
+            spdlog::debug(
                 "[species-mismatch-realign][minipoa] "
                 "reject_reason={} count={}",
                 missingWindowRejectName(
@@ -3923,37 +3941,37 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     }
     for (const auto& [species, count] :
          accepted_by_missing_species) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign] missing_species={} committed={}",
             species, count);
     }
     for (const auto& [pattern, count] : zero_gap_pattern_counts) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][zero-gap] pattern={} committed={}",
             pattern, count);
     }
     for (const auto& [boundary_k, count] :
          zero_gap_boundary_k_counts) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][zero-gap] boundary_k={} "
             "committed={}",
             boundary_k, count);
     }
     for (const auto& [pattern, count] : ordinary_pattern_counts) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][minipoa-ordinary] "
             "pattern={} committed={}",
             pattern, count);
     }
     for (const auto& [pattern, count] : hybrid_pattern_counts) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][minipoa-hybrid] "
             "pattern={} committed={}",
             pattern, count);
     }
     for (const auto& [boundary_k, candidates] :
          ordinary_candidates_by_k) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][minipoa-ordinary] "
             "boundary_k={} candidates={} committed={}",
             boundary_k, candidates,
@@ -3961,7 +3979,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     }
     for (const auto& [boundary_k, candidates] :
          hybrid_candidates_by_k) {
-        spdlog::info(
+        spdlog::debug(
             "[species-mismatch-realign][minipoa-hybrid] "
             "boundary_k={} candidates={} committed={}",
             boundary_k, candidates,
@@ -3973,7 +3991,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     const size_t total_replaced_old_blocks =
         zero_gap_replaced_old_blocks +
         minipoa_replaced_old_blocks;
-    spdlog::info(
+    spdlog::debug(
         "[species-mismatch-realign] reference={} replaced_windows={} "
         "zero_gap_deletion_windows={} ordinary_minipoa_windows={} "
         "hybrid_minipoa_windows={} minipoa_windows={} "

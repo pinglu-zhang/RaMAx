@@ -975,7 +975,7 @@ starAlignment(
             const size_t eliminated_boundaries =
                 multi_graph->mergeExactContiguousBlocks(
                     current_ref_name, 1000000, merge_query_gap_max);
-            spdlog::info(
+            spdlog::debug(
                 "[exact-block-merge] round={} reference={} optimization "
                 "completed: eliminated_boundaries={} max_query_gap={}",
                 i + 1, current_ref_name, eliminated_boundaries,
@@ -997,7 +997,7 @@ starAlignment(
                         current_ref_name, 1000000,
                         merge_query_gap_max);
             }
-            spdlog::info(
+            spdlog::debug(
                 "[species-mismatch-realign] round={} reference={} "
                 "replaced_windows={} post_realign_eliminated_boundaries={}",
                 i + 1, current_ref_name, replaced_windows,
@@ -1018,7 +1018,7 @@ starAlignment(
                         current_ref_name, 1000000,
                         merge_query_gap_max);
             }
-            spdlog::info(
+            spdlog::debug(
                 "[structural-break-repair] round={} reference={} "
                 "committed={} post_repair_eliminated_boundaries={}",
                 i + 1, current_ref_name, repair.committed,
@@ -1072,7 +1072,8 @@ starAlignment(
         processed_reference_species.insert(current_ref_name);
     }
 
-    if (merge_exact_contiguous_blocks_enabled && !reference_order.empty()) {
+    if (merge_exact_contiguous_blocks_enabled && !reference_order.empty() &&
+        spdlog::should_log(spdlog::level::debug)) {
         for (uint_t reference_index = 0; reference_index < round;
              ++reference_index) {
             multi_graph->inspectExactContiguousBlockBoundaries(
@@ -1084,13 +1085,8 @@ starAlignment(
         auto options = short_block_repair_options;
         options.parallel_threads = thread_num;
         options.maximum_query_gap = merge_query_gap_max;
-        const auto repaired =
-            RaMesh::ShortBlockRepair::repairFinalShortBlocks(
-                *multi_graph, reference_order, seqpro_managers, options);
-        spdlog::info(
-            "[short-block-repair] final merged={} deleted={} total_seconds={:.3f}",
-            repaired.left_merged + repaired.right_merged,
-            repaired.deleted_blocks, repaired.total_seconds);
+        RaMesh::ShortBlockRepair::repairFinalShortBlocks(
+            *multi_graph, reference_order, seqpro_managers, options);
     }
 
     // 所有轮次完成后，flush logger
