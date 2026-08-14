@@ -77,6 +77,17 @@ explicit, repeatable way to request the same default set. The defaults are:
 
 Run `ramax --help` for the complete core-alignment options.
 
+## Documentation
+
+- [Usage guide](docs/usage.md)
+- [Command-line parameters](docs/parameters.md)
+- [Restart and work directories](docs/restart.md)
+- [MAF and HAL output](docs/output-formats.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Realignment architecture](docs/realignment_architecture.md)
+
+See the [documentation index](docs/README.md) for the complete set.
+
 ## Input format
 
 ```text

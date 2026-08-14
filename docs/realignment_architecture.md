@@ -1,5 +1,8 @@
 # Realignment architecture
 
+This is an internal design reference. For user-facing commands and defaults,
+see [Command-line parameters](parameters.md) and [Usage guide](usage.md).
+
 ## Execution order
 
 Block optimization runs after each reference-guided alignment round in a

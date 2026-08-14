@@ -1,0 +1,94 @@
+# Command-line parameters
+
+This page documents the public RaMAx 1.0.5 interface. Values and ranges follow
+the current CLI implementation. Run `ramax --help` to inspect the installed
+binary.
+
+## General
+
+| Option | Type/default | Description |
+|---|---|---|
+| `-h`, `--help` | flag | Print help and exit. |
+| `-v`, `--version` | flag | Print the RaMAx version and exit. |
+
+## Input Files
+
+| Option | Type/default | Description |
+|---|---|---|
+| `-i`, `--input` | path; required for a new run | Cactus-compatible seqfile containing a Newick tree and genome mappings. |
+
+## Output
+
+| Option | Type/default | Description |
+|---|---|---|
+| `-o`, `--output` | path; required for a new run | Output file. The suffix must be `.maf` or `.hal`. |
+| `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
+| `--root` | string; automatic | Preferred HAL root name. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
+
+## Software Parameters
+
+| Option | Type/default/range | Description |
+|---|---|---|
+| `--chunk_size` | integer; `10000000`; `1000000..INT_MAX` bp | Reference/query chunk size used during parallel anchor search. |
+| `--ref` | string; automatic | Prefer a named genome as reference. When omitted, RaMAx determines reference order from assembly statistics. |
+| `--overlap_size` | integer; `0`; `0..INT_MAX` bp | Overlap between adjacent chunks. It must be smaller than `--chunk_size`. |
+| `--min_anchor_length` | integer; `20`; `1..INT_MAX` bp | Minimum anchor length. |
+| `--max_anchor_frequency` | integer; `50`; `0..INT_MAX` | Maximum accepted anchor occurrence frequency. |
+| `--search-mode` | `accurate`; `fast`, `middle`, or `accurate` | Anchor-search strategy. Numeric values `0`, `1`, and `2` map to the same modes. |
+| `--allow-mem` | flag; off | Allow MEM anchors instead of restricting discovery to MUM anchors. |
+| `--one-round` | flag; off | Stop after one reference-guided alignment round. |
+| `--slow-build` | flag; off | Use the slower index-building implementation. |
+| `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference index. |
+| `--min-span` | integer; `65`; `1..INT_MAX` bp | Minimum span used during graph construction. |
+
+Parameter names containing underscores are retained in the current public CLI
+for the anchor/chunk settings shown above.
+
+## Graph Optimization
+
+All four graph-optimization modules are enabled by default in 1.0.5.
+
+| Option | Type/default/range | Description |
+|---|---|---|
+| `--optimize-blocks` | flag; default behavior | Explicitly enable the complete default optimization set. |
+| `--merge-blocks` | flag; on | Merge compatible neighboring Blocks. |
+| `--merge-gap` | integer; `100`; `0..10000` bp | Maximum query-coordinate gap accepted when merging existing neighboring Blocks. `0` requires coordinate continuity. |
+| `--realign-missing` | flag; on | Realign bounded windows in which species participation differs between Blocks. |
+| `--realign-span` | integer; `3000`; `1..10000` bp | Maximum complete local span considered by missing-sequence and external-MSA realignment. |
+| `--zero-gap-span` | integer; `200`; `1..3000` bp | Maximum span for zero-reference-gap missing windows. It does not replace `--merge-gap`. |
+| `--repair-breaks` | flag; on | Repair high-confidence target, strand, or order discontinuities after missing-window cleanup. |
+| `--break-span` | integer; `1000`; `1..1000` bp | Maximum structural-discontinuity repair window. |
+| `--merge-short-blocks` | flag; on | Try to merge reference-order short Blocks using banded KSW2. The internal merge threshold is 500 bp; failed merges are not deleted because the deletion threshold is 0 bp. |
+
+The span parameters serve different candidate classes:
+
+- `--merge-gap` checks coordinate gaps between already participating query
+  Segments during ordinary Block merging.
+- `--zero-gap-span` limits missing-species windows whose reference interval is
+  empty or nearly empty.
+- `--realign-span` is the broader bound for missing-species local realignment.
+- `--break-span` applies only to structural-discontinuity repair.
+
+The CLI validates that `--merge-gap` belongs to Block merging,
+`--realign-span` and `--zero-gap-span` belong to missing-window realignment,
+and `--break-span` belongs to structural-break repair. Since the corresponding
+modules are enabled by default, the normal numeric-only overrides are valid.
+
+## Performance
+
+| Option | Type/default/range | Description |
+|---|---|---|
+| `-t`, `--threads` | integer; hardware concurrency; `1..INT_MAX` | Worker-thread count. It may also be supplied by `RAMAx_THREADS`. |
+| `--restart` | flag; off | Load the saved configuration and intermediate state from `--workdir`. |
+
+In restart mode, provide only `--restart -w <workdir>`. Input, output,
+algorithm, optimization, thread, root, and log-level settings are restored from
+`config.json` and are rejected as command-line overrides.
+
+## Output Control
+
+| Option | Type/default | Description |
+|---|---|---|
+| `--log-level` | `info`; `debug`, `info`, `warn`, or `error` | Select logging detail. |
+| `--verbose` | flag; off | Enable additional diagnostics. Mutually exclusive with `--quiet`. |
+| `--quiet` | flag; off | Emit errors only. Mutually exclusive with `--verbose`. |
