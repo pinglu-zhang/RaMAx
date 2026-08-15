@@ -1,4 +1,4 @@
-﻿// =============================================================
+// =============================================================
 //  File: ramesh.cpp   –  Low‑level primitives (v0.6‑alpha)
 //  ✧  Segment / Block / GenomeEnd implementation  ✧
 // =============================================================
@@ -7,6 +7,10 @@
 #include <shared_mutex>
 
 namespace RaMesh {
+    namespace {
+        std::atomic<uint64_t> g_next_block_id{1};
+    }
+
 
     /* =============================================================
      * 0.  Segment factories & utilities
@@ -449,7 +453,11 @@ namespace RaMesh {
 
             BlockPtr cur_block = cur_node->parent_block;
             ChrName  ref_chr_name = cur_block->ref_chr;
-            SegPtr   ref_cur_node = cur_block->anchors[{ ref_name, cur_block->ref_chr }];
+            const auto ref_anchor = cur_block->anchors.find({ref_name, cur_block->ref_chr});
+            if (ref_anchor == cur_block->anchors.end()) {
+                throw std::runtime_error("Reference occurrence is missing from the current block");
+            }
+            SegPtr ref_cur_node = ref_anchor->second;
 
             // 向左寻找“合适的”参考节点（与右扩扫右侧对称）
             SegPtr ref_left_node = ref_cur_node->primary_path.prev.load(std::memory_order_acquire);
@@ -501,31 +509,22 @@ namespace RaMesh {
                     // 如无 baseComplement，可用：reverseComplement(ref_seq); std::reverse(ref_seq.begin(), ref_seq.end());
                 }
 
-                // 与右扩统一：使用 KSW2 延伸
-                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, zdrop);
-
-                // 将 CIGAR 恢复到原坐标方向，再拼到左侧
-                std::reverse(result.begin(), result.end());
-
-                // 与右扩一致：此处质量判定留“true”或接入同一套检查
-                if (true /* checkGapCigarQuality(result, ref_len, query_len, 0.6) */) {
+                Cigar_t result =
+                    extendAlignKSW2(ref_seq, query_seq, zdrop);
+                if (alignmentCigarPreferredToUnaligned(
+                        ref_seq, query_seq, result)) {
+                    std::reverse(result.begin(), result.end());
                     AlignCount cnt = countAlignedBases(result);
 
-                    // 更新 query 段坐标（左扩：FORWARD 才需要移动 start）
                     if (strand == FORWARD) {
                         cur_node->start -= cnt.query_bases;
                     }
                     cur_node->length += cnt.query_bases;
 
-                    // 更新 ref 段坐标（左扩需要移动 ref_start）
                     ref_cur_node->start -= cnt.ref_bases;
                     ref_cur_node->length += cnt.ref_bases;
 
-                    // 拼到“左侧”
                     prependCigar(cur_node->cigar, result);
-                }
-                else {
-                    // std::cout << "Bad left extend cigar: " << ref_len << ", " << query_len << "\n";
                 }
 
                 // 如需去掉左端首个 I/D，可用下面这段（与右扩中注释块一致，默认不启用）
@@ -572,7 +571,11 @@ namespace RaMesh {
 
             BlockPtr cur_block = cur_node->parent_block;
             ChrName ref_chr_name = cur_block->ref_chr;
-            SegPtr ref_cur_node = cur_block->anchors[{ ref_name, cur_block->ref_chr }];
+            const auto ref_anchor = cur_block->anchors.find({ref_name, cur_block->ref_chr});
+            if (ref_anchor == cur_block->anchors.end()) {
+                throw std::runtime_error("Reference occurrence is missing from the current block");
+            }
+            SegPtr ref_cur_node = ref_anchor->second;
 
             bool find = false;
             SegPtr ref_right_node = ref_cur_node->primary_path.next.load(std::memory_order_acquire);
@@ -614,24 +617,17 @@ namespace RaMesh {
 					reverseComplement(query_seq);
                 }
 
-                Cigar_t result = extendAlignKSW2(ref_seq, query_seq, zdrop);
-                if (true) {
+                Cigar_t result =
+                    extendAlignKSW2(ref_seq, query_seq, zdrop);
+                if (alignmentCigarPreferredToUnaligned(
+                        ref_seq, query_seq, result)) {
                     AlignCount cnt = countAlignedBases(result);
                     if (strand == REVERSE) {
-                        //std::reverse(result.begin(), result.end());
                         cur_node->start -= cnt.query_bases;
                     }
-                    else {
-
-                    }
-
                     cur_node->length += cnt.query_bases;
-
                     ref_cur_node->length += cnt.ref_bases;
                     appendCigar(cur_node->cigar, result);
-                }
-                else {
-					std::cout << "Bad right extend cigar: " << ref_len << ", " << query_len << "\n";
                 }
                 //while (!result.empty()) {
                 //    char op; uint32_t len;
@@ -946,13 +942,17 @@ namespace RaMesh {
     BlockPtr Block::create(std::size_t hint)
     {
         auto bp = std::make_shared<Block>();
+        bp->block_id = g_next_block_id.fetch_add(1, std::memory_order_relaxed);
         bp->anchors.reserve(hint);
         return bp;
     }
 
-    BlockPtr Block::createEmpty(const ChrName& chr, std::size_t hint)
+    BlockPtr Block::createEmpty(const SpeciesName& species,
+                                const ChrName& chr,
+                                std::size_t hint)
     {
         auto bp = Block::create(hint);
+        bp->ref_species = species;
         bp->ref_chr = chr;
         return bp;
     }
@@ -978,8 +978,9 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
-            blk->anchors[{ ref_name, ref_chr }] = ref_seg;
-            blk->anchors[{ qry_name, qry_chr }] = qry_seg;
+            blk->ref_species = ref_name;
+            blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
+            blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
         }
         return { ref_seg, qry_seg };
     }
@@ -1004,8 +1005,9 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
-            blk->anchors[{ ref_name, ref_chr }] = ref_seg;
-            blk->anchors[{ qry_name, qry_chr }] = qry_seg;
+            blk->ref_species = ref_name;
+            blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
+            blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
         }
         return { ref_seg, qry_seg };
     }
@@ -1067,21 +1069,21 @@ namespace RaMesh {
         }
     }
     
-    bool Block::removeSegment(const SpeciesName& species, const ChrName& chr) {
+    size_t Block::removeSegments(const SpeciesName& species, const ChrName& chr) {
         std::unique_lock lk(rw);
-        
-        SpeciesChrPair key{species, chr};
-        auto it = anchors.find(key);
-        
-        if (it != anchors.end()) {
+
+        const SpeciesChrPair key{species, chr};
+        auto [first, last] = anchors.equal_range(key);
+        size_t removed = 0;
+        for (auto it = first; it != last; ++it) {
             if (it->second) {
                 Segment::unlinkSegment(it->second);
                 it->second->parent_block.reset();
             }
-            anchors.erase(it);
-            return true;
+            ++removed;
         }
-        return false;
+        anchors.erase(first, last);
+        return removed;
     }
 
 } // namespace RaMesh

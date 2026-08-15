@@ -731,6 +731,7 @@ Prepared prepareCandidate(
     if (!prepared.quality_ok) return prepared;
 
     prepared.replacement_block = Block::createEmpty(
+        prepared.candidate.reference_key.first,
         prepared.candidate.reference_key.second,
         prepared.candidate.paths.size() + 1);
     Cigar_t reference_cigar;
@@ -895,7 +896,8 @@ bool commitPrepared(RaMeshMultiGenomeGraph& graph, Prepared& prepared) {
     std::vector<Residual> residuals;
     residuals.reserve(old_set.size());
     for (const auto& [key, segment] : prepared.candidate.anomalous_segments) {
-        auto residual = Block::createEmpty(key.second, 1);
+        auto residual =
+            Block::createEmpty(key.first, key.second, 1);
         residual->anchors.emplace(key, segment);
         residuals.push_back({residual, key, segment, segment->parent_block,
                              segment->cigar, segment->strand});

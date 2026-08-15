@@ -645,7 +645,7 @@ starAlignment(
             species_fasta_manager_map,
             ACCURATE_SEARCH,
             fast_build,
-            false,
+            allow_mem,
             allow_short_mum,
             ref_global_cache,
             sampling_interval
@@ -836,6 +836,7 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     sdsl::int_vector<0>& ref_global_cache,
     SeqPro::Length sampling_interval)
 {
+    secondary_match_map.clear();
     /* ---------- 0. 合法性检查 ---------- */
     if (!species_fasta_manager_map.count(ref_name))
         throw std::runtime_error("[alignMultipleQuerys] reference species not found: " + ref_name);
@@ -907,13 +908,44 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
                 prefix,
                 *fm,
                 search_mode,
-                allow_MEM,
+                false,
                 allow_short_mum,
                 ref_global_cache,
                 sampling_interval,
                 true
             );
             (*result_map)[sp] = std::move(mv3);
+            if (allow_MEM) {
+                auto repeat_anchors =
+                    pra.findQueryFileAnchor(
+                        prefix,
+                        *fm,
+                        search_mode,
+                        true,
+                        allow_short_mum,
+                        ref_global_cache,
+                        sampling_interval,
+                        true,
+                        false);
+                auto full_sequence_repeat_anchors =
+                    pra.findQueryFileAnchor(
+                        prefix,
+                        *fm,
+                        search_mode,
+                        true,
+                        allow_short_mum,
+                        ref_global_cache,
+                        sampling_interval,
+                        true,
+                        true);
+                repeat_anchors->insert(
+                    repeat_anchors->end(),
+                    std::make_move_iterator(
+                        full_sequence_repeat_anchors->begin()),
+                    std::make_move_iterator(
+                        full_sequence_repeat_anchors->end()));
+                secondary_match_map[sp] = std::move(repeat_anchors);
+            }
             spdlog::info("[alignMultipleQuerys] {} aligned.", sp);
         }
         catch (const std::exception& e) {
@@ -930,6 +962,7 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
             next_progress = progress_stage + 1;
         }
     }
+
 
     return result_map;
 }
@@ -960,6 +993,7 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
     std::unordered_map<SpeciesName, MatchBySQR_SparsePtr> repeat_map;
 
     SpeciesClusterMap cluster_map;
+    secondary_cluster_map.clear();
 
     // 1) 收集 species 列表（不含 ref）
     std::vector<SpeciesName> species_list;
@@ -994,7 +1028,19 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
         auto& qfm = species_fm_map.at(species);
 
         groupMatchByQueryRefSparse(mv3_ptr, u_ptr, r_ptr, *rfm, *qfm);
+        if (const auto secondary_it =
+                secondary_match_map.find(species);
+            secondary_it != secondary_match_map.end()) {
+            auto secondary_unique =
+                std::make_shared<MatchBySQR_Sparse>();
+            MatchVec3DPtr secondary_matches =
+                secondary_it->second;
+            groupMatchByQueryRefSparse(
+                secondary_matches, secondary_unique, r_ptr,
+                *rfm, *qfm);
+        }
     }
+
 
     spdlog::info("Group Match By Query and Ref (Sparse) Done");
 
@@ -1003,6 +1049,7 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
         kv.second.reset();
     }
     species_match_map->clear();
+    secondary_match_map.clear();
 
     spdlog::info("Cluster All Chr Match (Sparse) Start...");
 
@@ -1012,8 +1059,16 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
         auto u_ptr = unique_map.at(species);
         auto r_ptr = repeat_map.at(species);
 
-        auto clusters = clusterAllChrMatchSparse(u_ptr, r_ptr, min_span, thread_num);
+        auto clusters = clusterAllChrMatchSparse(
+            u_ptr, r_ptr, min_span, thread_num, false);
         cluster_map.emplace(species, std::move(clusters));
+        if (allow_mem) {
+            auto empty = std::make_shared<MatchBySQR_Sparse>();
+            auto secondary_clusters = clusterAllChrMatchSparse(
+                r_ptr, empty, min_span, thread_num, false);
+            secondary_cluster_map.emplace(
+                species, std::move(secondary_clusters));
+        }
     }
 
     auto cluster_map_ptr = std::make_shared<SpeciesClusterMap>(std::move(cluster_map));
@@ -1090,6 +1145,30 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
     }
 
     spdlog::info("[constructMultipleGraphsByDP] Phase-A extend done.");
+    if (allow_mem) {
+        size_t secondary_anchor_count = 0;
+        for (const auto& species : species_list) {
+            const auto secondary_it =
+                secondary_cluster_map.find(species);
+            if (secondary_it == secondary_cluster_map.end() ||
+                !secondary_it->second) {
+                continue;
+            }
+            const auto secondary_anchors =
+                pra.extendClusterToAnchorByChr(
+                    species, *seqpro_managers[species],
+                    secondary_it->second, is_first);
+            for (const auto& group : *secondary_anchors) {
+                secondary_anchor_count += group.size();
+            }
+            pra.registerSecondaryAnchors(
+                species, *seqpro_managers[species],
+                secondary_anchors, graph, is_first);
+        }
+        spdlog::info(
+            "[secondary-mem] extended_anchors={}",
+            secondary_anchor_count);
+    }
 
     // ------------------------------------------------------------
     // 3) 对每个物种：DP 过滤 + 构图
@@ -1120,7 +1199,8 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             species,
             *seqpro_managers[species],
             anchor_ptr,
-            graph
+            graph,
+            is_first
         );
     }
 

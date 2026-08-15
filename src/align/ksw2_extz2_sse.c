@@ -1,6 +1,7 @@
 #include <string.h>
 #include <assert.h>
 #include "ksw2.h"
+#include <stdlib.h>
 
 #ifdef __SSE2__
 #include <emmintrin.h>
@@ -11,6 +12,41 @@
 
 #ifdef __SSE4_1__
 #include <smmintrin.h>
+#endif
+
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+#include <tmmintrin.h>
+#define KSW_HAVE_SSSE3_GENERIC_SCORING 1
+
+__attribute__((target("ssse3")))
+static void ksw_set_generic_scores_ssse3(
+	uint8_t *scores, const uint8_t *target, const uint8_t *query,
+	int start, int end, int8_t alphabet_size, const int8_t *matrix,
+	const __m128i lookup[5])
+{
+	int index = start;
+	for (; index + 15 <= end; index += 16) {
+		const __m128i query_symbols =
+			_mm_loadu_si128((const __m128i *)&query[index]);
+		const __m128i target_symbols =
+			_mm_loadu_si128((const __m128i *)&target[index]);
+		__m128i score = _mm_shuffle_epi8(lookup[0], query_symbols);
+		for (int target_symbol = 1; target_symbol < 5; ++target_symbol) {
+			const __m128i candidate =
+				_mm_shuffle_epi8(lookup[target_symbol], query_symbols);
+			const __m128i mask = _mm_cmpeq_epi8(
+				target_symbols, _mm_set1_epi8((char)target_symbol));
+			score = _mm_or_si128(
+				_mm_and_si128(mask, candidate),
+				_mm_andnot_si128(mask, score));
+		}
+		_mm_storeu_si128((__m128i *)&scores[index], score);
+	}
+	for (; index <= end; ++index)
+		scores[index] =
+			matrix[target[index] * alphabet_size + query[index]];
+}
 #endif
 
 #ifdef KSW_CPU_DISPATCH
@@ -52,6 +88,15 @@ void ksw_extz2_sse(void *km, int qlen, const uint8_t *query, int tlen, const uin
 	uint8_t *qr, *sf, *mem, *mem2 = 0;
 	__m128i q_, qe2_, zero_, flag1_, flag2_, flag8_, flag16_, sc_mch_, sc_mis_, sc_N_, m1_, max_sc_;
 	__m128i *u, *v, *x, *y, *s, *p = 0;
+#ifdef KSW_HAVE_SSSE3_GENERIC_SCORING
+	int request_ssse3_generic_scoring = 1;
+	int use_ssse3_generic_scoring = 0;
+#ifdef RAMAX_KSW_TEST_HOOKS
+	request_ssse3_generic_scoring =
+		getenv("RAMAX_KSW_FORCE_SCALAR") == 0;
+#endif
+	__m128i generic_score_lookup[5];
+#endif
 
 	ksw_reset_extz(ez);
 	if (m <= 0 || qlen <= 0 || tlen <= 0) return;
@@ -80,6 +125,21 @@ void ksw_extz2_sse(void *km, int qlen, const uint8_t *query, int tlen, const uin
 		min_sc = min_sc < mat[t]? min_sc : mat[t];
 	}
 	if (-min_sc > 2 * (q + e)) return; // otherwise, we won't see any mismatches
+#ifdef KSW_HAVE_SSSE3_GENERIC_SCORING
+	if ((flag & KSW_EZ_GENERIC_SC) && m == 5 &&
+		request_ssse3_generic_scoring &&
+		__builtin_cpu_supports("ssse3")) {
+		int8_t lookup_bytes[5][16] = {{0}};
+		for (int target_symbol = 0; target_symbol < 5; ++target_symbol) {
+			for (int query_symbol = 0; query_symbol < 5; ++query_symbol)
+				lookup_bytes[target_symbol][query_symbol] =
+					mat[target_symbol * 5 + query_symbol];
+			generic_score_lookup[target_symbol] = _mm_loadu_si128(
+				(const __m128i *)lookup_bytes[target_symbol]);
+		}
+		use_ssse3_generic_scoring = 1;
+	}
+#endif
 
 	mem = (uint8_t*)kcalloc(km, tlen_ * 6 + qlen_ + 1, 16);
 	u = (__m128i*)(((size_t)mem + 15) >> 4 << 4); // 16-byte aligned
@@ -139,8 +199,17 @@ void ksw_extz2_sse(void *km, int qlen, const uint8_t *query, int tlen, const uin
 				_mm_storeu_si128((__m128i*)((uint8_t*)s + t), tmp);
 			}
 		} else {
-			for (t = st0; t <= en0; ++t)
-				((uint8_t*)s)[t] = mat[sf[t] * m + qrr[t]];
+#ifdef KSW_HAVE_SSSE3_GENERIC_SCORING
+			if (use_ssse3_generic_scoring) {
+				ksw_set_generic_scores_ssse3(
+					(uint8_t *)s, sf, qrr, st0, en0, m, mat,
+					generic_score_lookup);
+			} else
+#endif
+			{
+				for (t = st0; t <= en0; ++t)
+					((uint8_t*)s)[t] = mat[sf[t] * m + qrr[t]];
+			}
 		}
 		// core loop
 		x1_ = _mm_cvtsi32_si128(x1);
