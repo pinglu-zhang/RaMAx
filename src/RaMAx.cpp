@@ -1,18 +1,23 @@
-﻿// RaMAx.cpp: 定义应用程序的入口点。
+// RaMAx.cpp: 定义应用程序的入口点。
 // 主程序：负责解析命令行参数，初始化配置，执行多基因组比对流程
 
 #include "SeqPro.h"
 #include "data_process.h"
 #include "config.hpp"
 #include "index.h"
+#include "minipoa_locator.h"
+#include "ramax_version.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
+#include "external_msa_runner.h"
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
 // 用于控制基因组比对 / 搜索 / 组装相关流程的全局参数
 // ------------------------------------------------------------------
 struct CommonArgs {
+
+    uint32_t schema_version = 1;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -68,7 +73,16 @@ struct CommonArgs {
 
     std::string root_name = "";                  // HAL 文件中的根基因组名称
     std::string ref_name = "";                   // 参考基因组名称
+    bool merge_exact_contiguous_blocks = true;   // 每轮合并连续 Block
+    uint_t merge_query_gap_max = 100;            // query 正间隔上限；0=仅严格连续
     bool one_round = false;                     // 是否只执行一轮处理流程
+
+    bool realign_single_missing_species = true;
+    uint_t species_mismatch_realign_max_span = 3000;
+    uint_t species_mismatch_zero_gap_max_span = 200;
+    bool repair_structural_breaks = true;
+    uint_t structural_break_max_span = 1000;
+    bool repair_short_blocks = true;
 
     // ========================
     // cereal 序列化支持
@@ -77,6 +91,7 @@ struct CommonArgs {
     template<class Archive>
     void serialize(Archive& ar) {
         ar(
+            CEREAL_NVP(schema_version),
             CEREAL_NVP(input_path),
             CEREAL_NVP(output_path),
             CEREAL_NVP(work_dir_path),
@@ -96,10 +111,33 @@ struct CommonArgs {
             CEREAL_NVP(quiet),
             CEREAL_NVP(root_name),
             CEREAL_NVP(ref_name),
-            CEREAL_NVP(one_round)
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks)
         );
     }
 };
+
+namespace {
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
+
+std::string requiredMinipoaExecutable() {
+    const auto executable =
+        RaMesh::Alignment::locateMinipoaExecutable();
+    if (executable.empty()) {
+        throw std::runtime_error(
+            "minipoa is required but was not found next to ramax or in PATH");
+    }
+    return executable.string();
+}
+
+}  // namespace
 
 
 // ------------------------------------------------------------------
@@ -136,6 +174,26 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Repeat masking        : {}", args.enable_repeat_masking ? "Enabled" : "Disabled");
     spdlog::info("  Tree root             ：{}", args.root_name);
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
+    spdlog::info("  Exact Block merge     : {}",
+        args.merge_exact_contiguous_blocks ? "Enabled" : "Disabled");
+    spdlog::info("  Query-gap merge max   : {}",
+        args.merge_query_gap_max);
+    spdlog::info("  Missing-species POA   : {}",
+        args.realign_single_missing_species ? "Enabled" : "Disabled");
+    if (args.realign_single_missing_species) {
+        spdlog::info("  Missing-species span  : {}",
+            args.species_mismatch_realign_max_span);
+        spdlog::info("  Zero-gap merge span   : {}",
+            args.species_mismatch_zero_gap_max_span);
+    }
+    spdlog::info("  Structural-break repair: {}",
+        args.repair_structural_breaks ? "Enabled" : "Disabled");
+    if (args.repair_structural_breaks) {
+        spdlog::info("  Structural-break span: {}",
+                     args.structural_break_max_span);
+    }
+    spdlog::info("  Short-Block repair     : {}",
+        args.repair_short_blocks ? "Enabled" : "Disabled");
     spdlog::info("  Single round alignment: {}", args.one_round ? "Enabled" : "Disabled");
     spdlog::info("");
 
@@ -173,7 +231,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 版本信息参数（-v / --version）
     cmd->set_version_flag("-v,--version",
-        std::string("RaMAx version ") + VERSION);
+        std::string("RaMAx version ") + RAMAX_VERSION);
 
     // ========================
     // 输入 / 输出路径参数
@@ -181,7 +239,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 输入序列文件路径
     auto* input_opt = cmd->add_option("-i,--input", args.input_path,
-        "Path to a Cactus-compatible seqfile.")
+        "Seqfile path; a Newick tree is required only for HAL output.")
         ->group("Input Files")                      // 帮助信息分组
         ->type_name("<path>")                       // 参数类型显示名称
         ->transform(trim_whitespace);               // 去除首尾空白字符
@@ -217,7 +275,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // HAL 文件中的根基因组名称
     auto* root_opt = cmd->add_option("--root", args.root_name,
-        "Root genome name used in HAL (default: 'root')")
+        "HAL root genome name; valid only for HAL output.")
         ->group("Output")
         ->type_name("<string>")
         ->transform(trim_whitespace);
@@ -292,6 +350,75 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* one_round_flag = cmd->add_flag("--one-round", args.one_round,
         "Only run one round for alignment.")
         ->group("Software Parameters");
+
+    auto* optimize_blocks_flag = cmd->add_flag(
+        "--optimize-blocks",
+        "Explicitly enable the default Block optimizations (enabled by default).")
+        ->group("Graph Optimization");
+
+    auto* merge_exact_blocks_flag = cmd->add_flag(
+        "--merge-blocks",
+        args.merge_exact_contiguous_blocks,
+        "Merge compatible neighboring Blocks.")
+        ->group("Graph Optimization");
+
+    auto* merge_query_gap_opt = cmd->add_option(
+        "--merge-gap",
+        args.merge_query_gap_max,
+        "Maximum query gap allowed when merging Blocks (bp).")
+        ->default_val(100)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->type_name("<bp>")
+        ->check(CLI::Range(0, 10000));
+
+    auto* realign_missing_species_flag = cmd->add_flag(
+        "--realign-missing",
+        args.realign_single_missing_species,
+        "Realign bounded windows with missing sequences.")
+        ->group("Graph Optimization");
+
+    auto* realign_missing_species_span_opt = cmd->add_option(
+        "--realign-span",
+        args.species_mismatch_realign_max_span,
+        "Maximum span for missing-sequence realignment (bp).")
+        ->default_val(3000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->type_name("<bp>")
+        ->check(CLI::Range(1, 10000));
+
+    auto* zero_gap_merge_span_opt = cmd->add_option(
+        "--zero-gap-span",
+        args.species_mismatch_zero_gap_max_span,
+        "Maximum span for zero-gap missing windows (bp).")
+        ->default_val(200)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->type_name("<bp>")
+        ->check(CLI::Range(1, 3000));
+
+    auto* structural_break_repair_flag = cmd->add_flag(
+        "--repair-breaks",
+        args.repair_structural_breaks,
+        "Repair high-confidence structural discontinuities.")
+        ->group("Graph Optimization");
+
+    auto* structural_break_span_opt = cmd->add_option(
+        "--break-span",
+        args.structural_break_max_span,
+        "Maximum structural-break repair span (bp).")
+        ->default_val(1000)
+        ->capture_default_str()
+        ->group("Graph Optimization")
+        ->type_name("<bp>")
+        ->check(CLI::Range(1, 1000));
+
+    auto* short_block_repair_flag = cmd->add_flag(
+        "--merge-short-blocks",
+        args.repair_short_blocks,
+        "Try to merge short Blocks with banded KSW2.")
+        ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式
     auto* slow_build_flag = cmd->add_flag("--slow-build",
@@ -401,6 +528,15 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         min_span_opt,
         root_opt,
         ref_opt,
+        optimize_blocks_flag,
+        merge_exact_blocks_flag,
+        merge_query_gap_opt,
+        realign_missing_species_flag,
+        realign_missing_species_span_opt,
+        zero_gap_merge_span_opt,
+        structural_break_repair_flag,
+        structural_break_span_opt,
+        short_block_repair_flag,
         one_round_flag,
         log_level_opt
     );
@@ -419,6 +555,36 @@ static inline void applySlowBuildFlag(const CLI::App& app, CommonArgs& common_ar
     // 若用户指定 --slow-build，则关闭 fast_build
     if (app.count("--slow-build")) {
         common_args.fast_build = false;
+    }
+}
+
+static inline void applyGraphOptimizationOptions(
+    const CLI::App& app, CommonArgs& args) {
+    if (app.count("--optimize-blocks") != 0) {
+        args.merge_exact_contiguous_blocks = true;
+        args.realign_single_missing_species = true;
+        args.repair_structural_breaks = true;
+        args.repair_short_blocks = true;
+    }
+
+    const bool merge_enabled = args.merge_exact_contiguous_blocks;
+    const bool realign_enabled = args.realign_single_missing_species;
+    const bool break_enabled = args.repair_structural_breaks;
+    if (realign_enabled && !merge_enabled) {
+        throw CLI::ValidationError(
+            "--realign-missing requires --merge-blocks");
+    }
+    if (app.count("--merge-gap") != 0 && !merge_enabled) {
+        throw CLI::ValidationError("--merge-gap requires --merge-blocks");
+    }
+    if ((app.count("--realign-span") != 0 ||
+         app.count("--zero-gap-span") != 0) &&
+        !realign_enabled) {
+        throw CLI::ValidationError(
+            "--realign-span and --zero-gap-span require --realign-missing");
+    }
+    if (app.count("--break-span") != 0 && !break_enabled) {
+        throw CLI::ValidationError("--break-span requires --repair-breaks");
     }
 }
 
@@ -491,7 +657,8 @@ static int runRestartMode(CommonArgs& common_args) {
 
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
-    spdlog::info("RaMAx version {}", VERSION);
+    configureLogLevel(common_args);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Restart mode enabled.");
 
@@ -503,11 +670,26 @@ static int runRestartMode(CommonArgs& common_args) {
         return 1;
     }
 
-    // 从 JSON 反序列化参数
-    cereal::JSONInputArchive archive(is);
-    archive(common_args);
+    try {
+        cereal::JSONInputArchive archive(is);
+        archive(cereal::make_nvp("common_args", common_args));
+    } catch (const std::exception& error) {
+        spdlog::error(
+            "Restart configuration is incompatible with RaMAx {}: {}",
+            RAMAX_VERSION, error.what());
+        return 1;
+    }
+    if (common_args.schema_version != CONFIG_SCHEMA_VERSION) {
+        spdlog::error(
+            "Unsupported restart schema version {} (expected {}). Old work "
+            "directories are not compatible with RaMAx {}.",
+            common_args.schema_version, CONFIG_SCHEMA_VERSION,
+            RAMAX_VERSION);
+        return 1;
+    }
+    common_args.restart = true;
+    configureLogLevel(common_args);
     spdlog::info("CommonArgs loaded from {}", config_path.string());
-
     return 0;
 }
 
@@ -545,7 +727,8 @@ static int runNormalMode(CommonArgs& common_args) {
 
     // 初始化日志器（输出到文件）
     setupLoggerWithFile(common_args.work_dir_path);
-    spdlog::info("RaMAx version {}", VERSION);
+    configureLogLevel(common_args);
+    spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
@@ -560,7 +743,7 @@ static int runNormalMode(CommonArgs& common_args) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
 
-    // 保存参数配置文件（用于 --restart）
+    common_args.schema_version = CONFIG_SCHEMA_VERSION;
     FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
     std::ofstream os(config_path);
     if (!os) {
@@ -606,9 +789,20 @@ static int inputValidationPhase(
     NewickParser& newick_tree,
     SpeciesPathMap& species_path_map
 ) {
-    // 解析 seqfile：构建 Newick 树与物种-路径映射
+    if (common_args.output_format != MultipleGenomeOutputFormat::HAL &&
+        !common_args.root_name.empty()) {
+        throw std::runtime_error("--root is only supported for HAL output");
+    }
+
+    // HAL requires a species tree. Other output formats may use mappings only.
     std::string root = common_args.root_name;
-    parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
+    const bool has_tree =
+        parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
+    if (common_args.output_format == MultipleGenomeOutputFormat::HAL &&
+        !has_tree) {
+        throw std::runtime_error(
+            "HAL output requires a Newick tree as the first seqfile record");
+    }
 
     // 逐个校验输入基因组路径是否合法（URL 可达 / 本地文件存在）
     for (const auto& [species, path] : species_path_map) {
@@ -637,6 +831,7 @@ static int preprocessingPhase(
     CommonArgs& common_args,
     SpeciesPathMap& species_path_map,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    SoftMask::PathMap& softmask_path_map,
     SeqPro::Length& reference_min_seq_length
 ) {
     // 拷贝或下载原始文件（并行执行）
@@ -648,8 +843,14 @@ static int preprocessingPhase(
     // 参考序列最短长度（用于后续 sampling_interval 截断）
     reference_min_seq_length = std::numeric_limits<SeqPro::Length>::max();
 
-    // 清洗 FASTA 文件（统一格式，替换非法字符）
-    cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+    // HAL uses the same all-uppercase alignment input as before and stores
+    // original lowercase runs in an export-only sidecar. MAF is unchanged.
+    if (common_args.output_format == MultipleGenomeOutputFormat::HAL) {
+        cleanRawDatasetWithSoftMaskIndex(common_args.work_dir_path, species_path_map,
+                                         softmask_path_map, common_args.thread_num);
+    } else {
+        cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+    }
 
     if (common_args.enable_repeat_masking) {
         spdlog::warn("Repeat masking is currently disabled; continuing without repeat masking.");
@@ -761,16 +962,19 @@ static void clearAllMaskedRegions(
 static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
     const CommonArgs& common_args,
     SpeciesPathMap& species_path_map,
-    NewickParser& newick_tree,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     SeqPro::Length reference_min_seq_length,
     double& align_seconds_out
 ) {
+    const std::string minipoa_executable = requiredMinipoaExecutable();
+    RaMesh::Alignment::ExternalMsaRunner::instance()
+        .configureScratchDirectory(
+            common_args.work_dir_path / "minipoa_tmp");
+
     // 初始化比对器
     MultipleRareAligner mra(
         common_args.work_dir_path,
         species_path_map,
-        newick_tree,
         common_args.thread_num,
         common_args.chunk_size,
         common_args.overlap_size,
@@ -778,7 +982,31 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.max_anchor_frequency
     );
 
+    mra.merge_exact_contiguous_blocks_enabled =
+        common_args.merge_exact_contiguous_blocks;
+    mra.merge_query_gap_max = common_args.merge_query_gap_max;
+
     // 计时：star alignment 总耗时
+    mra.realign_single_missing_species_enabled =
+        common_args.realign_single_missing_species;
+    mra.species_mismatch_realign_max_span =
+        common_args.species_mismatch_realign_max_span;
+    mra.species_mismatch_zero_gap_max_span =
+        common_args.species_mismatch_zero_gap_max_span;
+    mra.species_mismatch_msa_executable = minipoa_executable;
+    mra.structural_break_repair_options.enabled =
+        common_args.repair_structural_breaks;
+    mra.structural_break_repair_options.maximum_span =
+        common_args.structural_break_max_span;
+    mra.structural_break_repair_options.parallel_threads =
+        common_args.thread_num;
+    mra.structural_break_repair_options.msa_executable = minipoa_executable;
+    mra.short_block_repair_options.enabled =
+        common_args.repair_short_blocks;
+    mra.short_block_repair_options.maximum_query_gap =
+        common_args.merge_query_gap_max;
+    mra.short_block_repair_options.parallel_threads =
+        common_args.thread_num;
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）
@@ -812,16 +1040,23 @@ static void exportResults(
     const CommonArgs& common_args,
     const NewickParser& newick_tree,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    const SoftMask::PathMap& softmask_path_map,
     RaMesh::RaMeshMultiGenomeGraph* graph
 ) {
     // 清理遮蔽区间（导出前）
     clearAllMaskedRegions(seqpro_managers);
 
+    // Both direct MAF export and HAL construction reconstruct multiway
+    // columns through mergeAlignmentByRef().  Configure the shared repair
+    // once so the two output paths make the same local insertion decisions.
+    configureCrossAnchorInsertionRepair(
+        requiredMinipoaExecutable(),
+        common_args.species_mismatch_realign_max_span);
+
     // 根据输出格式选择导出方法
     switch (common_args.output_format) {
     case MultipleGenomeOutputFormat::MAF:
         spdlog::info("Exporting to MAF format...");
-        // TODO：双基因组比对模式后续要改为 false；当前保留原代码逻辑（true/false 组合）
         graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
         break;
 
@@ -833,13 +1068,16 @@ static void exportResults(
             seqpro_managers,
             newick_tree,
             true,
-            common_args.root_name
+            common_args.root_name,
+            softmask_path_map
         );
         break;
 
     default:
         throw std::runtime_error("Unsupported output format for multiple genome alignment");
     }
+    logCrossAnchorInsertionRepairStats();
+    RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
 }
 
 // ------------------------------
@@ -877,9 +1115,11 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // 数据预处理阶段
         // ------------------------------
         std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers;
+        SoftMask::PathMap softmask_path_map;
         SeqPro::Length reference_min_seq_length = std::numeric_limits<SeqPro::Length>::max();
 
-        if (preprocessingPhase(common_args, species_path_map, seqpro_managers, reference_min_seq_length) != 0) {
+        if (preprocessingPhase(common_args, species_path_map, seqpro_managers,
+                               softmask_path_map, reference_min_seq_length) != 0) {
             return 1;
         }
 
@@ -893,7 +1133,7 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // ------------------------------
         double align_seconds = 0.0;
         std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> graph =
-            runStarAlignment(common_args, species_path_map, newick_tree,
+            runStarAlignment(common_args, species_path_map,
                              seqpro_managers, reference_min_seq_length, align_seconds);
 
         spdlog::info("");
@@ -905,7 +1145,8 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // ------------------------------
         // 导出阶段
         // ------------------------------
-        exportResults(common_args, newick_tree, seqpro_managers, graph.get());
+        exportResults(common_args, newick_tree, seqpro_managers,
+                      softmask_path_map, graph.get());
 
         // ------------------------------
         // 清理工作目录
@@ -954,8 +1195,13 @@ int main(int argc, char** argv) {
     // 开始解析命令行参数
     CLI11_PARSE(app, argc, argv);
 
-    // 设置日志级别（quiet / verbose / log_level）
+    // Apply output policy before emitting deprecation warnings.
     configureLogLevel(common_args);
+    try {
+        applyGraphOptimizationOptions(app, common_args);
+    } catch (const CLI::Error& error) {
+        return app.exit(error);
+    }
 
     // 运行前准备：根据 restart 与否进行目录/参数/配置文件处理
     if (prepareRun(common_args) != 0) {

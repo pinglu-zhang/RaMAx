@@ -8,6 +8,8 @@
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
+#include "structural_break_repair.h"
+#include "short_block_repair.h"
 
 // 多基因组比对核心调度类
 class MultipleRareAligner {
@@ -16,7 +18,6 @@ public:
     FilePath index_dir;
 
     SpeciesPathMap species_path_map;
-    NewickParser newick_tree;
 
     uint_t chunk_size;
     uint_t overlap_size;
@@ -31,11 +32,19 @@ public:
     bool mask_export_done = false;
     FilePath mask_export_dir;
 
+    bool merge_exact_contiguous_blocks_enabled = true;
+    uint_t merge_query_gap_max = 100;
+    bool realign_single_missing_species_enabled = true;
+    uint_t species_mismatch_realign_max_span = 3000;
+    uint_t species_mismatch_zero_gap_max_span = 200;
+    std::string species_mismatch_msa_executable;
+    RaMesh::StructuralBreakRepair::Options structural_break_repair_options;
+    RaMesh::ShortBlockRepair::Options short_block_repair_options;
+
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(
         const FilePath& work_dir,
         SpeciesPathMap& species_path_map,
-        NewickParser& newick_tree,
         uint_t thread_num,
         uint_t chunk_size,
         uint_t overlap_size,
@@ -134,6 +143,3 @@ public:
 
 
 #endif
-
-
-

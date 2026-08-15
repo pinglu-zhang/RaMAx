@@ -1,6 +1,6 @@
-﻿cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 
-project("RaMAx")
+project(RaMAx VERSION 1.0.5 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -13,12 +13,17 @@ if(POLICY CMP0141)
     "$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
 endif()
 
-# 设置 C++23 标准
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ================= 路径设置 =================
+include(GNUInstallDirs)
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/ramax_version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/ramax_version.h"
+    @ONLY)
+
 set(SOURCE_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(INCLUDE_DIR        "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(THIRD_PARTY_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
@@ -43,7 +48,6 @@ else()
     set(RAMAX_HAL_MAKE_JOBS "-j")
 endif()
 
-# ================= 外部库依赖 =================
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(OpenMP REQUIRED)
@@ -56,7 +60,6 @@ foreach(dir IN LISTS HDF5_CXX_INCLUDE_DIRS)
     set(RAMAX_HAL_HDF5_INCLUDE_FLAGS "${RAMAX_HAL_HDF5_INCLUDE_FLAGS} -I${dir}")
 endforeach()
 
-# ================= HAL library =================
 add_custom_command(
     OUTPUT ${SONLIB_DIR}/lib/sonLib.h ${SONLIB_DIR}/lib/sonLib.a
     COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS} libs
@@ -90,7 +93,6 @@ add_custom_target(hal_library
 )
 
 add_dependencies(hal_library sonLib_build)
-# 如果没有显式设置构建类型，默认使用 Release
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -99,21 +101,35 @@ endif()
 # packages disable this in recipe/build.sh so the binary remains portable.
 option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 
-# 去掉符号表（减小二进制体积）
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-s")
+set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
+    "Existing minipoa executable; empty searches PATH")
 
+if(RAMAX_MINIPOA_EXECUTABLE)
+    if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
+        message(FATAL_ERROR
+            "RAMAX_MINIPOA_EXECUTABLE does not exist: "
+            "${RAMAX_MINIPOA_EXECUTABLE}")
+    endif()
+    get_filename_component(RAMAX_RESOLVED_MINIPOA
+        "${RAMAX_MINIPOA_EXECUTABLE}" REALPATH)
+    message(STATUS "Using configured minipoa: ${RAMAX_RESOLVED_MINIPOA}")
+else()
+    find_program(RAMAX_SYSTEM_MINIPOA NAMES minipoa)
+    if(RAMAX_SYSTEM_MINIPOA)
+        set(RAMAX_RESOLVED_MINIPOA "${RAMAX_SYSTEM_MINIPOA}")
+        message(STATUS "Using minipoa from PATH: ${RAMAX_RESOLVED_MINIPOA}")
+    else()
+        set(RAMAX_RESOLVED_MINIPOA "")
+        message(STATUS
+            "minipoa was not found during configuration; install it in PATH "
+            "or set RAMAX_MINIPOA_EXECUTABLE before using MSA-based options")
+    endif()
+endif()
 
-# ================= bundled dependencies =================
-# add_subdirectory("${THIRD_PARTY_DIR}/CLI11")
-# add_subdirectory("${THIRD_PARTY_DIR}/sdsl-lite")
-#set(WFA_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-#set(WFA_BUILD_STATIC ON CACHE BOOL "" FORCE)
-# add_subdirectory("${THIRD_PARTY_DIR}/WFA2-lib")
-# 已经 add_subdirectory(...) 产生了目标 "divsufsort"
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build bundled libraries statically" FORCE)
 set(BUILD_DIVSUFSORT64 ON CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort")
+add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort" EXCLUDE_FROM_ALL)
 
 # ================= 公共源文件 =================
 set(RAMA_COMMON_SOURCES
@@ -121,6 +137,7 @@ set(RAMA_COMMON_SOURCES
     "${PREPROCESS_DIR}/newick_tree.cpp"
     "${PREPROCESS_DIR}/sequence_utils.cpp"
     "${PREPROCESS_DIR}/SeqPro.cpp"
+    "${PREPROCESS_DIR}/softmask_index.cpp"
     "${INDEX_DIR}/fm_index.cpp"
     "${INDEX_DIR}/bigBWT_build.cpp"
     "${INDEX_DIR}/bigBWT/newscan.cpp"
@@ -133,32 +150,37 @@ set(RAMA_COMMON_SOURCES
     "${ANCHOR_DIR}/cluster.cpp"
     "${ANCHOR_DIR}/xxhash.c"
     "${ALIGN_DIR}/align.cpp"
+    "${ALIGN_DIR}/cross_anchor_repair.cpp"
+    "${ALIGN_DIR}/external_msa_runner.cpp"
+    "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"
     "${ALIGN_DIR}/pair_rare_aligner.cpp"
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
+    "${ALIGN_DIR}/minipoa_locator.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
+    "${GRAPH_DIR}/direct_block_merger.cpp"
+    "${GRAPH_DIR}/realignment_internal.cpp"
+    "${GRAPH_DIR}/structural_break_repair.cpp"
+    "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
 )
 
-# ================= 主程序入口文件 =================
-#set(MAIN_G "${SOURCE_DIR}/RaMA-G.cpp")
 set(MAIN_X "${SOURCE_DIR}/RaMAx.cpp")
 
 # ================= 公共头文件路径 =================
 set(RAMA_INCLUDE_DIRS
     "${INCLUDE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
+
+set(RAMA_SYSTEM_INCLUDE_DIRS
     "${THIRD_PARTY_DIR}/spdlog/include"
-    # "${THIRD_PARTY_DIR}/CLI11/include"
-#   "${THIRD_PARTY_DIR}/cereal/include"
     "${BIGBWT_INCLUDE_DIR}"
     "${SUFFIX_ARRAY_INCLUDE_DIR}"
-    # "${THIRD_PARTY_DIR}/sdsl-lite/include"
-    # "${THIRD_PARTY_DIR}/sdsl-lite/external/libdivsufsort/include"
     "${CMAKE_BINARY_DIR}/third_party/libdivsufsort/include"
-    # "${THIRD_PARTY_DIR}/WFA2-lib"
     "${THIRD_PARTY_DIR}/parlaylib/include"
     "${HAL_DIR}/api/inc"
     "${SONLIB_DIR}/C/inc"
@@ -168,6 +190,7 @@ set(RAMA_INCLUDE_DIRS
 # ================= 编译配置函数 =================
 function(configure_rama_target target)
     target_include_directories(${target} PRIVATE ${RAMA_INCLUDE_DIRS})
+    target_include_directories(${target} SYSTEM PRIVATE ${RAMA_SYSTEM_INCLUDE_DIRS})
 
     target_link_libraries(${target} PRIVATE
         # CLI11::CLI11
@@ -185,38 +208,54 @@ function(configure_rama_target target)
         ${HDF5_CXX_LIBRARIES}
     )
 
-    # 确保在构建目标前先构建libdivsufsort（生成头文件）
     add_dependencies(${target} divsufsort divsufsort64)
 
-    target_compile_definitions(${target} PRIVATE M64 SPDLOG_HEADER_ONLY)
+    target_compile_definitions(${target} PRIVATE M64)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_definitions(${target} PRIVATE _DEBUG_)
     endif()
 
-    target_compile_options(${target} PRIVATE -Wall -g)
+    target_compile_options(${target} PRIVATE
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+        # kseq and bigBWT are embedded upstream headers included by legacy code.
+        -Wno-unused-function
+        -Wno-sign-compare
+        # GCC 13 emits a false positive for Match vector copy elision.
+        -Wno-array-bounds
+        -Wno-stringop-overflow
+        -Wno-deprecated-declarations
+        -Wno-builtin-macro-redefined)
     if(RAMAX_NATIVE_ARCH)
         target_compile_options(${target} PRIVATE -march=native)
     endif()
 
 endfunction()
 
-# add_compile_definitions(KSW_CPU_DISPATCH)
-add_compile_options(-w)
+# Vendored algorithm implementations retain their upstream warning policy.
+set_source_files_properties(
+    "${INDEX_DIR}/bigBWT_build.cpp"
+    "${INDEX_DIR}/bigBWT/newscan.cpp"
+    "${INDEX_DIR}/bigBWT/utils.c"
+    "${INDEX_DIR}/bigBWT/xerrors.c"
+    "${SUFFIX_ARRAY_DIR}/gsa/gsacak.c"
+    "${SUFFIX_ARRAY_DIR}/CaPS-SA/Suffix_Array.cpp"
+    "${ANCHOR_DIR}/xxhash.c"
+    "${ALIGN_DIR}/ksw2_extz2_sse.c"
+    PROPERTIES COMPILE_OPTIONS "-w")
 
-# ================= 创建两个可执行文件 =================
-# add_executable(RaMA-G ${MAIN_G} ${RAMA_COMMON_SOURCES})
-# clonfigure_rama_target(RaMA-G)
+# ================= shared RaMAx core =================
+add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
+configure_rama_target(ramax_core)
+add_dependencies(ramax_core hal_library)
+target_compile_definitions(ramax_core PRIVATE
+    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}")
 
-add_executable(ramax ${MAIN_X} ${RAMA_COMMON_SOURCES})
+add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
+target_link_libraries(ramax PRIVATE ramax_core)
 
-# 如需确保先有 HAL 工具，再编你的程序：
-#add_dependencies(RaMA-G hal_tools)
 add_dependencies(ramax  hal_library)
 
-# ================= 安装规则（可选） =================
-# install(TARGETS RaMAG RaMAx DESTINATION bin)
-
-# ================= 安装规则 =================
-# 安装主程序
-install(TARGETS ramax DESTINATION bin)
+install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")

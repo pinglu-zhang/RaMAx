@@ -282,6 +282,66 @@ bool cleanRawDataset(const FilePath workdir_path,
 }
 
 // -----------------------------
+// HAL-only cleaning: alignment input remains uppercase, while original
+// lowercase runs are stored in a compact sidecar that is not opened until
+// HAL export.
+// -----------------------------
+bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
+    SpeciesPathMap& species_path_map,
+    SoftMask::PathMap& softmask_path_map,
+    int thread_num) {
+    try {
+        const FilePath clean_data_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
+        std::filesystem::create_directories(clean_data_dir);
+        spdlog::info("HAL soft-mask preprocessing directory: {}", clean_data_dir.string());
+
+        struct CleanResult {
+            SpeciesName species;
+            FilePath fasta;
+            FilePath index;
+        };
+
+        ThreadPool pool(std::max(1, thread_num));
+        std::vector<std::future<CleanResult>> futures;
+        futures.reserve(species_path_map.size());
+
+        for (const auto& [species, raw_path] : species_path_map) {
+            futures.emplace_back(pool.enqueue([species, raw_path, clean_data_dir]() -> CleanResult {
+                const FilePath out_fasta = clean_data_dir / (species + ".align-v2.fasta");
+                const FilePath out_index = clean_data_dir / (species + ".softmask-v1.bin");
+                const FilePath marker = clean_data_dir / (species + ".softmask-v1.complete.json");
+
+                SoftMask::ensureUppercaseFastaAndIndex(raw_path, out_fasta, out_index, marker);
+                return {species, out_fasta, out_index};
+            }));
+        }
+
+        // Publish maps only after each task has completed successfully. This
+        // avoids concurrent writes to unordered_map/map and propagates worker
+        // exceptions instead of silently swallowing them.
+        for (auto& future : futures) {
+            CleanResult result = future.get();
+            species_path_map[result.species] = result.fasta;
+            softmask_path_map[result.species] = result.index;
+            spdlog::info("Species {} alignment FASTA: {}; HAL soft-mask index: {}",
+                result.species, result.fasta.string(), result.index.string());
+        }
+        pool.waitAllTasksDone();
+
+        if (softmask_path_map.size() != species_path_map.size()) {
+            throw std::runtime_error("Not every species received a HAL soft-mask index");
+        }
+        spdlog::info("All uppercase alignment FASTAs and HAL soft-mask indexes are ready.");
+        return true;
+    }
+    catch (const std::exception& error) {
+        spdlog::error("Error during HAL soft-mask preprocessing: {}", error.what());
+        throw std::runtime_error("Failed to prepare uppercase FASTA and HAL soft-mask index: " +
+            std::string(error.what()));
+    }
+}
+
+// -----------------------------
 // 运行 WindowMasker 对 FASTA 文件进行处理
 // -----------------------------
 std::map<SpeciesName, FilePath>
@@ -566,7 +626,7 @@ FilePath getFaiIndexPath(const FilePath& fasta_path) {
 }
 
 // -----------------------------
-// parseSeqfile：解析 seqfile，同时使用 NewickParser 对第一行 Newick 树进行解析
+// parseSeqfile：解析可选 Newick 树和物种路径映射
 // -----------------------------
 bool parseSeqfile(const FilePath& seqfile_path,
     NewickParser& newick_tree,
@@ -584,6 +644,7 @@ bool parseSeqfile(const FilePath& seqfile_path,
     }
 
     std::string line;
+    bool first_record = true;
     bool got_tree = false;
 
     species_map.clear();
@@ -598,42 +659,50 @@ bool parseSeqfile(const FilePath& seqfile_path,
         auto r = line.find_last_not_of(" \t\r\n");
         std::string trimmed = line.substr(l, r - l + 1);
 
-        if (!got_tree) {
-            // 第一条非空行为 Newick
-            try {
-                newick_tree.parse(trimmed);
-            }
-            catch (const std::runtime_error& e) {
-                throw std::runtime_error(
-                    std::string("parseSeqfile: invalid Newick tree: ") + e.what());
-            }
-            got_tree = true;
+        if (first_record) {
+            first_record = false;
 
-            // 如果指定了 root，则裁剪到该子树
-            if (!root.empty()) {
-                int rootId = newick_tree.findNodeIdByName(root);
-                if (rootId == -1) {
-                    throw std::runtime_error("parseSeqfile: root name `" + root + "` not found in Newick tree");
+            // Multi-leaf trees start with '('; standard trees end with ';';
+            // a single-field first record preserves single-leaf Newick input.
+            const bool has_whitespace = std::any_of(
+                trimmed.begin(), trimmed.end(), [](unsigned char c) {
+                    return std::isspace(c) != 0;
+                });
+            const bool looks_like_newick =
+                trimmed.front() == '(' || trimmed.back() == ';' || !has_whitespace;
+
+            if (looks_like_newick) {
+                try {
+                    newick_tree.parse(trimmed);
                 }
-                newick_tree.restrictToSubtreeByRootId(rootId);
-            }
+                catch (const std::runtime_error& e) {
+                    throw std::runtime_error(
+                        std::string("parseSeqfile: invalid Newick tree: ") + e.what());
+                }
+                got_tree = true;
 
-            // 构建允许的叶子名集合（用于过滤 species）
-            {
+                // 如果指定了 root，则裁剪到该子树
+                if (!root.empty()) {
+                    int rootId = newick_tree.findNodeIdByName(root);
+                    if (rootId == -1) {
+                        throw std::runtime_error("parseSeqfile: root name `" + root + "` not found in Newick tree");
+                    }
+                    newick_tree.restrictToSubtreeByRootId(rootId);
+                }
+
+                // 构建允许的叶子名集合（用于过滤 species）
                 auto leafNames = newick_tree.getLeafNames();
-                allowed_leaves.clear();
                 for (auto& nm : leafNames) {
                     std::string tmp = nm;
-                    // 与 trimString 语义一致，防御性去空白
                     newick_tree.trimString(tmp);
                     if (!tmp.empty()) allowed_leaves.insert(std::move(tmp));
                 }
-            }
 
-            continue;
+                continue;
+            }
         }
 
-        // 其余行：<speciesName> <path>
+        // 物种映射：<speciesName> <path>
         std::istringstream iss(trimmed);
         std::string speciesName;
         std::string filePath;
@@ -653,28 +722,20 @@ bool parseSeqfile(const FilePath& seqfile_path,
         filePath = filePath.substr(p_l, p_r - p_l + 1);
 
         // 如果指定了 root，只接收子树中的叶子；否则全部接收
-        if (!root.empty()) {
-            // speciesName 必须在 allowed_leaves 里（和叶节点名匹配）
-            if (allowed_leaves.find(speciesName) == allowed_leaves.end()) {
-                // 不属于该子树，跳过
-                continue;
-            }
+        if (!root.empty() && allowed_leaves.find(speciesName) == allowed_leaves.end()) {
+            continue;
         }
 
         species_map.emplace(speciesName, FilePath(filePath));
     }
 
-    ifs.close();
-
-    if (!got_tree) {
-        throw std::runtime_error(
-            "parseSeqfile: no non-empty line found as Newick tree");
+    if (first_record) {
+        throw std::runtime_error("parseSeqfile: no non-empty records found");
     }
     if (species_map.empty()) {
-        // 如果有 root，空也可能意味着 root 子树没有任何叶子/或映射里没给这些叶子
         throw std::runtime_error("parseSeqfile: no species=>path mappings found"
             + std::string(root.empty() ? "" : " under root `" + root + "`"));
     }
 
-    return true;
+    return got_tree;
 }

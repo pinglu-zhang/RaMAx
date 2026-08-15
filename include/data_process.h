@@ -17,6 +17,7 @@
 #include <limits>
 #include <unordered_map>
 #include <cstdint>
+#include "softmask_index.h"
 
 class FastaManager;
 // 初始化 kseq 使用 gzFile 类型
@@ -384,6 +385,13 @@ bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map, 
 // 清洗原始数据集，并更新路径映射
 bool cleanRawDataset(const FilePath workdir_path, SpeciesPathMap& species_path_map, int thread_num);
 
+// HAL-only preprocessing: keep the existing all-uppercase alignment FASTA and
+// record original lowercase runs in a separate export-only sidecar.
+bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
+    SpeciesPathMap& species_path_map,
+    SoftMask::PathMap& softmask_path_map,
+    int thread_num);
+
 // 运行 WindowMasker 生成重复区域的 interval 文件
 std::map<SpeciesName, FilePath> repeatSeqMasking(const FilePath workdir_path, const SpeciesPathMap& species_path_map, int thread_num);
 
@@ -411,7 +419,7 @@ void repeatMaskRawData(
 
 // -----------------------------
 // seqfile 格式：
-// 第一行：Newick 进化树字符串
+// 可选第一行：Newick 进化树字符串
 // 其余行：<物种名><空格><FASTA 文件路径 或 URL>
 // 例如：
 //   ((simGorilla:0.008825,(simHuman:0.0067,simChimp:0.006667)sHuman-sChimp:0.00225)sG-sH-sC:0.00968,simOrang:0.018318);
@@ -420,7 +428,7 @@ void repeatMaskRawData(
 //   simGorilla /path/to/simGorilla.fa
 //   simOrang /path/to/simOrang.fa
 //
-// 该函数会将第一行读入 newickTree，之后每行拆成 “speciesName -> filePath” 存入 speciesPathMap。
+// 返回 seqfile 中是否包含 Newick 树。无树格式从第一行开始读取物种映射。
 // -----------------------------
 bool parseSeqfile(const FilePath& seqfile_path,
     NewickParser& newick_tree,

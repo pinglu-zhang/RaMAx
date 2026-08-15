@@ -241,10 +241,6 @@ public:
     uint_t sample_rate{ 32 };
     uint_t total_size{ 0 };
     std::array<uint8_t, 256> char2idx{};
-    // TODO 到时候删除T
-    // uint_t kmer_size;
-    // KmerTable_t kmer_table_left;
-    // KmerTable_t kmer_table_right;
 };
 
 #endif

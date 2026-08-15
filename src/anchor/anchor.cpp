@@ -240,7 +240,7 @@ ClusterVecPtrByRefPtr groupClustersToRefVec(
                             queryVec[ref_id]->end());
             (*dst)[ref_id] = std::move(combined);
         }
-        return dst;                   // ✅ 单线程直接结束
+        return dst;
     }
 
     /* =================== 并行分支（原逻辑） =================== */
@@ -570,19 +570,6 @@ AnchorVec extendClusterToAnchorVec(const MatchCluster& cluster,
         };
 
 
-    //wavefront_aligner_attr_t attributes = wavefront_aligner_attr_default;
-    //attributes.distance_metric = gap_affine;
-    //attributes.affine_penalties.mismatch = 2;      // X > 0
-    //attributes.affine_penalties.gap_opening = 3;   // O >= 0
-    //attributes.affine_penalties.gap_extension = 1; // E > 0
-    //attributes.memory_mode = wavefront_memory_ultralow;
-    //attributes.heuristic.strategy = wf_heuristic_wfadaptive;
-    //attributes.heuristic.min_wavefront_length = 10;
-    //attributes.heuristic.max_distance_threshold = 50;
-    //attributes.heuristic.steps_between_cutoffs = 1;
-
-    //wavefront_aligner_t* const wf_aligner = wavefront_aligner_new(&attributes);
-
     /* ==================== 遍历 cluster ==================== */
     for (size_t i = 0;i < cluster.size();++i) {
         const Match& m = cluster[i];
@@ -622,26 +609,6 @@ AnchorVec extendClusterToAnchorVec(const MatchCluster& cluster,
             std::string qry_gap = subSeq(query_mgr, qry_chr, qgBeg, qgEnd - qgBeg);
             if (strand == REVERSE) reverseComplement(qry_gap);
 
-            uint_t Lt = ref_gap.size();
-            uint_t Lq = qry_gap.size();
-            int64_t d = std::abs(static_cast<int64_t>(Lt) - static_cast<int64_t>(Lq));
-
-            //double rho = double(d) / std::min(Lt, Lq);
-
-            //
-            //if (rho <= 0.3 && Lt > 10 && Lq > 10) {
-            //    int cigar_len;
-            //    uint32_t* cigar_tmp;
-            //    wavefront_align(wf_aligner, ref_gap.c_str(), ref_gap.length(), qry_gap.c_str(), qry_gap.length());
-            //    cigar_get_CIGAR(wf_aligner->cigar, false, &cigar_tmp, &cigar_len);
-            //    for (uint_t j = 0; j < cigar_len; ++j) {
-            //        gap.push_back(cigar_tmp[j]);
-            //    }
-
-            //}
-            //else {
-            //    gap = globalAlignKSW2(ref_gap, qry_gap);
-            //}
             gap = globalAlignKSW2(ref_gap, qry_gap);
 
             /* ---- 扫描 gap-cigar，遇 >50bp I/D 即分段 ---- */
@@ -698,7 +665,6 @@ AnchorVec extendClusterToAnchorVec(const MatchCluster& cluster,
         if (!buf.empty()) appendCigar(cigar, buf);
     }
     flush();   
-    //wavefront_aligner_delete(wf_aligner);// 收尾
     return anchors;
 }
 
@@ -855,7 +821,7 @@ void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr)
                     for (std::size_t m_i = 0; m_i < cluster.size(); ++m_i) {
                         if (cluster[m_i].strand() != strand) {
                             spdlog::debug(
-                                "❌ Cluster FAILED (strand={},query={},ref={},cluster={}): "
+                                "Cluster FAILED (strand={},query={},ref={},cluster={}): "
                                 "strand mismatch (expected {}, got {})",
                                 strand_i, q_i, r_i, c_i, static_cast<int>(strand), static_cast<int>(cluster[m_i].strand()));
                         }
@@ -883,7 +849,7 @@ void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr)
 
                         if (ref_start < ref_last_end) {
                             spdlog::debug(
-                                "❌ Cluster FAILED (strand={},query={},ref={},cluster={}): "
+                                "Cluster FAILED (strand={},query={},ref={},cluster={}): "
                                 "ref_start < ref_last_end ({} < {})",
                                 strand_i, q_i, r_i, c_i, ref_start, ref_last_end);
                         }
@@ -902,7 +868,7 @@ void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr)
                             // 正向：要求升序且不重叠
                             if (qry_start < qry_last_pos) {
                                 spdlog::debug(
-                                    "❌ Cluster FAILED (strand={},query={},ref={},cluster={}): "
+                                    "Cluster FAILED (strand={},query={},ref={},cluster={}): "
                                     "qry_start < qry_last_pos ({} < {})",
                                     strand_i, q_i, r_i, c_i, qry_start, qry_last_pos);
                             }
@@ -912,7 +878,7 @@ void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr)
                             // 反向：查询坐标应当递减，区间不重叠
                             if (qry_end > qry_last_pos) {
                                 spdlog::debug(
-                                    "❌ Cluster FAILED (strand={},query={},ref={},cluster={}): "
+                                    "Cluster FAILED (strand={},query={},ref={},cluster={}): "
                                     "qry_start > qry_last_pos ({} > {})",
                                     strand_i, q_i, r_i, c_i, qry_start, qry_last_pos);
                             }
@@ -941,7 +907,6 @@ void linkClusters(AnchorPtrVec& anchors,
 {
     AnchorPtrVec linked;
     if (anchors.empty()) return;
-	Strand strand = anchors[0]->strand;
     // if (strand == FORWARD) {
     //     std::sort(anchors.begin(), anchors.end(),
     //         [](auto& a, auto& b) { return a->qry_start < b->qry_start; });
@@ -1071,15 +1036,10 @@ void linkClusters(AnchorPtrVec& anchors,
                 reach = false;
             }
             else {
-                //gap_cigar = globalAlignKSW2_2(ref_gap_seq, qry_gap_seq);
                 gap_cigar = extendAlignKSW2(ref_gap_seq, qry_gap_seq, 2 * break_len);
-                //gap_cigar = extendAlignWFA2(ref_gap_seq, qry_gap_seq, break_len);
                 ref_len = countRefLength(gap_cigar);
                 qry_len = countQryLength(gap_cigar);
             }
-            // ========== 调用 WFA 进行 gap 比对 ==========
-
-            //if (checkGapCigarQuality(gap_cigar, ref_gap_len, qry_gap_len, 0.6)){
             if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
 			    reach = true;
                 // ---- 更新 curr 坐标 ----
@@ -1165,7 +1125,7 @@ void linkClusters(AnchorPtrVec& anchors,
                     }
                 }
 
-// 🚀 找到了最合适的 prev
+// Found the best preceding anchor.
                 if (found_best) {
                     auto& prev = *best_it;
 
@@ -1212,7 +1172,7 @@ void linkClusters(AnchorPtrVec& anchors,
                     uint_t ref_len = countRefLength(gap_cigar);
                     uint_t qry_len = countQryLength(gap_cigar);
 
-                    // ✅ gap 完全比对上：把 gap_cigar 融入 curr
+                    // The gap aligns completely; append it to curr.
                     //if (checkGapCigarQuality(gap_cigar, ref_gap_len, qry_gap_len, 0.6))
                     if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
                         (*curr)->ref_len += ref_len;
@@ -1262,7 +1222,6 @@ void linkClusters(AnchorPtrVec& anchors,
 
             curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
             curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
-            int_t cur_qry_start = (*curr)->qry_start;
             //curr = best;
             while (curr != anchors.end()) {
                 if (!(*curr)->is_linked && (*curr)->ref_start >= curr_ref_end) {
@@ -1522,15 +1481,10 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                 reach = false;
             }
             else {
-                //gap_cigar = globalAlignKSW2_2(ref_gap_seq, qry_gap_seq);
                 gap_cigar = extendAlignKSW2(ref_gap_seq, qry_gap_seq, 2 * break_len);
-                //gap_cigar = extendAlignWFA2(ref_gap_seq, qry_gap_seq, break_len);
                 ref_len = countRefLength(gap_cigar);
                 qry_len = countQryLength(gap_cigar);
             }
-            // ========== 调用 WFA 进行 gap 比对 ==========
-
-            //if (checkGapCigarQuality(gap_cigar, ref_gap_len, qry_gap_len, 0.6)){
             if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
 			    reach = true;
                 // ---- 更新 curr 坐标 ----
@@ -1616,7 +1570,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                     }
                 }
 
-// 🚀 找到了最合适的 prev
+// Found the best preceding anchor.
                 if (found_best) {
                     auto& prev = *best_it;
 
@@ -1663,7 +1617,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                     uint_t ref_len = countRefLength(gap_cigar);
                     uint_t qry_len = countQryLength(gap_cigar);
 
-                    // ✅ gap 完全比对上：把 gap_cigar 融入 curr
+                    // The gap aligns completely; append it to curr.
                     //if (checkGapCigarQuality(gap_cigar, ref_gap_len, qry_gap_len, 0.6))
                     if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
                         (*curr)->ref_len += ref_len;
@@ -1713,7 +1667,6 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
 
             curr_qry_end = (*curr)->qry_start + (*curr)->qry_len;
             curr_ref_end = (*curr)->ref_start + (*curr)->ref_len;
-            int_t cur_qry_start = (*curr)->qry_start;
             //curr = best;
             while (curr != anchors.end()) {
                 if (!(*curr)->is_linked && (*curr)->ref_start >= curr_ref_end) {
@@ -1732,7 +1685,3 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
 
 
 }
-
-
-
-

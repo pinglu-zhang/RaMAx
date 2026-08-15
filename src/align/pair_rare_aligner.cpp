@@ -14,11 +14,11 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	uint_t max_anchor_frequency)
 	: work_dir(work_dir)
 	, index_dir(work_dir / INDEX_DIR)
-	, thread_num(thread_num)
 	, chunk_size(chunk_size)
 	, overlap_size(overlap_size)
 	, min_anchor_length(min_anchor_length)
 	, max_anchor_frequency(max_anchor_frequency)
+	, thread_num(thread_num)
 {
 	if (!std::filesystem::exists(index_dir)) {
 		std::filesystem::create_directories(index_dir);
@@ -287,12 +287,10 @@ static bool shadowedBy(const Anchor& a, const MatchCluster& cl) {
     }
 }
 
-// ========== 工具：把 gap 用 extendAlignKSW2 ends-free 对齐并“必须到达目标” ==========
+// Align a gap end-to-end with the existing KSW2 extension routine.
 static bool extend_gap_must_reach(const std::string& ref_gap,
                                          const std::string& qry_gap,
                                          Cigar_t& out) {
-    // 你项目里的 ends-free 对齐实现：extendAlignKSW2(ref, query, zdrop)
-    // （已在 align.h / align.cpp 定义）:contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}
     out = extendAlignKSW2(ref_gap, qry_gap, /*zdrop=*/200);
     return countRefLength(out) == ref_gap.size() && countQryLength(out) == qry_gap.size() && checkGapCigarQuality(out, ref_gap.size(), qry_gap.size(), 0.6);
 }
@@ -473,7 +471,7 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     AnchorPtrVec anchors;
     if (!cluster_vec_ptr || cluster_vec_ptr->empty()) return anchors;
 
-    // 1) 参照 A（ref）起点升序排序（MUMmer 同步骤）:contentReference[oaicite:2]{index=2}
+    // Sort clusters by ascending reference start.
     auto clusters = *cluster_vec_ptr; // 本地拷贝可重排
     std::sort(clusters.begin(), clusters.end(), [](const MatchCluster& a, const MatchCluster& b){
         if (a.empty() || b.empty()) return a.size() < b.size();
@@ -483,11 +481,10 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     const size_t N = clusters.size();
     std::vector<char> fused(N, 0);
 
-    // 2) 外层 while：按 MUMmer 逻辑在“当前簇”上做内部延伸 & 选取“前向目标簇”并尝试融合:contentReference[oaicite:3]{index=3}
+    // Extend the current cluster and attempt to fuse a forward target.
     size_t curr_idx = 0;                  // CurrCp
     size_t prev_idx = 0;                  // PrevCp
     bool   target_reached = false;        // 是否已“接上目标”
-    size_t target_idx = N;                // TargetCp（默认为 end）
 	/// 80-90    100-110 120-130 (100-130)
 	/// 120-130   100-110 80-90 (80-110)
 
@@ -503,10 +500,10 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     		continue;
     	}
 
-    	// 按 ref 坐标排序该簇内部匹配；反链也统一按 ref 升序（你已有的实现也这么做）:contentReference[oaicite:4]{index=4}
+        // Sort matches by reference coordinate on both strands.
     	std::sort(cl.begin(), cl.end(), [](const Match& x, const Match& y){ return x.ref_start < y.ref_start; });
 
-    	// 跳过已经融合过或被“shadow”的 cluster（MUMmer：wasFused / isShadowedCluster）:contentReference[oaicite:5]{index=5}
+        // Skip clusters already fused or contained by an existing anchor.
     	bool skip = false;
     	if (fused[curr_idx]) skip = true;
     	if (!skip) {
@@ -516,7 +513,7 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     	}
     	if (skip) { fused[curr_idx] = 1; curr_idx++; target_reached = false; continue; }
 
-    	// 3) 选择方向；对反链我们在提取 query gap 时做 reverseComplement，保证传给 KSW2 的方向一致:contentReference[oaicite:6]{index=6}
+        // Reverse-complement reverse-strand gaps before KSW2 alignment.
     	Strand strand = cl.front().strand();
     	bool   fwd    = (strand == FORWARD);
     	bool reach_target = false;
@@ -525,7 +522,6 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     	ChrIndex qry_chr = cl.front().qry_chr_index;
     	// 当前 anchor 的两端坐标
     	int_t ref_beg = start1(cl.front());
-    	int_t ref_end = start1(cl.back()) + len1(cl.back());
     	int_t qry_beg = fwd ? start2(cl.front()) : start2(cl.back());
 
     	int_t qry_end = fwd ? (start2(cl.back()) + len2(cl.back()))
@@ -562,7 +558,7 @@ AnchorPtrVec extendClustersToAnchors(const MatchClusterVecPtr& cluster_vec_ptr,
     				std::string qry_gap = fwd
 						? subSeq(qry_mgr, qry_chr, qry_gap_beg, qry_gap_len)
 						: subSeq(qry_mgr, qry_chr, qry_gap_beg, qry_gap_len);
-    				if (!fwd) reverseComplement(qry_gap); // 反链统一方向:contentReference[oaicite:8]{index=8}
+				if (!fwd) reverseComplement(qry_gap);
 
     				Cigar_t gap_cigar;
     				if (extend_gap_must_reach(ref_gap, qry_gap, gap_cigar)) {
@@ -1090,7 +1086,6 @@ static void filterChrByDP(
 
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
 
-	const uint_t n = anchor_map->size();
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < ref_chr_cnt; i++) {
 		filterChrByDP(anchor_map, i, true);
@@ -1123,8 +1118,5 @@ void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::Manager
 	}
 
 }
-
-
-
 
 

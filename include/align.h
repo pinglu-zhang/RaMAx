@@ -335,11 +335,8 @@ KSW2AlignConfig makeDefaultKSW2Config();
 
 Cigar_t globalAlignKSW2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2_2(const std::string& ref, const std::string& query);
-// Cigar_t globalAlignWFA2(const std::string& ref, const std::string& query);
-//
-// Cigar_t extendAlignWFA2(const std::string& ref,
-//     const std::string& query, int zdrop = 200);
-
+Cigar_t globalAlignKSW2BandedPublic(const std::string& ref,
+                                    const std::string& query);
 Cigar_t extendAlignKSW2(const std::string& ref,
     const std::string& query,
     int zdrop = 200);
@@ -352,37 +349,30 @@ uint_t mergeAlignmentByRef(
     std::unordered_map<ChrName, std::string>& seqs,
     const std::unordered_map<ChrName, Cigar_t>& cigars);
 
+bool alignSequencesWithExternalMsa(
+    const std::string& executable,
+    std::unordered_map<ChrName, std::string>& sequences);
+
+void configureExternalInsertionMsa(const std::string& executable);
+
+// Configure the export-time repair for homologous insertions whose CIGAR
+// anchors differ by only a few reference bases.  The 10 bp insertion and
+// 5 bp anchor-distance thresholds are intentionally fixed internally; only
+// the existing realignment span and executable are supplied by the caller.
+void configureCrossAnchorInsertionRepair(
+    const std::string& executable,
+    uint_t maximum_window_span);
+
+void logCrossAnchorInsertionRepairStats();
+
 struct InsertInfo {
     bool aligned = false;
     uint_t total_length = 0;
 	ChrName ref_name = ""; // 参考序列名称
     std::unordered_map<ChrName, std::string> seqs = {}; // key -> CIGAR (query 侧)
 
-    void alignSeqs() {
-		if (aligned) return; // 已经对齐过了
-		if (seqs.empty()) return; // 没有序列可对齐
-
-        size_t max_len = 0;
-        ChrName longest_key;
-        for (const auto& [key, s] : seqs) {
-            if (s.size() > max_len) {
-                max_len = s.size();
-                longest_key = key;
-            }
-        }
-        ref_name = longest_key;
-
-        std::unordered_map<ChrName, Cigar_t> cigars;
-        for (const auto& [key, s] : seqs) {
-			if (key == ref_name) continue;
-			cigars[key] = globalAlignKSW2(seqs[ref_name], s);
-        }
-        total_length = mergeAlignmentByRef(ref_name, seqs, cigars);
-        aligned = true;
-    }
+    void alignSeqs();
 };
 
 using RefAlignInfo = std::map<uint_t, InsertInfo>;
 #endif
-
-

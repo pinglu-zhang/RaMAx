@@ -1,118 +1,129 @@
 # RaMAx
 
-RaMAx aligns multiple genomes and produces whole‑genome alignments in standard formats. Its input and output conventions are **compatible with [Cactus]** (i.e., it accepts the same `seqfile` style input and can emit **MAF** and **HAL** alignments), so you can drop RaMAx into existing Cactus‑based workflows with minimal changes.
+RaMAx aligns multiple genomes and writes whole-genome alignments in MAF or HAL
+format. A seqfile contains one genome name and FASTA path per line. HAL output
+additionally requires a Newick species tree as the first record.
 
-> If you already have a Cactus `seqfile`, you can pass it directly to RaMAx.
+## Install
 
----
-
-## Install with Conda
-
-Conda is the recommended installation method for RaMAx. Install it from the `malab` channel:
+### Conda
 
 ```bash
 conda install -c conda-forge -c malab ramax
-ramax --help
+ramax --version
 ```
 
-The Linux conda package is built against the conda-forge sysroot and is intended to run on systems with `glibc >= 2.17`.
-
----
-
-## Install with Docker
-
-Docker is an alternative for older or heterogeneous Linux systems, especially when the host glibc is incompatible. The image includes its own userspace libraries.
-
-Pull the published image and check that RaMAx starts:
+### Docker
 
 ```bash
 docker pull pingluzhang/ramax:latest
-docker run pingluzhang/ramax:latest --help
+docker run --rm pingluzhang/ramax:latest --version
 ```
 
-## Install from Source
+### Build from source
 
-### Prerequisites (Ubuntu/Debian)
+RaMAx requires a C++23 compiler, CMake 3.20 or newer, zlib, libcurl, TBB,
+OpenMP, HDF5, and the bundled HAL/sonLib sources. On Ubuntu or Debian:
 
-Install the following packages first:
-
-```bash 
+```bash
 sudo apt update
-sudo apt install -y \
-    build-essential \
-    cmake \
-    libcurl4-openssl-dev \
-    zlib1g-dev \
-    libhdf5-dev
+sudo apt install -y build-essential cmake libcurl4-openssl-dev zlib1g-dev \
+  libtbb-dev libhdf5-dev
 ```
-> **Notes**
->
-> * `libhdf5-dev` is required for HAL support.
-> * On non‑Debian systems, install the equivalent development packages for **CMake**, **libcurl**, **zlib**, and **HDF5**.
 
-### Build Steps
+Configure, build, and install:
 
 ```bash
-# Clone the repository
-git clone https://github.com/pinglu-zhang/RaMAx
-cd RaMAx
-
-# Create a build directory
-mkdir build && cd build
-
-# Configure
-cmake ..
-
-# Build using all available CPU cores
-make -j"$(nproc)"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+cmake --install build --prefix "$HOME/.local"
 ```
 
-After a successful build, the executable **`ramax`** will be located in the `build/` directory.
-
----
-
-## Quick Start
-
-### Basic usage
+Install `minipoa` separately and place it in `PATH`, next to the installed
+`ramax` executable, or provide its path during configuration:
 
 ```bash
-./ramax \
-  -i <path/to/seqfile.txt> \
-  -o <path/to/output.{maf|hal}> \
-  -w <path/to/workdir> \
-  -t <threads>
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa
 ```
 
----
+Set `-DRAMAX_NATIVE_ARCH=OFF` for a portable x86-64 RaMAx build. Configuration
+and compilation do not write to `/usr/local`; installation is controlled only
+by `cmake --install` and its prefix.
 
-## Command‑line Options (common)
+## Quick start
 
-| Flag        | Description                                                                  |
-| ----------- | ---------------------------------------------------------------------------- |
-| `-i <file>` | Input **seqfile** (same format used by Cactus).                              |
-| `-o <file>` | Output alignment path. RaMAx supports **MAF** and **HAL**.                   |
-| `-w <dir>`  | Working directory to store intermediate files and logs (created if missing). |
-| `-t <N>`    | Number of worker threads to use.                                             |
+```bash
+ramax \
+  -i seqfile.txt \
+  -o alignment.maf \
+  -w work \
+  -t 16 \
+  --optimize-blocks
+```
 
-**Input format (seqfile)**
+Use an output name ending in `.maf` or `.hal`. Intermediate graph state, logs,
+and minipoa scratch files are kept under the work directory.
 
-RaMAx uses the same `seqfile` format as Cactus. The file has two parts:
-
-1. **A species tree in Newick** on the first non‑comment line (leaf names must match genomes below; branch lengths optional).
-2. **Genome mappings**, one per line: `<genome_name> <path/to/genome.{fa|fasta|fa.gz}>`.
-
-**Minimal example**
+The graph optimizations are enabled by default. `--optimize-blocks` is an
+explicit, repeatable way to request the same default set. The defaults are:
 
 ```text
-# seqfile.txt
-# 1) Species tree (Newick)
-((human:0.005,chimp:0.005):0.02,orangutan:0.025);
-
-# 2) Genome mappings (one per leaf)
-human      /data/genomes/hg38.fa
-chimp      /data/genomes/panTro6.fa
-orangutan  /data/genomes/ponAbe3.fa.gz
+--merge-blocks --merge-gap 100
+--realign-missing --realign-span 3000 --zero-gap-span 200
+--repair-breaks --break-span 1000
+--merge-short-blocks
 ```
 
-> **Output formats**
-> RaMAx can write **MAF** for broad downstream compatibility and **HAL** for hierarchical alignment workflows.
+Run `ramax --help` for the complete core-alignment options.
+
+## Documentation
+
+- [Usage guide](docs/usage.md)
+- [Command-line parameters](docs/parameters.md)
+- [Restart and work directories](docs/restart.md)
+- [MAF and HAL output](docs/output-formats.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Realignment architecture](docs/realignment_architecture.md)
+
+See the [documentation index](docs/README.md) for the complete set.
+
+## Input format
+
+MAF output accepts a mapping-only seqfile:
+
+```text
+human      /data/genomes/human.fa
+chimp      /data/genomes/chimp.fa
+orangutan  /data/genomes/orangutan.fa.gz
+```
+
+HAL output requires a Newick tree as the first record:
+
+```text
+((human:0.005,chimp:0.005):0.02,orangutan:0.025);
+human      /data/genomes/human.fa
+chimp      /data/genomes/chimp.fa
+orangutan  /data/genomes/orangutan.fa.gz
+```
+
+Tree input remains optional for MAF and other non-HAL formats. When a tree is
+provided, its leaf names should match the genome mappings. `--root` is valid
+only for HAL output.
+
+## Restart compatibility
+
+RaMAx 1.0.5 stores all restart settings in `<work>/config.json` with
+`schema_version: 1`. Restart with:
+
+```bash
+ramax --restart -w work
+```
+
+Restart directories created by older experimental configurations are not
+compatible with 1.0.5 and are rejected with an explicit schema error.
+
+## License and dependencies
+
+RaMAx is released under the MIT License. See [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
