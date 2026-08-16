@@ -570,9 +570,6 @@ MatchVec2DPtr FM_Index::findAnchorsAccurate(ChrIndex query_chr_index, std::strin
     uint_t total_length = 0;
     uint_t query_length = query.length();
     uint_t last_pos = 0;
-    uint64_t long_mum_skip_count = 0;
-    uint64_t skipped_internal_positions = 0;
-    uint_t max_skipped_match_length = 0;
 
     while (total_length < query_length) {
         RegionVec region_vec;
@@ -611,19 +608,8 @@ MatchVec2DPtr FM_Index::findAnchorsAccurate(ChrIndex query_chr_index, std::strin
 
         const uint_t advance = chooseAccurateSearchAdvance(
             match_length, region_vec.size(), accurate_skip_threshold);
-        if (advance > 1) {
-            ++long_mum_skip_count;
-            skipped_internal_positions += static_cast<uint64_t>(advance - 1);
-            max_skipped_match_length = std::max(max_skipped_match_length, match_length);
-        }
         total_length += advance;
     }
-
-    spdlog::info(
-        "[FM accurate] long-MUM skip summary: threshold={}, events={}, "
-        "skipped_positions={}, max_match_length={}",
-        accurate_skip_threshold, long_mum_skip_count,
-        skipped_internal_positions, max_skipped_match_length);
 
     anchor_ptr_list_vec->shrink_to_fit();
     return anchor_ptr_list_vec;
