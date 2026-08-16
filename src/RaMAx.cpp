@@ -346,7 +346,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     auto* accurate_skip_threshold_opt = cmd->add_option(
         "--accurate-skip-threshold", args.accurate_skip_threshold,
         "Skip accepted unique MUMs longer than this many bp in accurate mode; 0 disables (default: 10000).")
-        ->default_val(10000)
+        ->default_val(5000)
         ->capture_default_str()
         ->group("Software Parameters")
         ->check(CLI::Range(0, std::numeric_limits<int>::max()))
