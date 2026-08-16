@@ -165,6 +165,8 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/structural_break_repair.cpp"
     "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
+    "${GRAPH_DIR}/paf_utils.cpp"
+    "${GRAPH_DIR}/paf_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
 )
 
@@ -258,4 +260,54 @@ target_link_libraries(ramax PRIVATE ramax_core)
 
 add_dependencies(ramax  hal_library)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(ramax_paf_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/paf_utils_test.cpp"
+        "${GRAPH_DIR}/paf_utils.cpp")
+    target_include_directories(ramax_paf_tests PRIVATE "${INCLUDE_DIR}")
+    target_compile_features(ramax_paf_tests PRIVATE cxx_std_23)
+    target_compile_options(ramax_paf_tests PRIVATE -Wall -Wextra)
+    add_test(NAME ramax_paf_utils COMMAND ramax_paf_tests)
+
+    add_executable(ramax_paf_export_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/paf_export_test.cpp")
+    configure_rama_target(ramax_paf_export_tests)
+    target_link_libraries(ramax_paf_export_tests PRIVATE ramax_core)
+    target_compile_features(ramax_paf_export_tests PRIVATE cxx_std_23)
+    add_test(NAME ramax_paf_export COMMAND ramax_paf_export_tests)
+endif()
+
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+# Optional companion tools are self-contained under tools/.  A tool that was
+# already built in its own source-local build directory is installed directly,
+# avoiding a second compilation as part of the main RaMAx build.
+option(RAMAX_BUILD_TOOLS "Build and install RaMAx companion tools" ON)
+set(RAMAX_PAF_FASTA_PREBUILT "" CACHE FILEPATH
+    "Prebuilt ramax-paf-fasta executable; skips building the tool")
+
+if(RAMAX_BUILD_TOOLS)
+    set(_ramax_paf_fasta_prebuilt "${RAMAX_PAF_FASTA_PREBUILT}")
+    if(NOT _ramax_paf_fasta_prebuilt)
+        set(_ramax_paf_fasta_auto
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/ramax-paf-fasta/build/ramax-paf-fasta${CMAKE_EXECUTABLE_SUFFIX}")
+        if(EXISTS "${_ramax_paf_fasta_auto}")
+            set(_ramax_paf_fasta_prebuilt "${_ramax_paf_fasta_auto}")
+        endif()
+    elseif(NOT EXISTS "${_ramax_paf_fasta_prebuilt}")
+        message(FATAL_ERROR
+            "RAMAX_PAF_FASTA_PREBUILT does not exist: ${_ramax_paf_fasta_prebuilt}")
+    endif()
+
+    if(_ramax_paf_fasta_prebuilt)
+        message(STATUS
+            "Using prebuilt ramax-paf-fasta: ${_ramax_paf_fasta_prebuilt}; source build skipped")
+        install(PROGRAMS "${_ramax_paf_fasta_prebuilt}"
+            DESTINATION "${CMAKE_INSTALL_BINDIR}"
+            RENAME "ramax-paf-fasta${CMAKE_EXECUTABLE_SUFFIX}")
+    else()
+        message(STATUS "ramax-paf-fasta is not prebuilt; adding standalone tool build")
+        add_subdirectory(tools/ramax-paf-fasta)
+    endif()
+endif()

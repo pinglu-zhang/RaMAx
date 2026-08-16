@@ -13,6 +13,11 @@ the input/output paths, thread count, anchor and graph parameters, output
 format, optimization flags and spans, logging settings, and HAL root/reference
 selection.
 
+PAF pair-selection mode is stored separately in `<work>/paf_mode.txt` so the
+schema remains compatible with existing MAF/HAL work directories. Restart
+uses the saved value; an older PAF work directory without this sidecar defaults
+to `connected`.
+
 ## Starting a new run
 
 Use a new or empty work directory:
@@ -61,6 +66,7 @@ seqfile and desired current parameters as a new command.
 Before deleting a failed work directory, retain:
 
 - `config.json` for the exact effective settings;
+- `paf_mode.txt` for the effective PAF pair-selection mode, when present;
 - `RaMAx.log` for the last completed stage and error;
 - index and graph state when attempting `--restart`;
 - `minipoa_tmp/` only when diagnosing a forced termination, because normal

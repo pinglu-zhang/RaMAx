@@ -17,6 +17,7 @@
 
 #include "config.hpp"
 #include "anchor.h"
+#include "paf_export.h"
 #include "softmask_index.h"
 
 // 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
@@ -464,6 +465,12 @@ namespace RaMesh {
         void exportToMafWithoutReverse(const FilePath& maf_path, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
 
         void exportToMultipleMaf(const std::vector<std::pair<SpeciesName, FilePath>>& outs, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
+
+        Paf::PafExportStats exportToPaf(
+            const FilePath& paf_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const Paf::PafExportOptions& options = {}) const;
 
         void exportToHal(const FilePath& hal_path,
                         const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,

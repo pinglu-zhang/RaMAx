@@ -21,8 +21,9 @@ binary.
 
 | Option | Type/default | Description |
 |---|---|---|
-| `-o`, `--output` | path; required for a new run | Output file. The suffix must be `.maf` or `.hal`. |
+| `-o`, `--output` | path; required for a new run | Output file. The suffix must be `.maf`, `.hal`, or `.paf`. |
 | `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
+| `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid only with `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
 | `--root` | string; automatic | Preferred HAL root name. Valid only for HAL output, which requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters
@@ -92,3 +93,14 @@ algorithm, optimization, thread, root, and log-level settings are restored from
 | `--log-level` | `info`; `debug`, `info`, `warn`, or `error` | Select logging detail. |
 | `--verbose` | flag; off | Enable additional diagnostics. Mutually exclusive with `--quiet`. |
 | `--quiet` | flag; off | Emit errors only. Mutually exclusive with `--verbose`. |
+
+## PAF companion FASTA
+
+`ramax-paf-fasta` is a separate installed command and does not change the
+`ramax` alignment interface.
+
+| Option | Type/default | Description |
+|---|---|---|
+| `-i`, `--input` | seqfile; required | Input RaMAx seqfile, optionally beginning with a Newick record. |
+| `-o`, `--output` | path; required | Combined `.fa`, `.fasta`, or `.fna`, optionally followed by `.gz`. |
+| `--force` | flag; off | Atomically replace an existing output after complete generation. |

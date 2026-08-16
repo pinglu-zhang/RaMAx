@@ -4,6 +4,7 @@ RaMAx selects its exporter from the output filename suffix:
 
 - `.maf` writes a Multiple Alignment Format file;
 - `.hal` writes a Hierarchical Alignment Format file;
+- `.paf` writes pairwise projections of the primary Block alignments;
 - other suffixes are rejected before alignment begins.
 
 ## MAF
@@ -42,9 +43,53 @@ halValidate /data/project/results/alignment.hal
 halStats /data/project/results/alignment.hal
 ```
 
-## Shared MAF/HAL realignment
+## PAF
 
-Direct MAF export and HAL construction both use the shared
+PAF output does not require a species tree. Sequence names are always
+`species.original_contig_name`; RaMAx does not remove an existing species
+prefix from a contig. The FASTA passed to a downstream tool must use exactly
+the same qualified headers. Empty names, whitespace, and qualified-name
+collisions are rejected before export.
+
+Generate that FASTA without manually rewriting headers:
+
+```bash
+ramax-paf-fasta -i genomes.seqfile -o genomes.fa.gz
+```
+
+The tool streams plain or gzip inputs, preserves seqfile/contig order, converts
+sequences to uppercase `A/T/G/C/N` with every non-ATGC symbol represented as
+`N`, and publishes the result atomically. It refuses to overwrite an existing
+file unless `--force` is supplied.
+
+`--paf-mode connected` is the default. It first selects the explicit Block
+reference against every overlapping primary row, then deterministically adds
+pairs until every non-gap, non-`X`, case-normalized same-base set in every MSA
+column is connected. `--paf-mode all` emits all primary row pairs sharing at
+least one non-gap column and is the correctness baseline. A pair selected in a
+Block is emitted once as a complete Block projection.
+
+Records contain the standard 12 PAF fields followed by `cg:Z:`, `tp:A:P`, and
+`NM:i:` tags. MAPQ is 255 and CIGAR operations are limited to `=`, `X`, `I`,
+and `D`. Coordinates always refer to the forward source sequences; the PAF
+strand is the XOR of the two Segment orientations. Column 10 counts `=` bases,
+column 11 counts non-double-gap columns, and `NM` counts `X+I+D` bases.
+
+Malformed Blocks are skipped as complete units and summarized once after
+export. Treat any nonzero `invalid` count as a failed scientific acceptance
+check. Global naming or I/O errors fail the export without replacing an
+existing output file.
+
+The connected-mode completeness guarantee applies to the homologous
+same-base relations already present in valid primary Blocks and to
+`seqwish -k 0`. A nonzero seqwish `-k` intentionally removes short exact
+matches and therefore changes that relation set. See the seqwish
+[graph-induction algorithm](https://github.com/pangenome/seqwish#squish-graph-induction-algorithm)
+and [`-k` usage](https://github.com/pangenome/seqwish#usage).
+
+## Shared Block projection
+
+Direct MAF/PAF export and HAL construction use the shared
 `mergeAlignmentByRef()` reference projection. Nearby homologous insertions may
 be repaired during export, but failure or lack of strict improvement retains
 the original rows. HAL-specific code does not implement a separate insertion
@@ -73,5 +118,5 @@ input file and minipoa internal file is confined to:
 
 RaMAx removes per-process minipoa files after successful execution, non-zero
 exit, or output-parse failure. A forced process termination can leave files in
-this directory, but should not create them beside the output MAF/HAL or in the
+this directory, but should not create them beside the output MAF/HAL/PAF or in the
 launch directory.

@@ -167,7 +167,7 @@ public:
 	std::string make_usage(const CLI::App* app, std::string name) const override {
 		std::ostringstream out;
 		out << "Usage:\n"
-			<< "  ramax -i <seqfile.txt> -o <output.{maf|hal}> -w <workdir> [options]\n\n"
+			<< "  ramax -i <seqfile.txt> -o <output.{maf|hal|paf}> -w <workdir> [options]\n\n"
 			<< "Example:\n"
 			<< "  ramax -i seqfile.txt -o output.maf -w workdir -t 8\n\n";
 		return out.str();
@@ -189,6 +189,7 @@ inline CLI::Validator trim_whitespace = CLI::Validator(
 enum class MultipleGenomeOutputFormat {
 	HAL,
 	MAF,
+	PAF,
 	UNKNOWN
 };
 
@@ -197,6 +198,7 @@ inline MultipleGenomeOutputFormat detectMultipleGenomeOutputFormat(const std::fi
 	std::string ext = output_path.extension().string();
 	if (ext == ".hal") return MultipleGenomeOutputFormat::HAL;
 	if (ext == ".maf") return MultipleGenomeOutputFormat::MAF;
+	if (ext == ".paf") return MultipleGenomeOutputFormat::PAF;
 	return MultipleGenomeOutputFormat::UNKNOWN;
 }
 

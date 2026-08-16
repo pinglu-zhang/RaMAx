@@ -1,8 +1,8 @@
 # RaMAx
 
-RaMAx aligns multiple genomes and writes whole-genome alignments in MAF or HAL
-format. A seqfile contains one genome name and FASTA path per line. HAL output
-additionally requires a Newick species tree as the first record.
+RaMAx aligns multiple genomes and writes whole-genome alignments in MAF, HAL,
+or PAF format. A seqfile contains one genome name and FASTA path per line. HAL
+output additionally requires a Newick species tree as the first record.
 
 ## Install
 
@@ -62,8 +62,19 @@ ramax \
   --optimize-blocks
 ```
 
-Use an output name ending in `.maf` or `.hal`. Intermediate graph state, logs,
-and minipoa scratch files are kept under the work directory.
+Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
+information-complete sparse `connected` mode; use `--paf-mode all` for the
+all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
+are kept under the work directory.
+
+For seqwish, generate the matching qualified FASTA directly from the same
+seqfile:
+
+```bash
+ramax-paf-fasta -i seqfile.txt -o sequences.fa.gz
+ramax -i seqfile.txt -o alignment.paf -w work -t 16
+seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa -k 0
+```
 
 The graph optimizations are enabled by default. `--optimize-blocks` is an
 explicit, repeatable way to request the same default set. The defaults are:
@@ -82,7 +93,7 @@ Run `ramax --help` for the complete core-alignment options.
 - [Usage guide](docs/usage.md)
 - [Command-line parameters](docs/parameters.md)
 - [Restart and work directories](docs/restart.md)
-- [MAF and HAL output](docs/output-formats.md)
+- [MAF, HAL, and PAF output](docs/output-formats.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Realignment architecture](docs/realignment_architecture.md)
 
@@ -90,7 +101,7 @@ See the [documentation index](docs/README.md) for the complete set.
 
 ## Input format
 
-MAF output accepts a mapping-only seqfile:
+MAF and PAF output accept a mapping-only seqfile:
 
 ```text
 human      /data/genomes/human.fa

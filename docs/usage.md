@@ -49,7 +49,37 @@ ramax \
   --root ancestor
 ```
 
-The output suffix selects the format. Only `.maf` and `.hal` are accepted.
+Write sparse, information-complete PAF:
+
+```bash
+ramax \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/alignment.paf \
+  -w /data/project/work/ramax-paf \
+  -t 16
+```
+
+PAF defaults to `--paf-mode connected`. Use `--paf-mode all` to emit every
+primary path pair that shares at least one non-gap alignment column. A PAF run
+does not require a Newick tree. `--paf-mode` is rejected for MAF and HAL.
+
+Build the seqwish sequence input from the same seqfile. The companion tool
+preserves species and contig order, writes the exact `species.contig` names
+used by PAF, and applies the same base normalization:
+
+```bash
+ramax-paf-fasta \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/sequences.fa.gz
+
+seqwish \
+  -s /data/project/results/sequences.fa.gz \
+  -p /data/project/results/alignment.paf \
+  -g /data/project/results/graph.gfa \
+  -k 0
+```
+
+The output suffix selects the format. `.maf`, `.hal`, and `.paf` are accepted.
 
 ## Default Block optimization
 
@@ -108,7 +138,7 @@ For a new Release run, the directory must not contain existing files. RaMAx
 removes the entire work directory after a successful export. Failed or
 interrupted runs leave it in place for diagnosis and restart.
 
-Always place the final MAF or HAL outside the work directory:
+Always place the final MAF, HAL, or PAF outside the work directory:
 
 ```text
 /data/project/results/alignment.maf   # final output

@@ -36,7 +36,9 @@ struct CommonArgs {
     int thread_num = std::thread::hardware_concurrency(); // 使用的线程数（默认使用所有 CPU 核心）
 
     MultipleGenomeOutputFormat output_format =
-        MultipleGenomeOutputFormat::UNKNOWN;    // 多基因组输出格式（如 HAL、MAF 等）
+        MultipleGenomeOutputFormat::UNKNOWN;    // 多基因组输出格式（HAL、MAF、PAF）
+    std::string paf_mode = "connected";          // PAF pairing: connected or all
+    bool paf_mode_explicit = false;              // CLI-only; intentionally not serialized
 
     bool enable_repeat_masking = false;          // 是否启用重复序列遮蔽（Repeat Masking）
 
@@ -157,7 +159,11 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Work directory   : {}", args.work_dir_path.string());
     spdlog::info("  Output format    : {}",
         args.output_format == MultipleGenomeOutputFormat::HAL ? "HAL" :
-        args.output_format == MultipleGenomeOutputFormat::MAF ? "MAF" : "Unknown");
+        args.output_format == MultipleGenomeOutputFormat::MAF ? "MAF" :
+        args.output_format == MultipleGenomeOutputFormat::PAF ? "PAF" : "Unknown");
+    if (args.output_format == MultipleGenomeOutputFormat::PAF) {
+        spdlog::info("  PAF mode         : {}", args.paf_mode);
+    }
 
     spdlog::info("");
 
@@ -248,10 +254,23 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
 
     // 输出结果路径
     auto* output_opt = cmd->add_option("-o,--output", args.output_path,
-        "Output alignment path in MAF or HAL format.")
+        "Output alignment path in MAF, HAL, or PAF format.")
         ->group("Output")
         ->type_name("<path>")
         ->transform(trim_whitespace);
+
+    auto* paf_mode_opt = cmd->add_option("--paf-mode", args.paf_mode,
+        "PAF pairing mode: connected or all (default: connected).")
+        ->default_val("connected")
+        ->capture_default_str()
+        ->group("Output")
+        ->type_name("<mode>")
+        ->transform(CLI::CheckedTransformer(
+            std::map<std::string, std::string>{
+                {"connected", "connected"},
+                {"all", "all"}
+            },
+            CLI::ignore_case));
 
     // 工作目录路径（中间文件、索引缓存等）
     auto* workspace_opt = cmd->add_option("-w,--workdir", args.work_dir_path,
@@ -551,6 +570,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         structural_break_span_opt,
         short_block_repair_flag,
         one_round_flag,
+        paf_mode_opt,
         log_level_opt
     );
 
@@ -722,6 +742,26 @@ static int runRestartMode(CommonArgs& common_args) {
         }
         common_args.accurate_skip_threshold = static_cast<uint_t>(saved_threshold);
     }
+
+    common_args.paf_mode = "connected";
+    if (common_args.output_format == MultipleGenomeOutputFormat::PAF) {
+        const FilePath paf_mode_path =
+            common_args.work_dir_path / "paf_mode.txt";
+        if (std::filesystem::exists(paf_mode_path)) {
+            std::ifstream paf_mode_stream(paf_mode_path);
+            if (!(paf_mode_stream >> common_args.paf_mode) ||
+                (common_args.paf_mode != "connected" &&
+                 common_args.paf_mode != "all")) {
+                throw std::runtime_error(
+                    "Invalid saved PAF mode in " + paf_mode_path.string());
+            }
+            paf_mode_stream >> std::ws;
+            if (!paf_mode_stream.eof()) {
+                throw std::runtime_error(
+                    "Invalid saved PAF mode in " + paf_mode_path.string());
+            }
+        }
+    }
     return 0;
 }
 
@@ -764,10 +804,16 @@ static int runNormalMode(CommonArgs& common_args) {
     logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
-    // 根据输出文件扩展名检测输出格式（.hal / .maf）
+    // 根据输出文件扩展名检测输出格式（.hal / .maf / .paf）
     common_args.output_format = detectMultipleGenomeOutputFormat(common_args.output_path);
     if (common_args.output_format == MultipleGenomeOutputFormat::UNKNOWN) {
-        throw std::runtime_error("Invalid output file extension. Supported: .hal, .maf");
+        throw std::runtime_error(
+            "Invalid output file extension. Supported: .hal, .maf, .paf");
+    }
+    if (common_args.output_format != MultipleGenomeOutputFormat::PAF &&
+        common_args.paf_mode_explicit) {
+        throw std::runtime_error(
+            "--paf-mode is only valid with .paf output");
     }
 
     // 检查 chunk 与 overlap 的合法性
@@ -795,6 +841,17 @@ static int runNormalMode(CommonArgs& common_args) {
             "Failed to save accurate skip threshold to " + threshold_path.string());
     }
     threshold_stream << common_args.accurate_skip_threshold << '\n';
+
+    if (common_args.output_format == MultipleGenomeOutputFormat::PAF) {
+        const FilePath paf_mode_path =
+            common_args.work_dir_path / "paf_mode.txt";
+        std::ofstream paf_mode_stream(paf_mode_path, std::ios::trunc);
+        if (!paf_mode_stream) {
+            throw std::runtime_error(
+                "Failed to save PAF mode to " + paf_mode_path.string());
+        }
+        paf_mode_stream << common_args.paf_mode << '\n';
+    }
 
     return 0;
 }
@@ -1102,6 +1159,18 @@ static void exportResults(
         graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
         break;
 
+    case MultipleGenomeOutputFormat::PAF: {
+        spdlog::info(
+            "Exporting to PAF format (mode={})...", common_args.paf_mode);
+        RaMesh::Paf::PafExportOptions options;
+        options.mode = common_args.paf_mode == "all"
+            ? RaMesh::Paf::Mode::ALL : RaMesh::Paf::Mode::CONNECTED;
+        options.only_primary = true;
+        graph->exportToPaf(
+            common_args.output_path, seqpro_managers, options);
+        break;
+    }
+
     case MultipleGenomeOutputFormat::HAL:
         spdlog::info("Exporting to HAL format...");
         // 使用已解析并可能裁剪过的 newick_tree，避免重复读取导致 --root 子树失效
@@ -1236,6 +1305,7 @@ int main(int argc, char** argv) {
 
     // 开始解析命令行参数
     CLI11_PARSE(app, argc, argv);
+    common_args.paf_mode_explicit = app.count("--paf-mode") != 0;
 
     // Apply output policy before emitting deprecation warnings.
     configureLogLevel(common_args);
