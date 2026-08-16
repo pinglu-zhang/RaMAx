@@ -116,6 +116,7 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class Block : public std::enable_shared_from_this<Block> {
     public:
+        SpeciesName ref_species; // guard: rw
         ChrName   ref_chr;      // guard: rw
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
         mutable std::shared_mutex rw;

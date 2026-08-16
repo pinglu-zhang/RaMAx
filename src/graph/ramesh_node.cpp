@@ -978,6 +978,8 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
+            blk->ref_species = ref_name;
+            blk->ref_chr = ref_chr;
             blk->anchors[{ ref_name, ref_chr }] = ref_seg;
             blk->anchors[{ qry_name, qry_chr }] = qry_seg;
         }
@@ -1004,6 +1006,8 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
+            blk->ref_species = ref_name;
+            blk->ref_chr = ref_chr;
             blk->anchors[{ ref_name, ref_chr }] = ref_seg;
             blk->anchors[{ qry_name, qry_chr }] = qry_seg;
         }

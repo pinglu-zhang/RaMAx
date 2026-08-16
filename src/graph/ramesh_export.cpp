@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <exception>
 #include <map>
+#include <sstream>
 #include <vector>
 #include <spdlog/spdlog.h>
 #include <chrono>
@@ -21,20 +22,23 @@
 // ============================================================
 // emitMafBlock —— 所有导出函数共享的“写一个 MAF 块”实现
 // ============================================================
-static bool isMafReferenceCompatibleCigar(
-    const Cigar_t& cigar,
-    size_t sequence_length) {
-    size_t consumed = 0;
-    for (const auto unit : cigar) {
-        uint32_t length = 0;
-        char operation = '\0';
-        intToCigar(unit, operation, length);
-        if (operation != 'M' && operation != '=' && operation != 'X') {
-            return false;
-        }
-        consumed += length;
+struct MafExportStats {
+    size_t invalid_blocks{ 0 };
+    std::string first_error;
+
+    void recordInvalid(const std::string& error) {
+        ++invalid_blocks;
+        if (first_error.empty()) first_error = error;
     }
-    return consumed == sequence_length;
+};
+
+static void logMafExportSummary(const FilePath& maf_path,
+    const MafExportStats& stats)
+{
+    if (stats.invalid_blocks == 0) return;
+    spdlog::warn(
+        "MAF export skipped {} invalid block(s): output={}, first_error={}",
+        stats.invalid_blocks, maf_path.string(), stats.first_error);
 }
 
 static bool emitMafBlock(std::ostream& os,
@@ -43,6 +47,7 @@ static bool emitMafBlock(std::ostream& os,
     bool only_primary,
     bool pairwise_mode,
     bool allow_reverse,
+    MafExportStats& stats,
     const SpeciesName* first_sp = nullptr,
     bool ensure_forward = true)
 {
@@ -60,37 +65,27 @@ static bool emitMafBlock(std::ostream& os,
     }
     if (recs.size() < 2 || (!allow_reverse && have_reverse)) return false;
 
-    // ---------- 2. 选择对齐参考并决定首行 ----------
-    // ref_chr does not identify a species.  When several genomes use the
-    // same chromosome name, unordered anchor iteration must not choose a
-    // deletion-only hybrid row as the reference backbone.
-    auto alignment_ref = std::find_if(
-        recs.begin(), recs.end(), [&](const Rec& record) {
-            return record.chr == blk->ref_chr &&
-                isMafReferenceCompatibleCigar(
-                    record.seg->cigar, record.seg->length);
+    const auto ref_rec_it = std::find_if(recs.begin(), recs.end(),
+        [&](const auto& r) {
+            return r.sp == blk->ref_species && r.chr == blk->ref_chr;
         });
-    if (alignment_ref == recs.end()) {
-        alignment_ref = std::find_if(
-            recs.begin(), recs.end(),
-            [&](const Rec& record) {
-                return record.chr == blk->ref_chr;
-            });
+    if (ref_rec_it == recs.end()) {
+        std::ostringstream oss;
+        oss << "Block reference segment missing: ref_species="
+            << blk->ref_species << ", ref_chr=" << blk->ref_chr
+            << ", records=" << recs.size();
+        stats.recordInvalid(oss.str());
+        return false;
     }
-    if (alignment_ref == recs.end()) {
-        alignment_ref = recs.begin();
-    }
-    const SpeciesName alignment_ref_species = alignment_ref->sp;
-    const ChrName alignment_ref_chr = alignment_ref->chr;
 
+    // ---------- 2. 决定首行 ----------
     if (first_sp) {
         auto it_first = std::find_if(recs.begin(), recs.end(),
             [&](auto& r) { return r.sp == *first_sp; });
         if (it_first == recs.end()) {
             auto it_ref = std::find_if(recs.begin(), recs.end(),
                 [&](auto& r) {
-                    return r.sp == alignment_ref_species &&
-                        r.chr == alignment_ref_chr;
+                    return r.sp == blk->ref_species && r.chr == blk->ref_chr;
                 });
             if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
         }
@@ -102,8 +97,7 @@ static bool emitMafBlock(std::ostream& os,
     else {
         auto it_ref = std::find_if(recs.begin(), recs.end(),
             [&](auto& r) {
-                return r.sp == alignment_ref_species &&
-                    r.chr == alignment_ref_chr;
+                return r.sp == blk->ref_species && r.chr == blk->ref_chr;
             });
         if (it_ref != recs.end()) std::swap(*recs.begin(), *it_ref);
     }
@@ -135,26 +129,79 @@ static bool emitMafBlock(std::ostream& os,
     std::unordered_map<ChrName, Cigar_t>     cigars;
     for (auto& r : recs) {
         auto mit = seq_mgrs.find(r.sp);
-        if (mit == seq_mgrs.end()) { seqs.clear(); break; }
+        if (mit == seq_mgrs.end()) {
+            stats.recordInvalid(
+                "Sequence manager missing for species=" + r.sp);
+            return false;
+        }
         std::string raw = fetchSeq(*mit->second, r.chr, r.seg->start, r.seg->length);
+
+        if (raw.size() != r.seg->length) {
+            std::ostringstream oss;
+            oss << "Segment sequence length mismatch: ref_species="
+                << blk->ref_species << ", ref_chr=" << blk->ref_chr
+                << ", key=" << r.sp << '.' << r.chr
+                << ", segment_length=" << r.seg->length
+                << ", fetched_length=" << raw.size();
+            stats.recordInvalid(oss.str());
+            return false;
+        }
 
         if (r.seg->strand == Strand::REVERSE) reverseComplement(raw);
         ChrName key = pairwise_mode ? r.chr : r.sp + "." + r.chr;
-        seqs.emplace(key, std::move(raw));
-        cigars.emplace(key, r.seg->cigar);
+        if (!seqs.emplace(key, std::move(raw)).second ||
+            !cigars.emplace(key, r.seg->cigar).second) {
+            stats.recordInvalid(
+                "Duplicate MAF sequence key in block: key=" + key);
+            return false;
+        }
 
     }
-    if (seqs.empty()) return false;
 
     // ---------- 5. 归并对齐 ----------
     const ChrName ref_key = pairwise_mode
-        ? alignment_ref_chr
-        : alignment_ref_species + "." + alignment_ref_chr;
+        ? blk->ref_chr
+        : blk->ref_species + "." + blk->ref_chr;
+    const auto ref_seq_it = seqs.find(ref_key);
+    if (ref_seq_it == seqs.end()) {
+        stats.recordInvalid(
+            "Reference sequence missing after extraction: key=" + ref_key);
+        return false;
+    }
+
+    for (const auto& [key, cigar] : cigars) {
+        if (key == ref_key) continue;
+        const auto seq_it = seqs.find(key);
+        if (seq_it == seqs.end()) {
+            stats.recordInvalid(
+                "CIGAR sequence missing after extraction: key=" + key);
+            return false;
+        }
+
+        const AlignCount count = countAlignedBases(cigar);
+        if (count.ref_bases != ref_seq_it->second.size() ||
+            count.query_bases != seq_it->second.size()) {
+            std::ostringstream oss;
+            oss << "CIGAR consumption mismatch: ref=" << ref_key
+                << ", key=" << key
+                << ", cigar_ref=" << count.ref_bases
+                << ", ref_size=" << ref_seq_it->second.size()
+                << ", cigar_query=" << count.query_bases
+                << ", query_size=" << seq_it->second.size();
+            stats.recordInvalid(oss.str());
+            return false;
+        }
+    }
     try {
         mergeAlignmentByRef(ref_key, seqs, cigars);
     }
     catch (const std::exception& e) {
-        spdlog::warn("mergeAlignmentByRef failed: {}", e.what());
+        std::ostringstream oss;
+        oss << "mergeAlignmentByRef failed: ref=" << ref_key
+            << ", records=" << recs.size()
+            << ", pairwise_mode=" << (pairwise_mode ? "true" : "false")
+            << ", error=" << e.what();
+        stats.recordInvalid(oss.str());
         return false;
     }
 
@@ -202,7 +249,9 @@ namespace RaMesh {
         std::ofstream ofs(maf_path, std::ios::binary | std::ios::trunc);
         if (!ofs) throw std::runtime_error("Cannot open: " + maf_path.string());
         ofs << "##maf version=1 scoring=none\n";
-        for (auto& wblk : blocks) emitMafBlock(ofs, wblk.lock(), seq_mgrs, only_primary, pairwise_mode, true, nullptr, true);
+        MafExportStats stats;
+        for (auto& wblk : blocks) emitMafBlock(ofs, wblk.lock(), seq_mgrs, only_primary, pairwise_mode, true, stats, nullptr, true);
+        logMafExportSummary(maf_path, stats);
     }
 
     void RaMeshMultiGenomeGraph::exportToMafWithoutReverse(
@@ -216,7 +265,9 @@ namespace RaMesh {
         std::ofstream ofs(maf_path, std::ios::binary | std::ios::trunc);
         if (!ofs) throw std::runtime_error("Cannot open: " + maf_path.string());
         ofs << "##maf version=1 scoring=none\n";
-        for (auto& wblk : blocks) emitMafBlock(ofs, wblk.lock(), seq_mgrs, only_primary, pairwise_mode, false, nullptr, true);
+        MafExportStats stats;
+        for (auto& wblk : blocks) emitMafBlock(ofs, wblk.lock(), seq_mgrs, only_primary, pairwise_mode, false, stats, nullptr, true);
+        logMafExportSummary(maf_path, stats);
     }
 
     void RaMeshMultiGenomeGraph::exportToMultipleMaf(
@@ -226,21 +277,22 @@ namespace RaMesh {
         bool pairwise_mode) const
     {
         namespace fs = std::filesystem;
-        struct Out { SpeciesName sp; std::ofstream ofs; }; std::vector<Out> dests;
+        struct Out { SpeciesName sp; FilePath path; std::ofstream ofs; MafExportStats stats; }; std::vector<Out> dests;
         dests.reserve(outs.size());
         for (auto& pr : outs) {
             if (!pr.second.parent_path().empty()) fs::create_directories(pr.second.parent_path());
             std::ofstream f(pr.second, std::ios::binary | std::ios::trunc);
             if (!f) throw std::runtime_error("Cannot open: " + pr.second.string());
             f << "##maf version=1 scoring=none\n";
-            dests.push_back({ pr.first,std::move(f) });
+            dests.push_back({ pr.first, pr.second, std::move(f), {} });
         }
         for (auto& wblk : blocks) {
             auto blk = wblk.lock(); if (!blk) continue;
             for (auto& out : dests) {
-                emitMafBlock(out.ofs, blk, seq_mgrs, only_primary, pairwise_mode, true, &out.sp, true);
+                emitMafBlock(out.ofs, blk, seq_mgrs, only_primary, pairwise_mode, true, out.stats, &out.sp, true);
             }
         }
+        for (const auto& out : dests) logMafExportSummary(out.path, out.stats);
     }
 
     void RaMeshMultiGenomeGraph::exportToHal(const FilePath& hal_path,
