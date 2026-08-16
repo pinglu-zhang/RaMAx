@@ -950,10 +950,17 @@ namespace RaMesh {
         return bp;
     }
 
-    BlockPtr Block::createEmpty(const ChrName& chr, std::size_t hint)
+    BlockPtr Block::createEmpty(const SpeciesName& ref_species,
+                                const ChrName& ref_chr,
+                                std::size_t hint)
     {
+        if (ref_species.empty() || ref_chr.empty()) {
+            throw std::invalid_argument(
+                "Block::createEmpty requires a non-empty reference key");
+        }
         auto bp = Block::create(hint);
-        bp->ref_chr = chr;
+        bp->ref_species = ref_species;
+        bp->ref_chr = ref_chr;
         return bp;
     }
 
@@ -978,6 +985,8 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
+            blk->ref_species = ref_name;
+            blk->ref_chr = ref_chr;
             blk->anchors[{ ref_name, ref_chr }] = ref_seg;
             blk->anchors[{ qry_name, qry_chr }] = qry_seg;
         }
@@ -1004,6 +1013,8 @@ namespace RaMesh {
         // Register anchors
         {
             std::unique_lock lk(blk->rw);
+            blk->ref_species = ref_name;
+            blk->ref_chr = ref_chr;
             blk->anchors[{ ref_name, ref_chr }] = ref_seg;
             blk->anchors[{ qry_name, qry_chr }] = qry_seg;
         }

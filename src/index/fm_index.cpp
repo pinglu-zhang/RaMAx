@@ -1,6 +1,23 @@
 ﻿#include "index.h"
 #include <sdsl/io.hpp>
 
+namespace {
+
+constexpr uint_t chooseAccurateSearchAdvance(
+    uint_t match_length, size_t accepted_region_count, uint_t threshold) noexcept {
+    return threshold > 0 && accepted_region_count == 1 && match_length > threshold
+        ? match_length
+        : 1;
+}
+
+static_assert(chooseAccurateSearchAdvance(10000, 1, 10000) == 1);
+static_assert(chooseAccurateSearchAdvance(10001, 1, 10000) == 10001);
+static_assert(chooseAccurateSearchAdvance(10001, 1, 0) == 1);
+static_assert(chooseAccurateSearchAdvance(10001, 0, 10000) == 1);
+static_assert(chooseAccurateSearchAdvance(10001, 2, 10000) == 1);
+
+} // namespace
+
 // ------------------------------------------------------------------
 // FM_Index：FM-index（基于 BWT + wavelet tree + 采样 SA）实现
 // 说明：
@@ -359,7 +376,8 @@ MatchVec2DPtr FM_Index::findAnchors(ChrIndex query_chr_index, std::string query,
     bool allow_short_mum,
     uint_t max_anchor_frequency,
     sdsl::int_vector<0>& ref_global_cache,
-    SeqPro::Length sampling_interval) {
+    SeqPro::Length sampling_interval,
+    uint_t accurate_skip_threshold) {
 
     if (search_mode == FAST_SEARCH) {
         return findAnchorsFast(query_chr_index, query, strand, allow_MEM, query_offset,
@@ -368,7 +386,8 @@ MatchVec2DPtr FM_Index::findAnchors(ChrIndex query_chr_index, std::string query,
     else if (search_mode == ACCURATE_SEARCH) {
         return findAnchorsAccurate(query_chr_index, query, strand, allow_MEM,
             query_offset, min_anchor_length, allow_short_mum,
-            max_anchor_frequency, ref_global_cache, sampling_interval);
+            max_anchor_frequency, ref_global_cache, sampling_interval,
+            accurate_skip_threshold);
     }
     else if (search_mode == MIDDLE_SEARCH) {
         return findAnchorsMiddle(query_chr_index, query, strand, allow_MEM, query_offset,
@@ -521,10 +540,11 @@ MatchVec2DPtr FM_Index::findAnchorsFast(ChrIndex query_chr_index, std::string qu
 }
 
 // ------------------------------------------------------------------
-// Accurate 模式：更细粒度推进（每次推进 1）
+// Accurate 模式：默认逐碱基推进；已接受的唯一长 MUM 直接推进到匹配末尾
 // 说明：
 // - 同样使用 last_pos 做简单去重
-// - 推进策略：total_length += 1
+// - 阈值为 0 时保持逐碱基推进
+// - 多位置 MEM、被过滤匹配和短匹配仍只推进 1 bp
 // ------------------------------------------------------------------
 MatchVec2DPtr FM_Index::findAnchorsAccurate(ChrIndex query_chr_index, std::string query,
     Strand strand, bool allow_MEM,
@@ -533,7 +553,8 @@ MatchVec2DPtr FM_Index::findAnchorsAccurate(ChrIndex query_chr_index, std::strin
     bool allow_short_mum,
     uint_t max_anchor_frequency,
     sdsl::int_vector<0>& ref_global_cache,
-    SeqPro::Length sampling_interval) {
+    SeqPro::Length sampling_interval,
+    uint_t accurate_skip_threshold) {
 
     if (strand == Strand::FORWARD) {
         std::reverse(query.begin(), query.end());
@@ -585,8 +606,9 @@ MatchVec2DPtr FM_Index::findAnchorsAccurate(ChrIndex query_chr_index, std::strin
             last_pos = ref_end_pos;
         }
 
-        // 精确模式推进（保持原逻辑）
-        total_length += 1;
+        const uint_t advance = chooseAccurateSearchAdvance(
+            match_length, region_vec.size(), accurate_skip_threshold);
+        total_length += advance;
     }
 
     anchor_ptr_list_vec->shrink_to_fit();

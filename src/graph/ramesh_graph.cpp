@@ -1028,7 +1028,7 @@ void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
         return detail;
       };
 
-      if (block_ptr->ref_chr.empty()) {
+      if (block_ptr->ref_species.empty() || block_ptr->ref_chr.empty()) {
         missing_ref_definition++;
         std::string hint_species;
         std::string hint_chr;
@@ -1041,33 +1041,25 @@ void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
         addVerificationError(
             result, options, VerificationType::BLOCK_REFERENCE_CHR,
             ErrorSeverity::ERROR, hint_species, hint_chr, 0, 0,
-            "Block missing reference chromosome assignment",
+            "Block missing reference species or chromosome assignment",
             "anchors=" + makeAnchorSummary(block_ptr->anchors));
         continue;
       }
 
-      bool has_ref_anchor = false;
-      SpeciesName first_species;
-      for (const auto &entry : block_ptr->anchors) {
-        const auto &species_chr = entry.first;
-        if (first_species.empty()) {
-          first_species = species_chr.first;
-        }
-        if (species_chr.second == block_ptr->ref_chr) {
-          has_ref_anchor = true;
-          break;
-        }
-      }
+      const SpeciesChrPair ref_key{block_ptr->ref_species,
+                                   block_ptr->ref_chr};
+      const bool has_ref_anchor =
+          block_ptr->anchors.find(ref_key) != block_ptr->anchors.end();
 
       if (!has_ref_anchor) {
         missing_ref_anchor++;
         addVerificationError(result, options,
                              VerificationType::BLOCK_REFERENCE_CHR,
-                             ErrorSeverity::ERROR, first_species,
+                             ErrorSeverity::ERROR, block_ptr->ref_species,
                              block_ptr->ref_chr, 0, 0,
-                             "Block missing anchor entry for reference "
-                             "chromosome",
-                             "ref_chr=" + block_ptr->ref_chr +
+                             "Block missing anchor entry for exact reference",
+                             "ref_species=" + block_ptr->ref_species +
+                                 ", ref_chr=" + block_ptr->ref_chr +
                                  ", anchors=" +
                                  makeAnchorSummary(block_ptr->anchors));
       }
@@ -1837,6 +1829,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // 1. 创建前缀block和segment（如果存在）
               if (prev_has_prefix || curr_has_prefix) {
                 prefix_block = Block::create(2);
+                prefix_block->ref_species = ref_name;
                 prefix_block->ref_chr = prev_block->ref_chr;
                 prefix_ref_seg = Segment::create(
                     prefix_start, prefix_len,
@@ -1854,6 +1847,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
               // 2. 创建重叠block和segment（必定存在）
               overlap_block = Block::create(2);
+              overlap_block->ref_species = ref_name;
               overlap_block->ref_chr = prev_block->ref_chr;
               uint32_t overlap_len = overlap_end - overlap_start;
               overlap_ref_seg = Segment::create(
@@ -1872,6 +1866,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // 3. 创建后缀block和segment（如果存在）
               if (prev_has_suffix || curr_has_suffix) {
                 suffix_block = Block::create(2);
+                suffix_block->ref_species = ref_name;
                 suffix_block->ref_chr = prev_block->ref_chr;
                 suffix_ref_seg = Segment::create(
                     suffix_start, suffix_len,

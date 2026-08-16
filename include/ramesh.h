@@ -116,12 +116,15 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class Block : public std::enable_shared_from_this<Block> {
     public:
+        SpeciesName ref_species; // guard: rw
         ChrName   ref_chr;      // guard: rw
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
         mutable std::shared_mutex rw;
 
         static BlockPtr create(std::size_t hint = 1);
-        static BlockPtr createEmpty(const ChrName& chr, std::size_t hint = 1);
+        static BlockPtr createEmpty(const SpeciesName& ref_species,
+                                    const ChrName& ref_chr,
+                                    std::size_t hint = 1);
 
         // Convenience helper – create both ref&qry segments, register anchors
         static std::pair<SegPtr, SegPtr> createSegmentPair(const Match& match,

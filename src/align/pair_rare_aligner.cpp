@@ -11,7 +11,8 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	uint_t chunk_size,
 	uint_t overlap_size,
 	uint_t min_anchor_length,
-	uint_t max_anchor_frequency)
+	uint_t max_anchor_frequency,
+	uint_t accurate_skip_threshold)
 	: work_dir(work_dir)
 	, index_dir(work_dir / INDEX_DIR)
 	, chunk_size(chunk_size)
@@ -19,6 +20,7 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	, min_anchor_length(min_anchor_length)
 	, max_anchor_frequency(max_anchor_frequency)
 	, thread_num(thread_num)
+	, accurate_skip_threshold(accurate_skip_threshold)
 {
 	if (!std::filesystem::exists(index_dir)) {
 		std::filesystem::create_directories(index_dir);
@@ -189,7 +191,8 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 					allow_short_mum,
 					max_anchor_frequency,
 					ref_global_cache,
-					sampling_interval);
+					sampling_interval,
+					accurate_skip_threshold);
 			}
 		} catch (...) {
 			std::lock_guard<std::mutex> lock(task_exception_mutex);
@@ -244,6 +247,97 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 	spdlog::info("");
 
 	return result;          // NRVO / move-elided
+}
+
+std::shared_ptr<PreparedAnchorSearch> PairRareAligner::prepareQueryFileAnchor(
+	const std::string& prefix,
+	SeqPro::ManagerVariant& query_fasta_manager,
+	SearchMode search_mode,
+	bool allow_MEM,
+	bool allow_short_mum,
+	sdsl::int_vector<0>& ref_global_cache,
+	SeqPro::Length sampling_interval,
+	bool isMultiple)
+{
+	auto plan = std::make_shared<PreparedAnchorSearch>();
+	plan->prefix = prefix;
+	plan->query_manager = &query_fasta_manager;
+	plan->search_mode = search_mode;
+	plan->allow_MEM = allow_MEM;
+	plan->allow_short_mum = allow_short_mum;
+	plan->ref_global_cache = &ref_global_cache;
+	plan->sampling_interval = sampling_interval;
+
+	RegionVec chunks = isMultiple
+		? preAllocateChunksBySize(query_fasta_manager, chunk_size, overlap_size,
+			10000, true)
+		: preAllocateChunks(query_fasta_manager, chunk_size, overlap_size,
+			1000, 10000);
+
+	plan->tasks.reserve(chunks.size() * 2);
+	for (const auto& chunk : chunks) {
+		plan->tasks.push_back({chunk, Strand::FORWARD});
+		plan->tasks.push_back({chunk, Strand::REVERSE});
+	}
+	plan->task_results.resize(plan->tasks.size());
+	plan->task_errors.resize(plan->tasks.size());
+	return plan;
+}
+
+void PairRareAligner::executePreparedAnchorTask(PreparedAnchorSearch& plan,
+	size_t task_index)
+{
+	try {
+		const auto& task = plan.tasks.at(task_index);
+		const auto& chunk = task.chunk;
+		std::string seq = std::visit([&chunk](auto&& manager_ptr) -> std::string {
+			using PtrType = std::decay_t<decltype(manager_ptr)>;
+			if constexpr (std::is_same_v<PtrType,
+				std::unique_ptr<SeqPro::SequenceManager>>) {
+				return manager_ptr->getSubSequence(
+					chunk.chr_index, chunk.start, chunk.length);
+			} else if constexpr (std::is_same_v<PtrType,
+				std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+				return manager_ptr->getOriginalManager().getSubSequence(
+					chunk.chr_index, chunk.start, chunk.length);
+			} else {
+				throw std::runtime_error("Unhandled manager type in variant.");
+			}
+		}, *plan.query_manager);
+
+		if (seq.length() < chunk.length) {
+			plan.task_results[task_index] = std::make_shared<MatchVec2D>();
+			return;
+		}
+
+		const SearchMode task_search_mode =
+			(task.strand == Strand::FORWARD)
+			? plan.search_mode : ACCURATE_SEARCH;
+		plan.task_results[task_index] = ref_index->findAnchors(
+			chunk.chr_index, seq, task_search_mode, task.strand,
+			plan.allow_MEM, chunk.start, min_anchor_length,
+			plan.allow_short_mum, max_anchor_frequency,
+			*plan.ref_global_cache, plan.sampling_interval,
+			accurate_skip_threshold);
+	} catch (...) {
+		plan.task_errors[task_index] = std::current_exception();
+	}
+}
+
+MatchVec3DPtr PairRareAligner::collectPreparedAnchorSearch(
+	PreparedAnchorSearch& plan)
+{
+	for (const auto& error : plan.task_errors) {
+		if (error) std::rethrow_exception(error);
+	}
+
+	auto result = std::make_shared<MatchVec3D>();
+	result->reserve(plan.task_results.size());
+	for (auto& part : plan.task_results) {
+		if (!part) part = std::make_shared<MatchVec2D>();
+		result->emplace_back(std::move(*part));
+	}
+	return result;
 }
 
 // ========== 工具：快速取子串 ==========
@@ -836,28 +930,10 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
 
     #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
     for (long long t = 0; t < static_cast<long long>(cluster_num); ++t) {
-    	MatchClusterVecPtr tmp_p = tmp_cluster_vec[t];
-    	if (!tmp_p || tmp_p->empty()) continue;
-        AnchorPtrVec anchors;
-        anchors.reserve(1);
-
-        if (!is_first) {
-            for (auto& c : (*tmp_p)) {
-                for (auto& sub_c : c) {
-                    MatchVec mc;
-                    mc.push_back(sub_c);
-
-                    Anchor anchor = extendClusterToAnchor(
-                        mc, *ref_seqpro_manager, query_seqpro_manager
-                    );
-                    anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
-                }
-            }
-        } else {
-            anchors = linkClusters(
-                *tmp_p, *ref_seqpro_manager, query_seqpro_manager
-            );
-        }
+		MatchClusterVecPtr tmp_p = tmp_cluster_vec[t];
+		if (!tmp_p || tmp_p->empty()) continue;
+        AnchorPtrVec anchors = extendClusterGroupToAnchors(
+            query_name, query_seqpro_manager, tmp_p, is_first);
 
         if (!anchors.empty()) {
             tmp_res[t] = std::move(anchors);
@@ -900,6 +976,35 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
 
     spdlog::info("extend cluster to anchor successfully for {}", query_name);
     return result;
+}
+
+AnchorPtrVec PairRareAligner::extendClusterGroupToAnchors(
+    SpeciesName /*query_name*/,
+    SeqPro::ManagerVariant& query_seqpro_manager,
+    MatchClusterVecPtr cluster_group,
+    bool is_first)
+{
+    AnchorPtrVec anchors;
+    if (!cluster_group || cluster_group->empty()) return anchors;
+    anchors.reserve(1);
+
+    if (!is_first) {
+        for (auto& cluster : *cluster_group) {
+            for (auto& match : cluster) {
+                MatchVec single_match;
+                single_match.push_back(match);
+                Anchor anchor = extendClusterToAnchor(
+                    single_match, *ref_seqpro_manager,
+                    query_seqpro_manager);
+                anchors.push_back(
+                    std::make_shared<Anchor>(std::move(anchor)));
+            }
+        }
+    } else {
+        anchors = linkClusters(*cluster_group, *ref_seqpro_manager,
+            query_seqpro_manager);
+    }
+    return anchors;
 }
 
 
@@ -1084,16 +1189,21 @@ static void filterChrByDP(
 #endif
 }
 
+void PairRareAligner::filterAnchorByDPDimension(
+	AnchorBySQR_SparsePtr anchor_map, uint_t chromosome_id, bool filter_ref) {
+	filterChrByDP(anchor_map, chromosome_id, filter_ref);
+}
+
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < ref_chr_cnt; i++) {
-		filterChrByDP(anchor_map, i, true);
+		filterAnchorByDPDimension(anchor_map, i, true);
 	}
 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < qry_chr_cnt; i++) {
-		filterChrByDP(anchor_map, i, false);
+		filterAnchorByDPDimension(anchor_map, i, false);
 	}
 
 	return;
@@ -1118,5 +1228,4 @@ void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::Manager
 	}
 
 }
-
 
