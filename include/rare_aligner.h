@@ -23,6 +23,7 @@ public:
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold;
 
     uint_t thread_num;
     uint_t group_id;
@@ -49,7 +50,8 @@ public:
         uint_t chunk_size,
         uint_t overlap_size,
         uint_t min_anchor_length,
-        uint_t max_anchor_frequency
+        uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold
     );
 
     std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> starAlignment(
@@ -97,12 +99,15 @@ public:
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold = 0;
 
     uint_t group_id;
     uint_t round_id;
 
     uint_t thread_num;
-    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size, uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency);
+    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size,
+        uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold = 0);
 
     // 新增构造函数：从 MultipleRareAligner 初始化
     PairRareAligner(const MultipleRareAligner& mra)
@@ -112,6 +117,7 @@ public:
         overlap_size(mra.overlap_size),
         min_anchor_length(mra.min_anchor_length),
         max_anchor_frequency(mra.max_anchor_frequency),
+        accurate_skip_threshold(mra.accurate_skip_threshold),
         thread_num(mra.thread_num)
     {
         this->group_id = mra.group_id;

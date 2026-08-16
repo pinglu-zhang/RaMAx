@@ -45,6 +45,7 @@ struct CommonArgs {
     // ========================
 
     SearchMode search_mode = ACCURATE_SEARCH;   // 搜索模式（如精确搜索 / 快速搜索）
+    uint_t accurate_skip_threshold = 10000;     // accurate 模式长 MUM 跳跃阈值（0=关闭）
     bool allow_MEM = false;                     // 是否允许使用 MEM（Maximal Exact Match）
     bool fast_build = true;                     // 是否启用快速索引构建模式
     SeqPro::Length sampling_interval = 32;      // 索引采样间隔（影响速度与内存）
@@ -167,6 +168,7 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Min anchor length     : {}", args.min_anchor_length);
     spdlog::info("  Max anchor frequency  : {}", args.max_anchor_frequency);
     spdlog::info("  Search mode           : {}", SearchModeToString(args.search_mode));
+    spdlog::info("  Accurate skip threshold: {}", args.accurate_skip_threshold);
     spdlog::info("  Allow MEM             : {}", args.allow_MEM ? "Enabled" : "Disabled");
     spdlog::info("  Fast build            : {}", args.fast_build ? "Enabled" : "Disabled");
     spdlog::info("  Sampling interval     : {}", args.sampling_interval);
@@ -340,6 +342,16 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
                 {"accurate", ACCURATE_SEARCH}
             },
             CLI::ignore_case));                     // 忽略大小写
+
+    auto* accurate_skip_threshold_opt = cmd->add_option(
+        "--accurate-skip-threshold", args.accurate_skip_threshold,
+        "Skip accepted unique MUMs longer than this many bp in accurate mode; 0 disables (default: 10000).")
+        ->default_val(10000)
+        ->capture_default_str()
+        ->group("Software Parameters")
+        ->check(CLI::Range(0, std::numeric_limits<int>::max()))
+        ->type_name("<int>")
+        ->transform(trim_whitespace);
 
     // 是否允许使用 MEM（Maximal Exact Match）
     auto* allow_mem_flag = cmd->add_flag("--allow-mem", args.allow_MEM,
@@ -522,6 +534,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         min_anchor_length_opt,
         max_anchor_frequency_opt,
         search_mode_opt,
+        accurate_skip_threshold_opt,
         allow_mem_flag,
         slow_build_flag,
         sampling_interval_opt,
@@ -690,6 +703,25 @@ static int runRestartMode(CommonArgs& common_args) {
     common_args.restart = true;
     configureLogLevel(common_args);
     spdlog::info("CommonArgs loaded from {}", config_path.string());
+
+    const FilePath threshold_path =
+        common_args.work_dir_path / "accurate_skip_threshold.txt";
+    common_args.accurate_skip_threshold = 10000;
+    if (std::filesystem::exists(threshold_path)) {
+        std::ifstream threshold_stream(threshold_path);
+        uint64_t saved_threshold = 0;
+        if (!(threshold_stream >> saved_threshold) ||
+            saved_threshold > std::numeric_limits<uint_t>::max()) {
+            throw std::runtime_error(
+                "Invalid accurate skip threshold in " + threshold_path.string());
+        }
+        threshold_stream >> std::ws;
+        if (!threshold_stream.eof()) {
+            throw std::runtime_error(
+                "Invalid accurate skip threshold in " + threshold_path.string());
+        }
+        common_args.accurate_skip_threshold = static_cast<uint_t>(saved_threshold);
+    }
     return 0;
 }
 
@@ -754,6 +786,15 @@ static int runNormalMode(CommonArgs& common_args) {
     cereal::JSONOutputArchive archive(os);
     archive(cereal::make_nvp("common_args", common_args));
     spdlog::info("Configuration saved to {}", config_path.string());
+
+    const FilePath threshold_path =
+        common_args.work_dir_path / "accurate_skip_threshold.txt";
+    std::ofstream threshold_stream(threshold_path, std::ios::trunc);
+    if (!threshold_stream) {
+        throw std::runtime_error(
+            "Failed to save accurate skip threshold to " + threshold_path.string());
+    }
+    threshold_stream << common_args.accurate_skip_threshold << '\n';
 
     return 0;
 }
@@ -979,7 +1020,8 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.chunk_size,
         common_args.overlap_size,
         common_args.min_anchor_length,
-        common_args.max_anchor_frequency
+        common_args.max_anchor_frequency,
+        common_args.accurate_skip_threshold
     );
 
     mra.merge_exact_contiguous_blocks_enabled =

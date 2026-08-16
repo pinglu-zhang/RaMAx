@@ -11,7 +11,8 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	uint_t chunk_size,
 	uint_t overlap_size,
 	uint_t min_anchor_length,
-	uint_t max_anchor_frequency)
+	uint_t max_anchor_frequency,
+	uint_t accurate_skip_threshold)
 	: work_dir(work_dir)
 	, index_dir(work_dir / INDEX_DIR)
 	, chunk_size(chunk_size)
@@ -19,6 +20,7 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	, min_anchor_length(min_anchor_length)
 	, max_anchor_frequency(max_anchor_frequency)
 	, thread_num(thread_num)
+	, accurate_skip_threshold(accurate_skip_threshold)
 {
 	if (!std::filesystem::exists(index_dir)) {
 		std::filesystem::create_directories(index_dir);
@@ -189,7 +191,8 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 					allow_short_mum,
 					max_anchor_frequency,
 					ref_global_cache,
-					sampling_interval);
+					sampling_interval,
+					accurate_skip_threshold);
 			}
 		} catch (...) {
 			std::lock_guard<std::mutex> lock(task_exception_mutex);
@@ -1118,5 +1121,4 @@ void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::Manager
 	}
 
 }
-
 
