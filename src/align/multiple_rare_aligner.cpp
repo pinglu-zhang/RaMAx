@@ -1,5 +1,7 @@
 #include <sequence_utils.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -13,6 +15,29 @@ namespace {
 
     constexpr size_t kMaxReferenceSequenceCount = 100000;
 
+    struct OpenMPStageActivity {
+        std::atomic<size_t> active{0};
+        std::atomic<size_t> max_active{0};
+
+        void enter() {
+            const size_t current = active.fetch_add(1,
+                std::memory_order_relaxed) + 1;
+            size_t observed = max_active.load(std::memory_order_relaxed);
+            while (observed < current &&
+                   !max_active.compare_exchange_weak(observed, current,
+                       std::memory_order_relaxed)) {}
+        }
+
+        void leave() {
+            active.fetch_sub(1, std::memory_order_relaxed);
+        }
+    };
+
+    size_t stageWorkerCount(uint_t requested, size_t work_items) {
+        if (work_items == 0) return 1;
+        return std::max<size_t>(1,
+            std::min<size_t>(requested, work_items));
+    }
 void exportMaskIntervalsToDirectory(
     const std::filesystem::path& export_dir,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
@@ -891,43 +916,67 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
         query_species.push_back(sp);
     }
 
-    /* ---------- 5. 顺序处理 query 物种；每个物种内部由 OpenMP 并行搜索 chunks ---------- */
+    /* ---------- 5. 展平全部 (species, chunk, strand) 任务 ---------- */
+    std::vector<std::shared_ptr<PreparedAnchorSearch>> plans;
+    plans.reserve(query_species.size());
+    struct AnchorWorkItem { size_t species_index; size_t task_index; };
+    std::vector<AnchorWorkItem> work_items;
+
+    for (const auto& species : query_species) {
+        auto& manager = species_fasta_manager_map.at(species);
+        auto plan = pra.prepareQueryFileAnchor(
+            ref_name + "_vs_" + species, *manager, search_mode,
+            allow_MEM, allow_short_mum, ref_global_cache,
+            sampling_interval, true);
+        const size_t species_index = plans.size();
+        for (size_t task_index = 0; task_index < plan->tasks.size(); ++task_index) {
+            work_items.push_back({species_index, task_index});
+        }
+        plans.emplace_back(std::move(plan));
+    }
+
+    const size_t workers = stageWorkerCount(thread_num, work_items.size());
+    OpenMPStageActivity activity;
+    const auto stage_start = std::chrono::steady_clock::now();
+
+    if (workers == 1) {
+        for (const auto& item : work_items) {
+            activity.enter();
+            pra.executePreparedAnchorTask(
+                *plans[item.species_index], item.task_index);
+            activity.leave();
+        }
+    } else {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+        for (long long i = 0;
+             i < static_cast<long long>(work_items.size()); ++i) {
+            const auto& item = work_items[static_cast<size_t>(i)];
+            activity.enter();
+            pra.executePreparedAnchorTask(
+                *plans[item.species_index], item.task_index);
+            activity.leave();
+        }
+    }
+
+    const double stage_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - stage_start).count();
+    spdlog::info(
+        "[parallel-stage] anchor-search: tasks={}, threads={}, "
+        "max_active={}, elapsed_ms={:.3f}",
+        work_items.size(), workers,
+        activity.max_active.load(std::memory_order_relaxed), stage_ms);
+
+    // Preserve the original species insertion order in the unordered map.
     auto result_map = std::make_shared<SpeciesMatchVec3DPtrMap>();
-
-    size_t total = query_species.size();
-    size_t count = 0;
-    size_t next_progress = 1; // 下一次打印进度的阶段（1..20）
-
-    for (const auto& sp : query_species) {
+    for (size_t i = 0; i < query_species.size(); ++i) {
+        const auto& species = query_species[i];
         try {
-            std::string prefix = ref_name + "_vs_" + sp;
-            auto& fm = species_fasta_manager_map.at(sp);
-
-            MatchVec3DPtr mv3 = pra.findQueryFileAnchor(
-                prefix,
-                *fm,
-                search_mode,
-                allow_MEM,
-                allow_short_mum,
-                ref_global_cache,
-                sampling_interval,
-                true
-            );
-            (*result_map)[sp] = std::move(mv3);
-            spdlog::info("[alignMultipleQuerys] {} aligned.", sp);
-        }
-        catch (const std::exception& e) {
-            spdlog::error("[alignMultipleQuerys] {} failed: {}", sp, e.what());
-        }
-
-        ++count;
-
-        // 进度分 20 段打印（0..100%）
-        size_t progress_stage = total > 0 ? (count * 20) / total : 20;
-        if (progress_stage >= next_progress || count == total) {
-            int percent = static_cast<int>((progress_stage * 100) / 20);
-            spdlog::info("[alignMultipleQuerys] Progress: {}%", percent);
-            next_progress = progress_stage + 1;
+            (*result_map)[species] =
+                pra.collectPreparedAnchorSearch(*plans[i]);
+            spdlog::info("[alignMultipleQuerys] {} aligned.", species);
+        } catch (const std::exception& e) {
+            spdlog::error("[alignMultipleQuerys] {} failed: {}",
+                species, e.what());
         }
     }
 
@@ -1006,14 +1055,78 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
 
     spdlog::info("Cluster All Chr Match (Sparse) Start...");
 
-    // 5) 串行对每个物种做聚簇（clusterAllChrMatchSparse 内部可并行）
-    for (size_t i = 0; i < species_list.size(); ++i) {
-        const auto& species = species_list[i];
-        auto u_ptr = unique_map.at(species);
-        auto r_ptr = repeat_map.at(species);
+    // 5) Flatten all (species, SQR key) clustering work into one team.
+    struct ClusterWorkItem { size_t species_index; size_t key_index; };
+    std::vector<std::vector<uint64_t>> species_keys(species_list.size());
+    std::vector<std::vector<MatchClusterVecPtr>> cluster_results(
+        species_list.size());
+    std::vector<ClusterWorkItem> cluster_work;
 
-        auto clusters = clusterAllChrMatchSparse(u_ptr, r_ptr, min_span, thread_num);
-        cluster_map.emplace(species, std::move(clusters));
+    for (size_t species_index = 0;
+         species_index < species_list.size(); ++species_index) {
+        const auto& species = species_list[species_index];
+        auto& keys = species_keys[species_index];
+        const auto& anchors = *unique_map.at(species);
+        keys.reserve(anchors.size());
+        for (const auto& [key, _] : anchors) keys.push_back(key);
+        cluster_results[species_index].resize(keys.size());
+        for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+            cluster_work.push_back({species_index, key_index});
+        }
+    }
+
+    const size_t cluster_workers =
+        stageWorkerCount(thread_num, cluster_work.size());
+    OpenMPStageActivity cluster_activity;
+    const auto cluster_start = std::chrono::steady_clock::now();
+    auto run_cluster_item = [&](const ClusterWorkItem& item) {
+        const auto& species = species_list[item.species_index];
+        const uint64_t key = species_keys[item.species_index][item.key_index];
+        MatchVec matches = unique_map.at(species)->at(key);
+        cluster_results[item.species_index][item.key_index] =
+            clusterChrMatch(matches, min_span);
+    };
+
+    if (cluster_workers == 1) {
+        for (const auto& item : cluster_work) {
+            cluster_activity.enter();
+            run_cluster_item(item);
+            cluster_activity.leave();
+        }
+    } else {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(cluster_workers)
+        for (long long i = 0;
+             i < static_cast<long long>(cluster_work.size()); ++i) {
+            cluster_activity.enter();
+            run_cluster_item(cluster_work[static_cast<size_t>(i)]);
+            cluster_activity.leave();
+        }
+    }
+
+    const double cluster_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cluster_start).count();
+    spdlog::info(
+        "[parallel-stage] clustering: tasks={}, threads={}, "
+        "max_active={}, elapsed_ms={:.3f}",
+        cluster_work.size(), cluster_workers,
+        cluster_activity.max_active.load(std::memory_order_relaxed),
+        cluster_ms);
+
+    // Rebuild every sparse map in its original key order, then insert species
+    // in the original order so downstream iteration remains unchanged.
+    for (size_t species_index = 0;
+         species_index < species_list.size(); ++species_index) {
+        auto clusters = std::make_shared<ClusterBySQR_Sparse>();
+        clusters->reserve(species_keys[species_index].size());
+        for (size_t key_index = 0;
+             key_index < species_keys[species_index].size(); ++key_index) {
+            auto& result = cluster_results[species_index][key_index];
+            if (result && !result->empty()) {
+                (*clusters)[species_keys[species_index][key_index]] =
+                    std::move(result);
+            }
+        }
+        cluster_map.emplace(species_list[species_index], std::move(clusters));
     }
 
     auto cluster_map_ptr = std::make_shared<SpeciesClusterMap>(std::move(cluster_map));
@@ -1072,50 +1185,143 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
          说明：原代码未使用并行（保持原逻辑）
     ============================================================*/
 
-    std::vector<AnchorBySQR_SparsePtr> anchor_results(species_list.size());
+    struct ExtensionWorkItem { size_t species_index; size_t group_index; };
+    std::vector<std::vector<MatchClusterVecPtr>> cluster_groups(
+        species_list.size());
+    std::vector<std::vector<AnchorPtrVec>> extension_results(
+        species_list.size());
+    std::vector<ExtensionWorkItem> extension_work;
 
-    for (long long idx = 0; idx < (long long)species_list.size(); ++idx) {
-        const auto& species = species_list[(size_t)idx];
-        auto cluster_ptr_sparse = species_cluster_map.at(species);
-
-        // 将 cluster 扩展为 anchor（内部会 decode_sqr_key 并构建对应维度结构）
-        AnchorBySQR_SparsePtr result_ptr = pra.extendClusterToAnchorByChr(
-            species,
-            *seqpro_managers[species],
-            cluster_ptr_sparse,
-            is_first
-        );
-
-        anchor_results[(size_t)idx] = std::move(result_ptr);
+    for (size_t species_index = 0;
+         species_index < species_list.size(); ++species_index) {
+        const auto& sparse = *species_cluster_map.at(
+            species_list[species_index]);
+        auto& groups = cluster_groups[species_index];
+        groups.reserve(sparse.size());
+        for (const auto& [_, group] : sparse) groups.push_back(group);
+        extension_results[species_index].resize(groups.size());
+        for (size_t group_index = 0;
+             group_index < groups.size(); ++group_index) {
+            extension_work.push_back({species_index, group_index});
+        }
     }
 
-    spdlog::info("[constructMultipleGraphsByDP] Phase-A extend done.");
+    const size_t extension_workers =
+        stageWorkerCount(thread_num, extension_work.size());
+    OpenMPStageActivity extension_activity;
+    const auto extension_start = std::chrono::steady_clock::now();
+    auto run_extension_item = [&](const ExtensionWorkItem& item) {
+        const auto& species = species_list[item.species_index];
+        extension_results[item.species_index][item.group_index] =
+            pra.extendClusterGroupToAnchors(
+                species, *seqpro_managers.at(species),
+                cluster_groups[item.species_index][item.group_index],
+                is_first);
+    };
+
+    if (extension_workers == 1) {
+        for (const auto& item : extension_work) {
+            extension_activity.enter();
+            run_extension_item(item);
+            extension_activity.leave();
+        }
+    } else {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(extension_workers)
+        for (long long i = 0;
+             i < static_cast<long long>(extension_work.size()); ++i) {
+            extension_activity.enter();
+            run_extension_item(extension_work[static_cast<size_t>(i)]);
+            extension_activity.leave();
+        }
+    }
+
+    std::vector<AnchorBySQR_SparsePtr> anchor_results(species_list.size());
+    for (size_t species_index = 0;
+         species_index < species_list.size(); ++species_index) {
+        auto anchors = std::make_shared<AnchorBySQR_Sparse>();
+        anchors->reserve(extension_results[species_index].size());
+        for (auto& group_result : extension_results[species_index]) {
+            if (!group_result.empty()) {
+                anchors->emplace_back(std::move(group_result));
+            }
+        }
+        anchor_results[species_index] = std::move(anchors);
+    }
+
+    const double extension_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - extension_start).count();
+    spdlog::info(
+        "[parallel-stage] cluster-extension: tasks={}, threads={}, "
+        "max_active={}, elapsed_ms={:.3f}",
+        extension_work.size(), extension_workers,
+        extension_activity.max_active.load(std::memory_order_relaxed),
+        extension_ms);
 
     // ------------------------------------------------------------
     // 3) 对每个物种：DP 过滤 + 构图
     // ------------------------------------------------------------
+    struct DPWorkItem {
+        size_t species_index;
+        uint_t chromosome_id;
+        bool filter_ref;
+    };
+    const uint_t ref_chr_cnt = std::visit(
+        [](auto& manager) { return manager->getSequenceCount(); },
+        *seqpro_managers.at(ref_name));
+    std::vector<DPWorkItem> dp_work;
+    for (size_t species_index = 0;
+         species_index < species_list.size(); ++species_index) {
+        if (!anchor_results[species_index]) continue;
+        for (uint_t chr = 0; chr < ref_chr_cnt; ++chr) {
+            dp_work.push_back({species_index, chr, true});
+        }
+        const uint_t query_chr_cnt = std::visit(
+            [](auto& manager) { return manager->getSequenceCount(); },
+            *seqpro_managers.at(species_list[species_index]));
+        for (uint_t chr = 0; chr < query_chr_cnt; ++chr) {
+            dp_work.push_back({species_index, chr, false});
+        }
+    }
+
+    const size_t dp_workers = stageWorkerCount(thread_num, dp_work.size());
+    OpenMPStageActivity dp_activity;
+    const auto dp_start = std::chrono::steady_clock::now();
+    auto run_dp_item = [&](const DPWorkItem& item) {
+        pra.filterAnchorByDPDimension(
+            anchor_results[item.species_index], item.chromosome_id,
+            item.filter_ref);
+    };
+
+    if (dp_workers == 1) {
+        for (const auto& item : dp_work) {
+            dp_activity.enter();
+            run_dp_item(item);
+            dp_activity.leave();
+        }
+    } else {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(dp_workers)
+        for (long long i = 0;
+             i < static_cast<long long>(dp_work.size()); ++i) {
+            dp_activity.enter();
+            run_dp_item(dp_work[static_cast<size_t>(i)]);
+            dp_activity.leave();
+        }
+    }
+
+    const double dp_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - dp_start).count();
+    spdlog::info(
+        "[parallel-stage] anchor-dp: tasks={}, threads={}, "
+        "max_active={}, elapsed_ms={:.3f}",
+        dp_work.size(), dp_workers,
+        dp_activity.max_active.load(std::memory_order_relaxed), dp_ms);
+
+    // Graph insertion remains serial and follows the original species order.
     for (size_t i = 0; i < species_list.size(); ++i) {
         const auto& species = species_list[i];
         auto& anchor_ptr = anchor_results[i];
-
-        // ref/qry 染色体数量，用于 DP 过滤
-        const uint_t ref_chr_cnt = std::visit(
-            [](auto& m) { return m->getSequenceCount(); },
-            *seqpro_managers[ref_name]
-        );
-        const uint_t qry_chr_cnt = std::visit(
-            [](auto& m) { return m->getSequenceCount(); },
-            *seqpro_managers[species]
-        );
-
-        if (!anchor_ptr)
-            continue;
-
-        // DP 过滤 anchors
-        pra.filterAnchorByDP(anchor_ptr, ref_chr_cnt, qry_chr_cnt);
+        if (!anchor_ptr) continue;
         spdlog::info("DP filter success for {}", species);
-
-        // 用过滤后的 anchors 构建图结构
         pra.constructGraphByDP(
             species,
             *seqpro_managers[species],
