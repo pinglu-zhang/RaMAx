@@ -367,7 +367,7 @@ std::optional<PreparedMerge> prepareMerge(
     prepared.reference_rank = reference_rank;
     prepared.neighbor_reference_length = neighbor_reference->length;
     prepared.merged_block = Block::createEmpty(
-        reference_species, neighbor_block->ref_chr,
+        reference_species, reference_chromosome,
         neighbor_block->anchors.size());
     double coverage_sum = 0.0;
     const auto reject = [&]() -> std::optional<PreparedMerge> {
