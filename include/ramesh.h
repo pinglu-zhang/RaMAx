@@ -122,7 +122,9 @@ namespace RaMesh {
         mutable std::shared_mutex rw;
 
         static BlockPtr create(std::size_t hint = 1);
-        static BlockPtr createEmpty(const ChrName& chr, std::size_t hint = 1);
+        static BlockPtr createEmpty(const SpeciesName& ref_species,
+                                    const ChrName& ref_chr,
+                                    std::size_t hint = 1);
 
         // Convenience helper – create both ref&qry segments, register anchors
         static std::pair<SegPtr, SegPtr> createSegmentPair(const Match& match,

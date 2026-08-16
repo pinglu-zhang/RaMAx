@@ -383,7 +383,8 @@ PreparedChain prepareChain(const CandidateChain& candidate,
     PreparedChain prepared;
     prepared.candidate = candidate;
     prepared.merged_block =
-        Block::createEmpty(candidate.reference_chromosome,
+        Block::createEmpty(reference_species,
+                           candidate.reference_chromosome,
                            candidate.species_count);
 
     const auto& keys = candidate.views.front()->anchors;
@@ -1470,7 +1471,8 @@ std::optional<PreparedChain> prepareZeroGapDeletionWindow(
         static_cast<uint_t>(reference_length);
     prepared.candidate.species_count = candidate.paths.size();
     prepared.merged_block = Block::createEmpty(
-        candidate.reference_chromosome, candidate.paths.size());
+        reference_species, candidate.reference_chromosome,
+        candidate.paths.size());
     prepared.paths.reserve(candidate.paths.size());
     const auto reject_prepared = [&]() -> std::optional<PreparedChain> {
         detachPreparedChain(prepared);
@@ -1627,7 +1629,8 @@ std::optional<PreparedChain> prepareAdjacentPairDirect(
         static_cast<uint_t>(full_reference_length);
     prepared.candidate.species_count = candidate.paths.size();
     prepared.merged_block = Block::createEmpty(
-        candidate.reference_chromosome, candidate.paths.size());
+        reference_species, candidate.reference_chromosome,
+        candidate.paths.size());
     prepared.paths.reserve(candidate.paths.size());
     const auto reject_prepared = [&]() -> std::optional<PreparedChain> {
         detachPreparedChain(prepared);
@@ -1873,7 +1876,8 @@ std::optional<PreparedChain> prepareMissingWindow(
             static_cast<uint_t>(full_reference_length);
         prepared.candidate.species_count = candidate.paths.size();
         prepared.merged_block = Block::createEmpty(
-            candidate.reference_chromosome, candidate.paths.size());
+            reference_species, candidate.reference_chromosome,
+            candidate.paths.size());
         prepared.paths.reserve(candidate.paths.size());
         const auto reject_prepared =
             [&]() -> std::optional<PreparedChain> {
@@ -2003,7 +2007,8 @@ std::optional<PreparedChain> prepareMissingWindow(
         candidate.reference_chromosome;
     prepared.candidate.species_count = candidate.paths.size();
     prepared.merged_block = Block::createEmpty(
-        candidate.reference_chromosome, candidate.paths.size());
+        reference_species, candidate.reference_chromosome,
+        candidate.paths.size());
     prepared.paths.reserve(candidate.paths.size());
     const auto reject_prepared = [&]() -> std::optional<PreparedChain> {
         detachPreparedChain(prepared);
