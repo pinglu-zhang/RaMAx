@@ -14,6 +14,9 @@ This directory contains the detailed documentation for RaMAx 1.0.5.
   and compatibility rules.
 - [Output formats](output-formats.md): MAF/HAL/PAF conventions, validation, and
   normalized comparisons.
+- [PAF-to-GFA workflow](paf-to-gfa-workflow.md): companion FASTA generation,
+  direct seqwish induction, PGGB post-processing, validation, and a completed
+  Chr09 example.
 - [Troubleshooting](troubleshooting.md): common startup, dependency, resource,
   restart, and output problems.
 

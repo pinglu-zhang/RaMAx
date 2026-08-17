@@ -68,13 +68,29 @@ all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
 are kept under the work directory.
 
 For seqwish, generate the matching qualified FASTA directly from the same
-seqfile:
+seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
+the default `connected` PAF mode:
 
 ```bash
 ramax-paf-fasta -i seqfile.txt -o sequences.fa.gz
 ramax -i seqfile.txt -o alignment.paf -w work -t 16
 seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa -k 0
 ```
+
+For a normalized PGGB graph, write an uncompressed FASTA, index it, and reuse
+the RaMAx PAF with `pggb -a` so PGGB skips wfmash:
+
+```bash
+ramax-paf-fasta -i seqfile.txt -o sequences.fa
+samtools faidx sequences.fa
+mkdir -p pggb-out pggb-tmp
+pggb -i sequences.fa -o pggb-out -a alignment.paf -n <genome-count> \
+  -t 16 -T 8 -k 0 -D pggb-tmp
+```
+
+The detailed operator guide covers directory layout, validation, failure
+handling, the direct seqwish route, the PGGB route, and a completed
+seven-genome Chr09 example: [PAF-to-GFA workflow](docs/paf-to-gfa-workflow.md).
 
 The graph optimizations are enabled by default. `--optimize-blocks` is an
 explicit, repeatable way to request the same default set. The defaults are:
@@ -94,6 +110,7 @@ Run `ramax --help` for the complete core-alignment options.
 - [Command-line parameters](docs/parameters.md)
 - [Restart and work directories](docs/restart.md)
 - [MAF, HAL, and PAF output](docs/output-formats.md)
+- [PAF-to-GFA workflow](docs/paf-to-gfa-workflow.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Realignment architecture](docs/realignment_architecture.md)
 
