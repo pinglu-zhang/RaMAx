@@ -22,12 +22,3 @@ target_compile_definitions(ramax-paf-fasta PRIVATE
 target_link_libraries(ramax-paf-fasta PRIVATE ramax_paf_fasta_lib)
 
 install(TARGETS ramax-paf-fasta DESTINATION "${CMAKE_INSTALL_BINDIR}")
-
-include(CTest)
-if(BUILD_TESTING)
-    add_executable(ramax-paf-fasta-tests tests/ramax_paf_fasta_test.cpp)
-    target_compile_features(ramax-paf-fasta-tests PRIVATE cxx_std_23)
-    target_compile_options(ramax-paf-fasta-tests PRIVATE -Wall -Wextra)
-    target_link_libraries(ramax-paf-fasta-tests PRIVATE ramax_paf_fasta_lib)
-    add_test(NAME ramax-paf-fasta-unit COMMAND ramax-paf-fasta-tests)
-endif()

@@ -151,12 +151,17 @@ Use fewer threads when memory is the limiting resource.
 ## Work-directory lifecycle
 
 The work directory stores copied/cleaned sequences, indexes, serialized
-configuration, logs, graph state, mask intervals, and minipoa scratch files
-while a job is running.
+configuration, logs, mask intervals, and minipoa scratch files while a job is
+running. Anchor, cluster, Block, DP, and graph objects are not serialized.
 
 For a new Release run, the directory must not contain existing files. RaMAx
 removes the entire work directory after a successful export. Failed or
 interrupted runs leave it in place for diagnosis and restart.
+
+On restart, RaMAx retains only reusable preprocessing and FM-index caches. It
+archives the previous log, removes stale `result/`, `mask_interval/`, and
+`minipoa_tmp/` directories, and starts alignment from the first reference
+round.
 
 Always place the final MAF, HAL, or PAF outside the work directory:
 

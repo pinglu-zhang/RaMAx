@@ -352,7 +352,8 @@ MultipleRareAligner::MultipleRareAligner(
     uint_t overlap_size_,
     uint_t min_anchor_length_,
     uint_t max_anchor_frequency_,
-    uint_t accurate_skip_threshold_
+    uint_t accurate_skip_threshold_,
+    bool trust_legacy_cache_
 )
     : work_dir(work_dir_),                                  // 初始化成员
     index_dir(work_dir_ / INDEX_DIR),
@@ -362,7 +363,8 @@ MultipleRareAligner::MultipleRareAligner(
     min_anchor_length(min_anchor_length_),
     max_anchor_frequency(max_anchor_frequency_),
     accurate_skip_threshold(accurate_skip_threshold_),
-    thread_num(thread_num_)
+    thread_num(thread_num_),
+    trust_legacy_cache(trust_legacy_cache_)
 {
     // 确保工作目录存在
     if (!std::filesystem::exists(work_dir)) {
@@ -831,6 +833,11 @@ starAlignment(
         RaMesh::ShortBlockRepair::repairFinalShortBlocks(
             *multi_graph, reference_order, seqpro_managers, options);
     }
+
+    spdlog::info(
+        "[cache-summary] FM-index reused={} rebuilt={}",
+        index_cache_counters->reused.load(),
+        index_cache_counters->rebuilt.load());
 
     // 所有轮次完成后，flush logger
     spdlog::default_logger()->flush();

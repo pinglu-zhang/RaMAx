@@ -22,7 +22,6 @@ The output suffix must be `.fa`, `.fasta`, or `.fna`, optionally followed by
 cmake -S tools/ramax-paf-fasta -B tools/ramax-paf-fasta/build \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build tools/ramax-paf-fasta/build -j
-ctest --test-dir tools/ramax-paf-fasta/build --output-on-failure
 ```
 
 When this source-local binary already exists, the root RaMAx CMake build

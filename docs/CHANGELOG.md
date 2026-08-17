@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.7 - 2026-08-17
+
+- Redefined `--restart` as raw/clean FASTA and FM-index cache reuse; alignment,
+  clustering, graph construction, and export always restart from the beginning.
+- Added explicit restart parameter overrides, complete repeated-output
+  replacement, and atomic persistence of the latest effective schema-2 config.
+- Added size/mtime completion markers and atomic publication for preprocessing,
+  softmask, and all three FM-index components.
+- Added schema-1 workdir migration, input-identity validation, stale post-index
+  cleanup, previous-log archival, and cache reuse/rebuild summaries.
+
 ## 1.0.5 - 2026-08-14
 
 - Added compatible neighboring-Block merging and bounded missing-sequence

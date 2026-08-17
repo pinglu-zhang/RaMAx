@@ -64,8 +64,8 @@ ramax \
 
 Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
 information-complete sparse `connected` mode; use `--paf-mode all` for the
-all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
-are kept under the work directory.
+all-pairs baseline. Logs and reusable preprocessing/index caches are kept under
+the work directory; in-memory graph state is not serialized for restart.
 
 Repeat `-o` to export several formats from the same completed alignment:
 
@@ -155,15 +155,20 @@ only for HAL output.
 
 ## Restart compatibility
 
-RaMAx 1.0.5 stores all restart settings in `<work>/config.json` with
-`schema_version: 1`. Restart with:
+RaMAx 1.0.7 treats restart as cache reuse, not alignment checkpointing. It
+reuses validated raw/clean FASTA and FM-index artifacts, then reruns anchor
+search, clustering, graph construction, and export from the beginning:
 
 ```bash
 ramax --restart -w work
+
+# Explicit settings override the latest saved values.
+ramax --restart -w work -t 24 --min_anchor_length 30 \
+  -o results/retry.maf -o results/retry.paf
 ```
 
-Restart directories created by older experimental configurations are not
-compatible with 1.0.5 and are rejected with an explicit schema error.
+The seqfile cannot be replaced. Schema-1 work directories from 1.0.6 are
+loaded with an explicit compatibility warning and migrated to schema 2.
 
 ## License and dependencies
 

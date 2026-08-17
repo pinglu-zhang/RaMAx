@@ -2,6 +2,7 @@
 #define RARE_ALIGNER_H
 
 #include <optional>
+#include <atomic>
 
 #include "config.hpp"
 #include "index.h"
@@ -10,6 +11,12 @@
 #include "ramesh.h"
 #include "structural_break_repair.h"
 #include "short_block_repair.h"
+#include "cache_manifest.h"
+
+struct IndexCacheCounters {
+    std::atomic_size_t reused{0};
+    std::atomic_size_t rebuilt{0};
+};
 
 // 多基因组比对核心调度类
 class MultipleRareAligner {
@@ -28,6 +35,9 @@ public:
     uint_t thread_num;
     uint_t group_id;
     uint_t round_id;
+    bool trust_legacy_cache{false};
+    std::shared_ptr<IndexCacheCounters> index_cache_counters{
+        std::make_shared<IndexCacheCounters>()};
 
     bool enable_mask_export = false;
     bool mask_export_done = false;
@@ -51,7 +61,8 @@ public:
         uint_t overlap_size,
         uint_t min_anchor_length,
         uint_t max_anchor_frequency,
-        uint_t accurate_skip_threshold
+        uint_t accurate_skip_threshold,
+        bool trust_legacy_cache = false
     );
 
     std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> starAlignment(
@@ -125,7 +136,8 @@ public:
     uint_t thread_num;
     PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size,
         uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency,
-        uint_t accurate_skip_threshold = 0);
+        uint_t accurate_skip_threshold = 0,
+        bool trust_legacy_cache = false);
 
     // 新增构造函数：从 MultipleRareAligner 初始化
     PairRareAligner(const MultipleRareAligner& mra)
@@ -136,11 +148,17 @@ public:
         min_anchor_length(mra.min_anchor_length),
         max_anchor_frequency(mra.max_anchor_frequency),
         accurate_skip_threshold(mra.accurate_skip_threshold),
-        thread_num(mra.thread_num)
+        thread_num(mra.thread_num),
+        trust_legacy_cache(mra.trust_legacy_cache),
+        index_cache_counters(mra.index_cache_counters)
     {
         this->group_id = mra.group_id;
         this->round_id = mra.round_id;
     }
+
+    bool trust_legacy_cache{false};
+    std::shared_ptr<IndexCacheCounters> index_cache_counters{
+        std::make_shared<IndexCacheCounters>()};
 
     MatchVec3DPtr alignPairGenome(SpeciesName query_name, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval);
     FilePath buildIndex(const std::string prefix, SeqPro::ManagerVariant& ref_fasta_manager_, bool fast_build);

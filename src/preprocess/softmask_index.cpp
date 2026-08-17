@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
@@ -219,17 +221,64 @@ void writeCompletionMarker(const std::filesystem::path& marker_partial,
     if (!marker) {
         throw std::runtime_error("Cannot create soft-mask completion marker: " + marker_partial.string());
     }
+    const auto fasta_metadata = sourceMetadata(output_fasta);
+    const auto index_metadata = sourceMetadata(output_index);
     marker << "{\n"
-           << "  \"version\": 1,\n"
+           << "  \"version\": 2,\n"
            << "  \"source_size\": " << source_size << ",\n"
            << "  \"source_mtime\": " << source_mtime << ",\n"
            << "  \"alignment_fasta_size\": " << std::filesystem::file_size(output_fasta) << ",\n"
-           << "  \"softmask_index_size\": " << std::filesystem::file_size(output_index) << "\n"
+           << "  \"alignment_fasta_mtime\": " << fasta_metadata.second << ",\n"
+           << "  \"softmask_index_size\": " << std::filesystem::file_size(output_index) << ",\n"
+           << "  \"softmask_index_mtime\": " << index_metadata.second << "\n"
            << "}\n";
     marker.flush();
     if (!marker) {
         throw std::runtime_error("Failed to finalize soft-mask completion marker");
     }
+}
+
+std::optional<int64_t> markerNumber(const std::filesystem::path& marker,
+                                    const std::string& key) {
+    std::ifstream input(marker, std::ios::binary);
+    if (!input) return std::nullopt;
+    const std::string text((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    const std::regex pattern("\\\"" + key +
+                             "\\\"\\s*:\\s*(-?[0-9]+)");
+    std::smatch match;
+    if (!std::regex_search(text, match, pattern)) return std::nullopt;
+    try {
+        return std::stoll(match[1].str());
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+bool currentMarkerMatches(const std::filesystem::path& marker,
+                          const std::filesystem::path& input_fasta,
+                          const std::filesystem::path& output_fasta,
+                          const std::filesystem::path& output_index) {
+    const auto version = markerNumber(marker, "version");
+    const auto source_size = markerNumber(marker, "source_size");
+    const auto source_mtime = markerNumber(marker, "source_mtime");
+    const auto fasta_size = markerNumber(marker, "alignment_fasta_size");
+    const auto fasta_mtime = markerNumber(marker, "alignment_fasta_mtime");
+    const auto index_size = markerNumber(marker, "softmask_index_size");
+    const auto index_mtime = markerNumber(marker, "softmask_index_mtime");
+    if (!version || *version != 2 || !source_size || !source_mtime ||
+        !fasta_size || !fasta_mtime || !index_size || !index_mtime) {
+        return false;
+    }
+    const auto source = sourceMetadata(input_fasta);
+    const auto fasta = sourceMetadata(output_fasta);
+    const auto index = sourceMetadata(output_index);
+    return *source_size == static_cast<int64_t>(source.first) &&
+           *source_mtime == source.second &&
+           *fasta_size == static_cast<int64_t>(fasta.first) &&
+           *fasta_mtime == fasta.second &&
+           *index_size == static_cast<int64_t>(index.first) &&
+           *index_mtime == index.second;
 }
 
 }  // namespace
@@ -440,10 +489,11 @@ char AncestorBaseVote::result() const noexcept {
     return 'N';
 }
 
-void ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
+bool ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
                                   const std::filesystem::path& output_fasta,
                                   const std::filesystem::path& output_index,
-                                  const std::filesystem::path& completion_marker) {
+                                  const std::filesystem::path& completion_marker,
+                                  bool trust_legacy_cache) {
     std::filesystem::create_directories(output_fasta.parent_path());
     const auto [expected_size, expected_mtime] = sourceMetadata(input_fasta);
 
@@ -452,11 +502,34 @@ void ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
         std::filesystem::is_regular_file(completion_marker)) {
         try {
             Index existing(output_index);
-            if (existing.sourceSize() == expected_size && existing.sourceMtime() == expected_mtime) {
-                return;
+            if (existing.sourceSize() == expected_size &&
+                existing.sourceMtime() == expected_mtime &&
+                currentMarkerMatches(completion_marker, input_fasta,
+                                     output_fasta, output_index)) {
+                return true;
             }
         } catch (const std::exception&) {
             // Rebuild exact versioned intermediates below.
+        }
+    }
+
+    if (trust_legacy_cache &&
+        std::filesystem::is_regular_file(output_fasta) &&
+        std::filesystem::is_regular_file(output_index)) {
+        try {
+            Index existing(output_index);
+            if (existing.sourceSize() == expected_size &&
+                existing.sourceMtime() == expected_mtime) {
+                std::filesystem::path marker_partial = completion_marker;
+                marker_partial += ".partial";
+                removeIfPresent(marker_partial);
+                writeCompletionMarker(marker_partial, input_fasta,
+                                      output_fasta, output_index);
+                publishFile(marker_partial, completion_marker);
+                return true;
+            }
+        } catch (const std::exception&) {
+            // A legacy artifact that cannot be loaded is rebuilt below.
         }
     }
 
@@ -492,6 +565,7 @@ void ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
         removeIfPresent(marker_partial);
         throw;
     }
+    return false;
 }
 
 IndexMap loadIndexes(const PathMap& paths) {

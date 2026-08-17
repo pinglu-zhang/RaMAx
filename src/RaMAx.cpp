@@ -12,13 +12,17 @@
 #include "sequence_utils.h"
 #include "external_msa_runner.h"
 
+#include <array>
+#include <regex>
+#include <unordered_set>
+
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
 // 用于控制基因组比对 / 搜索 / 组装相关流程的全局参数
 // ------------------------------------------------------------------
 struct CommonArgs {
 
-    uint32_t schema_version = 1;
+    uint32_t schema_version = 2;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -42,6 +46,8 @@ struct CommonArgs {
         MultipleGenomeOutputFormat::UNKNOWN;    // 多基因组输出格式（HAL、MAF、PAF）
     std::string paf_mode = "connected";          // PAF pairing: connected or all
     bool paf_mode_explicit = false;              // CLI-only; intentionally not serialized
+    bool trust_legacy_cache = false;              // persisted until legacy workdir is discarded
+    bool pending_config_update = false;           // runtime-only post-input-validation write
 
     bool enable_repeat_masking = false;          // 是否启用重复序列遮蔽（Repeat Masking）
 
@@ -100,14 +106,19 @@ struct CommonArgs {
             CEREAL_NVP(schema_version),
             CEREAL_NVP(input_path),
             CEREAL_NVP(output_path),
+            CEREAL_NVP(output_paths),
             CEREAL_NVP(work_dir_path),
             CEREAL_NVP(chunk_size),
             CEREAL_NVP(overlap_size),
-            CEREAL_NVP(restart),
+            CEREAL_NVP(min_anchor_length),
+            CEREAL_NVP(max_anchor_frequency),
             CEREAL_NVP(thread_num),
             CEREAL_NVP(output_format),
+            CEREAL_NVP(paf_mode),
+            CEREAL_NVP(trust_legacy_cache),
             CEREAL_NVP(enable_repeat_masking),
             CEREAL_NVP(search_mode),
+            CEREAL_NVP(accurate_skip_threshold),
             CEREAL_NVP(allow_MEM),
             CEREAL_NVP(fast_build),
             CEREAL_NVP(sampling_interval),
@@ -131,9 +142,10 @@ struct CommonArgs {
 };
 
 namespace {
-constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 2;
 constexpr uint32_t OUTPUTS_SCHEMA_VERSION = 1;
 constexpr const char* OUTPUTS_FILE = "outputs.json";
+constexpr const char* INPUT_MANIFEST_FILE = "input_manifest.json";
 
 struct OutputManifest {
     uint32_t schema_version = OUTPUTS_SCHEMA_VERSION;
@@ -144,6 +156,397 @@ struct OutputManifest {
         archive(CEREAL_NVP(schema_version), CEREAL_NVP(output_paths));
     }
 };
+
+// Exact reader for the configuration written by RaMAx 1.0.6.  Several
+// parameters were not serialized in that schema and intentionally retain the
+// 1.0.6 restart defaults when migrated.
+struct LegacyCommonArgsV1 {
+    uint32_t schema_version{1};
+    FilePath input_path;
+    FilePath output_path;
+    FilePath work_dir_path;
+    uint_t chunk_size{10000000};
+    uint_t overlap_size{0};
+    bool restart{false};
+    int thread_num{static_cast<int>(std::thread::hardware_concurrency())};
+    MultipleGenomeOutputFormat output_format{MultipleGenomeOutputFormat::UNKNOWN};
+    bool enable_repeat_masking{false};
+    SearchMode search_mode{ACCURATE_SEARCH};
+    bool allow_MEM{false};
+    bool fast_build{true};
+    SeqPro::Length sampling_interval{32};
+    uint_t min_span{65};
+    std::string log_level{"info"};
+    bool verbose{false};
+    bool quiet{false};
+    std::string root_name;
+    std::string ref_name;
+    bool one_round{false};
+    bool merge_exact_contiguous_blocks{true};
+    uint_t merge_query_gap_max{100};
+    bool realign_single_missing_species{true};
+    uint_t species_mismatch_realign_max_span{3000};
+    uint_t species_mismatch_zero_gap_max_span{200};
+    bool repair_structural_breaks{true};
+    uint_t structural_break_max_span{1000};
+    bool repair_short_blocks{true};
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(
+            CEREAL_NVP(schema_version), CEREAL_NVP(input_path),
+            CEREAL_NVP(output_path), CEREAL_NVP(work_dir_path),
+            CEREAL_NVP(chunk_size), CEREAL_NVP(overlap_size),
+            CEREAL_NVP(restart), CEREAL_NVP(thread_num),
+            CEREAL_NVP(output_format), CEREAL_NVP(enable_repeat_masking),
+            CEREAL_NVP(search_mode), CEREAL_NVP(allow_MEM),
+            CEREAL_NVP(fast_build), CEREAL_NVP(sampling_interval),
+            CEREAL_NVP(min_span), CEREAL_NVP(log_level),
+            CEREAL_NVP(verbose), CEREAL_NVP(quiet),
+            CEREAL_NVP(root_name), CEREAL_NVP(ref_name),
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks));
+    }
+};
+
+struct InputIdentityRecord {
+    std::string species;
+    std::string source;
+    bool source_is_url{false};
+    uint64_t source_size{0};
+    int64_t source_mtime{0};
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(CEREAL_NVP(species), CEREAL_NVP(source),
+                CEREAL_NVP(source_is_url), CEREAL_NVP(source_size),
+                CEREAL_NVP(source_mtime));
+    }
+
+    bool operator==(const InputIdentityRecord&) const = default;
+};
+
+struct InputManifest {
+    uint32_t schema_version{1};
+    std::string seqfile;
+    uint64_t seqfile_size{0};
+    int64_t seqfile_mtime{0};
+    std::vector<InputIdentityRecord> inputs;
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(CEREAL_NVP(schema_version), CEREAL_NVP(seqfile),
+                CEREAL_NVP(seqfile_size), CEREAL_NVP(seqfile_mtime),
+                CEREAL_NVP(inputs));
+    }
+};
+
+struct RestartOverrides {
+    CommonArgs values;
+    std::unordered_set<std::string> specified;
+
+    bool has(const std::string& name) const {
+        return specified.contains(name);
+    }
+};
+
+uint32_t detectConfigSchema(const FilePath& config_path) {
+    std::ifstream input(config_path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Failed to open restart configuration: " +
+                                 config_path.string());
+    }
+    const std::string text((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    const std::regex pattern("\\\"schema_version\\\"\\s*:\\s*([0-9]+)");
+    std::smatch match;
+    if (!std::regex_search(text, match, pattern)) {
+        throw std::runtime_error(
+            "Restart configuration has no schema_version: " +
+            config_path.string());
+    }
+    return static_cast<uint32_t>(std::stoul(match[1].str()));
+}
+
+void saveEffectiveConfig(const CommonArgs& args) {
+    FilePath config_path = args.work_dir_path / CONFIG_FILE;
+    FilePath partial = config_path;
+    partial += ".partial";
+    RaMAxCache::removeIfPresent(partial);
+    CommonArgs saved = args;
+    saved.schema_version = CONFIG_SCHEMA_VERSION;
+    saved.restart = false;
+    saved.pending_config_update = false;
+    try {
+        std::ofstream output(partial, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Failed to save configuration: " +
+                                     partial.string());
+        }
+        {
+            cereal::JSONOutputArchive archive(output);
+            archive(cereal::make_nvp("common_args", saved));
+        }
+        output.close();
+        RaMAxCache::publishFile(partial, config_path);
+    } catch (...) {
+        RaMAxCache::removeIfPresent(partial);
+        throw;
+    }
+}
+
+CommonArgs convertLegacyConfig(const LegacyCommonArgsV1& legacy) {
+    CommonArgs args;
+    args.schema_version = CONFIG_SCHEMA_VERSION;
+    args.input_path = legacy.input_path;
+    args.output_path = legacy.output_path;
+    args.work_dir_path = legacy.work_dir_path;
+    args.chunk_size = legacy.chunk_size;
+    args.overlap_size = legacy.overlap_size;
+    args.thread_num = legacy.thread_num;
+    args.output_format = legacy.output_format;
+    args.enable_repeat_masking = legacy.enable_repeat_masking;
+    args.search_mode = legacy.search_mode;
+    args.allow_MEM = legacy.allow_MEM;
+    args.fast_build = legacy.fast_build;
+    args.sampling_interval = legacy.sampling_interval;
+    args.min_span = legacy.min_span;
+    args.log_level = legacy.log_level;
+    args.verbose = legacy.verbose;
+    args.quiet = legacy.quiet;
+    args.root_name = legacy.root_name;
+    args.ref_name = legacy.ref_name;
+    args.one_round = legacy.one_round;
+    args.merge_exact_contiguous_blocks = legacy.merge_exact_contiguous_blocks;
+    args.merge_query_gap_max = legacy.merge_query_gap_max;
+    args.realign_single_missing_species = legacy.realign_single_missing_species;
+    args.species_mismatch_realign_max_span =
+        legacy.species_mismatch_realign_max_span;
+    args.species_mismatch_zero_gap_max_span =
+        legacy.species_mismatch_zero_gap_max_span;
+    args.repair_structural_breaks = legacy.repair_structural_breaks;
+    args.structural_break_max_span = legacy.structural_break_max_span;
+    args.repair_short_blocks = legacy.repair_short_blocks;
+    // Fields absent from schema 1 retain the exact 1.0.6 restart defaults.
+    args.min_anchor_length = 20;
+    args.max_anchor_frequency = 50;
+    args.accurate_skip_threshold = 10000;
+    args.paf_mode = "connected";
+    args.trust_legacy_cache = true;
+    return args;
+}
+
+RestartOverrides captureRestartOverrides(const CLI::App& app,
+                                         const CommonArgs& values) {
+    RestartOverrides overrides;
+    overrides.values = values;
+    constexpr std::array<const char*, 27> names{
+        "--output", "--paf-mode", "--chunk_size", "--root", "--ref",
+        "--overlap_size", "--min_anchor_length", "--max_anchor_frequency",
+        "--search-mode", "--accurate-skip-threshold", "--allow-mem",
+        "--one-round", "--optimize-blocks", "--merge-blocks", "--merge-gap",
+        "--realign-missing", "--realign-span", "--zero-gap-span",
+        "--repair-breaks", "--break-span", "--merge-short-blocks",
+        "--slow-build", "--sampling-interval", "--min-span", "--threads",
+        "--log-level", "--verbose"
+    };
+    for (const char* name : names) {
+        if (app.count(name) != 0) overrides.specified.emplace(name);
+    }
+    if (app.count("--quiet") != 0) overrides.specified.emplace("--quiet");
+    return overrides;
+}
+
+void applyRestartOverrides(CommonArgs& args,
+                           const RestartOverrides& overrides) {
+    const CommonArgs& value = overrides.values;
+    if (overrides.has("--output")) args.output_paths = value.output_paths;
+    if (overrides.has("--paf-mode")) args.paf_mode = value.paf_mode;
+    if (overrides.has("--chunk_size")) args.chunk_size = value.chunk_size;
+    if (overrides.has("--root")) args.root_name = value.root_name;
+    if (overrides.has("--ref")) args.ref_name = value.ref_name;
+    if (overrides.has("--overlap_size")) args.overlap_size = value.overlap_size;
+    if (overrides.has("--min_anchor_length"))
+        args.min_anchor_length = value.min_anchor_length;
+    if (overrides.has("--max_anchor_frequency"))
+        args.max_anchor_frequency = value.max_anchor_frequency;
+    if (overrides.has("--search-mode")) args.search_mode = value.search_mode;
+    if (overrides.has("--accurate-skip-threshold"))
+        args.accurate_skip_threshold = value.accurate_skip_threshold;
+    if (overrides.has("--allow-mem")) args.allow_MEM = true;
+    if (overrides.has("--one-round")) args.one_round = true;
+    if (overrides.has("--merge-blocks"))
+        args.merge_exact_contiguous_blocks = true;
+    if (overrides.has("--merge-gap"))
+        args.merge_query_gap_max = value.merge_query_gap_max;
+    if (overrides.has("--realign-missing"))
+        args.realign_single_missing_species = true;
+    if (overrides.has("--realign-span"))
+        args.species_mismatch_realign_max_span =
+            value.species_mismatch_realign_max_span;
+    if (overrides.has("--zero-gap-span"))
+        args.species_mismatch_zero_gap_max_span =
+            value.species_mismatch_zero_gap_max_span;
+    if (overrides.has("--repair-breaks")) args.repair_structural_breaks = true;
+    if (overrides.has("--break-span"))
+        args.structural_break_max_span = value.structural_break_max_span;
+    if (overrides.has("--merge-short-blocks")) args.repair_short_blocks = true;
+    if (overrides.has("--slow-build")) args.fast_build = false;
+    if (overrides.has("--sampling-interval"))
+        args.sampling_interval = value.sampling_interval;
+    if (overrides.has("--min-span")) args.min_span = value.min_span;
+    if (overrides.has("--threads")) args.thread_num = value.thread_num;
+    if (overrides.has("--log-level")) args.log_level = value.log_level;
+    if (overrides.has("--verbose")) {
+        args.verbose = true;
+        args.quiet = false;
+    }
+    if (overrides.has("--quiet")) {
+        args.quiet = true;
+        args.verbose = false;
+    }
+    args.paf_mode_explicit = overrides.has("--paf-mode");
+}
+
+InputManifest makeInputManifest(const CommonArgs& args,
+                                const SpeciesPathMap& all_species) {
+    InputManifest manifest;
+    manifest.seqfile = args.input_path.string();
+    const auto seqfile_metadata = RaMAxCache::fileMetadata(args.input_path);
+    manifest.seqfile_size = seqfile_metadata.size;
+    manifest.seqfile_mtime = seqfile_metadata.mtime;
+    manifest.inputs.reserve(all_species.size());
+    for (const auto& [species, path] : all_species) {
+        InputIdentityRecord record;
+        record.species = species;
+        record.source = path.string();
+        record.source_is_url = isUrl(path.string());
+        if (!record.source_is_url) {
+            const auto metadata = RaMAxCache::fileMetadata(path);
+            record.source_size = metadata.size;
+            record.source_mtime = metadata.mtime;
+        }
+        manifest.inputs.push_back(std::move(record));
+    }
+    std::sort(manifest.inputs.begin(), manifest.inputs.end(),
+              [](const auto& left, const auto& right) {
+                  return left.species < right.species;
+              });
+    return manifest;
+}
+
+void saveInputManifest(const FilePath& path, const InputManifest& manifest) {
+    FilePath partial = path;
+    partial += ".partial";
+    RaMAxCache::removeIfPresent(partial);
+    try {
+        std::ofstream output(partial, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Failed to save input manifest: " +
+                                     partial.string());
+        }
+        {
+            cereal::JSONOutputArchive archive(output);
+            archive(cereal::make_nvp("input_manifest", manifest));
+        }
+        output.close();
+        RaMAxCache::publishFile(partial, path);
+    } catch (...) {
+        RaMAxCache::removeIfPresent(partial);
+        throw;
+    }
+}
+
+void validateOrCreateInputManifest(const CommonArgs& args,
+                                   const SpeciesPathMap& all_species) {
+    const FilePath path = args.work_dir_path / INPUT_MANIFEST_FILE;
+    const InputManifest current = makeInputManifest(args, all_species);
+    if (!std::filesystem::exists(path)) {
+        if (args.restart) {
+            spdlog::warn(
+                "Input manifest is absent; trusting current schema-1 input identity and migrating it");
+        }
+        saveInputManifest(path, current);
+        return;
+    }
+
+    InputManifest saved;
+    try {
+        std::ifstream input(path);
+        cereal::JSONInputArchive archive(input);
+        archive(cereal::make_nvp("input_manifest", saved));
+    } catch (const std::exception& error) {
+        throw std::runtime_error("Invalid input manifest " + path.string() +
+                                 ": " + error.what());
+    }
+    if (saved.schema_version != current.schema_version ||
+        saved.seqfile != current.seqfile ||
+        saved.seqfile_size != current.seqfile_size ||
+        saved.seqfile_mtime != current.seqfile_mtime ||
+        saved.inputs != current.inputs) {
+        throw std::runtime_error(
+            "Restart input identity changed; use a new work directory instead of reusing " +
+            args.work_dir_path.string());
+    }
+}
+
+bool hasReusableRawSnapshot(const CommonArgs& args,
+                            const SpeciesName& species,
+                            const FilePath& source) {
+    const FilePath raw = args.work_dir_path / DATA_DIR / RAW_DATA_DIR /
+        (species + getFileExtension(source));
+    const FilePath marker = RaMAxCache::completionMarkerPath(raw);
+    if (RaMAxCache::markerMatches(
+            marker, "raw-fasta", 1, source.string(), true, source, raw)) {
+        return true;
+    }
+    return args.trust_legacy_cache &&
+           std::filesystem::is_regular_file(raw) &&
+           !std::filesystem::exists(marker);
+}
+
+void archivePreviousLog(const FilePath& work_dir) {
+    const FilePath current = work_dir / LOGGER_FILE;
+    if (!std::filesystem::is_regular_file(current)) return;
+    for (uint32_t index = 1; ; ++index) {
+        const FilePath archived = work_dir /
+            ("RaMAx.restart." + std::to_string(index) + ".log");
+        if (std::filesystem::exists(archived)) continue;
+        std::error_code error;
+        std::filesystem::rename(current, archived, error);
+        if (error) {
+            throw std::runtime_error("Failed to archive previous RaMAx.log: " +
+                                     error.message());
+        }
+        return;
+    }
+}
+
+void clearNonReusableAlignmentState(const FilePath& work_dir) {
+    constexpr std::array<const char*, 3> volatile_directories{
+        RESULT_DIR, "mask_interval", "minipoa_tmp"};
+    for (const char* name : volatile_directories) {
+        const FilePath path = work_dir / name;
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+        if (error) {
+            throw std::runtime_error(
+                "Failed to clear non-reusable restart state " + path.string() +
+                ": " + error.message());
+        }
+    }
+    spdlog::info(
+        "Restart cache boundary applied: raw/clean/index retained; result/mask_interval/minipoa_tmp cleared");
+    spdlog::info(
+        "Alignment restarted from beginning; anchors, clusters, Blocks, DP state, and graph are not restored");
+}
 
 void configureOutputs(CommonArgs& args,
                       const std::vector<FilePath>& output_paths) {
@@ -285,13 +688,13 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);               // 去除首尾空白字符
 
     // 输出结果路径
-    auto* output_opt = cmd->add_option("-o,--output", args.output_paths,
+    cmd->add_option("-o,--output", args.output_paths,
         "Output alignment path; repeat -o for MAF, HAL, and PAF.")
         ->group("Output")
         ->type_name("<path>")
         ->transform(trim_whitespace);
 
-    auto* paf_mode_opt = cmd->add_option("--paf-mode", args.paf_mode,
+    cmd->add_option("--paf-mode", args.paf_mode,
         "PAF pairing mode: connected or all (default: connected).")
         ->default_val("connected")
         ->capture_default_str()
@@ -316,7 +719,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // ========================
 
     // 每个切片的长度（用于并行处理）
-    auto* chunk_size_opt = cmd->add_option("--chunk_size", args.chunk_size,
+    cmd->add_option("--chunk_size", args.chunk_size,
         "Size of each chunk for parallel processing (default: 10000000).")
         ->default_val(10000000)                     // 默认值
         ->capture_default_str()                     // 在 --help 中显示默认值
@@ -327,21 +730,21 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);
 
     // HAL 文件中的根基因组名称
-    auto* root_opt = cmd->add_option("--root", args.root_name,
+    cmd->add_option("--root", args.root_name,
         "HAL root genome name; valid only for HAL output.")
         ->group("Output")
         ->type_name("<string>")
         ->transform(trim_whitespace);
 
     // 参考基因组名称
-    auto* ref_opt = cmd->add_option("--ref", args.ref_name,
+    cmd->add_option("--ref", args.ref_name,
         "Ref genome name used in alignment")
         ->group("Software Parameters")
         ->type_name("<string>")
         ->transform(trim_whitespace);
 
     // 相邻切片之间的重叠长度
-    auto* overlap_size_opt = cmd->add_option("--overlap_size", args.overlap_size,
+    cmd->add_option("--overlap_size", args.overlap_size,
         "Size of overlap between chunks (default: 100000).")
         ->default_val(0)
         ->capture_default_str()
@@ -352,7 +755,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);
 
     // 锚点的最小长度
-    auto* min_anchor_length_opt = cmd->add_option(
+    cmd->add_option(
         "--min_anchor_length", args.min_anchor_length,
         "Minimum anchor length (default: 20).")
         ->default_val(20)
@@ -364,7 +767,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);
 
     // 锚点最大出现频率过滤阈值
-    auto* max_anchor_frequency_opt = cmd->add_option(
+    cmd->add_option(
         "--max_anchor_frequency", args.max_anchor_frequency,
         "Maximum anchor frequency filter (default: 50).")
         ->default_val(50)
@@ -380,7 +783,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // ========================
 
     // 锚点搜索模式（fast / middle / accurate）
-    auto* search_mode_opt = cmd->add_option("--search-mode", args.search_mode,
+    cmd->add_option("--search-mode", args.search_mode,
         "Anchor search mode: fast/middle/accurate (default: accurate).")
         ->default_val(ACCURATE_SEARCH)
         ->capture_default_str()
@@ -394,7 +797,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
             },
             CLI::ignore_case));                     // 忽略大小写
 
-    auto* accurate_skip_threshold_opt = cmd->add_option(
+    cmd->add_option(
         "--accurate-skip-threshold", args.accurate_skip_threshold,
         "Skip accepted unique MUMs longer than this many bp in accurate mode; 0 disables (default: 10000).")
         ->default_val(5000)
@@ -405,27 +808,27 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);
 
     // 是否允许使用 MEM（Maximal Exact Match）
-    auto* allow_mem_flag = cmd->add_flag("--allow-mem", args.allow_MEM,
+    cmd->add_flag("--allow-mem", args.allow_MEM,
         "Allow MEM (Maximal Exact Match) instead of only MUM.")
         ->group("Software Parameters");
 
     // 是否仅运行一轮比对流程
-    auto* one_round_flag = cmd->add_flag("--one-round", args.one_round,
+    cmd->add_flag("--one-round", args.one_round,
         "Only run one round for alignment.")
         ->group("Software Parameters");
 
-    auto* optimize_blocks_flag = cmd->add_flag(
+    cmd->add_flag(
         "--optimize-blocks",
         "Explicitly enable the default Block optimizations (enabled by default).")
         ->group("Graph Optimization");
 
-    auto* merge_exact_blocks_flag = cmd->add_flag(
+    cmd->add_flag(
         "--merge-blocks",
         args.merge_exact_contiguous_blocks,
         "Merge compatible neighboring Blocks.")
         ->group("Graph Optimization");
 
-    auto* merge_query_gap_opt = cmd->add_option(
+    cmd->add_option(
         "--merge-gap",
         args.merge_query_gap_max,
         "Maximum query gap allowed when merging Blocks (bp).")
@@ -435,13 +838,13 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<bp>")
         ->check(CLI::Range(0, 10000));
 
-    auto* realign_missing_species_flag = cmd->add_flag(
+    cmd->add_flag(
         "--realign-missing",
         args.realign_single_missing_species,
         "Realign bounded windows with missing sequences.")
         ->group("Graph Optimization");
 
-    auto* realign_missing_species_span_opt = cmd->add_option(
+    cmd->add_option(
         "--realign-span",
         args.species_mismatch_realign_max_span,
         "Maximum span for missing-sequence realignment (bp).")
@@ -451,7 +854,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<bp>")
         ->check(CLI::Range(1, 10000));
 
-    auto* zero_gap_merge_span_opt = cmd->add_option(
+    cmd->add_option(
         "--zero-gap-span",
         args.species_mismatch_zero_gap_max_span,
         "Maximum span for zero-gap missing windows (bp).")
@@ -461,13 +864,13 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<bp>")
         ->check(CLI::Range(1, 3000));
 
-    auto* structural_break_repair_flag = cmd->add_flag(
+    cmd->add_flag(
         "--repair-breaks",
         args.repair_structural_breaks,
         "Repair high-confidence structural discontinuities.")
         ->group("Graph Optimization");
 
-    auto* structural_break_span_opt = cmd->add_option(
+    cmd->add_option(
         "--break-span",
         args.structural_break_max_span,
         "Maximum structural-break repair span (bp).")
@@ -477,19 +880,19 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<bp>")
         ->check(CLI::Range(1, 1000));
 
-    auto* short_block_repair_flag = cmd->add_flag(
+    cmd->add_flag(
         "--merge-short-blocks",
         args.repair_short_blocks,
         "Try to merge short Blocks with banded KSW2.")
         ->group("Graph Optimization");
 
     // 使用慢但更精确的索引构建方式
-    auto* slow_build_flag = cmd->add_flag("--slow-build",
+    cmd->add_flag("--slow-build",
         "Use slow but more accurate index building method.")
         ->group("Software Parameters");
 
     // 参考序列索引采样间隔
-    auto* sampling_interval_opt = cmd->add_option("--sampling-interval",
+    cmd->add_option("--sampling-interval",
         args.sampling_interval,
         "Reference sequence sampling interval (default: 32).")
         ->default_val(32)
@@ -501,7 +904,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);
 
     // 构图或链式连接的最小跨度阈值
-    auto* min_span_opt = cmd->add_option("--min-span", args.min_span,
+    cmd->add_option("--min-span", args.min_span,
         "Minimum span threshold for graph construction (default: 50).")
         ->default_val(65)
         ->capture_default_str()
@@ -522,7 +925,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // ========================
 
     // 并行线程数
-    auto* threads_opt = cmd->add_option("-t,--threads", args.thread_num,
+    cmd->add_option("-t,--threads", args.thread_num,
         "Number of threads to use for parallel processing (default: system cores).")
         ->default_val(std::thread::hardware_concurrency())
         ->envname("RAMAx_THREADS")                  // 支持环境变量设置
@@ -533,9 +936,9 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
-    // 是否从已有索引和中间结果重新启动
+    // 复用预处理和 FM-index 缓存；比对与构图始终重新开始
     auto* restart_flag = cmd->add_flag("--restart", args.restart,
-        "Restart the alignment process by skipping the existing index files.")
+        "Reuse raw/clean FASTA and FM-index caches, then rerun alignment from the beginning; explicitly supplied options override saved values.")
         ->group("Performance");
 
     // ========================
@@ -543,7 +946,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // ========================
 
     // 日志级别设置
-    auto* log_level_opt = cmd->add_option("--log-level", args.log_level,
+    cmd->add_option("--log-level", args.log_level,
         "Log level: debug/info/warn/error (default: info).")
         ->default_val("info")
         ->capture_default_str()
@@ -575,36 +978,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // --restart 必须依赖工作目录存在
     restart_flag->needs(workspace_opt);
 
-    // --restart 模式下，禁止使用以下参数
-    restart_flag->excludes(
-        input_opt,
-        output_opt,
-        threads_opt,
-        chunk_size_opt,
-        overlap_size_opt,
-        min_anchor_length_opt,
-        max_anchor_frequency_opt,
-        search_mode_opt,
-        accurate_skip_threshold_opt,
-        allow_mem_flag,
-        slow_build_flag,
-        sampling_interval_opt,
-        min_span_opt,
-        root_opt,
-        ref_opt,
-        optimize_blocks_flag,
-        merge_exact_blocks_flag,
-        merge_query_gap_opt,
-        realign_missing_species_flag,
-        realign_missing_species_span_opt,
-        zero_gap_merge_span_opt,
-        structural_break_repair_flag,
-        structural_break_span_opt,
-        short_block_repair_flag,
-        one_round_flag,
-        paf_mode_opt,
-        log_level_opt
-    );
+    // 输入快照是 workdir 身份的一部分，restart 不允许替换 seqfile。
+    restart_flag->excludes(input_opt);
 
     // verbose 与 quiet 互斥
     verbose_flag->excludes(quiet_flag);
@@ -711,125 +1086,131 @@ static inline void ensureWorkDirValidOrCreate(const std::filesystem::path& work_
 // - workdir 必须提供
 // - 读取 workdir/CONFIG_FILE 反序列化 common_args
 // ------------------------------
-static int runRestartMode(CommonArgs& common_args) {
+static int runRestartMode(CommonArgs& common_args,
+                          const RestartOverrides& overrides,
+                          const CLI::App& app) {
     // restart 模式下 workdir 必须提供
     if (common_args.work_dir_path.empty()) {
         throw CLI::RequiredError("In restart mode, --workdir (-w) is required.");
     }
 
-    // 检查/创建工作目录
-    ensureWorkDirValidOrCreate(common_args.work_dir_path);
+    const FilePath requested_work_dir = common_args.work_dir_path;
+    if (!std::filesystem::is_directory(requested_work_dir)) {
+        throw CLI::ValidationError(
+            "Restart work directory does not exist: " +
+            requested_work_dir.string());
+    }
 
-    // 初始化日志器（输出到文件）
-    setupLoggerWithFile(common_args.work_dir_path);
+    archivePreviousLog(requested_work_dir);
+    setupLoggerWithFile(requested_work_dir);
     configureLogLevel(common_args);
     spdlog::info("RaMAx version {}", RAMAX_VERSION);
     logBuildMode();
     spdlog::info("Restart mode enabled.");
 
     // 加载之前保存的参数配置文件
-    FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
-    std::ifstream is(config_path);
-    if (!is) {
-        spdlog::error("Failed to open {} for loading CommonArgs", config_path.string());
-        return 1;
-    }
-
-    try {
-        cereal::JSONInputArchive archive(is);
-        archive(cereal::make_nvp("common_args", common_args));
-    } catch (const std::exception& error) {
-        spdlog::error(
-            "Restart configuration is incompatible with RaMAx {}: {}",
-            RAMAX_VERSION, error.what());
-        return 1;
-    }
-    if (common_args.schema_version != CONFIG_SCHEMA_VERSION) {
-        spdlog::error(
-            "Unsupported restart schema version {} (expected {}). Old work "
-            "directories are not compatible with RaMAx {}.",
-            common_args.schema_version, CONFIG_SCHEMA_VERSION,
-            RAMAX_VERSION);
-        return 1;
-    }
-    common_args.restart = true;
-    configureLogLevel(common_args);
-    spdlog::info("CommonArgs loaded from {}", config_path.string());
-
-    std::vector<FilePath> restored_output_paths{common_args.output_path};
-    const FilePath outputs_path =
-        common_args.work_dir_path / OUTPUTS_FILE;
-    if (std::filesystem::exists(outputs_path)) {
-        std::ifstream outputs_stream(outputs_path);
-        if (!outputs_stream) {
-            throw std::runtime_error(
-                "Failed to open output manifest: " + outputs_path.string());
-        }
-        OutputManifest manifest;
+    const FilePath config_path = requested_work_dir / CONFIG_FILE;
+    const uint32_t schema = detectConfigSchema(config_path);
+    CommonArgs loaded;
+    if (schema == CONFIG_SCHEMA_VERSION) {
         try {
-            cereal::JSONInputArchive archive(outputs_stream);
-            archive(cereal::make_nvp("outputs", manifest));
+            std::ifstream input(config_path);
+            cereal::JSONInputArchive archive(input);
+            archive(cereal::make_nvp("common_args", loaded));
         } catch (const std::exception& error) {
             throw std::runtime_error(
-                "Invalid output manifest " + outputs_path.string() +
-                ": " + error.what());
+                "Restart configuration is incompatible with RaMAx " +
+                std::string(RAMAX_VERSION) + ": " + error.what());
         }
-        if (manifest.schema_version != OUTPUTS_SCHEMA_VERSION) {
+    } else if (schema == 1) {
+        LegacyCommonArgsV1 legacy;
+        try {
+            std::ifstream input(config_path);
+            cereal::JSONInputArchive archive(input);
+            archive(cereal::make_nvp("common_args", legacy));
+        } catch (const std::exception& error) {
             throw std::runtime_error(
-                "Unsupported output manifest schema version " +
-                std::to_string(manifest.schema_version));
+                "Invalid schema-1 restart configuration: " +
+                std::string(error.what()));
         }
-        if (manifest.output_paths.empty() ||
-            manifest.output_paths.front() != common_args.output_path) {
-            throw std::runtime_error(
-                "Output manifest primary path does not match config.json");
+        loaded = convertLegacyConfig(legacy);
+        std::vector<FilePath> legacy_outputs{loaded.output_path};
+        const FilePath outputs_path = requested_work_dir / OUTPUTS_FILE;
+        if (std::filesystem::exists(outputs_path)) {
+            OutputManifest manifest;
+            try {
+                std::ifstream input(outputs_path);
+                cereal::JSONInputArchive archive(input);
+                archive(cereal::make_nvp("outputs", manifest));
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    "Invalid legacy output manifest: " +
+                    std::string(error.what()));
+            }
+            if (manifest.schema_version != OUTPUTS_SCHEMA_VERSION ||
+                manifest.output_paths.empty()) {
+                throw std::runtime_error("Invalid legacy output manifest schema");
+            }
+            legacy_outputs = std::move(manifest.output_paths);
         }
-        restored_output_paths = std::move(manifest.output_paths);
-        spdlog::info("Output manifest loaded from {}", outputs_path.string());
-    } else {
-        spdlog::info(
-            "Output manifest not found; restoring legacy single output");
-    }
-    configureOutputs(common_args, restored_output_paths);
+        loaded.output_paths = std::move(legacy_outputs);
 
-    const FilePath threshold_path =
-        common_args.work_dir_path / "accurate_skip_threshold.txt";
-    common_args.accurate_skip_threshold = 10000;
-    if (std::filesystem::exists(threshold_path)) {
-        std::ifstream threshold_stream(threshold_path);
-        uint64_t saved_threshold = 0;
-        if (!(threshold_stream >> saved_threshold) ||
-            saved_threshold > std::numeric_limits<uint_t>::max()) {
-            throw std::runtime_error(
-                "Invalid accurate skip threshold in " + threshold_path.string());
+        const FilePath threshold_path =
+            requested_work_dir / "accurate_skip_threshold.txt";
+        if (std::filesystem::exists(threshold_path)) {
+            std::ifstream input(threshold_path);
+            uint64_t value = 0;
+            if (!(input >> value) || value > std::numeric_limits<uint_t>::max()) {
+                throw std::runtime_error("Invalid legacy accurate skip threshold");
+            }
+            input >> std::ws;
+            if (!input.eof()) {
+                throw std::runtime_error("Invalid legacy accurate skip threshold");
+            }
+            loaded.accurate_skip_threshold = static_cast<uint_t>(value);
         }
-        threshold_stream >> std::ws;
-        if (!threshold_stream.eof()) {
-            throw std::runtime_error(
-                "Invalid accurate skip threshold in " + threshold_path.string());
-        }
-        common_args.accurate_skip_threshold = static_cast<uint_t>(saved_threshold);
-    }
-
-    common_args.paf_mode = "connected";
-    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF)) {
-        const FilePath paf_mode_path =
-            common_args.work_dir_path / "paf_mode.txt";
+        const FilePath paf_mode_path = requested_work_dir / "paf_mode.txt";
         if (std::filesystem::exists(paf_mode_path)) {
-            std::ifstream paf_mode_stream(paf_mode_path);
-            if (!(paf_mode_stream >> common_args.paf_mode) ||
-                (common_args.paf_mode != "connected" &&
-                 common_args.paf_mode != "all")) {
-                throw std::runtime_error(
-                    "Invalid saved PAF mode in " + paf_mode_path.string());
-            }
-            paf_mode_stream >> std::ws;
-            if (!paf_mode_stream.eof()) {
-                throw std::runtime_error(
-                    "Invalid saved PAF mode in " + paf_mode_path.string());
+            std::ifstream input(paf_mode_path);
+            if (!(input >> loaded.paf_mode) ||
+                (loaded.paf_mode != "connected" && loaded.paf_mode != "all")) {
+                throw std::runtime_error("Invalid legacy PAF mode");
             }
         }
+        spdlog::warn(
+            "Loaded schema-1 workdir: missing fields use RaMAx 1.0.6 restart defaults; existing caches will be trusted once and migrated");
+    } else {
+        throw std::runtime_error(
+            "Unsupported restart schema version " + std::to_string(schema));
     }
+
+    loaded.work_dir_path = requested_work_dir;
+    loaded.restart = true;
+    loaded.pending_config_update = true;
+    applyRestartOverrides(loaded, overrides);
+    applyGraphOptimizationOptions(app, loaded);
+    configureOutputs(loaded, loaded.output_paths);
+
+    if (loaded.overlap_size >= loaded.chunk_size) {
+        throw std::runtime_error("Overlap size must be less than chunk size.");
+    }
+    if (loaded.paf_mode_explicit &&
+        !hasOutputFormat(loaded, MultipleGenomeOutputFormat::PAF)) {
+        throw std::runtime_error("--paf-mode is only valid with .paf output");
+    }
+    if (overrides.has("--root") &&
+        !hasOutputFormat(loaded, MultipleGenomeOutputFormat::HAL)) {
+        throw std::runtime_error("--root is only supported for HAL output");
+    }
+    if (!hasOutputFormat(loaded, MultipleGenomeOutputFormat::HAL)) {
+        loaded.root_name.clear();
+    }
+
+    common_args = std::move(loaded);
+    configureLogLevel(common_args);
+    spdlog::info("Effective restart configuration loaded from {}",
+                 config_path.string());
+    spdlog::info("Explicit restart overrides: {}", overrides.specified.size());
     return 0;
 }
 
@@ -839,7 +1220,7 @@ static int runRestartMode(CommonArgs& common_args) {
 // - 非 debug 下：工作目录必须为空（否则报错）
 // - 保存参数到 workdir/CONFIG_FILE（用于 --restart）
 // ------------------------------
-static int runNormalMode(CommonArgs& common_args) {
+static int runNormalMode(CommonArgs& common_args, const CLI::App& app) {
     // 检查必要参数
     if (common_args.input_path.empty())
         throw CLI::RequiredError("Missing required option: --input (-i)");
@@ -848,6 +1229,7 @@ static int runNormalMode(CommonArgs& common_args) {
     if (common_args.work_dir_path.empty())
         throw CLI::RequiredError("Missing required option: --workdir (-w)");
 
+    applyGraphOptimizationOptions(app, common_args);
     configureOutputs(common_args, common_args.output_paths);
 
 #ifndef _DEBUG_
@@ -886,53 +1268,9 @@ static int runNormalMode(CommonArgs& common_args) {
     }
 
     common_args.schema_version = CONFIG_SCHEMA_VERSION;
-    FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
-    std::ofstream os(config_path);
-    if (!os) {
-        spdlog::error("Failed to open {} for saving CommonArgs", config_path.string());
-        return 1;
-    }
-
-    {
-        cereal::JSONOutputArchive archive(os);
-        archive(cereal::make_nvp("common_args", common_args));
-    }
+    saveEffectiveConfig(common_args);
+    const FilePath config_path = common_args.work_dir_path / CONFIG_FILE;
     spdlog::info("Configuration saved to {}", config_path.string());
-
-    const FilePath outputs_path =
-        common_args.work_dir_path / OUTPUTS_FILE;
-    std::ofstream outputs_stream(outputs_path, std::ios::trunc);
-    if (!outputs_stream) {
-        throw std::runtime_error(
-            "Failed to save output manifest to " + outputs_path.string());
-    }
-    OutputManifest manifest;
-    manifest.output_paths = common_args.output_paths;
-    {
-        cereal::JSONOutputArchive outputs_archive(outputs_stream);
-        outputs_archive(cereal::make_nvp("outputs", manifest));
-    }
-    spdlog::info("Output manifest saved to {}", outputs_path.string());
-
-    const FilePath threshold_path =
-        common_args.work_dir_path / "accurate_skip_threshold.txt";
-    std::ofstream threshold_stream(threshold_path, std::ios::trunc);
-    if (!threshold_stream) {
-        throw std::runtime_error(
-            "Failed to save accurate skip threshold to " + threshold_path.string());
-    }
-    threshold_stream << common_args.accurate_skip_threshold << '\n';
-
-    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF)) {
-        const FilePath paf_mode_path =
-            common_args.work_dir_path / "paf_mode.txt";
-        std::ofstream paf_mode_stream(paf_mode_path, std::ios::trunc);
-        if (!paf_mode_stream) {
-            throw std::runtime_error(
-                "Failed to save PAF mode to " + paf_mode_path.string());
-        }
-        paf_mode_stream << common_args.paf_mode << '\n';
-    }
 
     return 0;
 }
@@ -942,15 +1280,16 @@ static int runNormalMode(CommonArgs& common_args) {
 // - 根据 restart 标志选择模式
 // - 捕获 runtime_error 并统一打印提示
 // ------------------------------
-static int prepareRun(CommonArgs& common_args) {
+static int prepareRun(CommonArgs& common_args, const CLI::App& app,
+                      const RestartOverrides& overrides) {
     try {
         // 模式 1：重启模式（--restart）
         if (common_args.restart) {
-            return runRestartMode(common_args);
+            return runRestartMode(common_args, overrides, app);
         }
 
         // 模式 2：正常运行模式
-        return runNormalMode(common_args);
+        return runNormalMode(common_args, app);
     }
     catch (const std::runtime_error& e) {
         spdlog::error("{}", e.what());
@@ -964,7 +1303,7 @@ static int prepareRun(CommonArgs& common_args) {
 // 输入验证阶段：解析 seqfile 与校验输入基因组路径（本地/URL）
 // ------------------------------
 static int inputValidationPhase(
-    const CommonArgs& common_args,
+    CommonArgs& common_args,
     NewickParser& newick_tree,
     SpeciesPathMap& species_path_map
 ) {
@@ -973,10 +1312,21 @@ static int inputValidationPhase(
         throw std::runtime_error("--root is only supported for HAL output");
     }
 
+    // The input identity is independent of a HAL subtree selection, so parse
+    // the complete seqfile before applying --root.
+    SpeciesPathMap all_species;
+    NewickParser complete_tree;
+    const bool complete_has_tree = parseSeqfile(
+        common_args.input_path, complete_tree, all_species, "");
+    validateOrCreateInputManifest(common_args, all_species);
+
     // HAL requires a species tree. Other output formats may use mappings only.
     std::string root = common_args.root_name;
     const bool has_tree =
         parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
+    if (has_tree != complete_has_tree) {
+        throw std::runtime_error("Seqfile tree parsing changed during validation");
+    }
     if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL) &&
         !has_tree) {
         throw std::runtime_error(
@@ -986,7 +1336,14 @@ static int inputValidationPhase(
     // 逐个校验输入基因组路径是否合法（URL 可达 / 本地文件存在）
     for (const auto& [species, path] : species_path_map) {
         if (isUrl(path.string())) {
-            verifyUrlReachable(path.string());
+            if (common_args.restart &&
+                hasReusableRawSnapshot(common_args, species, path)) {
+                spdlog::info(
+                    "Using cached raw snapshot without rechecking URL: {}",
+                    species);
+            } else {
+                verifyUrlReachable(path.string());
+            }
         } else {
             verifyLocalFile(path);
         }
@@ -994,6 +1351,13 @@ static int inputValidationPhase(
         spdlog::info("Input genome: {} (size: {})",
                      species,
                      getReadableFileSize(path));
+    }
+
+    if (common_args.pending_config_update) {
+        saveEffectiveConfig(common_args);
+        common_args.pending_config_update = false;
+        spdlog::info("Restart configuration migrated/updated to schema {}",
+                     CONFIG_SCHEMA_VERSION);
     }
 
     return 0;
@@ -1014,7 +1378,10 @@ static int preprocessingPhase(
     SeqPro::Length& reference_min_seq_length
 ) {
     // 拷贝或下载原始文件（并行执行）
-    copyRawData(common_args.work_dir_path, species_path_map, common_args.thread_num);
+    RaMAxCache::StageStats raw_stats;
+    copyRawData(common_args.work_dir_path, species_path_map,
+                common_args.thread_num, &raw_stats,
+                common_args.trust_legacy_cache);
 
     // interval 文件映射（重复遮蔽用）
     std::map<SpeciesName, FilePath> interval_files_map;
@@ -1024,12 +1391,21 @@ static int preprocessingPhase(
 
     // HAL uses the same all-uppercase alignment input as before and stores
     // original lowercase runs in an export-only sidecar. MAF is unchanged.
+    RaMAxCache::StageStats clean_stats;
     if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL)) {
         cleanRawDatasetWithSoftMaskIndex(common_args.work_dir_path, species_path_map,
-                                         softmask_path_map, common_args.thread_num);
+                                         softmask_path_map, common_args.thread_num,
+                                         &clean_stats,
+                                         common_args.trust_legacy_cache);
     } else {
-        cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+        cleanRawDataset(common_args.work_dir_path, species_path_map,
+                        common_args.thread_num, &clean_stats,
+                        common_args.trust_legacy_cache);
     }
+    spdlog::info(
+        "[cache-summary] preprocessing raw(reused/rebuilt)={}/{} clean(reused/rebuilt)={}/{}",
+        raw_stats.reused, raw_stats.rebuilt,
+        clean_stats.reused, clean_stats.rebuilt);
 
     if (common_args.enable_repeat_masking) {
         spdlog::warn("Repeat masking is currently disabled; continuing without repeat masking.");
@@ -1159,7 +1535,8 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.overlap_size,
         common_args.min_anchor_length,
         common_args.max_anchor_frequency,
-        common_args.accurate_skip_threshold
+        common_args.accurate_skip_threshold,
+        common_args.trust_legacy_cache
     );
 
     mra.merge_exact_contiguous_blocks_enabled =
@@ -1362,6 +1739,10 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
             return 1;
         }
 
+        if (common_args.restart) {
+            clearNonReusableAlignmentState(common_args.work_dir_path);
+        }
+
         spdlog::info("");
         spdlog::info("============================================================");
         spdlog::info("                    STAR ALIGNMENT                         ");
@@ -1441,17 +1822,16 @@ int main(int argc, char** argv) {
     // 开始解析命令行参数
     CLI11_PARSE(app, argc, argv);
     common_args.paf_mode_explicit = app.count("--paf-mode") != 0;
+    applySlowBuildFlag(app, common_args);
+    const RestartOverrides restart_overrides =
+        captureRestartOverrides(app, common_args);
 
-    // Apply output policy before emitting deprecation warnings.
+    // Configure early console diagnostics; restart applies the saved/effective
+    // log policy after loading its configuration.
     configureLogLevel(common_args);
-    try {
-        applyGraphOptimizationOptions(app, common_args);
-    } catch (const CLI::Error& error) {
-        return app.exit(error);
-    }
 
     // 运行前准备：根据 restart 与否进行目录/参数/配置文件处理
-    if (prepareRun(common_args) != 0) {
+    if (prepareRun(common_args, app, restart_overrides) != 0) {
         return 1;
     }
 

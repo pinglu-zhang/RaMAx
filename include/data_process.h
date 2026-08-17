@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <cstdint>
 #include "softmask_index.h"
+#include "cache_manifest.h"
 
 class FastaManager;
 // 初始化 kseq 使用 gzFile 类型
@@ -380,17 +381,22 @@ void copyLocalFile(const FilePath& source, const FilePath& destination);
 std::string getFileExtension(const FilePath& file_path);
 
 // 拷贝或下载原始数据至工作目录
-bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map, int thread_num);
+bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map,
+    int thread_num, RaMAxCache::StageStats* cache_stats = nullptr,
+    bool trust_legacy_cache = false);
 
 // 清洗原始数据集，并更新路径映射
-bool cleanRawDataset(const FilePath workdir_path, SpeciesPathMap& species_path_map, int thread_num);
+bool cleanRawDataset(const FilePath workdir_path, SpeciesPathMap& species_path_map,
+    int thread_num, RaMAxCache::StageStats* cache_stats = nullptr,
+    bool trust_legacy_cache = false);
 
 // HAL-only preprocessing: keep the existing all-uppercase alignment FASTA and
 // record original lowercase runs in a separate export-only sidecar.
 bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
     SpeciesPathMap& species_path_map,
     SoftMask::PathMap& softmask_path_map,
-    int thread_num);
+    int thread_num, RaMAxCache::StageStats* cache_stats = nullptr,
+    bool trust_legacy_cache = false);
 
 // 运行 WindowMasker 生成重复区域的 interval 文件
 std::map<SpeciesName, FilePath> repeatSeqMasking(const FilePath workdir_path, const SpeciesPathMap& species_path_map, int thread_num);

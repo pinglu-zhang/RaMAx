@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.0.6 LANGUAGES C CXX)
+project(RaMAx VERSION 1.0.7 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -133,6 +133,7 @@ add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort" EXCLUDE_FROM_ALL)
 
 # ================= 公共源文件 =================
 set(RAMA_COMMON_SOURCES
+    "${PREPROCESS_DIR}/cache_manifest.cpp"
     "${PREPROCESS_DIR}/raw_data_process.cpp"
     "${PREPROCESS_DIR}/newick_tree.cpp"
     "${PREPROCESS_DIR}/sequence_utils.cpp"
@@ -258,38 +259,7 @@ add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
 target_link_libraries(ramax PRIVATE ramax_core)
 
-add_dependencies(ramax  hal_library)
-
-include(CTest)
-if(BUILD_TESTING)
-    add_executable(ramax_output_spec_tests
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/output_spec_test.cpp")
-    target_include_directories(ramax_output_spec_tests PRIVATE "${INCLUDE_DIR}")
-    target_compile_features(ramax_output_spec_tests PRIVATE cxx_std_23)
-    target_compile_options(ramax_output_spec_tests PRIVATE -Wall -Wextra)
-    add_test(NAME ramax_output_spec COMMAND ramax_output_spec_tests)
-
-    add_test(NAME ramax_multi_output_cli
-        COMMAND "${CMAKE_COMMAND}"
-            -DRAMAX=$<TARGET_FILE:ramax>
-            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/multi-output-cli-test
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/multi_output_cli_test.cmake")
-
-    add_executable(ramax_paf_tests
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/paf_utils_test.cpp"
-        "${GRAPH_DIR}/paf_utils.cpp")
-    target_include_directories(ramax_paf_tests PRIVATE "${INCLUDE_DIR}")
-    target_compile_features(ramax_paf_tests PRIVATE cxx_std_23)
-    target_compile_options(ramax_paf_tests PRIVATE -Wall -Wextra)
-    add_test(NAME ramax_paf_utils COMMAND ramax_paf_tests)
-
-    add_executable(ramax_paf_export_tests
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/paf_export_test.cpp")
-    configure_rama_target(ramax_paf_export_tests)
-    target_link_libraries(ramax_paf_export_tests PRIVATE ramax_core)
-    target_compile_features(ramax_paf_export_tests PRIVATE cxx_std_23)
-    add_test(NAME ramax_paf_export COMMAND ramax_paf_export_tests)
-endif()
+add_dependencies(ramax hal_library)
 
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 

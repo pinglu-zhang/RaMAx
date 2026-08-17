@@ -72,10 +72,12 @@ private:
  * Final artifacts are published atomically and are reused only when their
  * completion marker and source metadata match.
  */
-void ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
+// Returns true when existing artifacts were reused and false when rebuilt.
+bool ensureUppercaseFastaAndIndex(const std::filesystem::path& input_fasta,
                                   const std::filesystem::path& output_fasta,
                                   const std::filesystem::path& output_index,
-                                  const std::filesystem::path& completion_marker);
+                                  const std::filesystem::path& completion_marker,
+                                  bool trust_legacy_cache = false);
 
 /** Load all species indexes read-only. This is intended to run at HAL export. */
 IndexMap loadIndexes(const PathMap& paths);

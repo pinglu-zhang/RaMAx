@@ -1,6 +1,6 @@
 # Command-line parameters
 
-This page documents the public RaMAx 1.0.5 interface. Values and ranges follow
+This page documents the public RaMAx 1.0.7 interface. Values and ranges follow
 the current CLI implementation. Run `ramax --help` to inspect the installed
 binary.
 
@@ -80,11 +80,13 @@ modules are enabled by default, the normal numeric-only overrides are valid.
 | Option | Type/default/range | Description |
 |---|---|---|
 | `-t`, `--threads` | integer; hardware concurrency; `1..INT_MAX` | Worker-thread count. It may also be supplied by `RAMAx_THREADS`. |
-| `--restart` | flag; off | Load the saved configuration and intermediate state from `--workdir`. |
+| `--restart` | flag; off | Reuse validated raw/clean FASTA and FM-index caches, then rerun alignment from the beginning. |
 
-In restart mode, provide only `--restart -w <workdir>`. Input, output,
-algorithm, optimization, thread, root, and log-level settings are restored from
-`config.json` and are rejected as command-line overrides.
+In restart mode, `-w` identifies the interrupted run and `-i` is forbidden.
+Explicit output, algorithm, optimization, thread, root, PAF-mode, and logging
+options override the latest saved configuration. If any `-o` is supplied, the
+complete repeated `-o` list replaces the saved output list. Existing boolean
+flags retain their current one-way behavior; no new negative forms are added.
 
 ## Output Control
 

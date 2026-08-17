@@ -12,15 +12,17 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	uint_t overlap_size,
 	uint_t min_anchor_length,
 	uint_t max_anchor_frequency,
-	uint_t accurate_skip_threshold)
+	uint_t accurate_skip_threshold,
+	bool trust_legacy_cache_)
 	: work_dir(work_dir)
 	, index_dir(work_dir / INDEX_DIR)
 	, chunk_size(chunk_size)
 	, overlap_size(overlap_size)
 	, min_anchor_length(min_anchor_length)
 	, max_anchor_frequency(max_anchor_frequency)
-	, thread_num(thread_num)
 	, accurate_skip_threshold(accurate_skip_threshold)
+	, thread_num(thread_num)
+	, trust_legacy_cache(trust_legacy_cache_)
 {
 	if (!std::filesystem::exists(index_dir)) {
 		std::filesystem::create_directories(index_dir);
@@ -80,15 +82,100 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 	ref_index.emplace(prefix, ref_fasta_manager_);
 
 	FilePath idx_file_path = ref_index_path / (prefix + "." + FMINDEX_EXTESION);
+	FilePath sa_file_path = idx_file_path;
+	sa_file_path += ".sa";
+	FilePath wt_file_path = idx_file_path;
+	wt_file_path += ".wt";
+	const FilePath marker_path =
+		RaMAxCache::completionMarkerPath(idx_file_path);
+	const FilePath sa_marker_path =
+		RaMAxCache::completionMarkerPath(sa_file_path);
+	const FilePath wt_marker_path =
+		RaMAxCache::completionMarkerPath(wt_file_path);
 
 	spdlog::info("Indexing with prefix: {}, index path: {}", prefix, ref_index_path.string());
 
-	if (!std::filesystem::exists(idx_file_path)) {
-		ref_index->buildIndex(output_path, fast_build, thread_num);
-		ref_index->saveToFile(idx_file_path.string());
+	const auto load_existing = [&]() -> bool {
+		try {
+			if (!ref_index->loadFromFile(idx_file_path.string())) return false;
+			++index_cache_counters->reused;
+			spdlog::info("[cache] FM-index reused for {}: {}",
+				prefix, idx_file_path.string());
+			return true;
+		} catch (const std::exception& error) {
+			spdlog::warn("[cache] FM-index load failed for {}: {}; rebuilding",
+				prefix, error.what());
+			ref_index.emplace(prefix, ref_fasta_manager_);
+			return false;
+		}
+	};
+
+	bool loaded = false;
+	if (RaMAxCache::markerMatches(
+			marker_path, "fm-index", 1, fasta_path_str, false,
+			FilePath(fasta_path_str), idx_file_path) &&
+		RaMAxCache::markerMatches(
+			sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
+			FilePath(fasta_path_str), sa_file_path) &&
+		RaMAxCache::markerMatches(
+			wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
+			FilePath(fasta_path_str), wt_file_path)) {
+		loaded = load_existing();
+	} else if (trust_legacy_cache &&
+			   std::filesystem::is_regular_file(idx_file_path) &&
+			   !std::filesystem::exists(marker_path)) {
+		loaded = load_existing();
+		if (loaded) {
+			RaMAxCache::writeMarker(
+				marker_path, "fm-index", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), idx_file_path);
+			RaMAxCache::writeMarker(
+				sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), sa_file_path);
+			RaMAxCache::writeMarker(
+				wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), wt_file_path);
+			spdlog::warn("[cache] trusted legacy FM-index for {}", prefix);
+		}
 	}
-	else {
-		ref_index->loadFromFile(idx_file_path.string());
+
+	if (!loaded) {
+		ref_index.emplace(prefix, ref_fasta_manager_);
+		FilePath partial = idx_file_path;
+		partial += ".partial";
+		FilePath partial_sa = partial;
+		partial_sa += ".sa";
+		FilePath partial_wt = partial;
+		partial_wt += ".wt";
+		RaMAxCache::removeIfPresent(partial);
+		RaMAxCache::removeIfPresent(partial_sa);
+		RaMAxCache::removeIfPresent(partial_wt);
+		try {
+			ref_index->buildIndex(output_path, fast_build, thread_num);
+			if (!ref_index->saveToFile(partial.string())) {
+				throw std::runtime_error("Failed to save FM-index: " + partial.string());
+			}
+			RaMAxCache::publishFile(partial_sa, sa_file_path);
+			RaMAxCache::publishFile(partial_wt, wt_file_path);
+			RaMAxCache::publishFile(partial, idx_file_path);
+			RaMAxCache::writeMarker(
+				marker_path, "fm-index", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), idx_file_path);
+			RaMAxCache::writeMarker(
+				sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), sa_file_path);
+			RaMAxCache::writeMarker(
+				wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
+				FilePath(fasta_path_str), wt_file_path);
+		} catch (...) {
+			RaMAxCache::removeIfPresent(partial);
+			RaMAxCache::removeIfPresent(partial_sa);
+			RaMAxCache::removeIfPresent(partial_wt);
+			throw;
+		}
+		++index_cache_counters->rebuilt;
+		spdlog::info("[cache] FM-index rebuilt for {}: {}",
+			prefix, idx_file_path.string());
 	}
 	spdlog::info("Indexing finished, index path: {}", ref_index_path.string());
 
@@ -1228,4 +1315,3 @@ void PairRareAligner::constructGraphByDP(SpeciesName query_name, SeqPro::Manager
 	}
 
 }
-

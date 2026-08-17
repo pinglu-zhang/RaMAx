@@ -60,10 +60,15 @@ cmake -S . -B build \
 
 ## Restart schema is incompatible
 
-RaMAx 1.0.5 accepts `schema_version: 1`. A missing or different version means
-the work directory came from an incompatible build. Start a new run in a fresh
-directory; do not add fields manually to an old configuration because its
-other intermediate files may also be incompatible.
+RaMAx 1.0.7 writes `schema_version: 2`. It can read a schema-1 work directory
+from 1.0.6, recover its legacy sidecars, trust existing caches once, and write
+schema 2 after input validation. Missing schema information or any other schema
+version is rejected.
+
+Restart also rejects a changed seqfile, species mapping, or local FASTA
+size/mtime. Use a new work directory when changing input data. A damaged cache
+artifact is different: RaMAx rebuilds only that raw, clean, softmask, or
+FM-index artifact.
 
 ## MAF validation fails
 
