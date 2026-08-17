@@ -146,6 +146,40 @@ void testQualifiedNameCollisionIsAtomic(const fs::path& directory) {
     }
 }
 
+void testMafAtomicPublish(const fs::path& directory) {
+    writeFasta(directory / "maf-ref.fa", "chr", "AGTCAAAA");
+    writeFasta(directory / "maf-query.fa", "chr", "AGTCAAAA");
+
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
+    managers.emplace("ref", makeManager(directory / "maf-ref.fa"));
+    managers.emplace("query", makeManager(directory / "maf-query.fa"));
+    RaMesh::RaMeshMultiGenomeGraph graph(managers);
+
+    auto block = makeBlock(
+        "ref", "ref", "query", 0, 4, Strand::FORWARD, {},
+        0, 4, Strand::FORWARD, Cigar_t{cigarToInt('M', 4)});
+    graph.blocks.push_back(block);
+
+    const fs::path output = directory / "atomic.maf";
+    {
+        std::ofstream existing(output, std::ios::binary | std::ios::trunc);
+        existing << "sentinel-existing-output\n";
+    }
+
+    graph.exportToMaf(output, managers, true, false);
+    const std::string maf = readFile(output);
+    require(maf.starts_with("##maf version=1 scoring=none\n"),
+            "MAF atomic publish did not replace existing output");
+    require(maf.find("s ref.chr") != std::string::npos,
+            "MAF output is missing reference row");
+    require(maf.find("s query.chr") != std::string::npos,
+            "MAF output is missing query row");
+    for (const auto& entry : fs::directory_iterator(directory)) {
+        require(entry.path().filename().string().find("atomic.maf.tmp.") != 0,
+                "successful MAF export left a temporary file");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +199,7 @@ int main() {
         fs::create_directories(directory);
         testMalformedBlocksAndReverseRecord(directory);
         testQualifiedNameCollisionIsAtomic(directory);
+        testMafAtomicPublish(directory);
     } catch (const std::exception& error) {
         std::cerr << "ramax_paf_export_tests: " << error.what() << '\n';
         return EXIT_FAILURE;

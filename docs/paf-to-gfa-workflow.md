@@ -127,6 +127,20 @@ seqwish 支持普通或 gzip FASTA，因此可以直接生成 `.fa.gz`：
   2>&1 | tee "$RUN/logs/ramax.log"
 ```
 
+重复使用 `-o` 可以在同一次比对中同时生成 MAF 或 HAL。只要包含 HAL，
+seqfile 就必须提供 Newick 树：
+
+```bash
+"$RAMAX" \
+  -i "$SEQFILE" \
+  -w "$RUN/work-ramax" \
+  -o "$RUN/output/alignment.connected.paf" \
+  -o "$RUN/output/alignment.maf" \
+  -o "$RUN/output/alignment.hal" \
+  -t "$THREADS" \
+  --paf-mode connected
+```
+
 运行结束后检查：
 
 ```bash

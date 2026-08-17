@@ -1,11 +1,17 @@
 # Output formats
 
-RaMAx selects its exporter from the output filename suffix:
+RaMAx selects exporters from the suffixes of one or more repeated `-o` paths:
 
 - `.maf` writes a Multiple Alignment Format file;
 - `.hal` writes a Hierarchical Alignment Format file;
 - `.paf` writes pairwise projections of the primary Block alignments;
 - other suffixes are rejected before alignment begins.
+
+Each format may appear once. RaMAx constructs the optimized graph once and
+exports in the fixed order MAF, PAF, HAL. Each file is published independently
+through a temporary file. If one exporter fails, later formats are still
+attempted; successful files remain, the command exits nonzero, and the work
+directory is retained.
 
 ## MAF
 

@@ -6,6 +6,7 @@
 // ------------------------------------------------------------------
 #include "threadpool.h"                          // 自定义线程池（可能用于并行加速）
 #include "CLI11.hpp"                             // CLI11 命令行解析库（本地版本）
+#include "output_format.hpp"
 
 #include "spdlog/spdlog.h"                       // spdlog 主头文件
 #include "spdlog/sinks/stdout_color_sinks.h"     // 控制台彩色输出 sink
@@ -167,9 +168,9 @@ public:
 	std::string make_usage(const CLI::App* app, std::string name) const override {
 		std::ostringstream out;
 		out << "Usage:\n"
-			<< "  ramax -i <seqfile.txt> -o <output.{maf|hal|paf}> -w <workdir> [options]\n\n"
+			<< "  ramax -i <seqfile.txt> -o <output> [-o <output> ...] -w <workdir> [options]\n\n"
 			<< "Example:\n"
-			<< "  ramax -i seqfile.txt -o output.maf -w workdir -t 8\n\n";
+			<< "  ramax -i seqfile.txt -o output.maf -o output.hal -w workdir -t 8\n\n";
 		return out.str();
 	}
 };
@@ -185,23 +186,6 @@ inline CLI::Validator trim_whitespace = CLI::Validator(
 		return std::string();  // 空字符串表示验证通过
 	}, ""
 );
-
-enum class MultipleGenomeOutputFormat {
-	HAL,
-	MAF,
-	PAF,
-	UNKNOWN
-};
-
-// 根据输出文件扩展名自动判断输出格式
-inline MultipleGenomeOutputFormat detectMultipleGenomeOutputFormat(const std::filesystem::path& output_path) {
-	std::string ext = output_path.extension().string();
-	if (ext == ".hal") return MultipleGenomeOutputFormat::HAL;
-	if (ext == ".maf") return MultipleGenomeOutputFormat::MAF;
-	if (ext == ".paf") return MultipleGenomeOutputFormat::PAF;
-	return MultipleGenomeOutputFormat::UNKNOWN;
-}
-
 
 // ------------------------------------------------------------------
 // 日志系统初始化

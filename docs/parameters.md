@@ -21,10 +21,10 @@ binary.
 
 | Option | Type/default | Description |
 |---|---|---|
-| `-o`, `--output` | path; required for a new run | Output file. The suffix must be `.maf`, `.hal`, or `.paf`. |
+| `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, or `.paf`, and each format may appear once. |
 | `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
-| `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid only with `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
-| `--root` | string; automatic | Preferred HAL root name. Valid only for HAL output, which requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
+| `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid when any `-o` is `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
+| `--root` | string; automatic | Preferred HAL root name. Valid when any `-o` is `.hal`; HAL requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters
 

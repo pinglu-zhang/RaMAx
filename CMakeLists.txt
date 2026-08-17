@@ -262,6 +262,19 @@ add_dependencies(ramax  hal_library)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(ramax_output_spec_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/output_spec_test.cpp")
+    target_include_directories(ramax_output_spec_tests PRIVATE "${INCLUDE_DIR}")
+    target_compile_features(ramax_output_spec_tests PRIVATE cxx_std_23)
+    target_compile_options(ramax_output_spec_tests PRIVATE -Wall -Wextra)
+    add_test(NAME ramax_output_spec COMMAND ramax_output_spec_tests)
+
+    add_test(NAME ramax_multi_output_cli
+        COMMAND "${CMAKE_COMMAND}"
+            -DRAMAX=$<TARGET_FILE:ramax>
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/multi-output-cli-test
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/multi_output_cli_test.cmake")
+
     add_executable(ramax_paf_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/paf_utils_test.cpp"
         "${GRAPH_DIR}/paf_utils.cpp")

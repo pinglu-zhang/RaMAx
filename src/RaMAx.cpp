@@ -6,6 +6,7 @@
 #include "config.hpp"
 #include "index.h"
 #include "minipoa_locator.h"
+#include "output_spec.hpp"
 #include "ramax_version.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
@@ -25,6 +26,8 @@ struct CommonArgs {
 
     std::filesystem::path input_path = "";      // 输入序列文件路径seqfile
     std::filesystem::path output_path = "";     // 最终输出结果路径
+    std::vector<std::filesystem::path> output_paths; // CLI/restart multi-output list
+    std::vector<RaMAxOutput::OutputSpec> outputs;     // validated, canonical order
     std::filesystem::path work_dir_path = "";   // 工作目录路径（用于中间文件与缓存）
 
 
@@ -129,6 +132,35 @@ struct CommonArgs {
 
 namespace {
 constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
+constexpr uint32_t OUTPUTS_SCHEMA_VERSION = 1;
+constexpr const char* OUTPUTS_FILE = "outputs.json";
+
+struct OutputManifest {
+    uint32_t schema_version = OUTPUTS_SCHEMA_VERSION;
+    std::vector<FilePath> output_paths;
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(CEREAL_NVP(schema_version), CEREAL_NVP(output_paths));
+    }
+};
+
+void configureOutputs(CommonArgs& args,
+                      const std::vector<FilePath>& output_paths) {
+    try {
+        args.outputs = RaMAxOutput::validateOutputPaths(output_paths);
+    } catch (const std::invalid_argument& error) {
+        throw std::runtime_error(error.what());
+    }
+    args.output_paths = output_paths;
+    args.output_path = output_paths.front();
+    args.output_format = detectMultipleGenomeOutputFormat(args.output_path);
+}
+
+bool hasOutputFormat(const CommonArgs& args,
+                     MultipleGenomeOutputFormat format) {
+    return RaMAxOutput::hasFormat(args.outputs, format);
+}
 
 std::string requiredMinipoaExecutable() {
     const auto executable =
@@ -155,13 +187,13 @@ inline void printRunConfiguration(const CommonArgs& args) {
     // Input/Output section
     spdlog::info("Input/Output:");
     spdlog::info("  Input file       : {}", args.input_path.string());
-    spdlog::info("  Output file      : {}", args.output_path.string());
+    spdlog::info("  Output files     : {}", args.outputs.size());
+    for (const auto& output : args.outputs) {
+        spdlog::info("    {:<3}           : {}",
+            RaMAxOutput::formatName(output.format), output.path.string());
+    }
     spdlog::info("  Work directory   : {}", args.work_dir_path.string());
-    spdlog::info("  Output format    : {}",
-        args.output_format == MultipleGenomeOutputFormat::HAL ? "HAL" :
-        args.output_format == MultipleGenomeOutputFormat::MAF ? "MAF" :
-        args.output_format == MultipleGenomeOutputFormat::PAF ? "PAF" : "Unknown");
-    if (args.output_format == MultipleGenomeOutputFormat::PAF) {
+    if (hasOutputFormat(args, MultipleGenomeOutputFormat::PAF)) {
         spdlog::info("  PAF mode         : {}", args.paf_mode);
     }
 
@@ -253,8 +285,8 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->transform(trim_whitespace);               // 去除首尾空白字符
 
     // 输出结果路径
-    auto* output_opt = cmd->add_option("-o,--output", args.output_path,
-        "Output alignment path in MAF, HAL, or PAF format.")
+    auto* output_opt = cmd->add_option("-o,--output", args.output_paths,
+        "Output alignment path; repeat -o for MAF, HAL, and PAF.")
         ->group("Output")
         ->type_name("<path>")
         ->transform(trim_whitespace);
@@ -724,6 +756,42 @@ static int runRestartMode(CommonArgs& common_args) {
     configureLogLevel(common_args);
     spdlog::info("CommonArgs loaded from {}", config_path.string());
 
+    std::vector<FilePath> restored_output_paths{common_args.output_path};
+    const FilePath outputs_path =
+        common_args.work_dir_path / OUTPUTS_FILE;
+    if (std::filesystem::exists(outputs_path)) {
+        std::ifstream outputs_stream(outputs_path);
+        if (!outputs_stream) {
+            throw std::runtime_error(
+                "Failed to open output manifest: " + outputs_path.string());
+        }
+        OutputManifest manifest;
+        try {
+            cereal::JSONInputArchive archive(outputs_stream);
+            archive(cereal::make_nvp("outputs", manifest));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "Invalid output manifest " + outputs_path.string() +
+                ": " + error.what());
+        }
+        if (manifest.schema_version != OUTPUTS_SCHEMA_VERSION) {
+            throw std::runtime_error(
+                "Unsupported output manifest schema version " +
+                std::to_string(manifest.schema_version));
+        }
+        if (manifest.output_paths.empty() ||
+            manifest.output_paths.front() != common_args.output_path) {
+            throw std::runtime_error(
+                "Output manifest primary path does not match config.json");
+        }
+        restored_output_paths = std::move(manifest.output_paths);
+        spdlog::info("Output manifest loaded from {}", outputs_path.string());
+    } else {
+        spdlog::info(
+            "Output manifest not found; restoring legacy single output");
+    }
+    configureOutputs(common_args, restored_output_paths);
+
     const FilePath threshold_path =
         common_args.work_dir_path / "accurate_skip_threshold.txt";
     common_args.accurate_skip_threshold = 10000;
@@ -744,7 +812,7 @@ static int runRestartMode(CommonArgs& common_args) {
     }
 
     common_args.paf_mode = "connected";
-    if (common_args.output_format == MultipleGenomeOutputFormat::PAF) {
+    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF)) {
         const FilePath paf_mode_path =
             common_args.work_dir_path / "paf_mode.txt";
         if (std::filesystem::exists(paf_mode_path)) {
@@ -775,10 +843,12 @@ static int runNormalMode(CommonArgs& common_args) {
     // 检查必要参数
     if (common_args.input_path.empty())
         throw CLI::RequiredError("Missing required option: --input (-i)");
-    if (common_args.output_path.empty())
+    if (common_args.output_paths.empty())
         throw CLI::RequiredError("Missing required option: --output (-o)");
     if (common_args.work_dir_path.empty())
         throw CLI::RequiredError("Missing required option: --workdir (-w)");
+
+    configureOutputs(common_args, common_args.output_paths);
 
 #ifndef _DEBUG_
     // 非调试模式：确保工作目录为空且合法
@@ -804,13 +874,7 @@ static int runNormalMode(CommonArgs& common_args) {
     logBuildMode();
     spdlog::info("Multiple genome alignment mode enabled.");
 
-    // 根据输出文件扩展名检测输出格式（.hal / .maf / .paf）
-    common_args.output_format = detectMultipleGenomeOutputFormat(common_args.output_path);
-    if (common_args.output_format == MultipleGenomeOutputFormat::UNKNOWN) {
-        throw std::runtime_error(
-            "Invalid output file extension. Supported: .hal, .maf, .paf");
-    }
-    if (common_args.output_format != MultipleGenomeOutputFormat::PAF &&
+    if (!hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF) &&
         common_args.paf_mode_explicit) {
         throw std::runtime_error(
             "--paf-mode is only valid with .paf output");
@@ -829,9 +893,26 @@ static int runNormalMode(CommonArgs& common_args) {
         return 1;
     }
 
-    cereal::JSONOutputArchive archive(os);
-    archive(cereal::make_nvp("common_args", common_args));
+    {
+        cereal::JSONOutputArchive archive(os);
+        archive(cereal::make_nvp("common_args", common_args));
+    }
     spdlog::info("Configuration saved to {}", config_path.string());
+
+    const FilePath outputs_path =
+        common_args.work_dir_path / OUTPUTS_FILE;
+    std::ofstream outputs_stream(outputs_path, std::ios::trunc);
+    if (!outputs_stream) {
+        throw std::runtime_error(
+            "Failed to save output manifest to " + outputs_path.string());
+    }
+    OutputManifest manifest;
+    manifest.output_paths = common_args.output_paths;
+    {
+        cereal::JSONOutputArchive outputs_archive(outputs_stream);
+        outputs_archive(cereal::make_nvp("outputs", manifest));
+    }
+    spdlog::info("Output manifest saved to {}", outputs_path.string());
 
     const FilePath threshold_path =
         common_args.work_dir_path / "accurate_skip_threshold.txt";
@@ -842,7 +923,7 @@ static int runNormalMode(CommonArgs& common_args) {
     }
     threshold_stream << common_args.accurate_skip_threshold << '\n';
 
-    if (common_args.output_format == MultipleGenomeOutputFormat::PAF) {
+    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF)) {
         const FilePath paf_mode_path =
             common_args.work_dir_path / "paf_mode.txt";
         std::ofstream paf_mode_stream(paf_mode_path, std::ios::trunc);
@@ -887,7 +968,7 @@ static int inputValidationPhase(
     NewickParser& newick_tree,
     SpeciesPathMap& species_path_map
 ) {
-    if (common_args.output_format != MultipleGenomeOutputFormat::HAL &&
+    if (!hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL) &&
         !common_args.root_name.empty()) {
         throw std::runtime_error("--root is only supported for HAL output");
     }
@@ -896,7 +977,7 @@ static int inputValidationPhase(
     std::string root = common_args.root_name;
     const bool has_tree =
         parseSeqfile(common_args.input_path, newick_tree, species_path_map, root);
-    if (common_args.output_format == MultipleGenomeOutputFormat::HAL &&
+    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL) &&
         !has_tree) {
         throw std::runtime_error(
             "HAL output requires a Newick tree as the first seqfile record");
@@ -943,7 +1024,7 @@ static int preprocessingPhase(
 
     // HAL uses the same all-uppercase alignment input as before and stores
     // original lowercase runs in an export-only sidecar. MAF is unchanged.
-    if (common_args.output_format == MultipleGenomeOutputFormat::HAL) {
+    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL)) {
         cleanRawDatasetWithSoftMaskIndex(common_args.work_dir_path, species_path_map,
                                          softmask_path_map, common_args.thread_num);
     } else {
@@ -1133,9 +1214,16 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
 }
 
 // ------------------------------
-// 导出结果（MAF / HAL）
+// 导出结果（MAF / PAF / HAL）
 // ------------------------------
-static void exportResults(
+struct ExportAttempt {
+    RaMAxOutput::OutputSpec output;
+    bool success{false};
+    double elapsed_seconds{0.0};
+    std::string error;
+};
+
+static bool exportResults(
     const CommonArgs& common_args,
     const NewickParser& newick_tree,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
@@ -1152,43 +1240,83 @@ static void exportResults(
         requiredMinipoaExecutable(),
         common_args.species_mismatch_realign_max_span);
 
-    // 根据输出格式选择导出方法
-    switch (common_args.output_format) {
-    case MultipleGenomeOutputFormat::MAF:
-        spdlog::info("Exporting to MAF format...");
-        graph->exportToMaf(common_args.output_path, seqpro_managers, true, false);
-        break;
+    std::vector<ExportAttempt> attempts;
+    attempts.reserve(common_args.outputs.size());
+    bool all_succeeded = true;
 
-    case MultipleGenomeOutputFormat::PAF: {
-        spdlog::info(
-            "Exporting to PAF format (mode={})...", common_args.paf_mode);
-        RaMesh::Paf::PafExportOptions options;
-        options.mode = common_args.paf_mode == "all"
-            ? RaMesh::Paf::Mode::ALL : RaMesh::Paf::Mode::CONNECTED;
-        options.only_primary = true;
-        graph->exportToPaf(
-            common_args.output_path, seqpro_managers, options);
-        break;
-    }
+    for (const auto& output : common_args.outputs) {
+        const auto started = std::chrono::steady_clock::now();
+        ExportAttempt attempt;
+        attempt.output = output;
+        try {
+            switch (output.format) {
+            case MultipleGenomeOutputFormat::MAF:
+                spdlog::info("Exporting MAF to {}...", output.path.string());
+                graph->exportToMaf(
+                    output.path, seqpro_managers, true, false);
+                break;
 
-    case MultipleGenomeOutputFormat::HAL:
-        spdlog::info("Exporting to HAL format...");
-        // 使用已解析并可能裁剪过的 newick_tree，避免重复读取导致 --root 子树失效
-        graph->exportToHal(
-            common_args.output_path,
-            seqpro_managers,
-            newick_tree,
-            true,
-            common_args.root_name,
-            softmask_path_map
-        );
-        break;
+            case MultipleGenomeOutputFormat::PAF: {
+                spdlog::info(
+                    "Exporting PAF to {} (mode={})...",
+                    output.path.string(), common_args.paf_mode);
+                RaMesh::Paf::PafExportOptions options;
+                options.mode = common_args.paf_mode == "all"
+                    ? RaMesh::Paf::Mode::ALL
+                    : RaMesh::Paf::Mode::CONNECTED;
+                options.only_primary = true;
+                graph->exportToPaf(output.path, seqpro_managers, options);
+                break;
+            }
 
-    default:
-        throw std::runtime_error("Unsupported output format for multiple genome alignment");
+            case MultipleGenomeOutputFormat::HAL:
+                spdlog::info("Exporting HAL to {}...", output.path.string());
+                graph->exportToHal(
+                    output.path,
+                    seqpro_managers,
+                    newick_tree,
+                    true,
+                    common_args.root_name,
+                    softmask_path_map
+                );
+                break;
+
+            case MultipleGenomeOutputFormat::UNKNOWN:
+                throw std::runtime_error(
+                    "Unsupported output format for multiple genome alignment");
+            }
+            attempt.success = true;
+        } catch (const std::exception& error) {
+            attempt.error = error.what();
+            all_succeeded = false;
+            spdlog::error(
+                "{} export failed for {}: {}",
+                RaMAxOutput::formatName(output.format),
+                output.path.string(), attempt.error);
+        }
+        attempt.elapsed_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        attempts.push_back(std::move(attempt));
     }
     logCrossAnchorInsertionRepairStats();
     RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
+
+    spdlog::info("Output export summary:");
+    for (const auto& attempt : attempts) {
+        if (attempt.success) {
+            spdlog::info(
+                "  {} SUCCESS path={} elapsed_seconds={:.3f}",
+                RaMAxOutput::formatName(attempt.output.format),
+                attempt.output.path.string(), attempt.elapsed_seconds);
+        } else {
+            spdlog::error(
+                "  {} FAILED path={} elapsed_seconds={:.3f} error={}",
+                RaMAxOutput::formatName(attempt.output.format),
+                attempt.output.path.string(), attempt.elapsed_seconds,
+                attempt.error);
+        }
+    }
+    return all_succeeded;
 }
 
 // ------------------------------
@@ -1256,8 +1384,15 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         // ------------------------------
         // 导出阶段
         // ------------------------------
-        exportResults(common_args, newick_tree, seqpro_managers,
-                      softmask_path_map, graph.get());
+        const bool exports_succeeded = exportResults(
+            common_args, newick_tree, seqpro_managers,
+            softmask_path_map, graph.get());
+        if (!exports_succeeded) {
+            spdlog::error(
+                "One or more output formats failed; preserving work directory: {}",
+                common_args.work_dir_path.string());
+            return 1;
+        }
 
         // ------------------------------
         // 清理工作目录

@@ -67,13 +67,27 @@ information-complete sparse `connected` mode; use `--paf-mode all` for the
 all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
 are kept under the work directory.
 
+Repeat `-o` to export several formats from the same completed alignment:
+
+```bash
+ramax -i seqfile.txt -w work -t 16 \
+  -o alignment.maf \
+  -o alignment.paf \
+  -o alignment.hal
+```
+
+Each format may appear once. If HAL is requested anywhere in the output list,
+the seqfile must contain a Newick tree. Export order is MAF, PAF, then HAL.
+
 For seqwish, generate the matching qualified FASTA directly from the same
 seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
 the default `connected` PAF mode:
 
 ```bash
 ramax-paf-fasta -i seqfile.txt -o sequences.fa.gz
-ramax -i seqfile.txt -o alignment.paf -w work -t 16
+ramax -i seqfile.txt -w work -t 16 \
+  -o alignment.paf \
+  -o alignment.maf
 seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa -k 0
 ```
 
