@@ -47,6 +47,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa
 ```
 
+RaMAx also requires Mash 2.3 at runtime. Place `mash` in `PATH`, next to the
+installed `ramax`, or configure its exact location with:
+
+```bash
+cmake -S . -B build \
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
+```
+
+After selecting the first reference, RaMAx records whole-genome Mash distances
+using `k=31` and sketch size 20,000 before starting the legacy aligner.
+
 Set `-DRAMAX_NATIVE_ARCH=OFF` for a portable x86-64 RaMAx build. Configuration
 and compilation do not write to `/usr/local`; installation is controlled only
 by `cmake --install` and its prefix.

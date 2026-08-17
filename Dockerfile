@@ -13,6 +13,7 @@ RUN apt-get update \
         libhdf5-dev \
         libtbb-dev \
         make \
+        mash \
         pkg-config \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -25,6 +26,7 @@ WORKDIR /src
 COPY CMakeLists.txt ./
 COPY include ./include
 COPY src ./src
+COPY tests ./tests
 COPY third_party ./third_party
 
 RUN set -eux; \
@@ -65,6 +67,7 @@ RUN apt-get update \
         libhdf5-cpp-103-1 \
         libstdc++6 \
         libtbb12 \
+        mash \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*
 

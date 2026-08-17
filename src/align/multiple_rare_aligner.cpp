@@ -614,6 +614,14 @@ starAlignment(
         }
     }
 
+    // Estimate whole-genome Mash distance once for the first selected
+    // reference. The legacy FM-index aligner remains the only alignment
+    // backend in this phase; these records are retained for the future router.
+    MashDistanceEstimator mash_estimator(
+        locateMashExecutable(), work_dir / "similarity", thread_num);
+    first_reference_distances = mash_estimator.estimateFirstReference(
+        reference_order.front(), seqpro_managers);
+
     // ------------------------------------------------------------
     // 5) 初始化参考缓存 ref_global_cache
     //    - 用于加速 global 坐标定位到序列（避免频繁二分/查询）

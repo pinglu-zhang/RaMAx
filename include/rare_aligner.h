@@ -12,6 +12,7 @@
 #include "structural_break_repair.h"
 #include "short_block_repair.h"
 #include "cache_manifest.h"
+#include "mash_distance_estimator.h"
 
 struct IndexCacheCounters {
     std::atomic_size_t reused{0};
@@ -51,6 +52,7 @@ public:
     std::string species_mismatch_msa_executable;
     RaMesh::StructuralBreakRepair::Options structural_break_repair_options;
     RaMesh::ShortBlockRepair::Options short_block_repair_options;
+    std::vector<MashDistanceRecord> first_reference_distances;
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

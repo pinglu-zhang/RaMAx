@@ -22,8 +22,12 @@ orangutan  /data/genomes/orangutan.fa.gz
 
 A tree may still be supplied for non-HAL output, but it does not control
 reference ordering. RaMAx selects references from assembly N50, total length,
-genome name, and an optional `--ref`. `--root` is valid whenever the output
-list contains HAL.
+genome name, and an optional `--ref`. After selecting the first reference,
+RaMAx requires Mash 2.3 and estimates whole-genome distances to every other
+input with `k=31` and sketch size 20,000. The normalized table is written to
+`<workdir>/similarity/mash_first_reference.tsv`; alignment still uses the
+legacy FM-index backend in this release.
+`--root` is valid whenever the output list contains HAL.
 When a tree is present, its leaf names should match the genome mappings. Use
 absolute FASTA paths when jobs may be launched from different directories.
 

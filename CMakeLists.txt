@@ -103,6 +103,29 @@ option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 
 set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
     "Existing minipoa executable; empty searches PATH")
+set(RAMAX_MASH_EXECUTABLE "" CACHE FILEPATH
+    "Mash 2.3 executable; empty searches PATH")
+
+if(RAMAX_MASH_EXECUTABLE)
+    if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
+        message(FATAL_ERROR
+            "RAMAX_MASH_EXECUTABLE does not exist: ${RAMAX_MASH_EXECUTABLE}")
+    endif()
+    get_filename_component(RAMAX_RESOLVED_MASH
+        "${RAMAX_MASH_EXECUTABLE}" REALPATH)
+    message(STATUS "Using configured Mash: ${RAMAX_RESOLVED_MASH}")
+else()
+    find_program(RAMAX_SYSTEM_MASH NAMES mash)
+    if(RAMAX_SYSTEM_MASH)
+        set(RAMAX_RESOLVED_MASH "${RAMAX_SYSTEM_MASH}")
+        message(STATUS "Using Mash from PATH: ${RAMAX_RESOLVED_MASH}")
+    else()
+        set(RAMAX_RESOLVED_MASH "")
+        message(STATUS
+            "Mash was not found during configuration; runtime alignment will "
+            "require Mash 2.3 next to ramax or in PATH")
+    endif()
+endif()
 
 if(RAMAX_MINIPOA_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
@@ -159,6 +182,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/pair_rare_aligner.cpp"
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${ALIGN_DIR}/minipoa_locator.cpp"
+    "${ALIGN_DIR}/mash_distance_estimator.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
     "${GRAPH_DIR}/direct_block_merger.cpp"
@@ -253,13 +277,26 @@ add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
 configure_rama_target(ramax_core)
 add_dependencies(ramax_core hal_library)
 target_compile_definitions(ramax_core PRIVATE
-    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}")
+    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
+    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
 target_link_libraries(ramax PRIVATE ramax_core)
 
 add_dependencies(ramax hal_library)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(ramax_mash_distance_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
+    configure_rama_target(ramax_mash_distance_test)
+    target_link_libraries(ramax_mash_distance_test PRIVATE ramax_core)
+    add_test(NAME ramax_mash_distance_test
+        COMMAND ramax_mash_distance_test)
+    set_tests_properties(ramax_mash_distance_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
 
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
