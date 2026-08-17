@@ -13,6 +13,7 @@
 #include "short_block_repair.h"
 #include "cache_manifest.h"
 #include "mash_distance_estimator.h"
+#include "wfmash_router.h"
 
 struct IndexCacheCounters {
     std::atomic_size_t reused{0};
@@ -53,6 +54,8 @@ public:
     RaMesh::StructuralBreakRepair::Options structural_break_repair_options;
     RaMesh::ShortBlockRepair::Options short_block_repair_options;
     std::vector<MashDistanceRecord> first_reference_distances;
+    double near_distance_threshold{0.01};
+    double far_distance_threshold{0.02};
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

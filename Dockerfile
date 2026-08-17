@@ -1,3 +1,14 @@
+FROM mambaorg/micromamba:2.3.2 AS alignment-tools
+
+USER root
+RUN micromamba create -y -p /opt/ramax-tools/mash \
+        -c conda-forge -c bioconda mash=2.3=hb105d93_10 \
+    && micromamba create -y -p /opt/ramax-tools/wfmash \
+        -c conda-forge -c bioconda wfmash=0.24.2=hc76708e_1 \
+    && micromamba create -y -p /opt/ramax-tools/samtools \
+        -c conda-forge -c bioconda samtools=1.24=h9dcdb79_1 \
+    && micromamba clean --all --yes
+
 FROM ubuntu:22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -13,7 +24,6 @@ RUN apt-get update \
         libhdf5-dev \
         libtbb-dev \
         make \
-        mash \
         pkg-config \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -23,10 +33,13 @@ ENV CXX=/usr/bin/g++-12
 
 WORKDIR /src
 
+COPY --from=alignment-tools /opt/ramax-tools /opt/ramax-tools
+
 COPY CMakeLists.txt ./
 COPY include ./include
 COPY src ./src
 COPY tests ./tests
+COPY tools ./tools
 COPY third_party ./third_party
 
 RUN set -eux; \
@@ -45,6 +58,9 @@ RUN set -eux; \
         -DBUILD_EXAMPLES=OFF \
         -DBUILD_SHARED_LIBS=OFF \
         -DRAMAX_NATIVE_ARCH=OFF \
+        -DRAMAX_MASH_EXECUTABLE=/opt/ramax-tools/mash/bin/mash \
+        -DRAMAX_WFMASH_EXECUTABLE=/opt/ramax-tools/wfmash/bin/wfmash \
+        -DRAMAX_SAMTOOLS_EXECUTABLE=/opt/ramax-tools/samtools/bin/samtools \
         -DRAMAX_HAL_JOBS="${BUILD_JOBS}" \
         -DRAMAX_HAL_LIBS="${hdf5_libs} -lhdf5_cpp"; \
     cmake --build build --parallel "${BUILD_JOBS}"; \
@@ -67,11 +83,15 @@ RUN apt-get update \
         libhdf5-cpp-103-1 \
         libstdc++6 \
         libtbb12 \
-        mash \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/ramax /opt/ramax
+COPY --from=alignment-tools /opt/ramax-tools /opt/ramax-tools
+
+RUN ln -s /opt/ramax-tools/mash/bin/mash /usr/local/bin/mash \
+    && ln -s /opt/ramax-tools/wfmash/bin/wfmash /usr/local/bin/wfmash \
+    && ln -s /opt/ramax-tools/samtools/bin/samtools /usr/local/bin/samtools
 
 RUN set -eux; \
     /opt/ramax/bin/ramax --help >/dev/null; \
@@ -79,7 +99,11 @@ RUN set -eux; \
     ldd /opt/ramax/bin/ramax; \
     if ldd /opt/ramax/bin/ramax | grep -q "not found"; then exit 1; fi; \
     test ! -e /opt/ramax/bin/windowmasker; \
-    ! command -v windowmasker
+    ! command -v windowmasker; \
+    test "$(mash --version)" = "2.3"; \
+    wfmash --version 2>&1 | grep -q '^v0.24.2'; \
+    samtools --version | sed -n '1,2p' | grep -Fx 'samtools 1.24'; \
+    samtools --version | sed -n '1,2p' | grep -Fx 'Using htslib 1.24'
 
 WORKDIR /data
 

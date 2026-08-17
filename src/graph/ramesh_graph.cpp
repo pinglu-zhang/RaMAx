@@ -3205,8 +3205,14 @@ void RaMeshMultiGenomeGraph::optimizeGraphStructure() {
       // 清理零长度 segment 并同步 block/采样状态
       SegPtr current =
           genome_end.head->primary_path.next.load(std::memory_order_acquire);
+      std::unordered_set<const Segment*> cleanup_visited;
 
       while (current && !current->isTail()) {
+        if (!cleanup_visited.emplace(current.get()).second) {
+          throw std::runtime_error(
+              "optimizeGraphStructure detected a cycle during cleanup for " +
+              species + "." + chr);
+        }
         if (current->isSegment() && current->length == 0) {
           SegPtr next_ptr =
               current->primary_path.next.load(std::memory_order_acquire);
@@ -3238,7 +3244,13 @@ void RaMeshMultiGenomeGraph::optimizeGraphStructure() {
       genome_end.sample_vec.clear();
       SegPtr rebuild =
           genome_end.head->primary_path.next.load(std::memory_order_acquire);
+      std::unordered_set<const Segment*> rebuild_visited;
       while (rebuild && !rebuild->isTail()) {
+        if (!rebuild_visited.emplace(rebuild.get()).second) {
+          throw std::runtime_error(
+              "optimizeGraphStructure detected a cycle during sampling for " +
+              species + "." + chr);
+        }
         genome_end.setToSampling(rebuild);
         rebuild =
             rebuild->primary_path.next.load(std::memory_order_acquire);

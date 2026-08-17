@@ -22,7 +22,7 @@ binary.
 | Option | Type/default | Description |
 |---|---|---|
 | `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, or `.paf`, and each format may appear once. |
-| `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
+| `-w`, `--workdir` | path; required | Intermediate and routing-artifact directory. It must be empty for a new Release run and is preserved after success. |
 | `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid when any `-o` is `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
 | `--root` | string; automatic | Preferred HAL root name. Valid when any `-o` is `.hal`; HAL requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
@@ -41,6 +41,14 @@ binary.
 | `--slow-build` | flag; off | Use the slower index-building implementation. |
 | `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference index. |
 | `--min-span` | integer; `65`; `1..INT_MAX` bp | Minimum span used during graph construction. |
+| `--near-distance` | float; `0.01`; `0..1` | In the first round, route a query to wfmash only when its Mash distance is strictly smaller than this value. Equality stays on the RaMAx backend. |
+| `--far-distance` | float; `0.02`; `0..1` | Reserved distant-species threshold. It is persisted and logged but does not route queries in this release. |
+
+The thresholds must satisfy
+`0 <= --near-distance < --far-distance <= 1`. First-round wfmash uses
+`-w 5000 -l 25000 -p 90 -n 1 -k 19 -F 0.001
+--hg-filter=1.0,30,99.9`. Later reference rounds always use the RaMAx
+FM-index backend.
 
 Parameter names containing underscores are retained in the current public CLI
 for the anchor/chunk settings shown above.

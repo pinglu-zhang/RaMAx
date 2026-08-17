@@ -13,6 +13,7 @@
 #include "external_msa_runner.h"
 
 #include <array>
+#include <cmath>
 #include <regex>
 #include <unordered_set>
 
@@ -22,7 +23,7 @@
 // ------------------------------------------------------------------
 struct CommonArgs {
 
-    uint32_t schema_version = 2;
+    uint32_t schema_version = 3;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -61,6 +62,8 @@ struct CommonArgs {
     bool fast_build = true;                     // 是否启用快速索引构建模式
     SeqPro::Length sampling_interval = 32;      // 索引采样间隔（影响速度与内存）
     uint_t min_span = 65;                       // 锚点或匹配的最小跨度阈值
+    double near_distance = 0.01;                // 首轮 d < 此值使用 wfmash
+    double far_distance = 0.02;                 // 预留的远缘物种阈值
 
     // ========================
     // 基因组切片与锚点参数
@@ -123,6 +126,8 @@ struct CommonArgs {
             CEREAL_NVP(fast_build),
             CEREAL_NVP(sampling_interval),
             CEREAL_NVP(min_span),
+            CEREAL_NVP(near_distance),
+            CEREAL_NVP(far_distance),
             CEREAL_NVP(log_level),
             CEREAL_NVP(verbose),
             CEREAL_NVP(quiet),
@@ -142,7 +147,7 @@ struct CommonArgs {
 };
 
 namespace {
-constexpr uint32_t CONFIG_SCHEMA_VERSION = 2;
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 3;
 constexpr uint32_t OUTPUTS_SCHEMA_VERSION = 1;
 constexpr const char* OUTPUTS_FILE = "outputs.json";
 constexpr const char* INPUT_MANIFEST_FILE = "input_manifest.json";
@@ -200,6 +205,72 @@ struct LegacyCommonArgsV1 {
             CEREAL_NVP(restart), CEREAL_NVP(thread_num),
             CEREAL_NVP(output_format), CEREAL_NVP(enable_repeat_masking),
             CEREAL_NVP(search_mode), CEREAL_NVP(allow_MEM),
+            CEREAL_NVP(fast_build), CEREAL_NVP(sampling_interval),
+            CEREAL_NVP(min_span), CEREAL_NVP(log_level),
+            CEREAL_NVP(verbose), CEREAL_NVP(quiet),
+            CEREAL_NVP(root_name), CEREAL_NVP(ref_name),
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks));
+    }
+};
+
+// Exact reader for schema 2, before Mash-distance routing thresholds became
+// persistent restart parameters.
+struct LegacyCommonArgsV2 {
+    uint32_t schema_version{2};
+    FilePath input_path;
+    FilePath output_path;
+    std::vector<FilePath> output_paths;
+    FilePath work_dir_path;
+    uint_t chunk_size{10000000};
+    uint_t overlap_size{0};
+    uint_t min_anchor_length{20};
+    uint_t max_anchor_frequency{50};
+    int thread_num{static_cast<int>(std::thread::hardware_concurrency())};
+    MultipleGenomeOutputFormat output_format{MultipleGenomeOutputFormat::UNKNOWN};
+    std::string paf_mode{"connected"};
+    bool trust_legacy_cache{false};
+    bool enable_repeat_masking{false};
+    SearchMode search_mode{ACCURATE_SEARCH};
+    uint_t accurate_skip_threshold{10000};
+    bool allow_MEM{false};
+    bool fast_build{true};
+    SeqPro::Length sampling_interval{32};
+    uint_t min_span{65};
+    std::string log_level{"info"};
+    bool verbose{false};
+    bool quiet{false};
+    std::string root_name;
+    std::string ref_name;
+    bool one_round{false};
+    bool merge_exact_contiguous_blocks{true};
+    uint_t merge_query_gap_max{100};
+    bool realign_single_missing_species{true};
+    uint_t species_mismatch_realign_max_span{3000};
+    uint_t species_mismatch_zero_gap_max_span{200};
+    bool repair_structural_breaks{true};
+    uint_t structural_break_max_span{1000};
+    bool repair_short_blocks{true};
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(
+            CEREAL_NVP(schema_version), CEREAL_NVP(input_path),
+            CEREAL_NVP(output_path), CEREAL_NVP(output_paths),
+            CEREAL_NVP(work_dir_path), CEREAL_NVP(chunk_size),
+            CEREAL_NVP(overlap_size), CEREAL_NVP(min_anchor_length),
+            CEREAL_NVP(max_anchor_frequency), CEREAL_NVP(thread_num),
+            CEREAL_NVP(output_format), CEREAL_NVP(paf_mode),
+            CEREAL_NVP(trust_legacy_cache),
+            CEREAL_NVP(enable_repeat_masking), CEREAL_NVP(search_mode),
+            CEREAL_NVP(accurate_skip_threshold), CEREAL_NVP(allow_MEM),
             CEREAL_NVP(fast_build), CEREAL_NVP(sampling_interval),
             CEREAL_NVP(min_span), CEREAL_NVP(log_level),
             CEREAL_NVP(verbose), CEREAL_NVP(quiet),
@@ -343,11 +414,66 @@ CommonArgs convertLegacyConfig(const LegacyCommonArgsV1& legacy) {
     return args;
 }
 
+CommonArgs convertSchema2Config(const LegacyCommonArgsV2& legacy) {
+    CommonArgs args;
+    args.schema_version = CONFIG_SCHEMA_VERSION;
+    args.input_path = legacy.input_path;
+    args.output_path = legacy.output_path;
+    args.output_paths = legacy.output_paths;
+    args.work_dir_path = legacy.work_dir_path;
+    args.chunk_size = legacy.chunk_size;
+    args.overlap_size = legacy.overlap_size;
+    args.min_anchor_length = legacy.min_anchor_length;
+    args.max_anchor_frequency = legacy.max_anchor_frequency;
+    args.thread_num = legacy.thread_num;
+    args.output_format = legacy.output_format;
+    args.paf_mode = legacy.paf_mode;
+    args.trust_legacy_cache = legacy.trust_legacy_cache;
+    args.enable_repeat_masking = legacy.enable_repeat_masking;
+    args.search_mode = legacy.search_mode;
+    args.accurate_skip_threshold = legacy.accurate_skip_threshold;
+    args.allow_MEM = legacy.allow_MEM;
+    args.fast_build = legacy.fast_build;
+    args.sampling_interval = legacy.sampling_interval;
+    args.min_span = legacy.min_span;
+    args.log_level = legacy.log_level;
+    args.verbose = legacy.verbose;
+    args.quiet = legacy.quiet;
+    args.root_name = legacy.root_name;
+    args.ref_name = legacy.ref_name;
+    args.one_round = legacy.one_round;
+    args.merge_exact_contiguous_blocks = legacy.merge_exact_contiguous_blocks;
+    args.merge_query_gap_max = legacy.merge_query_gap_max;
+    args.realign_single_missing_species = legacy.realign_single_missing_species;
+    args.species_mismatch_realign_max_span =
+        legacy.species_mismatch_realign_max_span;
+    args.species_mismatch_zero_gap_max_span =
+        legacy.species_mismatch_zero_gap_max_span;
+    args.repair_structural_breaks = legacy.repair_structural_breaks;
+    args.structural_break_max_span = legacy.structural_break_max_span;
+    args.repair_short_blocks = legacy.repair_short_blocks;
+    args.near_distance = 0.01;
+    args.far_distance = 0.02;
+    return args;
+}
+
+void validateDistanceThresholds(const CommonArgs& args) {
+    if (!std::isfinite(args.near_distance) ||
+        !std::isfinite(args.far_distance) ||
+        args.near_distance < 0.0 ||
+        args.near_distance >= args.far_distance ||
+        args.far_distance > 1.0) {
+        throw std::runtime_error(
+            "Distance thresholds must satisfy 0 <= --near-distance < "
+            "--far-distance <= 1");
+    }
+}
+
 RestartOverrides captureRestartOverrides(const CLI::App& app,
                                          const CommonArgs& values) {
     RestartOverrides overrides;
     overrides.values = values;
-    constexpr std::array<const char*, 27> names{
+    constexpr std::array<const char*, 29> names{
         "--output", "--paf-mode", "--chunk_size", "--root", "--ref",
         "--overlap_size", "--min_anchor_length", "--max_anchor_frequency",
         "--search-mode", "--accurate-skip-threshold", "--allow-mem",
@@ -355,7 +481,7 @@ RestartOverrides captureRestartOverrides(const CLI::App& app,
         "--realign-missing", "--realign-span", "--zero-gap-span",
         "--repair-breaks", "--break-span", "--merge-short-blocks",
         "--slow-build", "--sampling-interval", "--min-span", "--threads",
-        "--log-level", "--verbose"
+        "--log-level", "--verbose", "--near-distance", "--far-distance"
     };
     for (const char* name : names) {
         if (app.count(name) != 0) overrides.specified.emplace(name);
@@ -402,6 +528,10 @@ void applyRestartOverrides(CommonArgs& args,
     if (overrides.has("--sampling-interval"))
         args.sampling_interval = value.sampling_interval;
     if (overrides.has("--min-span")) args.min_span = value.min_span;
+    if (overrides.has("--near-distance"))
+        args.near_distance = value.near_distance;
+    if (overrides.has("--far-distance"))
+        args.far_distance = value.far_distance;
     if (overrides.has("--threads")) args.thread_num = value.thread_num;
     if (overrides.has("--log-level")) args.log_level = value.log_level;
     if (overrides.has("--verbose")) {
@@ -614,6 +744,8 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Fast build            : {}", args.fast_build ? "Enabled" : "Disabled");
     spdlog::info("  Sampling interval     : {}", args.sampling_interval);
     spdlog::info("  Cluster Min span      : {}", args.min_span);
+    spdlog::info("  Near distance         : {}", args.near_distance);
+    spdlog::info("  Far distance          : {} (recorded only)", args.far_distance);
     spdlog::info("  Repeat masking        : {}", args.enable_repeat_masking ? "Enabled" : "Disabled");
     spdlog::info("  Tree root             ：{}", args.root_name);
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
@@ -914,6 +1046,22 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
+    cmd->add_option("--near-distance", args.near_distance,
+        "Mash distance below which first-round queries use wfmash (default: 0.01).")
+        ->default_val(0.01)
+        ->capture_default_str()
+        ->group("Software Parameters")
+        ->check(CLI::Range(0.0, 1.0))
+        ->type_name("<float>");
+
+    cmd->add_option("--far-distance", args.far_distance,
+        "Reserved distant-species Mash threshold; recorded only (default: 0.02).")
+        ->default_val(0.02)
+        ->capture_default_str()
+        ->group("Software Parameters")
+        ->check(CLI::Range(0.0, 1.0))
+        ->type_name("<float>");
+
     // Repeat masking is currently disabled because it depends on external
     // windowmasker binaries that are no longer bundled with RaMAx.
     // cmd->add_flag("--mask-repeats", args.enable_repeat_masking,
@@ -1122,6 +1270,20 @@ static int runRestartMode(CommonArgs& common_args,
                 "Restart configuration is incompatible with RaMAx " +
                 std::string(RAMAX_VERSION) + ": " + error.what());
         }
+    } else if (schema == 2) {
+        LegacyCommonArgsV2 legacy;
+        try {
+            std::ifstream input(config_path);
+            cereal::JSONInputArchive archive(input);
+            archive(cereal::make_nvp("common_args", legacy));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "Invalid schema-2 restart configuration: " +
+                std::string(error.what()));
+        }
+        loaded = convertSchema2Config(legacy);
+        spdlog::warn(
+            "Loaded schema-2 workdir: --near-distance=0.01 and --far-distance=0.02 were added during migration");
     } else if (schema == 1) {
         LegacyCommonArgsV1 legacy;
         try {
@@ -1194,6 +1356,7 @@ static int runRestartMode(CommonArgs& common_args,
     if (loaded.overlap_size >= loaded.chunk_size) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
+    validateDistanceThresholds(loaded);
     if (loaded.paf_mode_explicit &&
         !hasOutputFormat(loaded, MultipleGenomeOutputFormat::PAF)) {
         throw std::runtime_error("--paf-mode is only valid with .paf output");
@@ -1266,6 +1429,7 @@ static int runNormalMode(CommonArgs& common_args, const CLI::App& app) {
     if (common_args.overlap_size >= common_args.chunk_size) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
+    validateDistanceThresholds(common_args);
 
     common_args.schema_version = CONFIG_SCHEMA_VERSION;
     saveEffectiveConfig(common_args);
@@ -1564,6 +1728,8 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.merge_query_gap_max;
     mra.short_block_repair_options.parallel_threads =
         common_args.thread_num;
+    mra.near_distance_threshold = common_args.near_distance;
+    mra.far_distance_threshold = common_args.far_distance;
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）
@@ -1775,18 +1941,11 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
             return 1;
         }
 
-        // ------------------------------
-        // 清理工作目录
-        // ------------------------------
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(common_args.work_dir_path, ec);
-            if (ec) {
-                spdlog::warn("Failed to remove work directory: {}", ec.message());
-            } else {
-                spdlog::info("Work directory removed: {}", common_args.work_dir_path.string());
-            }
-        }
+        // Keep the work directory because it now contains the requested Mash
+        // routing table, samtools-generated FAI provenance, reusable wfmash
+        // reference index, and final per-query PAF files.
+        spdlog::info("Work directory preserved with routing artifacts: {}",
+                     common_args.work_dir_path.string());
 
         // ------------------------------
         // 退出

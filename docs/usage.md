@@ -25,8 +25,14 @@ reference ordering. RaMAx selects references from assembly N50, total length,
 genome name, and an optional `--ref`. After selecting the first reference,
 RaMAx requires Mash 2.3 and estimates whole-genome distances to every other
 input with `k=31` and sketch size 20,000. The normalized table is written to
-`<workdir>/similarity/mash_first_reference.tsv`; alignment still uses the
-legacy FM-index backend in this release.
+`<workdir>/similarity/mash_first_reference.tsv`. First-round queries with
+`d < --near-distance` (default `0.01`) use wfmash; only a validated final PAF
+removes a query from the first-round FM-index path. Failed wfmash queries fall
+back to RaMAx, and all later rounds use the original RaMAx algorithm. The
+reserved `--far-distance` default is `0.02` and does not yet affect routing.
+RaMAx requires Mash 2.3, wfmash 0.24.2, and Samtools/HTSlib 1.24. All wfmash
+FAI files are produced by `samtools faidx`, including indexes for multi-FASTA
+inputs and collision-safe query views.
 `--root` is valid whenever the output list contains HAL.
 When a tree is present, its leaf names should match the genome mappings. Use
 absolute FASTA paths when jobs may be launched from different directories.
@@ -159,8 +165,9 @@ configuration, logs, mask intervals, and minipoa scratch files while a job is
 running. Anchor, cluster, Block, DP, and graph objects are not serialized.
 
 For a new Release run, the directory must not contain existing files. RaMAx
-removes the entire work directory after a successful export. Failed or
-interrupted runs leave it in place for diagnosis and restart.
+preserves the work directory after a successful export so that
+`similarity/mash_first_reference.tsv` and `wfmash/round_0/` remain available.
+Failed or interrupted runs also leave it in place for diagnosis and restart.
 
 On restart, RaMAx retains only reusable preprocessing and FM-index caches. It
 archives the previous log, removes stale `result/`, `mask_interval/`, and

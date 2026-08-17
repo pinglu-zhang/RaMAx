@@ -105,6 +105,10 @@ set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
     "Existing minipoa executable; empty searches PATH")
 set(RAMAX_MASH_EXECUTABLE "" CACHE FILEPATH
     "Mash 2.3 executable; empty searches PATH")
+set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
+    "Samtools 1.24 executable; empty searches PATH")
+set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
+    "wfmash 0.24.2 executable; empty searches PATH")
 
 if(RAMAX_MASH_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
@@ -126,6 +130,34 @@ else()
             "require Mash 2.3 next to ramax or in PATH")
     endif()
 endif()
+
+function(resolve_ramax_tool configured_variable tool_name display_name output_variable)
+    if(${configured_variable})
+        if(NOT EXISTS "${${configured_variable}}")
+            message(FATAL_ERROR
+                "${configured_variable} does not exist: ${${configured_variable}}")
+        endif()
+        get_filename_component(_resolved "${${configured_variable}}" REALPATH)
+        message(STATUS "Using configured ${display_name}: ${_resolved}")
+    else()
+        find_program(_system_tool NAMES "${tool_name}" NO_CACHE)
+        if(_system_tool)
+            set(_resolved "${_system_tool}")
+            message(STATUS "Using ${display_name} from PATH: ${_resolved}")
+        else()
+            set(_resolved "")
+            message(STATUS
+                "${display_name} was not found during configuration; runtime "
+                "alignment will require it next to ramax or in PATH")
+        endif()
+    endif()
+    set(${output_variable} "${_resolved}" PARENT_SCOPE)
+endfunction()
+
+resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
+                   RAMAX_RESOLVED_SAMTOOLS)
+resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash 0.24.2"
+                   RAMAX_RESOLVED_WFMASH)
 
 if(RAMAX_MINIPOA_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
@@ -176,6 +208,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/align.cpp"
     "${ALIGN_DIR}/cross_anchor_repair.cpp"
     "${ALIGN_DIR}/external_msa_runner.cpp"
+    "${ALIGN_DIR}/external_tool.cpp"
     "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"
@@ -183,6 +216,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${ALIGN_DIR}/minipoa_locator.cpp"
     "${ALIGN_DIR}/mash_distance_estimator.cpp"
+    "${ALIGN_DIR}/wfmash_router.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
     "${GRAPH_DIR}/direct_block_merger.cpp"
@@ -278,7 +312,9 @@ configure_rama_target(ramax_core)
 add_dependencies(ramax_core hal_library)
 target_compile_definitions(ramax_core PRIVATE
     RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
-    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}")
+    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}"
+    RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_RESOLVED_SAMTOOLS}"
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
@@ -295,6 +331,15 @@ if(BUILD_TESTING)
     add_test(NAME ramax_mash_distance_test
         COMMAND ramax_mash_distance_test)
     set_tests_properties(ramax_mash_distance_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_wfmash_router_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/wfmash_router_test.cpp")
+    configure_rama_target(ramax_wfmash_router_test)
+    target_link_libraries(ramax_wfmash_router_test PRIVATE ramax_core)
+    add_test(NAME ramax_wfmash_router_test
+        COMMAND ramax_wfmash_router_test)
+    set_tests_properties(ramax_wfmash_router_test PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
