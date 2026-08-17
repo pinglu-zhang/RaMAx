@@ -15,6 +15,8 @@
 #include <vector>
 #include <spdlog/spdlog.h>
 #include <chrono>
+#include <functional>
+#include <thread>
 #include <variant>
 #include "halAlignmentInstance.h"
 #include "halGenome.h"
@@ -39,6 +41,21 @@ static void logMafExportSummary(const FilePath& maf_path,
     spdlog::warn(
         "MAF export skipped {} invalid block(s): output={}, first_error={}",
         stats.invalid_blocks, maf_path.string(), stats.first_error);
+}
+
+static std::filesystem::path mafTemporaryPath(
+    const std::filesystem::path& output_path) {
+    const auto stamp = std::chrono::steady_clock::now()
+                           .time_since_epoch().count();
+    const auto thread_hash =
+        std::hash<std::thread::id>{}(std::this_thread::get_id());
+    for (std::uint64_t attempt = 0; ; ++attempt) {
+        auto candidate = output_path;
+        candidate += ".tmp." + std::to_string(stamp) + "." +
+                     std::to_string(thread_hash) + "." +
+                     std::to_string(attempt);
+        if (!std::filesystem::exists(candidate)) return candidate;
+    }
 }
 
 static bool emitMafBlock(std::ostream& os,
@@ -245,13 +262,46 @@ namespace RaMesh {
         bool pairwise_mode) const
     {
         namespace fs = std::filesystem;
-        if (!maf_path.parent_path().empty()) fs::create_directories(maf_path.parent_path());
-        std::ofstream ofs(maf_path, std::ios::binary | std::ios::trunc);
-        if (!ofs) throw std::runtime_error("Cannot open: " + maf_path.string());
+        const FilePath output_path = fs::absolute(maf_path);
+        if (!output_path.parent_path().empty()) {
+            fs::create_directories(output_path.parent_path());
+        }
+        const FilePath temporary_path = mafTemporaryPath(output_path);
+        struct TemporaryGuard {
+            FilePath path;
+            bool keep{false};
+            ~TemporaryGuard() {
+                if (!keep) {
+                    std::error_code error;
+                    fs::remove(path, error);
+                }
+            }
+        } guard{temporary_path};
+
+        std::ofstream ofs(temporary_path, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            throw std::runtime_error(
+                "Cannot open MAF temporary output: " +
+                temporary_path.string());
+        }
         ofs << "##maf version=1 scoring=none\n";
         MafExportStats stats;
         for (auto& wblk : blocks) emitMafBlock(ofs, wblk.lock(), seq_mgrs, only_primary, pairwise_mode, true, stats, nullptr, true);
-        logMafExportSummary(maf_path, stats);
+        ofs.close();
+        if (!ofs) {
+            throw std::runtime_error(
+                "Failed to finalize MAF output: " + output_path.string());
+        }
+
+        std::error_code rename_error;
+        fs::rename(temporary_path, output_path, rename_error);
+        if (rename_error) {
+            throw std::runtime_error(
+                "Failed to atomically replace MAF output: " +
+                rename_error.message());
+        }
+        guard.keep = true;
+        logMafExportSummary(output_path, stats);
     }
 
     void RaMeshMultiGenomeGraph::exportToMafWithoutReverse(

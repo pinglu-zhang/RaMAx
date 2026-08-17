@@ -91,6 +91,22 @@ not truncated, and retain the failed work directory and `RaMAx.log`. When
 comparing a HAL-derived MAF to Truth, also verify the full leaf, ancestor,
 root, and chromosome name mapping.
 
+## PAF export skips Blocks or seqwish cannot find paths
+
+Check the final `PAF export complete` summary first. Formal acceptance requires
+`invalid=0`; the following warning reports the first malformed Block and its
+explicit `ref_species.ref_chr` key without writing a partial Block.
+
+Every PAF sequence name is `species.original_contig_name`. Build the seqwish
+input FASTA with exactly those headers, including repeated-looking prefixes,
+and use `seqwish -k 0` when comparing `connected` with `all`. Nonzero `-k`
+filters short exact matches and is outside RaMAx connected-mode completeness.
+
+Prefer `ramax-paf-fasta -i <seqfile> -o <sequences.fa.gz>` over manual header
+rewriting. If it reports a duplicate qualified name, change the conflicting
+species or contig name at the source; the tool intentionally does not invent
+suffixes because they would no longer match PAF.
+
 ## High memory use or poor scaling
 
 - Reduce `--threads`; the default is all reported hardware threads.

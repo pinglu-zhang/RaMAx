@@ -14,7 +14,7 @@ deterministic order:
 4. repair high-confidence structural discontinuities;
 5. merge newly compatible contiguous Blocks;
 6. after all rounds, merge short Blocks;
-7. export MAF or HAL, including nearby cross-anchor insertion repair.
+7. export MAF, HAL, or PAF, including nearby cross-anchor insertion repair.
 
 Disabling an optimization module avoids its scan and cache allocation.
 

@@ -8,10 +8,18 @@ RaMAx 1.0.5 writes all restartable user settings to:
 <work>/config.json
 ```
 
-The root object is `common_args` and contains `schema_version: 1`. It records
-the input/output paths, thread count, anchor and graph parameters, output
-format, optimization flags and spans, logging settings, and HAL root/reference
-selection.
+The root object is `common_args` and contains `schema_version: 1`. It retains
+the first output path for compatibility and records the thread count, anchor
+and graph parameters, optimization flags and spans, logging settings, and HAL
+root/reference selection.
+
+The complete repeated `-o` list is stored in `<work>/outputs.json`. Restart
+loads this list before input validation. A legacy work directory without this
+sidecar restores the single output stored in `config.json`.
+
+PAF pair-selection mode is stored separately in `<work>/paf_mode.txt` whenever
+the output list contains PAF. Restart uses the saved value; an older PAF work
+directory without this sidecar defaults to `connected`.
 
 ## Starting a new run
 
@@ -21,6 +29,7 @@ Use a new or empty work directory:
 ramax \
   -i /data/project/seqfile.txt \
   -o /data/project/results/alignment.maf \
+  -o /data/project/results/alignment.paf \
   -w /data/project/work/ramax-run \
   -t 16
 ```
@@ -28,8 +37,10 @@ ramax \
 In a Release build, an existing non-empty work directory is rejected. This
 prevents accidental reuse of indexes or graph state from a different run.
 
-RaMAx removes the entire work directory after a successful export. Keep the
-final output outside it.
+RaMAx removes the entire work directory only after every requested export
+succeeds. If one exporter fails, the remaining formats are still attempted,
+successful files are retained, the process exits nonzero, and the work
+directory is preserved.
 
 ## Restarting an interrupted run
 
@@ -60,7 +71,9 @@ seqfile and desired current parameters as a new command.
 
 Before deleting a failed work directory, retain:
 
-- `config.json` for the exact effective settings;
+- `config.json` for the legacy primary output and effective settings;
+- `outputs.json` for the complete output list, when present;
+- `paf_mode.txt` for the effective PAF pair-selection mode, when present;
 - `RaMAx.log` for the last completed stage and error;
 - index and graph state when attempting `--restart`;
 - `minipoa_tmp/` only when diagnosing a forced termination, because normal

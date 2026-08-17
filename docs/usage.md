@@ -22,7 +22,8 @@ orangutan  /data/genomes/orangutan.fa.gz
 
 A tree may still be supplied for non-HAL output, but it does not control
 reference ordering. RaMAx selects references from assembly N50, total length,
-genome name, and an optional `--ref`. `--root` is valid only for HAL output.
+genome name, and an optional `--ref`. `--root` is valid whenever the output
+list contains HAL.
 When a tree is present, its leaf names should match the genome mappings. Use
 absolute FASTA paths when jobs may be launched from different directories.
 
@@ -49,7 +50,56 @@ ramax \
   --root ancestor
 ```
 
-The output suffix selects the format. Only `.maf` and `.hal` are accepted.
+Write sparse, information-complete PAF:
+
+```bash
+ramax \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/alignment.paf \
+  -w /data/project/work/ramax-paf \
+  -t 16
+```
+
+Write all supported formats after one alignment and graph construction:
+
+```bash
+ramax \
+  -i /data/project/seqfile.txt \
+  -w /data/project/work/ramax-all \
+  -o /data/project/results/alignment.maf \
+  -o /data/project/results/alignment.paf \
+  -o /data/project/results/alignment.hal \
+  -t 16
+```
+
+`-o/--output` is repeatable, but each format may appear only once. RaMAx
+validates every suffix before alignment, constructs the alignment graph once,
+and exports in the fixed order MAF, PAF, HAL. A mixed output list containing
+HAL requires a Newick tree even when MAF or PAF is the first `-o`.
+
+PAF defaults to `--paf-mode connected`. Use `--paf-mode all` to emit every
+primary path pair that shares at least one non-gap alignment column. A PAF-only
+run does not require a Newick tree. `--paf-mode` is accepted whenever the
+output list contains PAF and rejected otherwise.
+
+Build the seqwish sequence input from the same seqfile. The companion tool
+preserves species and contig order, writes the exact `species.contig` names
+used by PAF, and applies the same base normalization:
+
+```bash
+ramax-paf-fasta \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/sequences.fa.gz
+
+seqwish \
+  -s /data/project/results/sequences.fa.gz \
+  -p /data/project/results/alignment.paf \
+  -g /data/project/results/graph.gfa \
+  -k 0
+```
+
+Each output suffix selects its format. `.maf`, `.hal`, and `.paf` are accepted.
+Duplicate paths, duplicate formats, and unsupported suffixes are rejected.
 
 ## Default Block optimization
 
@@ -108,7 +158,7 @@ For a new Release run, the directory must not contain existing files. RaMAx
 removes the entire work directory after a successful export. Failed or
 interrupted runs leave it in place for diagnosis and restart.
 
-Always place the final MAF or HAL outside the work directory:
+Always place the final MAF, HAL, or PAF outside the work directory:
 
 ```text
 /data/project/results/alignment.maf   # final output
