@@ -53,13 +53,14 @@ behavior; for example `--one-round` can enable one-round mode but there is no
 new restart-only flag to disable it.
 
 The merged configuration is validated against the final output set. An
-explicit `--paf-mode` requires PAF, and an explicit `--root` requires HAL.
+explicit `--paf-mode` requires PAF, an explicit `--gfa-version` requires GFA,
+and an explicit `--root` requires HAL.
 After input validation, the latest effective configuration is saved atomically
 and becomes the default for a later restart.
 
 ## Configuration and input identity
 
-`<work>/config.json` uses `schema_version: 2` and contains the complete output
+`<work>/config.json` uses `schema_version: 4` and contains the complete output
 list and all public alignment, graph, export, performance, and logging values.
 `<work>/input_manifest.json` records the seqfile, species mappings, and the
 size/mtime of local inputs.
@@ -70,11 +71,12 @@ to start with a new work directory. A valid cached URL snapshot can be reused
 without contacting the URL; the URL is accessed again only when that snapshot
 is absent or invalid.
 
-RaMAx reads schema-1 work directories produced by 1.0.6. Parameters absent
-from schema 1 use the 1.0.6 restart defaults. Legacy `outputs.json`,
+RaMAx reads schema-1, schema-2, and schema-3 work directories. Parameters absent
+from older schemas use their compatibility defaults; in particular GFA version
+migrates to `1.1`. Legacy schema-1 `outputs.json`,
 `paf_mode.txt`, and `accurate_skip_threshold.txt` are read when present.
 Existing legacy caches are trusted once, completion metadata is generated, and
-the effective configuration is migrated to schema 2 with a warning.
+the effective configuration is migrated to schema 4 with a warning.
 
 ## Cache validation and lifecycle
 

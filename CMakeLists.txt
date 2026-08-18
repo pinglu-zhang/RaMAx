@@ -224,6 +224,8 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/structural_break_repair.cpp"
     "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
+    "${GRAPH_DIR}/aligned_block_view.cpp"
+    "${GRAPH_DIR}/gfa_export.cpp"
     "${GRAPH_DIR}/paf_utils.cpp"
     "${GRAPH_DIR}/paf_export.cpp"
     "${GRAPH_DIR}/hal_converter.cpp"
@@ -340,6 +342,15 @@ if(BUILD_TESTING)
     add_test(NAME ramax_wfmash_router_test
         COMMAND ramax_wfmash_router_test)
     set_tests_properties(ramax_wfmash_router_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_gfa_export_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfa_export_test.cpp")
+    configure_rama_target(ramax_gfa_export_test)
+    target_link_libraries(ramax_gfa_export_test PRIVATE ramax_core)
+    add_test(NAME ramax_gfa_export_test
+        COMMAND ramax_gfa_export_test)
+    set_tests_properties(ramax_gfa_export_test PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 

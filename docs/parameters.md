@@ -21,9 +21,10 @@ binary.
 
 | Option | Type/default | Description |
 |---|---|---|
-| `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, or `.paf`, and each format may appear once. |
+| `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, `.paf`, or `.gfa`, and each format may appear once. Export order is MAF, PAF, GFA, HAL. |
 | `-w`, `--workdir` | path; required | Intermediate and routing-artifact directory. It must be empty for a new Release run and is preserved after success. |
 | `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid when any `-o` is `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
+| `--gfa-version` | `1.1`; exactly `1.0` or `1.1` | Native GFA path encoding. `1.0` writes P-lines; `1.1` writes structured W-lines. Valid only when any `-o` is `.gfa`. |
 | `--root` | string; automatic | Preferred HAL root name. Valid when any `-o` is `.hal`; HAL requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters
@@ -94,7 +95,7 @@ modules are enabled by default, the normal numeric-only overrides are valid.
 | `--restart` | flag; off | Reuse validated raw/clean FASTA and FM-index caches, then rerun alignment from the beginning. |
 
 In restart mode, `-w` identifies the interrupted run and `-i` is forbidden.
-Explicit output, algorithm, optimization, thread, root, PAF-mode, and logging
+Explicit output, algorithm, optimization, thread, root, PAF-mode, GFA-version, and logging
 options override the latest saved configuration. If any `-o` is supplied, the
 complete repeated `-o` list replaces the saved output list. Existing boolean
 flags retain their current one-way behavior; no new negative forms are added.

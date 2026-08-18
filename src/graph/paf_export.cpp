@@ -1,6 +1,6 @@
 #include "ramesh.h"
 
-#include "align.h"
+#include "aligned_block_view.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,66 +20,13 @@
 
 namespace {
 
-struct PafRow {
-    SpeciesName species;
-    ChrName chromosome;
-    std::string name;
-    RaMesh::SegPtr segment;
-    std::uint64_t sequence_length = 0;
-    std::string aligned;
-};
-
-struct PreparedBlock {
-    std::vector<PafRow> rows;
-    std::size_t reference_index = 0;
-};
-
-std::string qualifiedName(const SpeciesName& species,
-                          const ChrName& chromosome) {
-    return species + "." + chromosome;
-}
+using PafRow = RaMesh::Export::AlignedBlockRow;
+using PreparedBlock = RaMesh::Export::AlignedBlockView;
 
 std::string referenceName(const RaMesh::BlockPtr& block) {
     if (!block) return "<expired>";
-    return qualifiedName(block->ref_species, block->ref_chr);
-}
-
-std::string fetchSequence(
-    const SeqPro::ManagerVariant& manager,
-    const ChrName& chromosome,
-    Coord_t start,
-    Coord_t length) {
-    return std::visit([&](const auto& pointer) {
-        using T = std::decay_t<decltype(pointer)>;
-        if constexpr (std::is_same_v<
-                          T, std::unique_ptr<SeqPro::SequenceManager>>) {
-            return pointer->getSubSequence(chromosome, start, length);
-        } else {
-            return pointer->getOriginalManager().getSubSequence(
-                chromosome, start, length);
-        }
-    }, manager);
-}
-
-std::uint64_t fetchLength(
-    const SeqPro::ManagerVariant& manager,
-    const ChrName& chromosome) {
-    return std::visit([&](const auto& pointer) -> std::uint64_t {
-        using T = std::decay_t<decltype(pointer)>;
-        if constexpr (std::is_same_v<
-                          T, std::unique_ptr<SeqPro::SequenceManager>>) {
-            return pointer->getSequenceLength(chromosome);
-        } else {
-            return pointer->getOriginalManager().getSequenceLength(chromosome);
-        }
-    }, manager);
-}
-
-std::vector<std::string> fetchNames(
-    const SeqPro::ManagerVariant& manager) {
-    return std::visit([](const auto& pointer) {
-        return pointer->getSequenceNames();
-    }, manager);
+    return RaMesh::Export::qualifiedName(
+        block->ref_species, block->ref_chr);
 }
 
 void validatePafName(const std::string& name) {
@@ -92,126 +39,12 @@ void validatePafName(const std::string& name) {
     }
 }
 
-std::size_t countUngapped(const std::string& sequence) {
-    return static_cast<std::size_t>(std::count_if(
-        sequence.begin(), sequence.end(),
-        [](char base) { return base != '-'; }));
-}
-
 PreparedBlock prepareBlock(
     const RaMesh::BlockPtr& block,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
     bool only_primary) {
-    PreparedBlock prepared;
-    if (!block) return prepared;
-
-    for (const auto& [key, segment] : block->anchors) {
-        if (!segment || (only_primary && !segment->isPrimary())) continue;
-        const auto manager = managers.find(key.first);
-        if (manager == managers.end()) {
-            throw std::runtime_error(
-                "Missing sequence manager for PAF species: " + key.first);
-        }
-        PafRow row;
-        row.species = key.first;
-        row.chromosome = key.second;
-        row.name = qualifiedName(row.species, row.chromosome);
-        row.segment = segment;
-        row.sequence_length = fetchLength(*manager->second, row.chromosome);
-        prepared.rows.push_back(std::move(row));
-    }
-
-    std::sort(prepared.rows.begin(), prepared.rows.end(),
-              [](const PafRow& left, const PafRow& right) {
-                  return left.name < right.name;
-              });
-    if (prepared.rows.size() < 2) return prepared;
-
-    const auto reference = std::find_if(
-        prepared.rows.begin(), prepared.rows.end(),
-        [&](const PafRow& row) {
-            return row.species == block->ref_species &&
-                   row.chromosome == block->ref_chr;
-        });
-    if (reference == prepared.rows.end()) {
-        throw std::runtime_error(
-            "Block reference segment is missing from primary PAF rows");
-    }
-    prepared.reference_index = static_cast<std::size_t>(
-        std::distance(prepared.rows.begin(), reference));
-
-    std::unordered_map<ChrName, std::string> sequences;
-    std::unordered_map<ChrName, Cigar_t> cigars;
-    sequences.reserve(prepared.rows.size());
-    cigars.reserve(prepared.rows.size());
-
-    for (auto& row : prepared.rows) {
-        if (row.segment->start > row.sequence_length ||
-            row.segment->length > row.sequence_length - row.segment->start) {
-            throw std::runtime_error(
-                "PAF segment exceeds sequence bounds: " + row.name);
-        }
-        const auto manager = managers.find(row.species);
-        std::string sequence = fetchSequence(
-            *manager->second, row.chromosome,
-            row.segment->start, row.segment->length);
-        if (sequence.size() != row.segment->length) {
-            throw std::runtime_error(
-                "PAF extracted sequence length mismatch: " + row.name);
-        }
-        if (row.segment->strand == Strand::REVERSE) {
-            reverseComplement(sequence);
-        }
-        if (!sequences.emplace(row.name, std::move(sequence)).second ||
-            !cigars.emplace(row.name, row.segment->cigar).second) {
-            throw std::runtime_error(
-                "Duplicate PAF row name in Block: " + row.name);
-        }
-    }
-
-    const std::string reference_name =
-        prepared.rows[prepared.reference_index].name;
-    const auto reference_sequence = sequences.find(reference_name);
-    if (reference_sequence == sequences.end()) {
-        throw std::runtime_error("PAF reference sequence is missing");
-    }
-    for (const auto& row : prepared.rows) {
-        if (row.name == reference_name) continue;
-        const AlignCount count = countAlignedBases(row.segment->cigar);
-        if (count.ref_bases != reference_sequence->second.size() ||
-            count.query_bases != row.segment->length) {
-            std::ostringstream message;
-            message << "PAF CIGAR consumption mismatch: key=" << row.name
-                    << ", cigar_ref=" << count.ref_bases
-                    << ", ref_size=" << reference_sequence->second.size()
-                    << ", cigar_query=" << count.query_bases
-                    << ", query_size=" << row.segment->length;
-            throw std::runtime_error(message.str());
-        }
-    }
-
-    mergeAlignmentByRef(reference_name, sequences, cigars);
-
-    std::size_t width = 0;
-    for (auto& row : prepared.rows) {
-        const auto aligned = sequences.find(row.name);
-        if (aligned == sequences.end()) {
-            throw std::runtime_error(
-                "PAF merged alignment lost row: " + row.name);
-        }
-        row.aligned = aligned->second;
-        if (width == 0) width = row.aligned.size();
-        if (row.aligned.size() != width) {
-            throw std::runtime_error(
-                "PAF merged alignment has unequal row widths");
-        }
-        if (countUngapped(row.aligned) != row.segment->length) {
-            throw std::runtime_error(
-                "PAF merged alignment does not preserve row length: " +
-                row.name);
-        }
-    }
-    return prepared;
+    return RaMesh::Export::prepareAlignedBlock(
+        block, managers, only_primary);
 }
 
 std::filesystem::path temporaryPath(
@@ -255,8 +88,9 @@ Paf::PafExportStats RaMeshMultiGenomeGraph::exportToPaf(
 
     std::set<std::string> all_names;
     for (const auto& [species, manager] : managers) {
-        for (const auto& chromosome : fetchNames(*manager)) {
-            const std::string name = qualifiedName(species, chromosome);
+        for (const auto& chromosome : RaMesh::Export::fetchNames(*manager)) {
+            const std::string name = RaMesh::Export::qualifiedName(
+                species, chromosome);
             validatePafName(name);
             if (!all_names.insert(name).second) {
                 throw std::runtime_error(

@@ -73,7 +73,7 @@ ramax \
   --optimize-blocks
 ```
 
-Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
+Use an output name ending in `.maf`, `.hal`, `.paf`, or `.gfa`. PAF defaults to the
 information-complete sparse `connected` mode; use `--paf-mode all` for the
 all-pairs baseline. Logs and reusable preprocessing/index caches are kept under
 the work directory; in-memory graph state is not serialized for restart.
@@ -88,7 +88,9 @@ ramax -i seqfile.txt -w work -t 16 \
 ```
 
 Each format may appear once. If HAL is requested anywhere in the output list,
-the seqfile must contain a Newick tree. Export order is MAF, PAF, then HAL.
+the seqfile must contain a Newick tree. Export order is MAF, PAF, GFA, then HAL.
+Native GFA export defaults to GFA 1.1 W-lines; use `--gfa-version 1.0` for
+GFA 1.0 P-line compatibility.
 
 For seqwish, generate the matching qualified FASTA directly from the same
 seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
@@ -178,8 +180,10 @@ ramax --restart -w work -t 24 --min_anchor_length 30 \
   -o results/retry.maf -o results/retry.paf
 ```
 
-The seqfile cannot be replaced. Schema-1 work directories from 1.0.6 are
-loaded with an explicit compatibility warning and migrated to schema 2.
+The seqfile cannot be replaced. Schema-1, schema-2, and schema-3 work
+directories are loaded with explicit compatibility defaults and migrated to
+schema 4; older work directories default to GFA 1.1 when no GFA version was
+persisted.
 
 ## License and dependencies
 

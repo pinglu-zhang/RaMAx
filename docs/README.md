@@ -12,7 +12,7 @@ This directory contains the detailed documentation for RaMAx 1.0.7.
 
 - [Restart and work directories](restart.md): restart schema, retained state,
   and compatibility rules.
-- [Output formats](output-formats.md): MAF/HAL/PAF conventions, validation, and
+- [Output formats](output-formats.md): MAF/HAL/PAF/GFA conventions, validation, and
   normalized comparisons.
 - [PAF-to-GFA workflow](paf-to-gfa-workflow.md): companion FASTA generation,
   direct seqwish induction, PGGB post-processing, validation, and a completed

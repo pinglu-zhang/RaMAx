@@ -60,10 +60,11 @@ cmake -S . -B build \
 
 ## Restart schema is incompatible
 
-RaMAx 1.0.7 writes `schema_version: 2`. It can read a schema-1 work directory
-from 1.0.6, recover its legacy sidecars, trust existing caches once, and write
-schema 2 after input validation. Missing schema information or any other schema
-version is rejected.
+RaMAx 1.0.7 writes `schema_version: 4`. It can read schema-1, schema-2, and
+schema-3 work directories, recover schema-1 legacy sidecars, trust legacy
+caches once, and write schema 4 after input validation. Parameters absent from
+an older schema use compatibility defaults, including GFA 1.1. Missing schema
+information or any other schema version is rejected.
 
 Restart also rejects a changed seqfile, species mapping, or local FASTA
 size/mtime. Use a new work directory when changing input data. A damaged cache

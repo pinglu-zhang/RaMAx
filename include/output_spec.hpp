@@ -21,6 +21,7 @@ inline const char* formatName(MultipleGenomeOutputFormat format) {
     switch (format) {
     case MultipleGenomeOutputFormat::MAF: return "MAF";
     case MultipleGenomeOutputFormat::PAF: return "PAF";
+    case MultipleGenomeOutputFormat::GFA: return "GFA";
     case MultipleGenomeOutputFormat::HAL: return "HAL";
     case MultipleGenomeOutputFormat::UNKNOWN: return "UNKNOWN";
     }
@@ -31,8 +32,9 @@ inline int exportOrder(MultipleGenomeOutputFormat format) {
     switch (format) {
     case MultipleGenomeOutputFormat::MAF: return 0;
     case MultipleGenomeOutputFormat::PAF: return 1;
-    case MultipleGenomeOutputFormat::HAL: return 2;
-    case MultipleGenomeOutputFormat::UNKNOWN: return 3;
+    case MultipleGenomeOutputFormat::GFA: return 2;
+    case MultipleGenomeOutputFormat::HAL: return 3;
+    case MultipleGenomeOutputFormat::UNKNOWN: return 4;
     }
     return 3;
 }
@@ -57,7 +59,7 @@ inline std::vector<OutputSpec> validateOutputPaths(
         if (format == MultipleGenomeOutputFormat::UNKNOWN) {
             throw std::invalid_argument(
                 "Invalid output file extension for '" + path.string() +
-                "'. Supported: .hal, .maf, .paf");
+                "'. Supported: .hal, .maf, .paf, .gfa");
         }
 
         const std::filesystem::path normalized =

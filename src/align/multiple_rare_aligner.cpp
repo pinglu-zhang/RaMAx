@@ -646,6 +646,7 @@ starAlignment(
     // 6) 创建多基因组图（整个 starAlignment 过程使用同一个 multi_graph）
     // ------------------------------------------------------------
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
+    multi_graph->reference_order = reference_order;
 
     // ------------------------------------------------------------
     // 7) 决定轮数：only_one_round 只跑 1 轮，否则只遍历合法 reference

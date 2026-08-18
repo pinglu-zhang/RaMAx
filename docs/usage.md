@@ -72,6 +72,21 @@ ramax \
   -t 16
 ```
 
+Write native GFA 1.1 (the default):
+
+```bash
+ramax \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/graph.gfa \
+  --gfa-version 1.1 \
+  -w /data/project/work/ramax-gfa11 \
+  -t 16
+```
+
+Use `--gfa-version 1.0` in a separate run when a downstream consumer requires
+P-lines. The graph nodes and links are unchanged; only P/W serialization
+differs.
+
 Write all supported formats after one alignment and graph construction:
 
 ```bash
@@ -80,19 +95,24 @@ ramax \
   -w /data/project/work/ramax-all \
   -o /data/project/results/alignment.maf \
   -o /data/project/results/alignment.paf \
+  -o /data/project/results/alignment.gfa \
   -o /data/project/results/alignment.hal \
   -t 16
 ```
 
 `-o/--output` is repeatable, but each format may appear only once. RaMAx
 validates every suffix before alignment, constructs the alignment graph once,
-and exports in the fixed order MAF, PAF, HAL. A mixed output list containing
+and exports in the fixed order MAF, PAF, GFA, HAL. A mixed output list containing
 HAL requires a Newick tree even when MAF or PAF is the first `-o`.
 
 PAF defaults to `--paf-mode connected`. Use `--paf-mode all` to emit every
 primary path pair that shares at least one non-gap alignment column. A PAF-only
 run does not require a Newick tree. `--paf-mode` is accepted whenever the
 output list contains PAF and rejected otherwise.
+
+GFA defaults to `--gfa-version 1.1`, with one structured W-line per input
+contig. Version `1.0` writes one P-line per contig. Explicitly supplying
+`--gfa-version` without a GFA output is rejected.
 
 Build the seqwish sequence input from the same seqfile. The companion tool
 preserves species and contig order, writes the exact `species.contig` names
@@ -110,7 +130,7 @@ seqwish \
   -k 0
 ```
 
-Each output suffix selects its format. `.maf`, `.hal`, and `.paf` are accepted.
+Each output suffix selects its format. `.maf`, `.hal`, `.paf`, and `.gfa` are accepted.
 Duplicate paths, duplicate formats, and unsupported suffixes are rejected.
 
 ## Default Block optimization
