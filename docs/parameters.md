@@ -45,10 +45,13 @@ binary.
 | `--far-distance` | float; `0.02`; `0..1` | Reserved distant-species threshold. It is persisted and logged but does not route queries in this release. |
 
 The thresholds must satisfy
-`0 <= --near-distance < --far-distance <= 1`. First-round wfmash uses
-`-w 5000 -l 25000 -p 90 -n 1 -k 19 -F 0.001
---hg-filter=1.0,30,99.9`. Later reference rounds always use the RaMAx
-FM-index backend.
+`0 <= --near-distance < --far-distance <= 1`. First-round pairwise mapping
+uses PGGB-compatible wfmash `v0.14.0-0-g517e1bc` with
+`-s 5000 -l 25000 -p 95 -n 1 -k 19 -H 0.001 -Y '#'
+--hg-filter-ani-diff 30 --approx-map`; precise alignment reuses the mapping
+PAF with `--invert-filtering`. Later reference rounds always use the RaMAx
+FM-index backend. Unlike PGGB, RaMAx launches independent reference/query
+pairs and therefore does not use `--lower-triangular`.
 
 Parameter names containing underscores are retained in the current public CLI
 for the anchor/chunk settings shown above.

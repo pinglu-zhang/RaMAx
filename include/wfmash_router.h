@@ -64,6 +64,15 @@ std::vector<FaiRecord> parseFai(std::istream& input);
 ParsedPafRecord parsePafLine(std::string_view line, bool require_cigar);
 PafNormalizationStats normalizePafForGraph(
     std::vector<ParsedPafRecord>& records);
+std::vector<std::string> mappingArguments(
+    uint_t threads, const std::filesystem::path& tmp_directory,
+    const std::filesystem::path& reference,
+    const std::filesystem::path& query);
+std::vector<std::string> alignmentArguments(
+    uint_t threads, const std::filesystem::path& tmp_directory,
+    const std::filesystem::path& mapping,
+    const std::filesystem::path& reference,
+    const std::filesystem::path& query);
 size_t workerCount(size_t tasks, uint_t total_threads);
 uint_t threadsPerTask(size_t tasks, uint_t total_threads);
 

@@ -37,8 +37,8 @@ using WfmashRouterDetail::ParsedPafRecord;
 using WfmashRouterDetail::SequenceRecord;
 
 constexpr std::string_view kWfmashParameterSummary =
-    "-w 5000 -l 25000 -p 90 -n 1 -k 19 -F 0.001 "
-    "--hg-filter=1.0,30,99.9";
+    "-s 5000 -l 25000 -p 95 -n 1 -k 19 -H 0.001 -Y # "
+    "--hg-filter-ani-diff 30; alignment: -i PAF --invert-filtering";
 
 // Some wfmash builds intermittently fail to reopen a freshly produced mapping
 // PAF when several alignment processes start together. Keep the normal
@@ -220,16 +220,6 @@ std::string faiMarkerText(const std::filesystem::path& fasta,
         "\nsamtools\t" + std::string(version) + "\n";
 }
 
-std::string wfmashIndexMarkerText(const std::filesystem::path& fasta,
-                                  std::string_view version) {
-    return "schema\t1\npath\t" +
-        std::filesystem::absolute(fasta).lexically_normal().string() +
-        "\nsize\t" + std::to_string(std::filesystem::file_size(fasta)) +
-        "\nmtime\t" + std::to_string(fileMtime(fasta)) +
-        "\nwfmash\t" + std::string(version) +
-        "\nparameters\t" + std::string(kWfmashParameterSummary) + "\n";
-}
-
 void writeAtomicText(const std::filesystem::path& path,
                      std::string_view text) {
     auto partial = path;
@@ -365,45 +355,30 @@ void createAliasedView(
     writeAtomicText(query.directory / "name_map.tsv", mapping.str());
 }
 
-std::vector<std::string> mappingArguments(
+std::vector<std::string> buildMappingArguments(
     uint_t threads, const std::filesystem::path& tmp_directory,
     const std::filesystem::path& reference,
-    const std::filesystem::path& query,
-    const std::optional<std::pair<bool, std::filesystem::path>>& index) {
-    std::vector<std::string> args{
-        "-m", "-w", "5000", "-l", "25000", "-p", "90", "-n", "1",
-        "-k", "19", "-F", "0.001", "--hg-filter=1.0,30,99.9",
-        "-t", std::to_string(threads), "--tmp-base", tmp_directory.string()
+    const std::filesystem::path& query) {
+    return {
+        "-s", "5000", "-l", "25000", "-p", "95", "-n", "1",
+        "-k", "19", "-H", "0.001", "-Y", "#",
+        "-t", std::to_string(threads), "--tmp-base", tmp_directory.string(),
+        reference.string(), query.string(), "--hg-filter-ani-diff", "30",
+        "--approx-map"
     };
-    if (index) {
-        args.push_back(std::string(index->first ? "--write-index=" :
-                                                "--read-index=") +
-                       index->second.string());
-    }
-    args.push_back(reference.string());
-    args.push_back(query.string());
-    return args;
 }
 
-std::vector<std::string> alignmentArguments(
+std::vector<std::string> buildAlignmentArguments(
     uint_t threads, const std::filesystem::path& tmp_directory,
     const std::filesystem::path& mapping,
     const std::filesystem::path& reference,
     const std::filesystem::path& query) {
-    return {"-i", mapping.string(), "-t", std::to_string(threads),
-            "--tmp-base", tmp_directory.string(), reference.string(),
-            query.string()};
-}
-
-std::vector<std::string> indexArguments(
-    uint_t threads, const std::filesystem::path& tmp_directory,
-    const std::filesystem::path& index,
-    const std::filesystem::path& reference) {
     return {
-        "-m", "-w", "5000", "-l", "25000", "-p", "90", "-n", "1",
-        "-k", "19", "-F", "0.001", "--hg-filter=1.0,30,99.9",
+        "-s", "5000", "-l", "25000", "-p", "95", "-n", "1",
+        "-k", "19", "-H", "0.001", "-Y", "#",
         "-t", std::to_string(threads), "--tmp-base", tmp_directory.string(),
-        "--write-index=" + index.string(), reference.string()
+        reference.string(), query.string(), "--hg-filter-ani-diff", "30",
+        "-i", mapping.string(), "--invert-filtering"
     };
 }
 
@@ -551,8 +526,7 @@ PairExecutionResult executePair(
     const std::filesystem::path& reference_fasta,
     const std::vector<SequenceRecord>& reference_records,
     const SeqPro::SharedManagerVariant& reference_manager,
-    const PreparedQuery& query,
-    const std::optional<std::pair<bool, std::filesystem::path>>& index) {
+    const PreparedQuery& query) {
     try {
         std::filesystem::create_directories(query.directory / "tmp");
         const auto mappings = query.directory / "mappings.paf";
@@ -561,8 +535,8 @@ PairExecutionResult executePair(
         const auto mapping_stderr = query.directory / "mapping.stderr.log";
         const auto mapping_result = RaMAxExternalTool::run(
             wfmash,
-            mappingArguments(pair_threads, query.directory / "tmp",
-                             reference_fasta, query.fasta, index),
+            buildMappingArguments(pair_threads, query.directory / "tmp",
+                                  reference_fasta, query.fasta),
             mappings_partial, mapping_stderr);
         if (mapping_result.exit_code != 0) {
             throw std::runtime_error("wfmash mapping exited " +
@@ -579,9 +553,9 @@ PairExecutionResult executePair(
             query.directory / "alignment.attempt1.stderr.log";
         auto alignment_result = RaMAxExternalTool::run(
             wfmash,
-            alignmentArguments(pair_threads, query.directory / "tmp",
-                               mappings_partial,
-                               reference_fasta, query.fasta),
+            buildAlignmentArguments(pair_threads, query.directory / "tmp",
+                                    mappings_partial,
+                                    reference_fasta, query.fasta),
             alignment_partial, first_alignment_stderr);
         if (alignment_result.exit_code != 0) {
             const int first_exit_code = alignment_result.exit_code;
@@ -600,9 +574,9 @@ PairExecutionResult executePair(
             mapping_check.close();
             alignment_result = RaMAxExternalTool::run(
                 wfmash,
-                alignmentArguments(pair_threads, query.directory / "tmp",
-                                   mappings_partial,
-                                   reference_fasta, query.fasta),
+                buildAlignmentArguments(pair_threads, query.directory / "tmp",
+                                        mappings_partial,
+                                        reference_fasta, query.fasta),
                 alignment_partial, alignment_stderr);
             if (alignment_result.exit_code != 0) {
                 throw std::runtime_error(
@@ -664,11 +638,28 @@ std::string validateSamtoolsVersion(std::string_view output) {
 
 std::string validateWfmashVersion(std::string_view output) {
     std::string first(output.substr(0, output.find_first_of("\r\n")));
-    if (first != "v0.24.2" && first.rfind("v0.24.2-", 0) != 0) {
+    if (first != "v0.14.0-0-g517e1bc") {
         throw std::runtime_error(
-            "RaMAx requires wfmash 0.24.2; observed: " + first);
+            "RaMAx requires PGGB-compatible wfmash "
+            "v0.14.0-0-g517e1bc; observed: " + first);
     }
     return first;
+}
+
+std::vector<std::string> mappingArguments(
+    uint_t threads, const std::filesystem::path& tmp_directory,
+    const std::filesystem::path& reference,
+    const std::filesystem::path& query) {
+    return buildMappingArguments(threads, tmp_directory, reference, query);
+}
+
+std::vector<std::string> alignmentArguments(
+    uint_t threads, const std::filesystem::path& tmp_directory,
+    const std::filesystem::path& mapping,
+    const std::filesystem::path& reference,
+    const std::filesystem::path& query) {
+    return buildAlignmentArguments(
+        threads, tmp_directory, mapping, reference, query);
 }
 
 std::vector<FaiRecord> parseFai(std::istream& input) {
@@ -1080,51 +1071,6 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         pair_threads, kWfmashParameterSummary);
 
     std::vector<PairExecutionResult> pair_results(queries.size());
-    std::optional<std::filesystem::path> index_path;
-    if (runnable.size() > 1) {
-        const auto final_index = output_directory_ / "reference.wfmash.index";
-        const auto index_marker = output_directory_ /
-                                  "reference.wfmash.index.ramax.complete";
-        auto partial_index = final_index;
-        partial_index += ".part";
-        const std::string expected_marker = wfmashIndexMarkerText(
-            reference_fasta, wfmash_version_);
-        bool reusable = false;
-        try {
-            reusable = std::filesystem::is_regular_file(final_index) &&
-                std::filesystem::file_size(final_index) > 0 &&
-                std::filesystem::is_regular_file(index_marker) &&
-                RaMAxExternalTool::readText(index_marker) == expected_marker;
-        } catch (const std::exception&) {
-            reusable = false;
-        }
-        if (reusable) {
-            index_path = final_index;
-        } else {
-            std::error_code ignored;
-            std::filesystem::remove(partial_index, ignored);
-            std::filesystem::create_directories(output_directory_ / "index_tmp");
-            const auto index_result = RaMAxExternalTool::run(
-                wfmash_executable_,
-                indexArguments(pair_threads, output_directory_ / "index_tmp",
-                               partial_index, reference_fasta),
-                output_directory_ / "index.stdout",
-                output_directory_ / "index.stderr.log");
-            if (index_result.exit_code == 0 &&
-                std::filesystem::is_regular_file(partial_index) &&
-                std::filesystem::file_size(partial_index) > 0) {
-                atomicPublish(partial_index, final_index);
-                writeAtomicText(index_marker, expected_marker);
-                index_path = final_index;
-            } else {
-                for (const size_t index : runnable) {
-                    pair_results[index].error =
-                        "shared reference index could not be constructed";
-                }
-                runnable.clear();
-            }
-        }
-    }
 
     if (!runnable.empty()) {
         const int omp_workers = static_cast<int>(
@@ -1132,12 +1078,9 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
 #pragma omp parallel for schedule(dynamic) num_threads(omp_workers)
         for (size_t position = 0; position < runnable.size(); ++position) {
             const size_t index = runnable[position];
-            std::optional<std::pair<bool, std::filesystem::path>> index_option;
-            if (index_path) index_option = std::pair{false, *index_path};
             pair_results[index] = executePair(
                 wfmash_executable_, pair_threads, reference_fasta,
-                reference_records, reference_it->second, queries[index],
-                index_option);
+                reference_records, reference_it->second, queries[index]);
         }
     }
 
@@ -1199,7 +1142,8 @@ std::filesystem::path locateWfmashExecutable() {
         "wfmash", RAMAX_WFMASH_CONFIGURED_PATH);
     if (executable.empty()) {
         throw std::runtime_error(
-            "wfmash 0.24.2 was not found at the configured path, next to ramax, or in PATH");
+            "PGGB-compatible wfmash v0.14.0-0-g517e1bc was not found at "
+            "the configured path, next to ramax, or in PATH");
     }
     return executable;
 }

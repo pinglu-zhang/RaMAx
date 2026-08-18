@@ -108,7 +108,7 @@ set(RAMAX_MASH_EXECUTABLE "" CACHE FILEPATH
 set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
     "Samtools 1.24 executable; empty searches PATH")
 set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
-    "wfmash 0.24.2 executable; empty searches PATH")
+    "PGGB-compatible wfmash v0.14.0-0-g517e1bc executable; empty searches PATH")
 
 if(RAMAX_MASH_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
@@ -156,7 +156,7 @@ endfunction()
 
 resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
                    RAMAX_RESOLVED_SAMTOOLS)
-resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash 0.24.2"
+resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
                    RAMAX_RESOLVED_WFMASH)
 
 if(RAMAX_MINIPOA_EXECUTABLE)

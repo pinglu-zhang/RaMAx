@@ -1,6 +1,7 @@
 #include "wfmash_router.h"
 #include "external_tool.h"
 
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -34,10 +35,11 @@ void testVersions() {
             "samtools 1.24\nUsing htslib 1.23\n");
     });
     require(WfmashRouterDetail::validateWfmashVersion(
-        "v0.24.2-0-g774c01ff\n") == "v0.24.2-0-g774c01ff",
+        "v0.14.0-0-g517e1bc\n") == "v0.14.0-0-g517e1bc",
         "wfmash version");
     expectFailure([] {
-        WfmashRouterDetail::validateWfmashVersion("v0.24.1\n");
+        WfmashRouterDetail::validateWfmashVersion(
+            "v0.24.2-0-g774c01ff\n");
     });
     require(RaMAxExternalTool::locateExecutable(
                 "ramax-tool-that-does-not-exist", "/missing/ramax/tool").empty(),
@@ -76,7 +78,7 @@ void testPaf() {
         WfmashRouterDetail::parsePafLine(reverse, true);
     require(reverse_parsed.strand == Strand::REVERSE, "reverse PAF strand");
 
-    // wfmash 0.24.2 reports field 11 as max(query span, target span), not
+    // wfmash may report field 11 as max(query span, target span), not
     // necessarily the number of CIGAR columns when both insertions and
     // deletions occur. Coordinate consumption remains the strict invariant.
     const std::string wfmash_indel =
@@ -129,6 +131,38 @@ void testPaf() {
         WfmashRouterDetail::parsePafLine(
             "q1\t100\t10\t41\t+\tt1\t200\t20\t50\t28\t31\t60\tcg:Z:30M", true);
     });
+}
+
+void testArguments() {
+    const std::filesystem::path tmp{"/tmp/path with spaces"};
+    const std::filesystem::path reference{"/data/reference.fa"};
+    const std::filesystem::path query{"/data/query.fa"};
+    const std::filesystem::path mapping{"/data/mappings.paf"};
+    const std::vector<std::string> expected_mapping{
+        "-s", "5000", "-l", "25000", "-p", "95", "-n", "1",
+        "-k", "19", "-H", "0.001", "-Y", "#", "-t", "4",
+        "--tmp-base", tmp.string(), reference.string(), query.string(),
+        "--hg-filter-ani-diff", "30", "--approx-map"
+    };
+    const auto mapping_args = WfmashRouterDetail::mappingArguments(
+        4, tmp, reference, query);
+    require(mapping_args == expected_mapping,
+            "mapping arguments must match PGGB 0.14 pairwise semantics");
+    require(std::find(mapping_args.begin(), mapping_args.end(),
+                      "--lower-triangular") == mapping_args.end(),
+            "pairwise mapping must not use lower triangular mode");
+
+    const std::vector<std::string> expected_alignment{
+        "-s", "5000", "-l", "25000", "-p", "95", "-n", "1",
+        "-k", "19", "-H", "0.001", "-Y", "#", "-t", "4",
+        "--tmp-base", tmp.string(), reference.string(), query.string(),
+        "--hg-filter-ani-diff", "30", "-i", mapping.string(),
+        "--invert-filtering"
+    };
+    const auto alignment_args = WfmashRouterDetail::alignmentArguments(
+        4, tmp, mapping, reference, query);
+    require(alignment_args == expected_alignment,
+            "alignment arguments must match PGGB 0.14 pairwise semantics");
 }
 
 void testScheduling() {
@@ -244,18 +278,13 @@ void testRealMultiFastaRouting() {
             "unhit contig must not create a false anchor");
     require(std::filesystem::is_regular_file(ref_path.string() + ".fai"),
             "reference samtools FAI");
-    require(std::filesystem::is_regular_file(
+    require(!std::filesystem::exists(
                 root / "work" / "wfmash" / "round_0" /
                 "reference.wfmash.index"),
-            "shared wfmash index");
-    const auto index_path = root / "work" / "wfmash" / "round_0" /
-                            "reference.wfmash.index";
-    const auto index_mtime = std::filesystem::last_write_time(index_path);
+            "wfmash 0.14 must not publish a persistent reference index");
     const auto rerouted = router.run("ref", distances, 0.01, 0.02, managers);
     require(rerouted.successful_species.size() == 2,
-            "cached-index reroute must succeed");
-    require(std::filesystem::last_write_time(index_path) == index_mtime,
-            "shared wfmash index must be reused");
+            "independent pairwise reroute must succeed");
 
     std::vector<MashDistanceRecord> legacy_distances{
         {"ref", "query one", 0.01, 0.0, 19000, 20000,
@@ -275,6 +304,7 @@ int main() {
     testVersions();
     testFai();
     testPaf();
+    testArguments();
     testScheduling();
     testRealMultiFastaRouting();
     return 0;

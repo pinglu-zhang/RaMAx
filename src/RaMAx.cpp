@@ -1942,8 +1942,8 @@ static int runMainPipeline(CommonArgs& common_args, int argc, char** argv) {
         }
 
         // Keep the work directory because it now contains the requested Mash
-        // routing table, samtools-generated FAI provenance, reusable wfmash
-        // reference index, and final per-query PAF files.
+        // routing table, samtools-generated FAI provenance, and final
+        // per-query mapping/alignment PAF files.
         spdlog::info("Work directory preserved with routing artifacts: {}",
                      common_args.work_dir_path.string());
 
