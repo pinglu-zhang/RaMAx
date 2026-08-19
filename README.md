@@ -47,25 +47,16 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa
 ```
 
-RaMAx also requires Mash 2.3 at runtime. The first-round external alignment
-routes additionally use PGGB-compatible wfmash `v0.14.0-0-g517e1bc`,
-Samtools/HTSlib 1.24, and mm2plus 1.3 (based on Minimap2 2.31/r1302). Place the
-tools in `PATH`, next to the installed `ramax`, or configure their exact
-locations with:
+RaMAx also requires Mash 2.3 at runtime. Place `mash` in `PATH`, next to the
+installed `ramax`, or configure its exact location with:
 
 ```bash
 cmake -S . -B build \
-  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash \
-  -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
-  -DRAMAX_SAMTOOLS_EXECUTABLE=/opt/samtools/bin/samtools \
-  -DRAMAX_MM2PLUS_EXECUTABLE=/opt/mm2plus/bin/mm2plus
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
 ```
 
 After selecting the first reference, RaMAx records whole-genome Mash distances
-using `k=31` and sketch size 20,000. In the first round only, distances below
-`--near-distance` use wfmash, distances above `--far-distance` use mm2-plus,
-and both equality boundaries use the legacy RaMAx aligner. A failed per-query
-external alignment safely falls back to the legacy first-round path.
+using `k=31` and sketch size 20,000 before starting the legacy aligner.
 
 Set `-DRAMAX_NATIVE_ARCH=OFF` for a portable x86-64 RaMAx build. Configuration
 and compilation do not write to `/usr/local`; installation is controlled only

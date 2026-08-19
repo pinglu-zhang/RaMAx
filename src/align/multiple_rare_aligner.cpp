@@ -2,9 +2,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -40,32 +37,6 @@ namespace {
         if (work_items == 0) return 1;
         return std::max<size_t>(1,
             std::min<size_t>(requested, work_items));
-    }
-
-    void writeAtomicTextFile(const std::filesystem::path& path,
-                             const std::string& text) {
-        auto partial = path;
-        partial += ".part";
-        std::ofstream output(partial, std::ios::binary | std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("Cannot write " + partial.string());
-        }
-        output.write(text.data(), static_cast<std::streamsize>(text.size()));
-        output.close();
-        if (!output) {
-            throw std::runtime_error("Cannot finalize " + partial.string());
-        }
-        std::error_code error;
-        std::filesystem::rename(partial, path, error);
-        if (error) {
-            std::filesystem::remove(path, error);
-            error.clear();
-            std::filesystem::rename(partial, path, error);
-        }
-        if (error) {
-            throw std::runtime_error("Cannot publish " + path.string() +
-                                     ": " + error.message());
-        }
     }
 void exportMaskIntervalsToDirectory(
     const std::filesystem::path& export_dir,
@@ -644,8 +615,8 @@ starAlignment(
     }
 
     // Estimate whole-genome Mash distance once for the first selected
-    // reference. The first round routes strict near/far candidates through
-    // wfmash/mm2-plus; threshold equalities and later rounds remain legacy.
+    // reference. The legacy FM-index aligner remains the only alignment
+    // backend in this phase; these records are retained for the future router.
     MashDistanceEstimator mash_estimator(
         locateMashExecutable(), work_dir / "similarity", thread_num);
     first_reference_distances = mash_estimator.estimateFirstReference(
@@ -664,55 +635,6 @@ starAlignment(
         "[wfmash-router] tools: samtools={} wfmash={} successful_pairs={}",
         wfmash_router.samtoolsVersion(), wfmash_router.wfmashVersion(),
         first_round_wfmash.successful_species.size());
-
-    FirstRoundMm2plusResult first_round_mm2plus;
-    const bool has_far_candidates = std::any_of(
-        first_reference_distances.begin(), first_reference_distances.end(),
-        [&](const MashDistanceRecord& distance) {
-            return distance.reference == reference_order.front() &&
-                   distance.distance > far_distance_threshold;
-        });
-    if (has_far_candidates) {
-        FirstRoundMm2plusRouter mm2plus_router(
-            locateMm2plusExecutable(), work_dir / "mm2plus" / "round_0",
-            thread_num);
-        first_round_mm2plus = mm2plus_router.run(
-            reference_order.front(), first_reference_distances,
-            far_distance_threshold, min_span, seqpro_managers);
-        spdlog::info(
-            "[mm2plus-router] tool={} successful_pairs={}",
-            mm2plus_router.version(),
-            first_round_mm2plus.successful_species.size());
-    } else {
-        spdlog::info(
-            "[mm2plus-router] no first-round distance exceeds {}; tool not required",
-            far_distance_threshold);
-    }
-
-    {
-        std::ostringstream routing;
-        routing << "species\tdistance\tselected_backend\tstatus\n";
-        for (const auto& distance : first_reference_distances) {
-            if (distance.reference != reference_order.front()) continue;
-            std::string backend = "legacy";
-            std::string status = "selected";
-            if (distance.distance < near_distance_threshold) {
-                backend = "wfmash";
-                status = first_round_wfmash.successful_species.contains(
-                    distance.query) ? "success" : "fallback";
-            } else if (distance.distance > far_distance_threshold) {
-                backend = "mm2plus";
-                status = first_round_mm2plus.successful_species.contains(
-                    distance.query) ? "success" : "fallback";
-            }
-            routing << distance.query << '\t' << std::setprecision(17)
-                    << distance.distance << '\t' << backend << '\t'
-                    << status << '\n';
-        }
-        writeAtomicTextFile(
-            work_dir / "similarity" / "first_round_routing.tsv",
-            routing.str());
-    }
 
     // ------------------------------------------------------------
     // 5) 初始化参考缓存 ref_global_cache
@@ -755,8 +677,7 @@ starAlignment(
                 continue;
             }
             if (i == 0 && query_name != current_ref_name &&
-                (first_round_wfmash.successful_species.contains(query_name) ||
-                 first_round_mm2plus.successful_species.contains(query_name))) {
+                first_round_wfmash.successful_species.contains(query_name)) {
                 continue;
             }
             auto query_fasta_manager = seqpro_managers.at(query_name);
@@ -818,7 +739,7 @@ starAlignment(
         } else {
             if (i == 0) {
                 spdlog::info(
-                    "[external-router] all first-round queries succeeded; skipping FM-index, cluster, and DP for {}",
+                    "[wfmash-router] all first-round queries succeeded; skipping FM-index, cluster, and DP for {}",
                     current_ref_name);
             } else {
                 spdlog::info(
@@ -829,21 +750,8 @@ starAlignment(
 
         if (i == 0) {
             auto& reference_manager = *seqpro_managers.at(current_ref_name);
-            std::map<SpeciesName, const AnchorVec*> external_anchors;
             for (const auto& [query_name, anchors] :
                  first_round_wfmash.anchors_by_species) {
-                external_anchors.emplace(query_name, &anchors);
-            }
-            for (const auto& [query_name, anchors] :
-                 first_round_mm2plus.anchors_by_species) {
-                if (!external_anchors.emplace(query_name, &anchors).second) {
-                    throw std::runtime_error(
-                        "A first-round query was routed through both wfmash and mm2-plus: " +
-                        query_name);
-                }
-            }
-            for (const auto& [query_name, anchors_pointer] : external_anchors) {
-                const auto& anchors = *anchors_pointer;
                 auto& query_manager = *seqpro_managers.at(query_name);
                 for (const auto& anchor : anchors) {
                     multi_graph->insertAnchorIntoGraph(
@@ -851,7 +759,7 @@ starAlignment(
                         query_name, anchor, true);
                 }
                 spdlog::info(
-                    "[external-router] imported {} anchors for {} before graph extension",
+                    "[wfmash-router] imported {} anchors for {} before graph extension",
                     anchors.size(), query_name);
             }
         }

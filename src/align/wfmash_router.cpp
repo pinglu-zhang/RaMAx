@@ -6,10 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <charconv>
 #include <cmath>
-#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -57,36 +55,6 @@ uint64_t parseUnsigned(std::string_view value, const char* field) {
     if (error != std::errc{} || end != value.data() + value.size()) {
         throw std::runtime_error(std::string("Invalid ") + field + ": " +
                                  std::string(value));
-    }
-    return result;
-}
-
-int64_t parseSigned(std::string_view value, const char* field) {
-    if (value.empty()) {
-        throw std::runtime_error(std::string("Empty ") + field);
-    }
-    int64_t result = 0;
-    const auto [end, error] = std::from_chars(
-        value.data(), value.data() + value.size(), result);
-    if (error != std::errc{} || end != value.data() + value.size()) {
-        throw std::runtime_error(std::string("Invalid ") + field + ": " +
-                                 std::string(value));
-    }
-    return result;
-}
-
-double parseFloating(std::string_view value, const char* field) {
-    if (value.empty()) {
-        throw std::runtime_error(std::string("Empty ") + field);
-    }
-    std::string storage(value);
-    char* end = nullptr;
-    errno = 0;
-    const double result = std::strtod(storage.c_str(), &end);
-    if (errno != 0 || end != storage.c_str() + storage.size() ||
-        !std::isfinite(result)) {
-        throw std::runtime_error(std::string("Invalid ") + field + ": " +
-                                 storage);
     }
     return result;
 }
@@ -760,21 +728,6 @@ ParsedPafRecord parsePafLine(std::string_view line, bool require_cigar) {
                 throw std::runtime_error("PAF contains duplicate cg tags");
             }
             record.cigar_text = std::string(fields[i].substr(5));
-        } else if (fields[i].rfind("tp:A:", 0) == 0) {
-            if (record.alignment_type || fields[i].size() != 6) {
-                throw std::runtime_error("PAF contains invalid or duplicate tp tags");
-            }
-            record.alignment_type = fields[i][5];
-        } else if (fields[i].rfind("AS:i:", 0) == 0) {
-            if (record.alignment_score) {
-                throw std::runtime_error("PAF contains duplicate AS tags");
-            }
-            record.alignment_score = parseSigned(fields[i].substr(5), "PAF AS");
-        } else if (fields[i].rfind("dv:f:", 0) == 0) {
-            if (record.divergence) {
-                throw std::runtime_error("PAF contains duplicate dv tags");
-            }
-            record.divergence = parseFloating(fields[i].substr(5), "PAF dv");
         }
     }
     if (!require_cigar) return record;
@@ -814,8 +767,6 @@ ParsedPafRecord parsePafLine(std::string_view line, bool require_cigar) {
         } else {
             target_consumed += length;
         }
-        if (operation == '=') record.equal_bases += length;
-        if (operation == 'X') record.mismatch_bases += length;
         columns += length;
     }
     record.cigar_columns = columns;

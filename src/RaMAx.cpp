@@ -1001,7 +1001,7 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Sampling interval     : {}", args.sampling_interval);
     spdlog::info("  Cluster Min span      : {}", args.min_span);
     spdlog::info("  Near distance         : {}", args.near_distance);
-    spdlog::info("  Far distance          : {} (first-round mm2-plus)", args.far_distance);
+    spdlog::info("  Far distance          : {} (recorded only)", args.far_distance);
     spdlog::info("  Repeat masking        : {}", args.enable_repeat_masking ? "Enabled" : "Disabled");
     spdlog::info("  Tree root             ：{}", args.root_name);
     spdlog::info("  Ref genome name        : {}", args.ref_name.empty() ? "Not specified" : args.ref_name);
@@ -1327,7 +1327,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<float>");
 
     cmd->add_option("--far-distance", args.far_distance,
-        "Mash distance above which first-round queries use mm2-plus (default: 0.02).")
+        "Reserved distant-species Mash threshold; recorded only (default: 0.02).")
         ->default_val(0.02)
         ->capture_default_str()
         ->group("Software Parameters")

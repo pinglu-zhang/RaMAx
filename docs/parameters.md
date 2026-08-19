@@ -44,23 +44,16 @@ binary.
 | `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference index. |
 | `--min-span` | integer; `65`; `1..INT_MAX` bp | Minimum span used during graph construction. |
 | `--near-distance` | float; `0.01`; `0..1` | In the first round, route a query to wfmash only when its Mash distance is strictly smaller than this value. Equality stays on the RaMAx backend. |
-| `--far-distance` | float; `0.02`; `0..1` | Route first-round queries with strictly larger Mash distance to mm2-plus. Equality stays on legacy RaMAx; use `1` to disable mm2-plus routing. |
+| `--far-distance` | float; `0.02`; `0..1` | Reserved distant-species threshold. It is persisted and logged but does not route queries in this release. |
 
 The thresholds must satisfy
-`0 <= --near-distance < --far-distance <= 1`. First-round near pairwise mapping
+`0 <= --near-distance < --far-distance <= 1`. First-round pairwise mapping
 uses PGGB-compatible wfmash `v0.14.0-0-g517e1bc` with
 `-s 5000 -l 25000 -p 95 -n 1 -k 19 -H 0.001 -Y '#'
 --hg-filter-ani-diff 30 --approx-map`; precise alignment reuses the mapping
 PAF with `--invert-filtering`. Later reference rounds always use the RaMAx
 FM-index backend. Unlike PGGB, RaMAx launches independent reference/query
 pairs and therefore does not use `--lower-triangular`.
-
-First-round distant pairwise mapping uses mm2plus 1.3 (Minimap2 2.31/r1302)
-with `-x asm20 -c --eqx --secondary=no`. RaMAx builds a single-part reference
-index once, validates the required `cg`, `tp`, and `AS` PAF tags, removes exact
-duplicates and two-axis interval conflicts, and then imports the normalized
-primary alignments as graph Anchors. A failed or empty query falls back to the
-legacy first-round path. All later rounds use legacy RaMAx.
 
 Parameter names containing underscores are retained in the current public CLI
 for the anchor/chunk settings shown above.
