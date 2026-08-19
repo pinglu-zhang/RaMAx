@@ -102,6 +102,15 @@ W-line per input contig. `--gfa-version 1.0` emits the same logical walks as
 P-lines for compatibility with GFA 1.0 consumers. The option is rejected when
 the output list has no `.gfa` path.
 
+`--gfa-profile exact` is the current default and preserves every maximal exact
+run as the audit graph. `--gfa-profile compact` enables compact-v1: exact runs
+shorter than 25 bp are left private, occurrence-equivalent chains are unitigged,
+and safe dense small-variant intervals may be rewritten as observed compound
+alleles. It never invents an allele or removes sequence from an input path.
+Compact export keeps the same-version exact graph at `work/gfa/exact.gfa` and
+writes `compact_transform.tsv`, `compact_stats.tsv`,
+`compact_rejections.tsv`, and `compact_parameters.tsv` beside it.
+
 Both versions use byte-identical S-lines, L-lines, deterministic numeric node
 IDs, and `0M` link overlap. They differ only in path serialization:
 
@@ -117,6 +126,11 @@ unrelated repeats merely because their strings are equal. Before publication,
 every logical walk is reconstructed in memory and compared base-for-base and
 length-for-length with its cleaned input contig. Thus every input base occurs
 once in its walk, including contigs with no alignment Block.
+
+Compact transforms additionally retain at least 99.5% of the exact graph's
+direction-aware homology mass and limit graph sequence growth to 2%. A budget
+or invariant failure leaves the exact shadow available, does not publish the
+requested compact GFA, and makes RaMAx exit nonzero.
 
 GFA 1.0 rejects a collision between qualified `species.contig` path names.
 GFA 1.1 keeps species and contig in separate W fields and can represent that

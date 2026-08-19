@@ -260,6 +260,175 @@ void testPathNameCollision(const fs::path& root) {
     require(parsed.wlines == 2, "W metadata disambiguates P-name collision");
 }
 
+struct CompactFixtureResult {
+    RaMesh::Gfa::GfaExportStats exact_stats;
+    RaMesh::Gfa::GfaExportStats compact_stats;
+    fs::path exact;
+    fs::path compact;
+    fs::path work;
+    std::string reference;
+    std::string query;
+};
+
+CompactFixtureResult runCompactFixture(const fs::path& root,
+                                       std::size_t short_run,
+                                       int threads,
+                                       const std::string& label) {
+    const std::string shared_prefix(10000, 'A');
+    CompactFixtureResult result;
+    result.reference = shared_prefix + "C" + std::string(short_run, 'G');
+    result.query = shared_prefix + "T" + std::string(short_run, 'G');
+    const fs::path reference = root / (label + "-reference.fa");
+    const fs::path query = root / (label + "-query.fa");
+    writeFasta(reference, {{"chr1", result.reference}});
+    writeFasta(query, {{"chr1", result.query}});
+
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
+    managers.emplace("ref", managerFor(reference));
+    managers.emplace("query", managerFor(query));
+    RaMesh::RaMeshMultiGenomeGraph graph(managers);
+    graph.reference_order = {"ref", "query"};
+    Cigar_t cigar;
+    parseCigarString(std::to_string(result.reference.size()) + "M", cigar);
+    Anchor anchor(
+        0, 0, static_cast<Length_t>(result.reference.size()),
+        0, 0, static_cast<Length_t>(result.query.size()),
+        Strand::FORWARD, static_cast<uint_t>(result.reference.size()),
+        static_cast<uint_t>(result.query.size()), cigar);
+    graph.insertAnchorIntoGraph(
+        *managers.at("ref"), *managers.at("query"),
+        "ref", "query", anchor, true);
+
+    RaMesh::Gfa::GfaExportOptions options;
+    options.version = RaMesh::Gfa::Version::V1_1;
+    options.threads = threads;
+    result.exact = root / (label + "-exact.gfa");
+    result.exact_stats = graph.exportToGfa(result.exact, managers, options);
+    options.profile = RaMesh::Gfa::Profile::COMPACT;
+    result.work = root / (label + "-work");
+    options.work_dir = result.work;
+    result.compact = root / (label + "-compact.gfa");
+    result.compact_stats = graph.exportToGfa(
+        result.compact, managers, options);
+    return result;
+}
+
+void testCompactThresholdAndDeterminism(const fs::path& root) {
+    const auto below = runCompactFixture(root, 24, 1, "threshold-24-t1");
+    require(below.compact_stats.suppressed_exact_runs == 1,
+            "24 bp exact relation is suppressed");
+    require(below.compact_stats.nodes < below.exact_stats.nodes,
+            "short relation suppression reduces nodes");
+    require(readFile(below.exact) ==
+                readFile(below.work / "gfa" / "exact.gfa"),
+            "compact exact shadow is byte-identical to exact output");
+    require(fs::exists(below.work / "gfa" / "compact_transform.tsv") &&
+            fs::exists(below.work / "gfa" / "compact_stats.tsv") &&
+            fs::exists(below.work / "gfa" / "compact_rejections.tsv") &&
+            fs::exists(below.work / "gfa" / "compact_parameters.tsv"),
+            "compact audit reports are published");
+    const auto parsed = parseGfa(below.compact);
+    require(spell(parsed, parsed.walks.at("ref.chr1")) == below.reference,
+            "compact reference walk is lossless");
+    require(spell(parsed, parsed.walks.at("query.chr1")) == below.query,
+            "compact query walk is lossless");
+
+    const auto boundary = runCompactFixture(root, 25, 1, "threshold-25");
+    require(boundary.compact_stats.suppressed_exact_runs == 0,
+            "25 bp exact relation is retained");
+
+    const auto parallel12 = runCompactFixture(
+        root, 24, 12, "threshold-24-t12");
+    const auto parallel32 = runCompactFixture(
+        root, 24, 32, "threshold-24-t32");
+    require(readFile(below.compact) == readFile(parallel12.compact) &&
+            readFile(below.compact) == readFile(parallel32.compact),
+            "compact output is byte-identical at 1, 12, and 32 threads");
+}
+
+void testUnitigAndCompoundAllele(const fs::path& root) {
+    {
+        const std::string sequence(200, 'A');
+        const fs::path reference = root / "unitig-reference.fa";
+        const fs::path query = root / "unitig-query.fa";
+        writeFasta(reference, {{"chr1", sequence}});
+        writeFasta(query, {{"chr1", sequence}});
+        std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
+        managers.emplace("ref", managerFor(reference));
+        managers.emplace("query", managerFor(query));
+        RaMesh::RaMeshMultiGenomeGraph graph(managers);
+        graph.reference_order = {"ref", "query"};
+        for (std::size_t start : {std::size_t{0}, std::size_t{100}}) {
+            Cigar_t cigar;
+            parseCigarString("100M", cigar);
+            Anchor anchor(
+                0, static_cast<Coord_t>(start), 100,
+                0, static_cast<Coord_t>(start), 100,
+                Strand::FORWARD, 100, 100, cigar);
+            graph.insertAnchorIntoGraph(
+                *managers.at("ref"), *managers.at("query"),
+                "ref", "query", anchor, true);
+        }
+        RaMesh::Gfa::GfaExportOptions options;
+        options.version = RaMesh::Gfa::Version::V1_1;
+        options.profile = RaMesh::Gfa::Profile::COMPACT;
+        options.work_dir = root / "unitig-work";
+        options.threads = 2;
+        const auto stats = graph.exportToGfa(
+            root / "unitig.gfa", managers, options);
+        require(stats.unitig_merges >= 1,
+                "occurrence-aware unitig compaction merges a forced chain");
+        require(stats.nodes == 1, "forced shared chain becomes one node");
+    }
+
+    {
+        const std::string prefix(10000, 'A');
+        const std::string middle(30, 'C');
+        const std::string suffix(10000, 'G');
+        const std::string reference_sequence =
+            prefix + "A" + middle + "T" + suffix;
+        const std::string query_sequence =
+            prefix + "T" + middle + "A" + suffix;
+        const fs::path reference = root / "allele-reference.fa";
+        const fs::path query = root / "allele-query.fa";
+        writeFasta(reference, {{"chr1", reference_sequence}});
+        writeFasta(query, {{"chr1", query_sequence}});
+        std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
+        managers.emplace("ref", managerFor(reference));
+        managers.emplace("query", managerFor(query));
+        RaMesh::RaMeshMultiGenomeGraph graph(managers);
+        graph.reference_order = {"ref", "query"};
+        Cigar_t cigar;
+        parseCigarString(std::to_string(reference_sequence.size()) + "M",
+                         cigar);
+        Anchor anchor(
+            0, 0, static_cast<Length_t>(reference_sequence.size()),
+            0, 0, static_cast<Length_t>(query_sequence.size()),
+            Strand::FORWARD,
+            static_cast<uint_t>(reference_sequence.size()),
+            static_cast<uint_t>(query_sequence.size()), cigar);
+        graph.insertAnchorIntoGraph(
+            *managers.at("ref"), *managers.at("query"),
+            "ref", "query", anchor, true);
+        RaMesh::Gfa::GfaExportOptions options;
+        options.version = RaMesh::Gfa::Version::V1_1;
+        options.profile = RaMesh::Gfa::Profile::COMPACT;
+        options.work_dir = root / "allele-work";
+        options.threads = 4;
+        const auto stats = graph.exportToGfa(
+            root / "allele.gfa", managers, options);
+        require(stats.allele_islands == 1,
+                "dense small variants become an observed compound allele");
+        const auto parsed = parseGfa(root / "allele.gfa");
+        require(spell(parsed, parsed.walks.at("ref.chr1")) ==
+                    reference_sequence,
+                "compound reference allele is lossless");
+        require(spell(parsed, parsed.walks.at("query.chr1")) ==
+                    query_sequence,
+                "compound query allele is lossless");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -278,8 +447,17 @@ int main(int argc, char** argv) {
                 "parse GFA 1.1");
         expectFailure([] { RaMesh::Gfa::parseVersion("1"); });
         expectFailure([] { RaMesh::Gfa::parseVersion("1.2"); });
+        require(RaMesh::Gfa::parseProfile("exact") ==
+                    RaMesh::Gfa::Profile::EXACT,
+                "parse exact GFA profile");
+        require(RaMesh::Gfa::parseProfile("compact") ==
+                    RaMesh::Gfa::Profile::COMPACT,
+                "parse compact GFA profile");
+        expectFailure([] { RaMesh::Gfa::parseProfile("compact-v1"); });
         testVersionsAndLosslessWalks(root);
         testPathNameCollision(root);
+        testCompactThresholdAndDeterminism(root);
+        testUnitigAndCompoundAllele(root);
         if (!preserve_outputs) fs::remove_all(root);
         return 0;
     } catch (...) {

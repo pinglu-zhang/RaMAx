@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -19,6 +20,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,16 @@ Version parseVersion(const std::string& value) {
 
 const char* versionString(Version version) noexcept {
     return version == Version::V1_0 ? "1.0" : "1.1";
+}
+
+Profile parseProfile(const std::string& value) {
+    if (value == "exact") return Profile::EXACT;
+    if (value == "compact") return Profile::COMPACT;
+    throw std::invalid_argument("GFA profile must be exactly exact or compact");
+}
+
+const char* profileString(Profile profile) noexcept {
+    return profile == Profile::EXACT ? "exact" : "compact";
 }
 
 namespace {
@@ -86,6 +98,8 @@ struct Atom {
 struct Step {
     std::uint64_t node{0};
     bool reverse{false};
+    std::uint64_t source_start{0};
+    std::uint64_t source_end{0};
 };
 
 struct Edge {
@@ -106,7 +120,60 @@ struct Node {
     std::size_t representative_atom{0};
     std::string sequence;
     std::size_t occurrence_count{0};
+    std::size_t source_sequence{0};
+    std::uint64_t source_start{0};
 };
+
+struct GraphMetrics {
+    std::size_t nodes{0};
+    std::size_t edges{0};
+    std::size_t steps{0};
+    std::size_t nodes_le_10{0};
+    std::size_t nodes_lt_25{0};
+    std::size_t nodes_lt_100{0};
+    std::uint64_t graph_bp{0};
+    std::uint64_t homology_mass{0};
+    std::uint64_t median_node_length{0};
+};
+
+struct GraphIR {
+    std::vector<Node> nodes;
+    std::vector<std::vector<Step>> walks;
+    std::set<Edge> edges;
+    std::size_t atomic_intervals{0};
+};
+
+struct IslandReplacement {
+    std::size_t walk{0};
+    std::size_t begin{0};
+    std::size_t end{0};
+    std::uint64_t replacement_node{0};
+};
+
+struct IslandCandidate {
+    std::size_t reference_walk{0};
+    std::size_t reference_begin{0};
+    std::size_t reference_end{0};
+    std::vector<IslandReplacement> replacements;
+    std::vector<std::pair<std::string, std::vector<std::size_t>>> alleles;
+    std::set<std::uint64_t> interior_nodes;
+    std::uint64_t old_homology_mass{0};
+    std::uint64_t new_homology_mass{0};
+    std::uint64_t old_graph_bp{0};
+    std::uint64_t new_graph_bp{0};
+    std::size_t old_short_nodes{0};
+    std::size_t new_short_nodes{0};
+};
+
+constexpr std::uint64_t COMPACT_MIN_EXACT_RUN = 25;
+constexpr std::uint64_t COMPACT_SHORT_NODE = 25;
+constexpr std::uint64_t COMPACT_STABLE_ANCHOR = 100;
+constexpr std::uint64_t COMPACT_MAX_REFERENCE_SPAN = 1000;
+constexpr std::uint64_t COMPACT_MAX_PATH_SPAN = 3000;
+constexpr std::size_t COMPACT_MIN_SHORT_NODES = 2;
+constexpr std::size_t COMPACT_MAX_ALLELES = 64;
+constexpr double COMPACT_MIN_HOMOLOGY_RETENTION = 0.995;
+constexpr double COMPACT_MAX_GRAPH_BP_RATIO = 1.02;
 
 class OrientedDisjointSet {
 public:
@@ -418,17 +485,170 @@ Edge canonicalEdge(Edge edge) {
     return reversed < edge ? reversed : edge;
 }
 
+using Handle = std::pair<std::uint64_t, bool>;
+using HandlePair = std::pair<Handle, Handle>;
+
+Handle reverseHandle(const Handle& handle) {
+    return {handle.first, !handle.second};
+}
+
+HandlePair canonicalHandlePair(HandlePair pair) {
+    HandlePair reversed{reverseHandle(pair.second),
+                        reverseHandle(pair.first)};
+    return reversed < pair ? reversed : pair;
+}
+
+HandlePair orientPairByFirstOccurrence(
+    const HandlePair& canonical,
+    const std::vector<std::vector<Step>>& walks) {
+    const HandlePair reversed{reverseHandle(canonical.second),
+                              reverseHandle(canonical.first)};
+    std::optional<std::tuple<std::size_t, std::uint64_t, HandlePair>> best;
+    for (std::size_t walk_index = 0; walk_index < walks.size(); ++walk_index) {
+        const auto& walk = walks[walk_index];
+        for (std::size_t position = 1; position < walk.size(); ++position) {
+            const HandlePair observed{
+                {walk[position - 1].node, walk[position - 1].reverse},
+                {walk[position].node, walk[position].reverse}};
+            if (observed != canonical && observed != reversed) continue;
+            const auto key = std::tuple{
+                walk_index, walk[position - 1].source_start, observed};
+            if (!best || key < *best) best = key;
+        }
+    }
+    if (!best) {
+        throw std::runtime_error("Cannot orient a unitig candidate");
+    }
+    return std::get<2>(*best);
+}
+
+std::string orientedNodeSequence(const Node& node, bool reverse) {
+    if (!reverse) return node.sequence;
+    std::string sequence = node.sequence;
+    reverseComplement(sequence);
+    return sequence;
+}
+
+std::set<Edge> rebuildEdges(const std::vector<std::vector<Step>>& walks) {
+    std::set<Edge> edges;
+    for (const auto& walk : walks) {
+        for (std::size_t index = 1; index < walk.size(); ++index) {
+            const auto& left = walk[index - 1];
+            const auto& right = walk[index];
+            edges.insert(canonicalEdge(
+                {left.node, left.reverse, right.node, right.reverse}));
+        }
+    }
+    return edges;
+}
+
+void rebuildOccurrences(std::vector<Node>& nodes,
+                        const std::vector<std::vector<Step>>& walks) {
+    for (auto& node : nodes) {
+        node.occurrence_count = 0;
+        node.source_sequence = std::numeric_limits<std::size_t>::max();
+        node.source_start = std::numeric_limits<std::uint64_t>::max();
+    }
+    for (std::size_t sequence = 0; sequence < walks.size(); ++sequence) {
+        for (const auto& step : walks[sequence]) {
+            if (step.node == 0 || step.node > nodes.size()) {
+                throw std::runtime_error(
+                    "GFA occurrence references an unknown node");
+            }
+            auto& node = nodes[step.node - 1];
+            ++node.occurrence_count;
+            const auto key = std::pair{sequence, step.source_start};
+            const auto current =
+                std::pair{node.source_sequence, node.source_start};
+            if (key < current) {
+                node.source_sequence = sequence;
+                node.source_start = step.source_start;
+            }
+        }
+    }
+}
+
+void normalizeGraph(std::vector<Node>& nodes,
+                    std::vector<std::vector<Step>>& walks,
+                    std::set<Edge>& edges) {
+    rebuildOccurrences(nodes, walks);
+    std::vector<std::size_t> order;
+    order.reserve(nodes.size());
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        if (nodes[index].occurrence_count != 0) order.push_back(index);
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t left,
+                                               std::size_t right) {
+        const auto& left_node = nodes[left];
+        const auto& right_node = nodes[right];
+        return std::tie(left_node.source_sequence, left_node.source_start,
+                        left_node.id) <
+               std::tie(right_node.source_sequence, right_node.source_start,
+                        right_node.id);
+    });
+    std::vector<std::uint64_t> new_id(nodes.size() + 1, 0);
+    std::vector<Node> normalized;
+    normalized.reserve(order.size());
+    for (const auto old_index : order) {
+        Node node = std::move(nodes[old_index]);
+        node.id = normalized.size() + 1;
+        new_id[old_index + 1] = node.id;
+        normalized.push_back(std::move(node));
+    }
+    for (auto& walk : walks) {
+        for (auto& step : walk) {
+            if (step.node >= new_id.size() || new_id[step.node] == 0) {
+                throw std::runtime_error(
+                    "GFA normalization lost a referenced node");
+            }
+            step.node = new_id[step.node];
+        }
+    }
+    nodes = std::move(normalized);
+    rebuildOccurrences(nodes, walks);
+    edges = rebuildEdges(walks);
+}
+
+GraphMetrics collectMetrics(const std::vector<Node>& nodes,
+                            const std::vector<std::vector<Step>>& walks,
+                            const std::set<Edge>& edges) {
+    GraphMetrics metrics;
+    metrics.nodes = nodes.size();
+    metrics.edges = edges.size();
+    std::vector<std::uint64_t> lengths;
+    lengths.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        const auto length = static_cast<std::uint64_t>(node.sequence.size());
+        lengths.push_back(length);
+        metrics.graph_bp += length;
+        if (length <= 10) ++metrics.nodes_le_10;
+        if (length < COMPACT_SHORT_NODE) ++metrics.nodes_lt_25;
+        if (length < 100) ++metrics.nodes_lt_100;
+        if (node.occurrence_count > 1) {
+            metrics.homology_mass +=
+                length * static_cast<std::uint64_t>(
+                    node.occurrence_count - 1);
+        }
+    }
+    for (const auto& walk : walks) metrics.steps += walk.size();
+    if (!lengths.empty()) {
+        const std::size_t middle = lengths.size() / 2;
+        std::nth_element(lengths.begin(), lengths.begin() + middle,
+                         lengths.end());
+        metrics.median_node_length = lengths[middle];
+    }
+    return metrics;
+}
+
 void validateGraph(
     const std::vector<SourceSequence>& sequences,
-    const std::vector<Atom>& atoms,
     const std::vector<Node>& nodes,
-    const std::vector<std::uint64_t>& node_for_atom,
-    const std::vector<bool>& reverse_for_atom,
     const std::vector<std::vector<Step>>& walks,
     const std::set<Edge>& edges) {
     if (walks.size() != sequences.size()) {
         throw std::runtime_error("GFA walk count does not match contig count");
     }
+    std::vector<std::size_t> observed_occurrences(nodes.size(), 0);
     for (const auto& node : nodes) {
         if (node.id == 0 || node.id > nodes.size() ||
             !validSequence(node.sequence)) {
@@ -438,11 +658,7 @@ void validateGraph(
     for (std::size_t sequence_index = 0;
          sequence_index < sequences.size(); ++sequence_index) {
         const auto& source = sequences[sequence_index];
-        const auto& path_atoms = source.atoms;
         const auto& walk = walks[sequence_index];
-        if (path_atoms.size() != walk.size()) {
-            throw std::runtime_error("GFA walk lost an atomic interval");
-        }
         std::string expected = Export::fetchSequence(
             *source.manager, source.chromosome, 0,
             static_cast<Coord_t>(source.length));
@@ -456,12 +672,18 @@ void validateGraph(
             if (step.node == 0 || step.node > nodes.size()) {
                 throw std::runtime_error("GFA walk references an unknown node");
             }
-            const Atom& atom = atoms[path_atoms[index]];
-            if (node_for_atom[path_atoms[index]] != step.node ||
-                reverse_for_atom[path_atoms[index]] != step.reverse) {
-                throw std::runtime_error("GFA walk/atom mapping is inconsistent");
+            ++observed_occurrences[step.node - 1];
+            if (step.source_start != offset ||
+                step.source_end <= step.source_start) {
+                throw std::runtime_error(
+                    "GFA provenance is not a complete ordered partition: " +
+                    source.species + "." + source.chromosome);
             }
             const std::string& node_sequence = nodes[step.node - 1].sequence;
+            if (step.source_end - step.source_start != node_sequence.size()) {
+                throw std::runtime_error(
+                    "GFA provenance length does not match node length");
+            }
             for (std::size_t base = 0; base < node_sequence.size(); ++base) {
                 const char observed = step.reverse
                     ? complement(node_sequence[node_sequence.size() - 1 - base])
@@ -482,9 +704,6 @@ void validateGraph(
                         "GFA walk adjacency has no corresponding Link");
                 }
             }
-            if (atom.end <= atom.start) {
-                throw std::runtime_error("GFA contains an empty atom");
-            }
         }
         if (offset != source.length || offset != expected.size()) {
             throw std::runtime_error(
@@ -492,6 +711,886 @@ void validateGraph(
                 source.species + "." + source.chromosome);
         }
     }
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        if (observed_occurrences[index] != nodes[index].occurrence_count) {
+            throw std::runtime_error(
+                "GFA node occurrence count is inconsistent");
+        }
+    }
+}
+
+using Occurrence = std::pair<std::size_t, std::size_t>;
+
+bool handleEquals(const Step& step, const Handle& handle) {
+    return step.node == handle.first && step.reverse == handle.second;
+}
+
+bool deterministicPair(
+    const HandlePair& pair,
+    const std::vector<std::vector<Occurrence>>& occurrences,
+    const std::vector<std::vector<Step>>& walks) {
+    const auto& left = pair.first;
+    const auto& right = pair.second;
+    if (left.first == right.first) return false;
+    for (const auto& [walk_index, position] : occurrences[left.first]) {
+        const auto& walk = walks[walk_index];
+        const auto& step = walk[position];
+        if (step.reverse == left.second) {
+            if (position + 1 >= walk.size() ||
+                !handleEquals(walk[position + 1], right)) return false;
+        } else {
+            if (position == 0 ||
+                !handleEquals(walk[position - 1], reverseHandle(right))) {
+                return false;
+            }
+        }
+    }
+    for (const auto& [walk_index, position] : occurrences[right.first]) {
+        const auto& walk = walks[walk_index];
+        const auto& step = walk[position];
+        if (step.reverse == right.second) {
+            if (position == 0 ||
+                !handleEquals(walk[position - 1], left)) return false;
+        } else {
+            if (position + 1 >= walk.size() ||
+                !handleEquals(walk[position + 1], reverseHandle(left))) {
+                return false;
+            }
+        }
+    }
+    return !occurrences[left.first].empty() &&
+           occurrences[left.first].size() == occurrences[right.first].size();
+}
+
+std::size_t compactUnitigs(std::vector<Node>& nodes,
+                           std::vector<std::vector<Step>>& walks,
+                           std::set<Edge>& edges) {
+    std::size_t merges = 0;
+    while (true) {
+        std::vector<std::vector<Occurrence>> occurrences(nodes.size() + 1);
+        std::set<HandlePair> possible;
+        for (std::size_t walk_index = 0; walk_index < walks.size();
+             ++walk_index) {
+            const auto& walk = walks[walk_index];
+            for (std::size_t position = 0; position < walk.size(); ++position) {
+                occurrences[walk[position].node].push_back(
+                    {walk_index, position});
+                if (position + 1 < walk.size()) {
+                    possible.insert(canonicalHandlePair({
+                        {walk[position].node, walk[position].reverse},
+                        {walk[position + 1].node,
+                         walk[position + 1].reverse}}));
+                }
+            }
+        }
+        std::vector<HandlePair> candidates;
+        for (const auto& pair : possible) {
+            if (deterministicPair(pair, occurrences, walks)) {
+                candidates.push_back(pair);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](const HandlePair& left, const HandlePair& right) {
+            const auto left_key = std::tuple{
+                nodes[left.first.first - 1].source_sequence,
+                nodes[left.first.first - 1].source_start,
+                nodes[left.second.first - 1].source_sequence,
+                nodes[left.second.first - 1].source_start,
+                left};
+            const auto right_key = std::tuple{
+                nodes[right.first.first - 1].source_sequence,
+                nodes[right.first.first - 1].source_start,
+                nodes[right.second.first - 1].source_sequence,
+                nodes[right.second.first - 1].source_start,
+                right};
+            return left_key < right_key;
+        });
+        std::vector<HandlePair> selected;
+        std::unordered_set<std::uint64_t> used;
+        for (const auto& canonical_pair : candidates) {
+            const auto pair = orientPairByFirstOccurrence(
+                canonical_pair, walks);
+            if (used.contains(pair.first.first) ||
+                used.contains(pair.second.first)) continue;
+            used.insert(pair.first.first);
+            used.insert(pair.second.first);
+            selected.push_back(pair);
+        }
+        if (selected.empty()) break;
+
+        std::map<HandlePair, std::pair<std::uint64_t, bool>> replacements;
+        for (const auto& pair : selected) {
+            const auto new_id = static_cast<std::uint64_t>(nodes.size() + 1);
+            std::string sequence = orientedNodeSequence(
+                nodes[pair.first.first - 1], pair.first.second);
+            sequence += orientedNodeSequence(
+                nodes[pair.second.first - 1], pair.second.second);
+            const auto& first_node = nodes[pair.first.first - 1];
+            const auto& second_node = nodes[pair.second.first - 1];
+            const auto source_key = std::min(
+                std::pair{first_node.source_sequence, first_node.source_start},
+                std::pair{second_node.source_sequence,
+                          second_node.source_start});
+            nodes.push_back({new_id, 0, std::move(sequence), 0,
+                             source_key.first, source_key.second});
+            replacements.emplace(pair, std::pair{new_id, false});
+            replacements.emplace(
+                HandlePair{reverseHandle(pair.second),
+                           reverseHandle(pair.first)},
+                std::pair{new_id, true});
+        }
+
+        for (auto& walk : walks) {
+            std::vector<Step> rewritten;
+            rewritten.reserve(walk.size());
+            for (std::size_t position = 0; position < walk.size();) {
+                if (position + 1 < walk.size()) {
+                    const HandlePair pair{
+                        {walk[position].node, walk[position].reverse},
+                        {walk[position + 1].node,
+                         walk[position + 1].reverse}};
+                    const auto replacement = replacements.find(pair);
+                    if (replacement != replacements.end()) {
+                        rewritten.push_back({replacement->second.first,
+                                             replacement->second.second,
+                                             walk[position].source_start,
+                                             walk[position + 1].source_end});
+                        position += 2;
+                        continue;
+                    }
+                }
+                rewritten.push_back(walk[position]);
+                ++position;
+            }
+            walk = std::move(rewritten);
+        }
+        merges += selected.size();
+        normalizeGraph(nodes, walks, edges);
+    }
+    return merges;
+}
+
+GraphIR buildInitialGraph(
+    const std::vector<SourceSequence>& base_sequences,
+    const std::vector<ExactRelation>& relations) {
+    std::vector<SourceSequence> sequences = base_sequences;
+    for (const auto& relation : relations) {
+        auto validate_endpoint = [&](std::size_t sequence,
+                                     std::uint64_t start) {
+            if (sequence >= sequences.size() ||
+                start > sequences[sequence].length ||
+                relation.length > sequences[sequence].length - start) {
+                throw std::runtime_error(
+                    "Exact run exceeds cleaned sequence bounds");
+            }
+        };
+        validate_endpoint(relation.left_sequence, relation.left_start);
+        validate_endpoint(relation.right_sequence, relation.right_start);
+        sequences[relation.left_sequence].breakpoints.insert(
+            relation.left_start);
+        sequences[relation.left_sequence].breakpoints.insert(
+            relation.left_start + relation.length);
+        sequences[relation.right_sequence].breakpoints.insert(
+            relation.right_start);
+        sequences[relation.right_sequence].breakpoints.insert(
+            relation.right_start + relation.length);
+    }
+    propagateBreakpoints(sequences, relations);
+
+    std::vector<Atom> atoms;
+    for (std::size_t sequence = 0; sequence < sequences.size(); ++sequence) {
+        auto& source = sequences[sequence];
+        source.ordered_breakpoints.assign(
+            source.breakpoints.begin(), source.breakpoints.end());
+        for (std::size_t index = 1;
+             index < source.ordered_breakpoints.size(); ++index) {
+            const std::uint64_t start = source.ordered_breakpoints[index - 1];
+            const std::uint64_t end = source.ordered_breakpoints[index];
+            if (start >= end) continue;
+            const std::size_t atom = atoms.size();
+            atoms.push_back({sequence, start, end});
+            source.atom_by_start.emplace(start, atom);
+            source.atoms.push_back(atom);
+        }
+    }
+
+    OrientedDisjointSet dsu(atoms.size());
+    for (const auto& relation : relations) {
+        const auto& left_points =
+            sequences[relation.left_sequence].ordered_breakpoints;
+        auto it = std::lower_bound(
+            left_points.begin(), left_points.end(), relation.left_start);
+        if (it == left_points.end() || *it != relation.left_start) {
+            throw std::runtime_error("Exact-run left boundary was not atomized");
+        }
+        while (*it < relation.left_start + relation.length) {
+            const auto next = std::next(it);
+            if (next == left_points.end() ||
+                *next > relation.left_start + relation.length) {
+                throw std::runtime_error("Exact run was incompletely atomized");
+            }
+            const std::uint64_t left_start = *it;
+            const std::uint64_t left_end = *next;
+            const std::uint64_t left_offset =
+                left_start - relation.left_start;
+            const std::uint64_t right_start = relation.reverse
+                ? relation.right_start + relation.length -
+                      (left_end - relation.left_start)
+                : relation.right_start + left_offset;
+            const auto left_atom =
+                sequences[relation.left_sequence].atom_by_start.at(left_start);
+            const auto right_atom =
+                sequences[relation.right_sequence].atom_by_start.at(right_start);
+            if (atoms[left_atom].end - atoms[left_atom].start !=
+                atoms[right_atom].end - atoms[right_atom].start) {
+                throw std::runtime_error("Exact-run atom lengths do not agree");
+            }
+            const std::string left_sequence = atomSequence(
+                sequences[relation.left_sequence], atoms[left_atom]);
+            const std::string right_sequence = atomSequence(
+                sequences[relation.right_sequence], atoms[right_atom]);
+            if (!orientedSequencesEqual(
+                    left_sequence, right_sequence, relation.reverse)) {
+                throw std::runtime_error("Exact-run atom sequences do not agree");
+            }
+            dsu.unite(left_atom, right_atom, relation.reverse);
+            it = next;
+        }
+    }
+
+    GraphIR graph;
+    graph.atomic_intervals = atoms.size();
+    std::unordered_map<std::size_t, std::size_t> component_by_root;
+    std::vector<std::uint64_t> node_for_atom(atoms.size(), 0);
+    std::vector<bool> reverse_for_atom(atoms.size(), false);
+    std::vector<bool> representative_parity;
+    for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
+        const auto [root, parity] = dsu.find(atom);
+        auto component = component_by_root.find(root);
+        if (component == component_by_root.end()) {
+            const std::size_t node_index = graph.nodes.size();
+            component_by_root.emplace(root, node_index);
+            const Atom& representative = atoms[atom];
+            std::string sequence = atomSequence(
+                sequences[representative.sequence], representative);
+            if (!validSequence(sequence)) {
+                throw std::runtime_error(
+                    "Cleaned FASTA contains a base outside A/C/G/T/N");
+            }
+            graph.nodes.push_back({node_index + 1, atom, std::move(sequence),
+                                   0, representative.sequence,
+                                   representative.start});
+            representative_parity.push_back(parity);
+            component = component_by_root.find(root);
+        }
+        Node& node = graph.nodes[component->second];
+        ++node.occurrence_count;
+        node_for_atom[atom] = node.id;
+        reverse_for_atom[atom] =
+            parity ^ representative_parity[component->second];
+    }
+
+    graph.walks.resize(sequences.size());
+    for (std::size_t sequence = 0; sequence < sequences.size(); ++sequence) {
+        auto& walk = graph.walks[sequence];
+        walk.reserve(sequences[sequence].atoms.size());
+        for (const auto atom : sequences[sequence].atoms) {
+            walk.push_back({node_for_atom[atom], reverse_for_atom[atom],
+                            atoms[atom].start, atoms[atom].end});
+        }
+    }
+    graph.edges = rebuildEdges(graph.walks);
+    validateGraph(sequences, graph.nodes, graph.walks, graph.edges);
+    return graph;
+}
+
+void validatePathNames(const std::vector<SourceSequence>& sequences,
+                       Version version) {
+    if (version != Version::V1_0) return;
+    std::set<std::string> path_names;
+    for (const auto& source : sequences) {
+        const std::string name = Export::qualifiedName(
+            source.species, source.chromosome);
+        if (!validPathName(name) || !path_names.insert(name).second) {
+            throw std::runtime_error(
+                "Invalid or duplicate GFA 1.0 path name: " + name);
+        }
+    }
+}
+
+void atomicWrite(const std::filesystem::path& output_path,
+                 const std::function<void(std::ostream&)>& writer) {
+    namespace fs = std::filesystem;
+    const fs::path absolute = fs::absolute(output_path);
+    if (!absolute.parent_path().empty()) {
+        fs::create_directories(absolute.parent_path());
+    }
+    const fs::path temporary = temporaryPath(absolute);
+    struct Guard {
+        fs::path path;
+        bool keep{false};
+        ~Guard() {
+            if (!keep) {
+                std::error_code error;
+                fs::remove(path, error);
+            }
+        }
+    } guard{temporary};
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("Cannot open temporary output: " +
+                                 temporary.string());
+    }
+    writer(output);
+    output.close();
+    if (!output) {
+        throw std::runtime_error("Failed to finalize output: " +
+                                 absolute.string());
+    }
+    std::error_code rename_error;
+    fs::rename(temporary, absolute, rename_error);
+    if (rename_error) {
+        throw std::runtime_error("Failed to atomically replace output: " +
+                                 rename_error.message());
+    }
+    guard.keep = true;
+}
+
+void writeGraph(const std::filesystem::path& path,
+                Version version,
+                const std::string& reference_species,
+                const std::vector<SourceSequence>& sequences,
+                const GraphIR& graph) {
+    atomicWrite(path, [&](std::ostream& output) {
+        if (version == Version::V1_0) {
+            output << "H\tVN:Z:1.0\n";
+        } else {
+            output << "H\tVN:Z:1.1\tRS:Z:" << reference_species << '\n';
+        }
+        for (const auto& node : graph.nodes) {
+            output << "S\t" << node.id << '\t' << node.sequence << '\n';
+        }
+        for (const auto& edge : graph.edges) {
+            output << "L\t" << edge.from << '\t'
+                   << (edge.from_reverse ? '-' : '+') << '\t'
+                   << edge.to << '\t' << (edge.to_reverse ? '-' : '+')
+                   << "\t0M\n";
+        }
+        for (std::size_t index = 0; index < sequences.size(); ++index) {
+            const auto& source = sequences[index];
+            const auto& walk = graph.walks[index];
+            if (version == Version::V1_0) {
+                output << "P\t"
+                       << Export::qualifiedName(source.species,
+                                                source.chromosome)
+                       << '\t';
+                for (std::size_t step = 0; step < walk.size(); ++step) {
+                    if (step != 0) output << ',';
+                    output << walk[step].node
+                           << (walk[step].reverse ? '-' : '+');
+                }
+                output << "\t*\n";
+            } else {
+                output << "W\t" << source.species << "\t0\t"
+                       << source.chromosome << "\t0\t" << source.length
+                       << '\t';
+                for (const auto& step : walk) {
+                    output << (step.reverse ? '<' : '>') << step.node;
+                }
+                output << '\n';
+            }
+        }
+    });
+}
+
+std::string spellInterval(const std::vector<Node>& nodes,
+                          const std::vector<Step>& walk,
+                          std::size_t begin,
+                          std::size_t end) {
+    std::string sequence;
+    for (std::size_t index = begin; index < end; ++index) {
+        sequence += orientedNodeSequence(
+            nodes[walk[index].node - 1], walk[index].reverse);
+    }
+    return sequence;
+}
+
+bool hasN(const std::string& sequence) {
+    return sequence.find('N') != std::string::npos;
+}
+
+std::optional<IslandCandidate> analyzeIsland(
+    const GraphIR& graph,
+    const std::vector<std::vector<Occurrence>>& occurrences,
+    std::size_t reference_walk,
+    std::size_t left_position,
+    std::size_t right_position,
+    std::string& rejection) {
+    const auto& reference = graph.walks[reference_walk];
+    if (right_position <= left_position + 1) {
+        rejection = "empty_reference_interior";
+        return std::nullopt;
+    }
+    const Step& left_anchor = reference[left_position];
+    const Step& right_anchor = reference[right_position];
+    if (left_anchor.reverse || right_anchor.reverse) {
+        rejection = "anchor_orientation";
+        return std::nullopt;
+    }
+    const auto reference_span =
+        right_anchor.source_start - left_anchor.source_end;
+    if (reference_span > COMPACT_MAX_REFERENCE_SPAN) {
+        rejection = "reference_span";
+        return std::nullopt;
+    }
+
+    IslandCandidate candidate;
+    candidate.reference_walk = reference_walk;
+    candidate.reference_begin = left_position;
+    candidate.reference_end = right_position;
+    for (std::size_t walk_index = 0; walk_index < graph.walks.size();
+         ++walk_index) {
+        const auto& walk = graph.walks[walk_index];
+        std::optional<std::size_t> left;
+        std::optional<std::size_t> right;
+        for (std::size_t position = 0; position < walk.size(); ++position) {
+            if (handleEquals(walk[position],
+                             {left_anchor.node, left_anchor.reverse})) {
+                if (left) {
+                    rejection = "repeated_left_anchor";
+                    return std::nullopt;
+                }
+                left = position;
+            }
+            if (handleEquals(walk[position],
+                             {right_anchor.node, right_anchor.reverse})) {
+                if (right) {
+                    rejection = "repeated_right_anchor";
+                    return std::nullopt;
+                }
+                right = position;
+            }
+        }
+        if (left.has_value() != right.has_value()) {
+            rejection = "unpaired_anchor";
+            return std::nullopt;
+        }
+        if (!left) continue;
+        if (*right <= *left) {
+            rejection = "anchor_order_or_inversion";
+            return std::nullopt;
+        }
+        const auto source_span =
+            walk[*right].source_start - walk[*left].source_end;
+        if (source_span > COMPACT_MAX_PATH_SPAN) {
+            rejection = "path_span";
+            return std::nullopt;
+        }
+        std::set<std::uint64_t> local_nodes;
+        for (std::size_t position = *left + 1; position < *right; ++position) {
+            const auto& step = walk[position];
+            if (step.reverse || !local_nodes.insert(step.node).second) {
+                rejection = "orientation_or_repeated_node";
+                return std::nullopt;
+            }
+            if (hasN(graph.nodes[step.node - 1].sequence)) {
+                rejection = "contains_N";
+                return std::nullopt;
+            }
+            candidate.interior_nodes.insert(step.node);
+        }
+        const std::string allele = spellInterval(
+            graph.nodes, walk, *left + 1, *right);
+        auto allele_it = std::find_if(
+            candidate.alleles.begin(), candidate.alleles.end(),
+            [&](const auto& value) { return value.first == allele; });
+        std::size_t allele_index = 0;
+        if (allele_it == candidate.alleles.end()) {
+            allele_index = candidate.alleles.size();
+            candidate.alleles.push_back({allele, {walk_index}});
+        } else {
+            allele_index = static_cast<std::size_t>(
+                std::distance(candidate.alleles.begin(), allele_it));
+            allele_it->second.push_back(walk_index);
+        }
+        candidate.replacements.push_back(
+            {walk_index, *left + 1, *right, allele_index + 1});
+    }
+    if (candidate.alleles.size() > COMPACT_MAX_ALLELES) {
+        rejection = "allele_limit";
+        return std::nullopt;
+    }
+    if (candidate.replacements.size() < 2) {
+        rejection = "single_path";
+        return std::nullopt;
+    }
+
+    std::size_t short_nodes = 0;
+    for (const auto node_id : candidate.interior_nodes) {
+        const auto& node = graph.nodes[node_id - 1];
+        if (node.sequence.size() < COMPACT_SHORT_NODE) ++short_nodes;
+        candidate.old_graph_bp += node.sequence.size();
+        if (node.occurrence_count > 1) {
+            candidate.old_homology_mass +=
+                node.sequence.size() * (node.occurrence_count - 1);
+        }
+        for (const auto& occurrence : occurrences[node_id]) {
+            const auto replacement = std::find_if(
+                candidate.replacements.begin(), candidate.replacements.end(),
+                [&](const IslandReplacement& value) {
+                    return value.walk == occurrence.first &&
+                           occurrence.second >= value.begin &&
+                           occurrence.second < value.end;
+                });
+            if (replacement == candidate.replacements.end()) {
+                rejection = "external_interior_occurrence";
+                return std::nullopt;
+            }
+        }
+    }
+    std::map<std::uint64_t, std::set<std::uint64_t>> adjacency;
+    std::map<std::uint64_t, std::size_t> indegree;
+    for (const auto node_id : candidate.interior_nodes) indegree[node_id] = 0;
+    for (const auto& replacement : candidate.replacements) {
+        const auto& walk = graph.walks[replacement.walk];
+        for (std::size_t position = replacement.begin + 1;
+             position < replacement.end; ++position) {
+            const auto left = walk[position - 1].node;
+            const auto right = walk[position].node;
+            if (left == right) {
+                rejection = "cycle";
+                return std::nullopt;
+            }
+            if (adjacency[left].insert(right).second) ++indegree[right];
+        }
+    }
+    std::deque<std::uint64_t> ready;
+    for (const auto& [node, degree] : indegree) {
+        if (degree == 0) ready.push_back(node);
+    }
+    std::size_t visited = 0;
+    while (!ready.empty()) {
+        const auto node = ready.front();
+        ready.pop_front();
+        ++visited;
+        for (const auto next : adjacency[node]) {
+            if (--indegree[next] == 0) ready.push_back(next);
+        }
+    }
+    if (visited != candidate.interior_nodes.size()) {
+        rejection = "cycle";
+        return std::nullopt;
+    }
+    candidate.old_short_nodes = short_nodes;
+    if (short_nodes < COMPACT_MIN_SHORT_NODES) {
+        rejection = "too_few_short_nodes";
+        return std::nullopt;
+    }
+    for (const auto& [allele, member_walks] : candidate.alleles) {
+        if (allele.empty()) continue;
+        candidate.new_graph_bp += allele.size();
+        if (allele.size() < COMPACT_SHORT_NODE) ++candidate.new_short_nodes;
+        if (member_walks.size() > 1) {
+            candidate.new_homology_mass +=
+                allele.size() * (member_walks.size() - 1);
+        }
+    }
+    const std::size_t new_nodes = std::count_if(
+        candidate.alleles.begin(), candidate.alleles.end(),
+        [](const auto& allele) { return !allele.first.empty(); });
+    if (new_nodes >= candidate.interior_nodes.size() ||
+        candidate.new_short_nodes >= candidate.old_short_nodes) {
+        rejection = "no_fragmentation_gain";
+        return std::nullopt;
+    }
+    return candidate;
+}
+
+std::size_t rewriteAlleleIslands(
+    GraphIR& graph,
+    const std::vector<SourceSequence>& sequences,
+    const std::string& reference_species,
+    std::uint64_t exact_homology_mass,
+    std::uint64_t exact_graph_bp,
+    int threads,
+    std::vector<std::string>& rejections) {
+    struct Request {
+        std::size_t walk{0};
+        std::size_t left{0};
+        std::size_t right{0};
+    };
+    std::vector<std::vector<std::pair<std::uint64_t, Occurrence>>>
+        occurrences_by_walk(graph.walks.size());
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (std::int64_t walk_index = 0;
+         walk_index < static_cast<std::int64_t>(graph.walks.size());
+         ++walk_index) {
+        const auto& walk = graph.walks[static_cast<std::size_t>(walk_index)];
+        auto& indexed = occurrences_by_walk[
+            static_cast<std::size_t>(walk_index)];
+        indexed.reserve(walk.size());
+        for (std::size_t position = 0; position < walk.size(); ++position) {
+            indexed.push_back({walk[position].node,
+                               {static_cast<std::size_t>(walk_index),
+                                position}});
+        }
+    }
+    std::vector<std::vector<Occurrence>> occurrences(graph.nodes.size() + 1);
+    for (const auto& indexed : occurrences_by_walk) {
+        for (const auto& [node, occurrence] : indexed) {
+            occurrences[node].push_back(occurrence);
+        }
+    }
+
+    std::vector<Request> requests;
+    for (std::size_t walk_index = 0; walk_index < sequences.size();
+         ++walk_index) {
+        if (sequences[walk_index].species != reference_species) continue;
+        const auto& walk = graph.walks[walk_index];
+        std::unordered_map<std::uint64_t, std::size_t> counts;
+        for (const auto& step : walk) ++counts[step.node];
+        std::vector<std::size_t> anchors;
+        for (std::size_t position = 0; position < walk.size(); ++position) {
+            const auto& node = graph.nodes[walk[position].node - 1];
+            if (!walk[position].reverse &&
+                node.sequence.size() >= COMPACT_STABLE_ANCHOR &&
+                node.occurrence_count > 1 && counts[node.id] == 1) {
+                anchors.push_back(position);
+            }
+        }
+        for (std::size_t index = 1; index < anchors.size(); ++index) {
+            requests.push_back(
+                {walk_index, anchors[index - 1], anchors[index]});
+        }
+    }
+    std::vector<std::optional<IslandCandidate>> analyses(requests.size());
+    std::vector<std::string> analysis_rejections(requests.size());
+#pragma omp parallel for schedule(dynamic) num_threads(threads)
+    for (std::int64_t index = 0;
+         index < static_cast<std::int64_t>(requests.size()); ++index) {
+        const auto& request = requests[static_cast<std::size_t>(index)];
+        analyses[static_cast<std::size_t>(index)] = analyzeIsland(
+            graph, occurrences, request.walk, request.left, request.right,
+            analysis_rejections[static_cast<std::size_t>(index)]);
+    }
+
+    std::vector<IslandCandidate> selected;
+    std::vector<std::vector<std::pair<std::size_t, std::size_t>>> occupied(
+        graph.walks.size());
+    std::uint64_t projected_homology = collectMetrics(
+        graph.nodes, graph.walks, graph.edges).homology_mass;
+    std::uint64_t projected_graph_bp = collectMetrics(
+        graph.nodes, graph.walks, graph.edges).graph_bp;
+
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+            const auto& request = requests[index];
+            auto& candidate = analyses[index];
+            if (!candidate) {
+                rejections.push_back(
+                    std::to_string(request.walk) + "\t" +
+                    std::to_string(request.left) + "\t" +
+                    std::to_string(request.right) + "\t" +
+                    analysis_rejections[index]);
+                continue;
+            }
+            bool overlaps = false;
+            for (const auto& replacement : candidate->replacements) {
+                for (const auto& interval : occupied[replacement.walk]) {
+                    if (replacement.begin < interval.second &&
+                        interval.first < replacement.end) {
+                        overlaps = true;
+                    }
+                }
+            }
+            if (overlaps) {
+                rejections.push_back(
+                    std::to_string(request.walk) + "\t" +
+                    std::to_string(request.left) + "\t" +
+                    std::to_string(request.right) +
+                    "\toverlapping_candidate");
+                continue;
+            }
+            const auto next_homology = projected_homology -
+                candidate->old_homology_mass +
+                candidate->new_homology_mass;
+            const auto next_graph_bp = projected_graph_bp -
+                candidate->old_graph_bp + candidate->new_graph_bp;
+            const double retention = exact_homology_mass == 0 ? 1.0 :
+                static_cast<double>(next_homology) /
+                static_cast<double>(exact_homology_mass);
+            const double bp_ratio = exact_graph_bp == 0 ? 1.0 :
+                static_cast<double>(next_graph_bp) /
+                static_cast<double>(exact_graph_bp);
+            if (retention < COMPACT_MIN_HOMOLOGY_RETENTION) {
+                rejections.push_back(
+                    std::to_string(request.walk) + "\t" +
+                    std::to_string(request.left) + "\t" +
+                    std::to_string(request.right) +
+                    "\thomology_budget");
+                continue;
+            }
+            if (bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+                rejections.push_back(
+                    std::to_string(request.walk) + "\t" +
+                    std::to_string(request.left) + "\t" +
+                    std::to_string(request.right) + "\tgraph_bp_budget");
+                continue;
+            }
+            projected_homology = next_homology;
+            projected_graph_bp = next_graph_bp;
+            for (const auto& replacement : candidate->replacements) {
+                occupied[replacement.walk].push_back(
+                    {replacement.begin, replacement.end});
+            }
+            selected.push_back(std::move(*candidate));
+    }
+    if (selected.empty()) return 0;
+
+    std::vector<std::vector<IslandReplacement>> replacements(graph.walks.size());
+    for (auto& candidate : selected) {
+        std::vector<std::uint64_t> allele_nodes(candidate.alleles.size(), 0);
+        for (std::size_t allele = 0; allele < candidate.alleles.size();
+             ++allele) {
+            const auto& sequence = candidate.alleles[allele].first;
+            if (sequence.empty()) continue;
+            const auto first_walk = candidate.alleles[allele].second.front();
+            const auto replacement = std::find_if(
+                candidate.replacements.begin(), candidate.replacements.end(),
+                [&](const IslandReplacement& value) {
+                    return value.walk == first_walk &&
+                           value.replacement_node == allele + 1;
+                });
+            const auto source_start =
+                graph.walks[first_walk][replacement->begin].source_start;
+            const std::uint64_t id = graph.nodes.size() + 1;
+            graph.nodes.push_back({id, 0, sequence, 0,
+                                   first_walk, source_start});
+            allele_nodes[allele] = id;
+        }
+        for (auto replacement : candidate.replacements) {
+            const auto allele = replacement.replacement_node - 1;
+            replacement.replacement_node = allele_nodes[allele];
+            replacements[replacement.walk].push_back(replacement);
+        }
+    }
+    for (std::size_t walk_index = 0; walk_index < graph.walks.size();
+         ++walk_index) {
+        auto& walk_replacements = replacements[walk_index];
+        std::sort(walk_replacements.begin(), walk_replacements.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.begin < right.begin;
+                  });
+        const auto old_walk = graph.walks[walk_index];
+        std::vector<Step> rewritten;
+        std::size_t position = 0;
+        for (const auto& replacement : walk_replacements) {
+            rewritten.insert(rewritten.end(), old_walk.begin() + position,
+                             old_walk.begin() + replacement.begin);
+            if (replacement.replacement_node != 0) {
+                rewritten.push_back({replacement.replacement_node, false,
+                                     old_walk[replacement.begin].source_start,
+                                     old_walk[replacement.end - 1].source_end});
+            }
+            position = replacement.end;
+        }
+        rewritten.insert(rewritten.end(), old_walk.begin() + position,
+                         old_walk.end());
+        graph.walks[walk_index] = std::move(rewritten);
+    }
+    normalizeGraph(graph.nodes, graph.walks, graph.edges);
+    return selected.size();
+}
+
+void fillStatsFromGraph(GfaExportStats& stats,
+                        const GraphIR& graph,
+                        const GraphMetrics& metrics) {
+    stats.nodes = metrics.nodes;
+    stats.edges = metrics.edges;
+    stats.walks = graph.walks.size();
+    stats.graph_sequence_bp = metrics.graph_bp;
+    stats.homology_mass = metrics.homology_mass;
+    stats.shared_sequence_bp = 0;
+    stats.private_sequence_bp = 0;
+    for (const auto& node : graph.nodes) {
+        if (node.occurrence_count > 1) {
+            stats.shared_sequence_bp += node.sequence.size();
+        } else {
+            stats.private_sequence_bp += node.sequence.size();
+        }
+    }
+}
+
+void writeCompactReports(
+    const std::filesystem::path& directory,
+    const std::vector<SourceSequence>& sequences,
+    const GraphIR& exact,
+    const GraphIR& compact,
+    const GraphMetrics& exact_metrics,
+    const GraphMetrics& compact_metrics,
+    const std::vector<std::string>& rejections,
+    const GfaExportStats& stats) {
+    std::filesystem::create_directories(directory);
+    atomicWrite(directory / "compact_parameters.tsv", [&](std::ostream& out) {
+        out << "parameter\tvalue\n"
+            << "profile\tcompact-v1\n"
+            << "minimum_exact_run_bp\t" << COMPACT_MIN_EXACT_RUN << '\n'
+            << "short_node_bp\t" << COMPACT_SHORT_NODE << '\n'
+            << "stable_anchor_bp\t" << COMPACT_STABLE_ANCHOR << '\n'
+            << "maximum_reference_span_bp\t" << COMPACT_MAX_REFERENCE_SPAN << '\n'
+            << "maximum_path_span_bp\t" << COMPACT_MAX_PATH_SPAN << '\n'
+            << "minimum_short_nodes\t" << COMPACT_MIN_SHORT_NODES << '\n'
+            << "maximum_distinct_alleles\t" << COMPACT_MAX_ALLELES << '\n'
+            << "minimum_homology_retention\t" << COMPACT_MIN_HOMOLOGY_RETENTION << '\n'
+            << "maximum_graph_bp_ratio\t" << COMPACT_MAX_GRAPH_BP_RATIO << '\n';
+    });
+    atomicWrite(directory / "compact_stats.tsv", [&](std::ostream& out) {
+        out << "metric\texact\tcompact\n"
+            << "nodes\t" << exact_metrics.nodes << '\t' << compact_metrics.nodes << '\n'
+            << "edges\t" << exact_metrics.edges << '\t' << compact_metrics.edges << '\n'
+            << "steps\t" << exact_metrics.steps << '\t' << compact_metrics.steps << '\n'
+            << "nodes_le_10\t" << exact_metrics.nodes_le_10 << '\t' << compact_metrics.nodes_le_10 << '\n'
+            << "nodes_lt_25\t" << exact_metrics.nodes_lt_25 << '\t' << compact_metrics.nodes_lt_25 << '\n'
+            << "nodes_lt_100\t" << exact_metrics.nodes_lt_100 << '\t' << compact_metrics.nodes_lt_100 << '\n'
+            << "median_node_length\t" << exact_metrics.median_node_length << '\t' << compact_metrics.median_node_length << '\n'
+            << "graph_sequence_bp\t" << exact_metrics.graph_bp << '\t' << compact_metrics.graph_bp << '\n'
+            << "homology_mass\t" << exact_metrics.homology_mass << '\t' << compact_metrics.homology_mass << '\n'
+            << "suppressed_exact_runs\t0\t" << stats.suppressed_exact_runs << '\n'
+            << "unitig_merges\t0\t" << stats.unitig_merges << '\n'
+            << "allele_islands\t0\t" << stats.allele_islands << '\n';
+    });
+    atomicWrite(directory / "compact_rejections.tsv", [&](std::ostream& out) {
+        out << "reference_walk\tleft_step\tright_step\treason\n";
+        for (const auto& rejection : rejections) out << rejection << '\n';
+    });
+    atomicWrite(directory / "compact_transform.tsv", [&](std::ostream& out) {
+        out << "species\tcontig\tstart\tend\texact_node\tcompact_node\t"
+               "exact_reverse\tcompact_reverse\n";
+        for (std::size_t sequence = 0; sequence < sequences.size(); ++sequence) {
+            const auto& exact_walk = exact.walks[sequence];
+            const auto& compact_walk = compact.walks[sequence];
+            std::size_t left = 0;
+            std::size_t right = 0;
+            while (left < exact_walk.size() && right < compact_walk.size()) {
+                const auto start = std::max(exact_walk[left].source_start,
+                                            compact_walk[right].source_start);
+                const auto end = std::min(exact_walk[left].source_end,
+                                          compact_walk[right].source_end);
+                if (start < end) {
+                    out << sequences[sequence].species << '\t'
+                        << sequences[sequence].chromosome << '\t'
+                        << start << '\t' << end << '\t'
+                        << exact_walk[left].node << '\t'
+                        << compact_walk[right].node << '\t'
+                        << (exact_walk[left].reverse ? 1 : 0) << '\t'
+                        << (compact_walk[right].reverse ? 1 : 0) << '\n';
+                }
+                const auto exact_end = exact_walk[left].source_end;
+                const auto compact_end = compact_walk[right].source_end;
+                if (exact_end <= compact_end) ++left;
+                if (compact_end <= exact_end) ++right;
+            }
+        }
+    });
 }
 
 }  // namespace
@@ -592,164 +1691,6 @@ GfaExportStats exportGraph(
         }), relations.end());
     stats.exact_runs = relations.size();
 
-    for (const auto& relation : relations) {
-        auto validate_endpoint = [&](std::size_t sequence,
-                                     std::uint64_t start) {
-            if (sequence >= sequences.size() ||
-                start > sequences[sequence].length ||
-                relation.length > sequences[sequence].length - start) {
-                throw std::runtime_error(
-                    "Exact run exceeds cleaned sequence bounds");
-            }
-        };
-        validate_endpoint(relation.left_sequence, relation.left_start);
-        validate_endpoint(relation.right_sequence, relation.right_start);
-        sequences[relation.left_sequence].breakpoints.insert(
-            relation.left_start);
-        sequences[relation.left_sequence].breakpoints.insert(
-            relation.left_start + relation.length);
-        sequences[relation.right_sequence].breakpoints.insert(
-            relation.right_start);
-        sequences[relation.right_sequence].breakpoints.insert(
-            relation.right_start + relation.length);
-    }
-    propagateBreakpoints(sequences, relations);
-
-    std::vector<Atom> atoms;
-    for (std::size_t sequence = 0; sequence < sequences.size(); ++sequence) {
-        auto& source = sequences[sequence];
-        source.ordered_breakpoints.assign(
-            source.breakpoints.begin(), source.breakpoints.end());
-        for (std::size_t index = 1;
-             index < source.ordered_breakpoints.size(); ++index) {
-            const std::uint64_t start = source.ordered_breakpoints[index - 1];
-            const std::uint64_t end = source.ordered_breakpoints[index];
-            if (start >= end) continue;
-            const std::size_t atom = atoms.size();
-            atoms.push_back({sequence, start, end});
-            source.atom_by_start.emplace(start, atom);
-            source.atoms.push_back(atom);
-        }
-    }
-    stats.atomic_intervals = atoms.size();
-    OrientedDisjointSet dsu(atoms.size());
-
-    for (const auto& relation : relations) {
-        const auto& left_points =
-            sequences[relation.left_sequence].ordered_breakpoints;
-        auto it = std::lower_bound(
-            left_points.begin(), left_points.end(), relation.left_start);
-        if (it == left_points.end() || *it != relation.left_start) {
-            throw std::runtime_error("Exact-run left boundary was not atomized");
-        }
-        while (*it < relation.left_start + relation.length) {
-            const auto next = std::next(it);
-            if (next == left_points.end() ||
-                *next > relation.left_start + relation.length) {
-                throw std::runtime_error("Exact run was incompletely atomized");
-            }
-            const std::uint64_t left_start = *it;
-            const std::uint64_t left_end = *next;
-            const std::uint64_t left_offset =
-                left_start - relation.left_start;
-            const std::uint64_t right_start = relation.reverse
-                ? relation.right_start + relation.length -
-                      (left_end - relation.left_start)
-                : relation.right_start + left_offset;
-            const auto left_atom =
-                sequences[relation.left_sequence].atom_by_start.at(left_start);
-            const auto right_atom =
-                sequences[relation.right_sequence].atom_by_start.at(right_start);
-            if (atoms[left_atom].end - atoms[left_atom].start !=
-                atoms[right_atom].end - atoms[right_atom].start) {
-                throw std::runtime_error(
-                    "Exact-run atom lengths do not agree");
-            }
-            const std::string left_sequence = atomSequence(
-                sequences[relation.left_sequence], atoms[left_atom]);
-            const std::string right_sequence = atomSequence(
-                sequences[relation.right_sequence], atoms[right_atom]);
-            if (!orientedSequencesEqual(
-                    left_sequence, right_sequence, relation.reverse)) {
-                throw std::runtime_error(
-                    "Exact-run atom sequences do not agree");
-            }
-            dsu.unite(left_atom, right_atom, relation.reverse);
-            it = next;
-        }
-    }
-
-    std::unordered_map<std::size_t, std::size_t> component_by_root;
-    std::vector<Node> nodes;
-    std::vector<std::uint64_t> node_for_atom(atoms.size(), 0);
-    std::vector<bool> reverse_for_atom(atoms.size(), false);
-    std::vector<bool> representative_parity;
-    for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
-        const auto [root, parity] = dsu.find(atom);
-        auto component = component_by_root.find(root);
-        if (component == component_by_root.end()) {
-            const std::size_t node_index = nodes.size();
-            component_by_root.emplace(root, node_index);
-            const Atom& representative = atoms[atom];
-            std::string sequence = atomSequence(
-                sequences[representative.sequence], representative);
-            if (!validSequence(sequence)) {
-                throw std::runtime_error(
-                    "Cleaned FASTA contains a base outside A/C/G/T/N");
-            }
-            nodes.push_back({node_index + 1, atom, std::move(sequence), 0});
-            representative_parity.push_back(parity);
-            component = component_by_root.find(root);
-        }
-        Node& node = nodes[component->second];
-        ++node.occurrence_count;
-        node_for_atom[atom] = node.id;
-        reverse_for_atom[atom] =
-            parity ^ representative_parity[component->second];
-    }
-
-    std::vector<std::vector<Step>> walks(sequences.size());
-    std::set<Edge> edges;
-    for (std::size_t sequence = 0; sequence < sequences.size(); ++sequence) {
-        auto& walk = walks[sequence];
-        walk.reserve(sequences[sequence].atoms.size());
-        for (const auto atom : sequences[sequence].atoms) {
-            walk.push_back({node_for_atom[atom], reverse_for_atom[atom]});
-            if (walk.size() > 1) {
-                const Step& left = walk[walk.size() - 2];
-                const Step& right = walk.back();
-                edges.insert(canonicalEdge(
-                    {left.node, left.reverse, right.node, right.reverse}));
-            }
-        }
-    }
-    validateGraph(sequences, atoms, nodes, node_for_atom,
-                  reverse_for_atom, walks, edges);
-
-    stats.nodes = nodes.size();
-    stats.edges = edges.size();
-    stats.walks = walks.size();
-    for (const auto& node : nodes) {
-        stats.graph_sequence_bp += node.sequence.size();
-        if (node.occurrence_count > 1) {
-            stats.shared_sequence_bp += node.sequence.size();
-        } else {
-            stats.private_sequence_bp += node.sequence.size();
-        }
-    }
-
-    std::set<std::string> path_names;
-    if (options.version == Version::V1_0) {
-        for (const auto& source : sequences) {
-            const std::string name = Export::qualifiedName(
-                source.species, source.chromosome);
-            if (!validPathName(name) || !path_names.insert(name).second) {
-                throw std::runtime_error(
-                    "Invalid or duplicate GFA 1.0 path name: " + name);
-            }
-        }
-    }
-
     const std::string reference_species = !graph.reference_order.empty()
         ? graph.reference_order.front() : managers.begin()->first;
     if (!validWalkField(reference_species)) {
@@ -757,87 +1698,119 @@ GfaExportStats exportGraph(
             "Invalid GFA reference sample identifier: " + reference_species);
     }
 
-    const fs::path output_path = fs::absolute(gfa_path);
-    if (!output_path.parent_path().empty()) {
-        fs::create_directories(output_path.parent_path());
-    }
-    const fs::path temporary_output = temporaryPath(output_path);
-    struct TemporaryGuard {
-        fs::path path;
-        bool keep{false};
-        ~TemporaryGuard() {
-            if (!keep) {
-                std::error_code error;
-                fs::remove(path, error);
+    validatePathNames(sequences, options.version);
+    GraphIR exact = buildInitialGraph(sequences, relations);
+    const GraphMetrics exact_metrics = collectMetrics(
+        exact.nodes, exact.walks, exact.edges);
+    stats.atomic_intervals = exact.atomic_intervals;
+    stats.exact_homology_mass = exact_metrics.homology_mass;
+
+    GraphIR result = exact;
+    GraphMetrics result_metrics = exact_metrics;
+    std::vector<std::string> rejections;
+    if (options.profile == Profile::COMPACT) {
+        if (options.work_dir.empty()) {
+            throw std::runtime_error(
+                "Compact GFA export requires a non-empty work directory");
+        }
+        const fs::path report_dir = fs::absolute(options.work_dir) / "gfa";
+        const fs::path exact_shadow = report_dir / "exact.gfa";
+        if (fs::absolute(gfa_path) == exact_shadow) {
+            throw std::runtime_error(
+                "Compact GFA output must differ from work/gfa/exact.gfa");
+        }
+        writeGraph(exact_shadow, options.version, reference_species,
+                   sequences, exact);
+
+        std::vector<unsigned char> keep(relations.size(), 0);
+#pragma omp parallel for schedule(static) num_threads(export_threads)
+        for (std::int64_t index = 0;
+             index < static_cast<std::int64_t>(relations.size()); ++index) {
+            keep[static_cast<std::size_t>(index)] =
+                relations[static_cast<std::size_t>(index)].length >=
+                COMPACT_MIN_EXACT_RUN;
+        }
+        std::vector<ExactRelation> retained;
+        retained.reserve(relations.size());
+        for (std::size_t index = 0; index < relations.size(); ++index) {
+            if (!keep[index]) {
+                ++stats.suppressed_exact_runs;
+            } else {
+                retained.push_back(relations[index]);
             }
         }
-    } guard{temporary_output};
-
-    std::ofstream output(
-        temporary_output, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error(
-            "Cannot open GFA output: " + temporary_output.string());
-    }
-    if (options.version == Version::V1_0) {
-        output << "H\tVN:Z:1.0\n";
+        result = buildInitialGraph(sequences, retained);
+        auto initial_metrics = collectMetrics(
+            result.nodes, result.walks, result.edges);
+        const double initial_homology_retention =
+            exact_metrics.homology_mass == 0 ? 1.0 :
+            static_cast<double>(initial_metrics.homology_mass) /
+            static_cast<double>(exact_metrics.homology_mass);
+        const double initial_graph_bp_ratio = exact_metrics.graph_bp == 0 ? 1.0 :
+            static_cast<double>(initial_metrics.graph_bp) /
+            static_cast<double>(exact_metrics.graph_bp);
+        if (initial_homology_retention < COMPACT_MIN_HOMOLOGY_RETENTION) {
+            throw std::runtime_error(
+                "Compact short-relation suppression violates the 99.5% "
+                "homology-mass budget; exact shadow was retained");
+        }
+        if (initial_graph_bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+            throw std::runtime_error(
+                "Compact short-relation suppression violates the 2% graph "
+                "sequence budget; exact shadow was retained");
+        }
+        stats.unitig_merges += compactUnitigs(
+            result.nodes, result.walks, result.edges);
+        validateGraph(sequences, result.nodes, result.walks, result.edges);
+        stats.allele_islands = rewriteAlleleIslands(
+            result, sequences, reference_species,
+            exact_metrics.homology_mass, exact_metrics.graph_bp,
+            export_threads, rejections);
+        stats.rejected_allele_islands = rejections.size();
+        validateGraph(sequences, result.nodes, result.walks, result.edges);
+        stats.unitig_merges += compactUnitigs(
+            result.nodes, result.walks, result.edges);
+        validateGraph(sequences, result.nodes, result.walks, result.edges);
+        result_metrics = collectMetrics(
+            result.nodes, result.walks, result.edges);
+        const double final_homology_retention =
+            exact_metrics.homology_mass == 0 ? 1.0 :
+            static_cast<double>(result_metrics.homology_mass) /
+            static_cast<double>(exact_metrics.homology_mass);
+        const double final_graph_bp_ratio = exact_metrics.graph_bp == 0 ? 1.0 :
+            static_cast<double>(result_metrics.graph_bp) /
+            static_cast<double>(exact_metrics.graph_bp);
+        if (final_homology_retention < COMPACT_MIN_HOMOLOGY_RETENTION ||
+            final_graph_bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+            throw std::runtime_error(
+                "Compact transforms exceeded a global safety budget; exact "
+                "shadow was retained");
+        }
+        fillStatsFromGraph(stats, result, result_metrics);
+        writeCompactReports(report_dir, sequences, exact, result,
+                            exact_metrics, result_metrics, rejections, stats);
     } else {
-        output << "H\tVN:Z:1.1\tRS:Z:" << reference_species << '\n';
+        fillStatsFromGraph(stats, result, result_metrics);
     }
-    for (const auto& node : nodes) {
-        output << "S\t" << node.id << '\t' << node.sequence << '\n';
-    }
-    for (const auto& edge : edges) {
-        output << "L\t" << edge.from << '\t'
-               << (edge.from_reverse ? '-' : '+') << '\t'
-               << edge.to << '\t' << (edge.to_reverse ? '-' : '+')
-               << "\t0M\n";
-    }
-    for (std::size_t index = 0; index < sequences.size(); ++index) {
-        const auto& source = sequences[index];
-        const auto& walk = walks[index];
-        if (options.version == Version::V1_0) {
-            output << "P\t"
-                   << Export::qualifiedName(source.species, source.chromosome)
-                   << '\t';
-            for (std::size_t step = 0; step < walk.size(); ++step) {
-                if (step != 0) output << ',';
-                output << walk[step].node
-                       << (walk[step].reverse ? '-' : '+');
-            }
-            output << "\t*\n";
-        } else {
-            output << "W\t" << source.species << "\t0\t"
-                   << source.chromosome << "\t0\t" << source.length
-                   << '\t';
-            for (const auto& step : walk) {
-                output << (step.reverse ? '<' : '>') << step.node;
-            }
-            output << '\n';
-        }
-    }
-    output.close();
-    if (!output) throw std::runtime_error("Failed to finalize GFA output");
 
-    std::error_code rename_error;
-    fs::rename(temporary_output, output_path, rename_error);
-    if (rename_error) {
-        throw std::runtime_error(
-            "Failed to atomically replace GFA output: " +
-            rename_error.message());
-    }
-    guard.keep = true;
+    writeGraph(gfa_path, options.version, reference_species,
+               sequences, result);
 
     stats.elapsed_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     spdlog::info(
-        "GFA {} export complete: blocks(seen/used)={}/{}, exact_runs={}, "
-        "atoms={}, nodes={}, edges={}, paths={}, graph_bp={}, "
-        "shared_bp={}, private_bp={}, elapsed_seconds={:.3f}",
-        versionString(options.version), stats.blocks_seen, stats.blocks_used,
-        stats.exact_runs, stats.atomic_intervals, stats.nodes, stats.edges,
-        stats.walks, stats.graph_sequence_bp, stats.shared_sequence_bp,
-        stats.private_sequence_bp, stats.elapsed_seconds);
+        "GFA {} {} export complete: blocks(seen/used)={}/{}, exact_runs={}, "
+        "suppressed_runs={}, atoms={}, nodes={}, edges={}, paths={}, graph_bp={}, "
+        "shared_bp={}, private_bp={}, homology_mass={}/{}, unitig_merges={}, "
+        "allele_islands={}, elapsed_seconds={:.3f}",
+        versionString(options.version), profileString(options.profile),
+        stats.blocks_seen, stats.blocks_used,
+        stats.exact_runs, stats.suppressed_exact_runs,
+        stats.atomic_intervals, stats.nodes, stats.edges,
+        stats.walks, stats.graph_sequence_bp,
+        stats.shared_sequence_bp, stats.private_sequence_bp,
+        stats.homology_mass, stats.exact_homology_mass,
+        stats.unitig_merges, stats.allele_islands, stats.elapsed_seconds);
     return stats;
 }
 

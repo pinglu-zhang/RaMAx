@@ -90,7 +90,9 @@ ramax -i seqfile.txt -w work -t 16 \
 Each format may appear once. If HAL is requested anywhere in the output list,
 the seqfile must contain a Newick tree. Export order is MAF, PAF, GFA, then HAL.
 Native GFA export defaults to GFA 1.1 W-lines; use `--gfa-version 1.0` for
-GFA 1.0 P-line compatibility.
+GFA 1.0 P-line compatibility. The graph profile currently defaults to the
+audit-preserving `--gfa-profile exact`; `--gfa-profile compact` enables the
+lossless compact-v1 transforms and keeps an exact shadow under `work/gfa/`.
 
 For seqwish, generate the matching qualified FASTA directly from the same
 seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
@@ -180,10 +182,10 @@ ramax --restart -w work -t 24 --min_anchor_length 30 \
   -o results/retry.maf -o results/retry.paf
 ```
 
-The seqfile cannot be replaced. Schema-1, schema-2, and schema-3 work
-directories are loaded with explicit compatibility defaults and migrated to
-schema 4; older work directories default to GFA 1.1 when no GFA version was
-persisted.
+The seqfile cannot be replaced. Schema-1 through schema-4 work directories are
+loaded with explicit compatibility defaults and migrated to schema 5; older
+work directories use `--gfa-profile exact`, and schemas before 4 default to
+GFA 1.1 when no GFA version was persisted.
 
 ## License and dependencies
 

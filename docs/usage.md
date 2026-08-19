@@ -79,6 +79,7 @@ ramax \
   -i /data/project/seqfile.txt \
   -o /data/project/results/graph.gfa \
   --gfa-version 1.1 \
+  --gfa-profile compact \
   -w /data/project/work/ramax-gfa11 \
   -t 16
 ```
@@ -111,8 +112,10 @@ run does not require a Newick tree. `--paf-mode` is accepted whenever the
 output list contains PAF and rejected otherwise.
 
 GFA defaults to `--gfa-version 1.1`, with one structured W-line per input
-contig. Version `1.0` writes one P-line per contig. Explicitly supplying
-`--gfa-version` without a GFA output is rejected.
+contig. Version `1.0` writes one P-line per contig. The graph profile currently
+defaults to `exact`; `--gfa-profile compact` applies compact-v1 and writes its
+exact shadow and audit tables under `work/gfa/`. Explicitly supplying either
+GFA option without a GFA output is rejected.
 
 Build the seqwish sequence input from the same seqfile. The companion tool
 preserves species and contig order, writes the exact `species.contig` names
