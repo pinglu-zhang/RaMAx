@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -47,9 +48,14 @@ struct ParsedPafRecord {
     uint64_t matches{0};
     uint64_t block_length{0};
     uint64_t cigar_columns{0};
+    uint64_t equal_bases{0};
+    uint64_t mismatch_bases{0};
     uint64_t mapq{0};
     Cigar_t cigar;
     std::string cigar_text;
+    std::optional<char> alignment_type;
+    std::optional<int64_t> alignment_score;
+    std::optional<double> divergence;
 };
 
 struct PafNormalizationStats {

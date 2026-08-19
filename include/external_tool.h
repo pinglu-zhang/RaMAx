@@ -10,6 +10,10 @@ namespace RaMAxExternalTool {
 
 struct CommandResult {
     int exit_code{0};
+    double wall_seconds{0.0};
+    double user_seconds{0.0};
+    double system_seconds{0.0};
+    long peak_rss_kb{0};
 };
 
 bool isExecutable(const std::filesystem::path& candidate);

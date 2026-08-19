@@ -1,6 +1,7 @@
 #include "external_tool.h"
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -102,6 +104,7 @@ CommandResult run(
     for (auto& value : storage) argv.push_back(value.data());
     argv.push_back(nullptr);
 
+    const auto started = std::chrono::steady_clock::now();
     pid_t pid = -1;
     const int spawn_error = ::posix_spawn(
         &pid, executable.c_str(), &actions, nullptr, argv.data(), environ);
@@ -114,14 +117,23 @@ CommandResult run(
     }
 
     int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
+    struct rusage usage {};
+    while (::wait4(pid, &status, 0, &usage) < 0) {
         if (errno == EINTR) continue;
         throw std::runtime_error("Cannot wait for " + executable.string() +
                                  ": " + std::strerror(errno));
     }
-    if (WIFEXITED(status)) return {WEXITSTATUS(status)};
-    if (WIFSIGNALED(status)) return {128 + WTERMSIG(status)};
-    return {255};
+    const double wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const double user_seconds = static_cast<double>(usage.ru_utime.tv_sec) +
+        static_cast<double>(usage.ru_utime.tv_usec) / 1'000'000.0;
+    const double system_seconds = static_cast<double>(usage.ru_stime.tv_sec) +
+        static_cast<double>(usage.ru_stime.tv_usec) / 1'000'000.0;
+    const int exit_code = WIFEXITED(status)
+        ? WEXITSTATUS(status)
+        : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 255);
+    return {exit_code, wall_seconds, user_seconds, system_seconds,
+            usage.ru_maxrss};
 }
 
 std::string readText(const std::filesystem::path& path) {

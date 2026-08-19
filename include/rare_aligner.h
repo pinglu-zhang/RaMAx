@@ -14,6 +14,7 @@
 #include "cache_manifest.h"
 #include "mash_distance_estimator.h"
 #include "wfmash_router.h"
+#include "mm2plus_router.h"
 
 struct IndexCacheCounters {
     std::atomic_size_t reused{0};

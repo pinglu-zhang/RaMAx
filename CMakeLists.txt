@@ -109,6 +109,8 @@ set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
     "Samtools 1.24 executable; empty searches PATH")
 set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
     "PGGB-compatible wfmash v0.14.0-0-g517e1bc executable; empty searches PATH")
+set(RAMAX_MM2PLUS_EXECUTABLE "" CACHE FILEPATH
+    "mm2plus 1.3 executable (upstream Minimap2 2.31-r1302); empty searches PATH")
 
 if(RAMAX_MASH_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
@@ -158,6 +160,8 @@ resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
                    RAMAX_RESOLVED_SAMTOOLS)
 resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
                    RAMAX_RESOLVED_WFMASH)
+resolve_ramax_tool(RAMAX_MM2PLUS_EXECUTABLE mm2plus "mm2plus 1.3"
+                   RAMAX_RESOLVED_MM2PLUS)
 
 if(RAMAX_MINIPOA_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
@@ -217,6 +221,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/minipoa_locator.cpp"
     "${ALIGN_DIR}/mash_distance_estimator.cpp"
     "${ALIGN_DIR}/wfmash_router.cpp"
+    "${ALIGN_DIR}/mm2plus_router.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
     "${GRAPH_DIR}/direct_block_merger.cpp"
@@ -316,7 +321,8 @@ target_compile_definitions(ramax_core PRIVATE
     RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
     RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}"
     RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_RESOLVED_SAMTOOLS}"
-    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}")
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}"
+    RAMAX_MM2PLUS_CONFIGURED_PATH="${RAMAX_RESOLVED_MM2PLUS}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
@@ -342,6 +348,15 @@ if(BUILD_TESTING)
     add_test(NAME ramax_wfmash_router_test
         COMMAND ramax_wfmash_router_test)
     set_tests_properties(ramax_wfmash_router_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_mm2plus_router_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mm2plus_router_test.cpp")
+    configure_rama_target(ramax_mm2plus_router_test)
+    target_link_libraries(ramax_mm2plus_router_test PRIVATE ramax_core)
+    add_test(NAME ramax_mm2plus_router_test
+        COMMAND ramax_mm2plus_router_test)
+    set_tests_properties(ramax_mm2plus_router_test PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 
     add_executable(ramax_gfa_export_test
