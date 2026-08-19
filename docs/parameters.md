@@ -25,7 +25,7 @@ binary.
 | `-w`, `--workdir` | path; required | Intermediate and routing-artifact directory. It must be empty for a new Release run and is preserved after success. |
 | `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid when any `-o` is `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
 | `--gfa-version` | `1.1`; exactly `1.0` or `1.1` | Native GFA path encoding. `1.0` writes P-lines; `1.1` writes structured W-lines. Valid only when any `-o` is `.gfa`. |
-| `--gfa-profile` | `exact`; exactly `exact` or `compact` | Native GFA graph construction. `exact` preserves every maximal exact-run relation. `compact` enables compact-v1 while preserving every cleaned path base and writes an exact audit shadow plus transform reports under `work/gfa/`. Valid only with `.gfa` output. |
+| `--gfa-profile` | `exact`; exactly `exact` or `compact` | Native GFA graph construction. `exact` preserves every maximal exact-run relation. `compact` enables compact-v2-balanced while preserving every cleaned path base and writes an exact audit shadow plus staged transform reports under `work/gfa/`. Valid only with `.gfa` output. |
 | `--root` | string; automatic | Preferred HAL root name. Valid when any `-o` is `.hal`; HAL requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters

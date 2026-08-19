@@ -136,6 +136,14 @@ struct GraphMetrics {
     std::uint64_t median_node_length{0};
 };
 
+struct CompactStageMetrics {
+    std::string name;
+    GraphMetrics graph;
+    std::size_t suppressed_exact_runs{0};
+    std::size_t unitig_merges{0};
+    std::size_t allele_islands{0};
+};
+
 struct GraphIR {
     std::vector<Node> nodes;
     std::vector<std::vector<Step>> walks;
@@ -165,15 +173,29 @@ struct IslandCandidate {
     std::size_t new_short_nodes{0};
 };
 
-constexpr std::uint64_t COMPACT_MIN_EXACT_RUN = 25;
-constexpr std::uint64_t COMPACT_SHORT_NODE = 25;
-constexpr std::uint64_t COMPACT_STABLE_ANCHOR = 100;
-constexpr std::uint64_t COMPACT_MAX_REFERENCE_SPAN = 1000;
-constexpr std::uint64_t COMPACT_MAX_PATH_SPAN = 3000;
-constexpr std::size_t COMPACT_MIN_SHORT_NODES = 2;
-constexpr std::size_t COMPACT_MAX_ALLELES = 64;
-constexpr double COMPACT_MIN_HOMOLOGY_RETENTION = 0.995;
-constexpr double COMPACT_MAX_GRAPH_BP_RATIO = 1.02;
+constexpr std::uint64_t REPORT_SHORT_NODE_BP = 25;
+constexpr const char* COMPACT_PROFILE_VERSION = "compact-v2-balanced";
+
+void validateCompactConfig(const GfaCompactConfig& config) {
+    if (config.minimum_exact_run_bp == 0 || config.short_node_bp == 0 ||
+        config.stable_anchor_bp == 0 ||
+        config.maximum_reference_span_bp == 0 ||
+        config.maximum_path_span_bp == 0 ||
+        config.minimum_short_nodes == 0 ||
+        config.maximum_distinct_alleles == 0) {
+        throw std::invalid_argument(
+            "Compact GFA integer parameters must be positive");
+    }
+    if (!(config.minimum_homology_retention > 0.0 &&
+          config.minimum_homology_retention <= 1.0)) {
+        throw std::invalid_argument(
+            "Compact GFA homology retention must be in (0,1]");
+    }
+    if (config.maximum_graph_bp_ratio < 1.0) {
+        throw std::invalid_argument(
+            "Compact GFA graph-bp ratio must be at least 1");
+    }
+}
 
 class OrientedDisjointSet {
 public:
@@ -622,7 +644,7 @@ GraphMetrics collectMetrics(const std::vector<Node>& nodes,
         lengths.push_back(length);
         metrics.graph_bp += length;
         if (length <= 10) ++metrics.nodes_le_10;
-        if (length < COMPACT_SHORT_NODE) ++metrics.nodes_lt_25;
+        if (length < REPORT_SHORT_NODE_BP) ++metrics.nodes_lt_25;
         if (length < 100) ++metrics.nodes_lt_100;
         if (node.occurrence_count > 1) {
             metrics.homology_mass +=
@@ -1125,6 +1147,7 @@ std::optional<IslandCandidate> analyzeIsland(
     std::size_t reference_walk,
     std::size_t left_position,
     std::size_t right_position,
+    const GfaCompactConfig& config,
     std::string& rejection) {
     const auto& reference = graph.walks[reference_walk];
     if (right_position <= left_position + 1) {
@@ -1139,7 +1162,7 @@ std::optional<IslandCandidate> analyzeIsland(
     }
     const auto reference_span =
         right_anchor.source_start - left_anchor.source_end;
-    if (reference_span > COMPACT_MAX_REFERENCE_SPAN) {
+    if (reference_span > config.maximum_reference_span_bp) {
         rejection = "reference_span";
         return std::nullopt;
     }
@@ -1182,7 +1205,7 @@ std::optional<IslandCandidate> analyzeIsland(
         }
         const auto source_span =
             walk[*right].source_start - walk[*left].source_end;
-        if (source_span > COMPACT_MAX_PATH_SPAN) {
+        if (source_span > config.maximum_path_span_bp) {
             rejection = "path_span";
             return std::nullopt;
         }
@@ -1216,7 +1239,7 @@ std::optional<IslandCandidate> analyzeIsland(
         candidate.replacements.push_back(
             {walk_index, *left + 1, *right, allele_index + 1});
     }
-    if (candidate.alleles.size() > COMPACT_MAX_ALLELES) {
+    if (candidate.alleles.size() > config.maximum_distinct_alleles) {
         rejection = "allele_limit";
         return std::nullopt;
     }
@@ -1228,7 +1251,7 @@ std::optional<IslandCandidate> analyzeIsland(
     std::size_t short_nodes = 0;
     for (const auto node_id : candidate.interior_nodes) {
         const auto& node = graph.nodes[node_id - 1];
-        if (node.sequence.size() < COMPACT_SHORT_NODE) ++short_nodes;
+        if (node.sequence.size() < config.short_node_bp) ++short_nodes;
         candidate.old_graph_bp += node.sequence.size();
         if (node.occurrence_count > 1) {
             candidate.old_homology_mass +=
@@ -1282,14 +1305,16 @@ std::optional<IslandCandidate> analyzeIsland(
         return std::nullopt;
     }
     candidate.old_short_nodes = short_nodes;
-    if (short_nodes < COMPACT_MIN_SHORT_NODES) {
+    if (short_nodes < config.minimum_short_nodes) {
         rejection = "too_few_short_nodes";
         return std::nullopt;
     }
     for (const auto& [allele, member_walks] : candidate.alleles) {
         if (allele.empty()) continue;
         candidate.new_graph_bp += allele.size();
-        if (allele.size() < COMPACT_SHORT_NODE) ++candidate.new_short_nodes;
+        if (allele.size() < config.short_node_bp) {
+            ++candidate.new_short_nodes;
+        }
         if (member_walks.size() > 1) {
             candidate.new_homology_mass +=
                 allele.size() * (member_walks.size() - 1);
@@ -1312,6 +1337,7 @@ std::size_t rewriteAlleleIslands(
     const std::string& reference_species,
     std::uint64_t exact_homology_mass,
     std::uint64_t exact_graph_bp,
+    const GfaCompactConfig& config,
     int threads,
     std::vector<std::string>& rejections) {
     struct Request {
@@ -1353,7 +1379,7 @@ std::size_t rewriteAlleleIslands(
         for (std::size_t position = 0; position < walk.size(); ++position) {
             const auto& node = graph.nodes[walk[position].node - 1];
             if (!walk[position].reverse &&
-                node.sequence.size() >= COMPACT_STABLE_ANCHOR &&
+                node.sequence.size() >= config.stable_anchor_bp &&
                 node.occurrence_count > 1 && counts[node.id] == 1) {
                 anchors.push_back(position);
             }
@@ -1371,6 +1397,7 @@ std::size_t rewriteAlleleIslands(
         const auto& request = requests[static_cast<std::size_t>(index)];
         analyses[static_cast<std::size_t>(index)] = analyzeIsland(
             graph, occurrences, request.walk, request.left, request.right,
+            config,
             analysis_rejections[static_cast<std::size_t>(index)]);
     }
 
@@ -1421,7 +1448,7 @@ std::size_t rewriteAlleleIslands(
             const double bp_ratio = exact_graph_bp == 0 ? 1.0 :
                 static_cast<double>(next_graph_bp) /
                 static_cast<double>(exact_graph_bp);
-            if (retention < COMPACT_MIN_HOMOLOGY_RETENTION) {
+            if (retention < config.minimum_homology_retention) {
                 rejections.push_back(
                     std::to_string(request.walk) + "\t" +
                     std::to_string(request.left) + "\t" +
@@ -1429,7 +1456,7 @@ std::size_t rewriteAlleleIslands(
                     "\thomology_budget");
                 continue;
             }
-            if (bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+            if (bp_ratio > config.maximum_graph_bp_ratio) {
                 rejections.push_back(
                     std::to_string(request.walk) + "\t" +
                     std::to_string(request.left) + "\t" +
@@ -1525,38 +1552,57 @@ void writeCompactReports(
     const std::vector<SourceSequence>& sequences,
     const GraphIR& exact,
     const GraphIR& compact,
-    const GraphMetrics& exact_metrics,
-    const GraphMetrics& compact_metrics,
-    const std::vector<std::string>& rejections,
-    const GfaExportStats& stats) {
+    const GfaCompactConfig& config,
+    const std::vector<CompactStageMetrics>& stages,
+    const std::vector<std::string>& rejections) {
     std::filesystem::create_directories(directory);
     atomicWrite(directory / "compact_parameters.tsv", [&](std::ostream& out) {
         out << "parameter\tvalue\n"
-            << "profile\tcompact-v1\n"
-            << "minimum_exact_run_bp\t" << COMPACT_MIN_EXACT_RUN << '\n'
-            << "short_node_bp\t" << COMPACT_SHORT_NODE << '\n'
-            << "stable_anchor_bp\t" << COMPACT_STABLE_ANCHOR << '\n'
-            << "maximum_reference_span_bp\t" << COMPACT_MAX_REFERENCE_SPAN << '\n'
-            << "maximum_path_span_bp\t" << COMPACT_MAX_PATH_SPAN << '\n'
-            << "minimum_short_nodes\t" << COMPACT_MIN_SHORT_NODES << '\n'
-            << "maximum_distinct_alleles\t" << COMPACT_MAX_ALLELES << '\n'
-            << "minimum_homology_retention\t" << COMPACT_MIN_HOMOLOGY_RETENTION << '\n'
-            << "maximum_graph_bp_ratio\t" << COMPACT_MAX_GRAPH_BP_RATIO << '\n';
+            << "profile\t" << COMPACT_PROFILE_VERSION << '\n'
+            << "minimum_exact_run_bp\t" << config.minimum_exact_run_bp << '\n'
+            << "short_node_bp\t" << config.short_node_bp << '\n'
+            << "stable_anchor_bp\t" << config.stable_anchor_bp << '\n'
+            << "maximum_reference_span_bp\t"
+            << config.maximum_reference_span_bp << '\n'
+            << "maximum_path_span_bp\t" << config.maximum_path_span_bp << '\n'
+            << "minimum_short_nodes\t" << config.minimum_short_nodes << '\n'
+            << "maximum_distinct_alleles\t"
+            << config.maximum_distinct_alleles << '\n'
+            << "minimum_homology_retention\t"
+            << config.minimum_homology_retention << '\n'
+            << "maximum_graph_bp_ratio\t" << config.maximum_graph_bp_ratio << '\n'
+            << "enable_unitig_compaction\t"
+            << (config.enable_unitig_compaction ? 1 : 0) << '\n'
+            << "enable_compound_alleles\t"
+            << (config.enable_compound_alleles ? 1 : 0) << '\n';
     });
     atomicWrite(directory / "compact_stats.tsv", [&](std::ostream& out) {
-        out << "metric\texact\tcompact\n"
-            << "nodes\t" << exact_metrics.nodes << '\t' << compact_metrics.nodes << '\n'
-            << "edges\t" << exact_metrics.edges << '\t' << compact_metrics.edges << '\n'
-            << "steps\t" << exact_metrics.steps << '\t' << compact_metrics.steps << '\n'
-            << "nodes_le_10\t" << exact_metrics.nodes_le_10 << '\t' << compact_metrics.nodes_le_10 << '\n'
-            << "nodes_lt_25\t" << exact_metrics.nodes_lt_25 << '\t' << compact_metrics.nodes_lt_25 << '\n'
-            << "nodes_lt_100\t" << exact_metrics.nodes_lt_100 << '\t' << compact_metrics.nodes_lt_100 << '\n'
-            << "median_node_length\t" << exact_metrics.median_node_length << '\t' << compact_metrics.median_node_length << '\n'
-            << "graph_sequence_bp\t" << exact_metrics.graph_bp << '\t' << compact_metrics.graph_bp << '\n'
-            << "homology_mass\t" << exact_metrics.homology_mass << '\t' << compact_metrics.homology_mass << '\n'
-            << "suppressed_exact_runs\t0\t" << stats.suppressed_exact_runs << '\n'
-            << "unitig_merges\t0\t" << stats.unitig_merges << '\n'
-            << "allele_islands\t0\t" << stats.allele_islands << '\n';
+        out << "metric";
+        for (const auto& stage : stages) out << '\t' << stage.name;
+        out << '\n';
+        auto graph_row = [&](const char* name, auto member) {
+            out << name;
+            for (const auto& stage : stages) out << '\t' << stage.graph.*member;
+            out << '\n';
+        };
+        auto counter_row = [&](const char* name, auto member) {
+            out << name;
+            for (const auto& stage : stages) out << '\t' << stage.*member;
+            out << '\n';
+        };
+        graph_row("nodes", &GraphMetrics::nodes);
+        graph_row("edges", &GraphMetrics::edges);
+        graph_row("steps", &GraphMetrics::steps);
+        graph_row("nodes_le_10", &GraphMetrics::nodes_le_10);
+        graph_row("nodes_lt_25", &GraphMetrics::nodes_lt_25);
+        graph_row("nodes_lt_100", &GraphMetrics::nodes_lt_100);
+        graph_row("median_node_length", &GraphMetrics::median_node_length);
+        graph_row("graph_sequence_bp", &GraphMetrics::graph_bp);
+        graph_row("homology_mass", &GraphMetrics::homology_mass);
+        counter_row("suppressed_exact_runs",
+                    &CompactStageMetrics::suppressed_exact_runs);
+        counter_row("unitig_merges", &CompactStageMetrics::unitig_merges);
+        counter_row("allele_islands", &CompactStageMetrics::allele_islands);
     });
     atomicWrite(directory / "compact_rejections.tsv", [&](std::ostream& out) {
         out << "reference_walk\tleft_step\tright_step\treason\n";
@@ -1709,6 +1755,7 @@ GfaExportStats exportGraph(
     GraphMetrics result_metrics = exact_metrics;
     std::vector<std::string> rejections;
     if (options.profile == Profile::COMPACT) {
+        validateCompactConfig(options.compact);
         if (options.work_dir.empty()) {
             throw std::runtime_error(
                 "Compact GFA export requires a non-empty work directory");
@@ -1722,13 +1769,16 @@ GfaExportStats exportGraph(
         writeGraph(exact_shadow, options.version, reference_species,
                    sequences, exact);
 
+        std::vector<CompactStageMetrics> stages;
+        stages.push_back({"exact", exact_metrics, 0, 0, 0});
+
         std::vector<unsigned char> keep(relations.size(), 0);
 #pragma omp parallel for schedule(static) num_threads(export_threads)
         for (std::int64_t index = 0;
              index < static_cast<std::int64_t>(relations.size()); ++index) {
             keep[static_cast<std::size_t>(index)] =
                 relations[static_cast<std::size_t>(index)].length >=
-                COMPACT_MIN_EXACT_RUN;
+                options.compact.minimum_exact_run_bp;
         }
         std::vector<ExactRelation> retained;
         retained.reserve(relations.size());
@@ -1742,6 +1792,8 @@ GfaExportStats exportGraph(
         result = buildInitialGraph(sequences, retained);
         auto initial_metrics = collectMetrics(
             result.nodes, result.walks, result.edges);
+        stages.push_back({"after_filter", initial_metrics,
+                          stats.suppressed_exact_runs, 0, 0});
         const double initial_homology_retention =
             exact_metrics.homology_mass == 0 ? 1.0 :
             static_cast<double>(initial_metrics.homology_mass) /
@@ -1749,30 +1801,52 @@ GfaExportStats exportGraph(
         const double initial_graph_bp_ratio = exact_metrics.graph_bp == 0 ? 1.0 :
             static_cast<double>(initial_metrics.graph_bp) /
             static_cast<double>(exact_metrics.graph_bp);
-        if (initial_homology_retention < COMPACT_MIN_HOMOLOGY_RETENTION) {
+        if (initial_homology_retention <
+            options.compact.minimum_homology_retention) {
             throw std::runtime_error(
                 "Compact short-relation suppression violates the 99.5% "
                 "homology-mass budget; exact shadow was retained");
         }
-        if (initial_graph_bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+        if (initial_graph_bp_ratio > options.compact.maximum_graph_bp_ratio) {
             throw std::runtime_error(
                 "Compact short-relation suppression violates the 2% graph "
                 "sequence budget; exact shadow was retained");
         }
-        stats.unitig_merges += compactUnitigs(
-            result.nodes, result.walks, result.edges);
+        if (options.compact.enable_unitig_compaction) {
+            stats.unitig_merges += compactUnitigs(
+                result.nodes, result.walks, result.edges);
+        }
         validateGraph(sequences, result.nodes, result.walks, result.edges);
-        stats.allele_islands = rewriteAlleleIslands(
-            result, sequences, reference_species,
-            exact_metrics.homology_mass, exact_metrics.graph_bp,
-            export_threads, rejections);
+        auto after_unitig_metrics = collectMetrics(
+            result.nodes, result.walks, result.edges);
+        stages.push_back({"after_unitig", after_unitig_metrics,
+                          stats.suppressed_exact_runs,
+                          stats.unitig_merges, 0});
+
+        if (options.compact.enable_compound_alleles) {
+            stats.allele_islands = rewriteAlleleIslands(
+                result, sequences, reference_species,
+                exact_metrics.homology_mass, exact_metrics.graph_bp,
+                options.compact, export_threads, rejections);
+        }
         stats.rejected_allele_islands = rejections.size();
         validateGraph(sequences, result.nodes, result.walks, result.edges);
-        stats.unitig_merges += compactUnitigs(
+        auto after_allele_metrics = collectMetrics(
             result.nodes, result.walks, result.edges);
+        stages.push_back({"after_allele_islands", after_allele_metrics,
+                          stats.suppressed_exact_runs,
+                          stats.unitig_merges, stats.allele_islands});
+
+        if (options.compact.enable_unitig_compaction) {
+            stats.unitig_merges += compactUnitigs(
+                result.nodes, result.walks, result.edges);
+        }
         validateGraph(sequences, result.nodes, result.walks, result.edges);
         result_metrics = collectMetrics(
             result.nodes, result.walks, result.edges);
+        stages.push_back({"final", result_metrics,
+                          stats.suppressed_exact_runs,
+                          stats.unitig_merges, stats.allele_islands});
         const double final_homology_retention =
             exact_metrics.homology_mass == 0 ? 1.0 :
             static_cast<double>(result_metrics.homology_mass) /
@@ -1780,15 +1854,16 @@ GfaExportStats exportGraph(
         const double final_graph_bp_ratio = exact_metrics.graph_bp == 0 ? 1.0 :
             static_cast<double>(result_metrics.graph_bp) /
             static_cast<double>(exact_metrics.graph_bp);
-        if (final_homology_retention < COMPACT_MIN_HOMOLOGY_RETENTION ||
-            final_graph_bp_ratio > COMPACT_MAX_GRAPH_BP_RATIO) {
+        if (final_homology_retention <
+                options.compact.minimum_homology_retention ||
+            final_graph_bp_ratio > options.compact.maximum_graph_bp_ratio) {
             throw std::runtime_error(
                 "Compact transforms exceeded a global safety budget; exact "
                 "shadow was retained");
         }
         fillStatsFromGraph(stats, result, result_metrics);
         writeCompactReports(report_dir, sequences, exact, result,
-                            exact_metrics, result_metrics, rejections, stats);
+                            options.compact, stages, rejections);
     } else {
         fillStatsFromGraph(stats, result, result_metrics);
     }

@@ -92,7 +92,8 @@ the seqfile must contain a Newick tree. Export order is MAF, PAF, GFA, then HAL.
 Native GFA export defaults to GFA 1.1 W-lines; use `--gfa-version 1.0` for
 GFA 1.0 P-line compatibility. The graph profile currently defaults to the
 audit-preserving `--gfa-profile exact`; `--gfa-profile compact` enables the
-lossless compact-v1 transforms and keeps an exact shadow under `work/gfa/`.
+lossless compact-v2-balanced transforms and keeps an exact shadow under
+`work/gfa/`.
 
 For seqwish, generate the matching qualified FASTA directly from the same
 seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by

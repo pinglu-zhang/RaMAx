@@ -273,7 +273,8 @@ struct CompactFixtureResult {
 CompactFixtureResult runCompactFixture(const fs::path& root,
                                        std::size_t short_run,
                                        int threads,
-                                       const std::string& label) {
+                                       const std::string& label,
+                                       std::size_t minimum_exact_run = 25) {
     const std::string shared_prefix(10000, 'A');
     CompactFixtureResult result;
     result.reference = shared_prefix + "C" + std::string(short_run, 'G');
@@ -305,6 +306,7 @@ CompactFixtureResult runCompactFixture(const fs::path& root,
     result.exact = root / (label + "-exact.gfa");
     result.exact_stats = graph.exportToGfa(result.exact, managers, options);
     options.profile = RaMesh::Gfa::Profile::COMPACT;
+    options.compact.minimum_exact_run_bp = minimum_exact_run;
     result.work = root / (label + "-work");
     options.work_dir = result.work;
     result.compact = root / (label + "-compact.gfa");
@@ -327,6 +329,19 @@ void testCompactThresholdAndDeterminism(const fs::path& root) {
             fs::exists(below.work / "gfa" / "compact_rejections.tsv") &&
             fs::exists(below.work / "gfa" / "compact_parameters.tsv"),
             "compact audit reports are published");
+    const std::string stage_stats = readFile(
+        below.work / "gfa" / "compact_stats.tsv");
+    require(stage_stats.find(
+                "metric\texact\tafter_filter\tafter_unitig\t"
+                "after_allele_islands\tfinal") != std::string::npos,
+            "compact report contains all transform stages");
+    const std::string parameters = readFile(
+        below.work / "gfa" / "compact_parameters.tsv");
+    require(parameters.find("profile\tcompact-v2-balanced") !=
+                std::string::npos &&
+            parameters.find("minimum_exact_run_bp\t25") !=
+                std::string::npos,
+            "compact report records the profile and effective configuration");
     const auto parsed = parseGfa(below.compact);
     require(spell(parsed, parsed.walks.at("ref.chr1")) == below.reference,
             "compact reference walk is lossless");
@@ -426,6 +441,19 @@ void testUnitigAndCompoundAllele(const fs::path& root) {
         require(spell(parsed, parsed.walks.at("query.chr1")) ==
                     query_sequence,
                 "compound query allele is lossless");
+
+        options.compact.enable_compound_alleles = false;
+        options.work_dir = root / "allele-disabled-work";
+        const auto disabled_stats = graph.exportToGfa(
+            root / "allele-disabled.gfa", managers, options);
+        require(disabled_stats.allele_islands == 0,
+                "compound allele rewriting can be disabled internally");
+        const auto disabled = parseGfa(root / "allele-disabled.gfa");
+        require(spell(disabled, disabled.walks.at("ref.chr1")) ==
+                    reference_sequence &&
+                spell(disabled, disabled.walks.at("query.chr1")) ==
+                    query_sequence,
+                "disabling compound alleles remains lossless");
     }
 }
 

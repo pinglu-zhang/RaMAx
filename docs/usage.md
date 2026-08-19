@@ -113,8 +113,9 @@ output list contains PAF and rejected otherwise.
 
 GFA defaults to `--gfa-version 1.1`, with one structured W-line per input
 contig. Version `1.0` writes one P-line per contig. The graph profile currently
-defaults to `exact`; `--gfa-profile compact` applies compact-v1 and writes its
-exact shadow and audit tables under `work/gfa/`. Explicitly supplying either
+defaults to `exact`; `--gfa-profile compact` applies compact-v2-balanced and
+writes its exact shadow and staged audit tables under `work/gfa/`. Explicitly
+supplying either
 GFA option without a GFA output is rejected.
 
 Build the seqwish sequence input from the same seqfile. The companion tool

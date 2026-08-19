@@ -103,13 +103,21 @@ P-lines for compatibility with GFA 1.0 consumers. The option is rejected when
 the output list has no `.gfa` path.
 
 `--gfa-profile exact` is the current default and preserves every maximal exact
-run as the audit graph. `--gfa-profile compact` enables compact-v1: exact runs
-shorter than 25 bp are left private, occurrence-equivalent chains are unitigged,
-and safe dense small-variant intervals may be rewritten as observed compound
-alleles. It never invents an allele or removes sequence from an input path.
+run as the audit graph. `--gfa-profile compact` enables
+compact-v2-balanced: exact runs shorter than the selected balanced threshold
+are left private, occurrence-equivalent chains are unitigged, and conservative
+dense small-variant intervals may be rewritten as observed compound alleles.
+The profile favors SV accuracy among configurations with PGGB-like graph
+granularity. It never invents an allele or removes sequence from an input path.
 Compact export keeps the same-version exact graph at `work/gfa/exact.gfa` and
 writes `compact_transform.tsv`, `compact_stats.tsv`,
 `compact_rejections.tsv`, and `compact_parameters.tsv` beside it.
+
+`compact_stats.tsv` reports the exact graph, short-relation filtering, first
+unitig pass, compound-allele pass, and final unitig pass separately. The
+effective fixed policy and profile version are recorded in
+`compact_parameters.tsv`; these implementation parameters are not runtime CLI
+options.
 
 Both versions use byte-identical S-lines, L-lines, deterministic numeric node
 IDs, and `0M` link overlap. They differ only in path serialization:

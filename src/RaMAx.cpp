@@ -49,7 +49,7 @@ struct CommonArgs {
     bool paf_mode_explicit = false;              // CLI-only; intentionally not serialized
     std::string gfa_version = "1.1";             // GFA path encoding: 1.0 P-lines or 1.1 W-lines
     bool gfa_version_explicit = false;            // CLI-only; intentionally not serialized
-    std::string gfa_profile = "exact";            // exact audit graph or compact-v1 graph
+    std::string gfa_profile = "exact";            // exact audit graph or compact-v2-balanced graph
     bool gfa_profile_explicit = false;            // CLI-only; intentionally not serialized
     bool trust_legacy_cache = false;              // persisted until legacy workdir is discarded
     bool pending_config_update = false;           // runtime-only post-input-validation write
@@ -1104,7 +1104,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->check(CLI::IsMember({"1.0", "1.1"}));
 
     cmd->add_option("--gfa-profile", args.gfa_profile,
-        "GFA graph profile: exact preserves the audit graph; compact applies compact-v1 (default: exact).")
+        "GFA graph profile: exact preserves the audit graph; compact applies compact-v2-balanced (default: exact).")
         ->default_val("exact")
         ->capture_default_str()
         ->group("Output")
