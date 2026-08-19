@@ -2,9 +2,45 @@
 
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace RaMesh::Realignment {
+
+void BlockView::OrderedAnchorRefs::assign(const ChrHeadMap& anchors) {
+    entries_.clear();
+    entries_.reserve(anchors.size());
+    for (const auto& entry : anchors) {
+        entries_.push_back(&entry);
+    }
+    std::sort(
+        entries_.begin(), entries_.end(),
+        [](const AnchorEntry* left, const AnchorEntry* right) {
+            return left->first < right->first;
+        });
+}
+
+BlockView::OrderedAnchorRefs::const_iterator
+BlockView::OrderedAnchorRefs::find(const SpeciesChrPair& key) const {
+    const auto found = std::lower_bound(
+        entries_.begin(), entries_.end(), key,
+        [](const AnchorEntry* entry, const SpeciesChrPair& value) {
+            return entry->first < value;
+        });
+    if (found == entries_.end() || (*found)->first != key) {
+        return end();
+    }
+    return const_iterator(found);
+}
+
+const SegPtr& BlockView::OrderedAnchorRefs::at(
+    const SpeciesChrPair& key) const {
+    const auto found = find(key);
+    if (found == end()) {
+        throw std::out_of_range("BlockView anchor key is absent");
+    }
+    return found->second;
+}
 
 BlockViewBuilder::BlockViewBuilder(SpeciesName reference_species,
                                    uint64_t graph_version)
@@ -77,8 +113,8 @@ bool BlockViewBuilder::buildUncached(
             !species.insert(key.first).second) {
             return false;
         }
-        view.anchors.emplace(key, segment);
     }
+    view.anchors.assign(block->anchors);
 
     const ChrName& reference_chromosome =
         profile == BlockViewProfile::Diagnostics
