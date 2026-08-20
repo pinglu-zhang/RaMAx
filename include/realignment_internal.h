@@ -6,8 +6,11 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <iterator>
+#include <memory>
 #include <optional>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -82,15 +85,20 @@ struct BlockView {
             std::vector<const AnchorEntry*>::const_iterator iterator_{};
         };
 
+        OrderedAnchorRefs();
         void assign(const ChrHeadMap& anchors);
-        void clear() noexcept { entries_.clear(); }
-        [[nodiscard]] size_t size() const noexcept { return entries_.size(); }
-        [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
+        void clear();
+        [[nodiscard]] size_t size() const noexcept {
+            return entries_->size();
+        }
+        [[nodiscard]] bool empty() const noexcept {
+            return entries_->empty();
+        }
         [[nodiscard]] const_iterator begin() const {
-            return const_iterator(entries_.begin());
+            return const_iterator(entries_->begin());
         }
         [[nodiscard]] const_iterator end() const {
-            return const_iterator(entries_.end());
+            return const_iterator(entries_->end());
         }
         [[nodiscard]] const_iterator find(const SpeciesChrPair& key) const;
         [[nodiscard]] size_t count(const SpeciesChrPair& key) const {
@@ -99,7 +107,7 @@ struct BlockView {
         [[nodiscard]] const SegPtr& at(const SpeciesChrPair& key) const;
 
     private:
-        std::vector<const AnchorEntry*> entries_;
+        std::shared_ptr<std::vector<const AnchorEntry*>> entries_;
     };
 
     BlockPtr block;
@@ -156,6 +164,49 @@ public:
         const std::vector<PlannerConflictFootprint>& footprints,
         const std::vector<const Block*>& reserved_reads = {},
         const std::vector<const Block*>& reserved_writes = {});
+};
+
+// Stateful equivalent of repeatedly calling selectConflictFreeBatch().  The
+// old fixed-size batching code rebuilt and rescanned every remaining candidate
+// after each batch, which becomes quadratic on multi-million-Block graphs.
+// This scheduler retains the same stable greedy order while visiting a
+// candidate again only when an earlier conflicting candidate failed.
+class MissingWindowBatchScheduler {
+public:
+    MissingWindowBatchScheduler(
+        std::vector<size_t> ordered_candidates,
+        const std::vector<PlannerConflictFootprint>& footprints,
+        const std::vector<size_t>& anchor_counts);
+
+    [[nodiscard]] std::vector<size_t> nextBatch(
+        size_t maximum_windows,
+        size_t maximum_anchors,
+        bool defer_anchor_overflow = false);
+
+    void completeBatch(
+        const std::vector<size_t>& batch,
+        const std::vector<bool>& succeeded);
+
+    [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] size_t droppedConflicts() const noexcept;
+    [[nodiscard]] size_t retriedCandidates() const noexcept;
+    [[nodiscard]] size_t pendingCandidates() const noexcept;
+
+private:
+    [[nodiscard]] static bool conflicts(
+        const PlannerConflictFootprint& footprint,
+        const std::unordered_set<const Block*>& reads,
+        const std::unordered_set<const Block*>& writes);
+
+    const std::vector<PlannerConflictFootprint>* footprints_ = nullptr;
+    const std::vector<size_t>* anchor_counts_ = nullptr;
+    std::deque<size_t> pending_;
+    std::vector<size_t> batch_deferred_;
+    std::unordered_set<const Block*> committed_reads_;
+    std::unordered_set<const Block*> committed_writes_;
+    bool batch_active_ = false;
+    size_t dropped_conflicts_ = 0;
+    size_t retried_candidates_ = 0;
 };
 
 }  // namespace RaMesh::Realignment
