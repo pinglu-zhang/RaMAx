@@ -6,28 +6,41 @@
 #include <unordered_set>
 
 namespace RaMesh::Realignment {
+namespace {
+
+constexpr size_t kMaximumBlockViewCacheEntries = 65536;
+
+}  // namespace
+
+BlockView::OrderedAnchorRefs::OrderedAnchorRefs()
+    : entries_(std::make_shared<std::vector<const AnchorEntry*>>()) {}
 
 void BlockView::OrderedAnchorRefs::assign(const ChrHeadMap& anchors) {
-    entries_.clear();
-    entries_.reserve(anchors.size());
+    auto entries = std::make_shared<std::vector<const AnchorEntry*>>();
+    entries->reserve(anchors.size());
     for (const auto& entry : anchors) {
-        entries_.push_back(&entry);
+        entries->push_back(&entry);
     }
     std::sort(
-        entries_.begin(), entries_.end(),
+        entries->begin(), entries->end(),
         [](const AnchorEntry* left, const AnchorEntry* right) {
             return left->first < right->first;
         });
+    entries_ = std::move(entries);
+}
+
+void BlockView::OrderedAnchorRefs::clear() {
+    entries_ = std::make_shared<std::vector<const AnchorEntry*>>();
 }
 
 BlockView::OrderedAnchorRefs::const_iterator
 BlockView::OrderedAnchorRefs::find(const SpeciesChrPair& key) const {
     const auto found = std::lower_bound(
-        entries_.begin(), entries_.end(), key,
+        entries_->begin(), entries_->end(), key,
         [](const AnchorEntry* entry, const SpeciesChrPair& value) {
             return entry->first < value;
         });
-    if (found == entries_.end() || (*found)->first != key) {
+    if (found == entries_->end() || (*found)->first != key) {
         return end();
     }
     return const_iterator(found);
@@ -76,6 +89,9 @@ bool BlockViewBuilder::build(
         if (!cached->second) return false;
         view = *cached->second;
         return true;
+    }
+    if (cache_.size() >= kMaximumBlockViewCacheEntries) {
+        cache_.clear();
     }
     BlockView built;
     if (!buildUncached(block, profile, built,
@@ -167,6 +183,143 @@ std::vector<size_t> MissingWindowPlanner::selectConflictFreeBatch(
         writes.insert(footprint.writes.begin(), footprint.writes.end());
     }
     return selected;
+}
+
+MissingWindowBatchScheduler::MissingWindowBatchScheduler(
+    std::vector<size_t> ordered_candidates,
+    const std::vector<PlannerConflictFootprint>& footprints,
+    const std::vector<size_t>& anchor_counts)
+    : footprints_(&footprints), anchor_counts_(&anchor_counts),
+      pending_(ordered_candidates.begin(), ordered_candidates.end()) {
+    if (anchor_counts.size() != footprints.size()) {
+        throw std::invalid_argument(
+            "Missing-window scheduler footprint/count size mismatch");
+    }
+}
+
+bool MissingWindowBatchScheduler::conflicts(
+    const PlannerConflictFootprint& footprint,
+    const std::unordered_set<const Block*>& reads,
+    const std::unordered_set<const Block*>& writes) {
+    for (const Block* block : footprint.writes) {
+        if (!block || reads.count(block) != 0) return true;
+    }
+    for (const Block* block : footprint.reads) {
+        if (!block || writes.count(block) != 0) return true;
+    }
+    return false;
+}
+
+std::vector<size_t> MissingWindowBatchScheduler::nextBatch(
+    size_t maximum_windows,
+    size_t maximum_anchors,
+    bool defer_anchor_overflow) {
+    if (batch_active_) {
+        throw std::logic_error(
+            "Missing-window scheduler batch was not completed");
+    }
+    if (maximum_windows == 0 || maximum_anchors == 0) {
+        throw std::invalid_argument(
+            "Missing-window scheduler limits must be positive");
+    }
+
+    batch_deferred_.clear();
+    std::unordered_set<const Block*> batch_reads;
+    std::unordered_set<const Block*> batch_writes;
+    std::vector<size_t> batch;
+    batch.reserve(std::min(maximum_windows, pending_.size()));
+    size_t anchors = 0;
+
+    while (!pending_.empty()) {
+        const size_t index = pending_.front();
+        pending_.pop_front();
+        if (index >= footprints_->size()) {
+            ++dropped_conflicts_;
+            continue;
+        }
+        const auto& footprint = (*footprints_)[index];
+        if (conflicts(footprint, committed_reads_, committed_writes_)) {
+            ++dropped_conflicts_;
+            continue;
+        }
+        if (conflicts(footprint, batch_reads, batch_writes)) {
+            batch_deferred_.push_back(index);
+            continue;
+        }
+
+        const size_t next_anchors = (*anchor_counts_)[index];
+        if (!batch.empty() && batch.size() >= maximum_windows) {
+            pending_.push_front(index);
+            break;
+        }
+        if (!batch.empty() &&
+            anchors + next_anchors > maximum_anchors) {
+            if (defer_anchor_overflow) {
+                batch_deferred_.push_back(index);
+                continue;
+            }
+            pending_.push_front(index);
+            break;
+        }
+
+        batch.push_back(index);
+        anchors += next_anchors;
+        batch_reads.insert(footprint.reads.begin(), footprint.reads.end());
+        batch_writes.insert(footprint.writes.begin(), footprint.writes.end());
+    }
+
+    batch_active_ = !batch.empty();
+    if (!batch_active_ && !batch_deferred_.empty()) {
+        throw std::logic_error(
+            "Missing-window scheduler deferred candidates without a blocker");
+    }
+    return batch;
+}
+
+void MissingWindowBatchScheduler::completeBatch(
+    const std::vector<size_t>& batch,
+    const std::vector<bool>& succeeded) {
+    if (!batch_active_ || batch.size() != succeeded.size()) {
+        throw std::logic_error(
+            "Missing-window scheduler completed an invalid batch");
+    }
+    for (size_t slot = 0; slot < batch.size(); ++slot) {
+        if (!succeeded[slot]) continue;
+        const size_t index = batch[slot];
+        if (index >= footprints_->size()) {
+            throw std::logic_error(
+                "Missing-window scheduler success index is invalid");
+        }
+        const auto& footprint = (*footprints_)[index];
+        committed_reads_.insert(
+            footprint.reads.begin(), footprint.reads.end());
+        committed_writes_.insert(
+            footprint.writes.begin(), footprint.writes.end());
+    }
+
+    retried_candidates_ += batch_deferred_.size();
+    for (auto iterator = batch_deferred_.rbegin();
+         iterator != batch_deferred_.rend(); ++iterator) {
+        pending_.push_front(*iterator);
+    }
+    batch_deferred_.clear();
+    batch_active_ = false;
+}
+
+bool MissingWindowBatchScheduler::empty() const noexcept {
+    return pending_.empty() && batch_deferred_.empty() && !batch_active_;
+}
+
+size_t MissingWindowBatchScheduler::droppedConflicts() const noexcept {
+    return dropped_conflicts_;
+}
+
+size_t MissingWindowBatchScheduler::retriedCandidates() const noexcept {
+    return retried_candidates_;
+}
+
+size_t MissingWindowBatchScheduler::pendingCandidates() const noexcept {
+    return pending_.size() + batch_deferred_.size();
 }
 
 }  // namespace RaMesh::Realignment

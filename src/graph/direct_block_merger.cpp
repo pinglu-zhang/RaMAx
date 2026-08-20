@@ -157,6 +157,31 @@ void logAllocationFailure(const char* module,
     }
 }
 
+void maybeLogRealignmentProgress(
+    const SpeciesName& reference_species,
+    const char* phase,
+    size_t generation,
+    size_t processed,
+    size_t candidates,
+    size_t pending,
+    size_t committed,
+    size_t batch_size,
+    const std::chrono::steady_clock::time_point& started,
+    std::chrono::steady_clock::time_point& last_report) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report < std::chrono::minutes(10)) return;
+    last_report = now;
+    const auto memory = readProcessMemorySnapshot();
+    spdlog::info(
+        "[species-mismatch-realign][progress] reference={} phase={} "
+        "generation={} processed={} candidates={} pending={} committed={} "
+        "batch_size={} elapsed_seconds={:.1f} vm_rss_kib={} vm_peak_kib={}",
+        reference_species, phase, generation, processed, candidates,
+        pending, committed, batch_size,
+        std::chrono::duration<double>(now - started).count(),
+        memory.rss_kib, memory.peak_kib);
+}
+
 class BlockPoolEditor {
 public:
     using AddedSlotMap = std::unordered_map<const Block*, size_t>;
@@ -3306,8 +3331,22 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             "Species-mismatch realignment reference is absent: " +
             reference_species);
     }
+    const auto realignment_started = std::chrono::steady_clock::now();
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=start "
+        "blocks={} species={} threads={} maximum_span={} "
+        "zero_gap_span={}",
+        reference_species, blocks.size(), seqpro_managers.size(),
+        parallel_threads, maximum_span, zero_gap_maximum_span);
+    const auto pool_index_started = std::chrono::steady_clock::now();
     AllocationPhaseScope pool_index_phase("pool-index");
     BlockPoolEditor pool_editor(blocks);
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=pool-index "
+        "status=done blocks={} wall_seconds={:.3f}",
+        reference_species, pool_editor.activeCount(),
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pool_index_started).count());
     std::set<SpeciesChrPair> affected_paths;
 
     constexpr size_t rejection_count =
@@ -3333,6 +3372,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     const size_t zero_gap_iteration_limit = blocks.size() + 1;
     bool zero_gap_full_scan = true;
     std::vector<std::pair<ChrName, SegPtr>> zero_gap_dirty_starts;
+    size_t zero_gap_reference_visits = 0;
+    const auto zero_gap_started = std::chrono::steady_clock::now();
+    auto zero_gap_last_report = zero_gap_started;
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=zero-gap "
+        "status=start",
+        reference_species);
 
     while (true) {
         AllocationPhaseScope iteration_phase("zero-gap-scan");
@@ -3356,6 +3402,15 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 const SegPtr& left_reference) {
                 if (!left_reference || left_reference->isTail()) {
                     return;
+                }
+                ++zero_gap_reference_visits;
+                if ((zero_gap_reference_visits & 65535U) == 0) {
+                    maybeLogRealignmentProgress(
+                        reference_species, "zero-gap-scan",
+                        zero_gap_scan_count, zero_gap_reference_visits,
+                        zero_gap_candidates.size(), 0,
+                        zero_gap_replaced_windows, 0,
+                        zero_gap_started, zero_gap_last_report);
                 }
                 const auto next_reference =
                     left_reference->primary_path.next.load(
@@ -3493,11 +3548,6 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
         size_t prepared_this_iteration = 0;
         size_t overlap_this_iteration = 0;
-        std::unordered_set<const Block*> reserved_read_blocks;
-        reserved_read_blocks.reserve(
-            std::min<size_t>(zero_gap_candidates.size() * 3, 262144));
-        std::vector<size_t> remaining(zero_gap_candidates.size());
-        std::iota(remaining.begin(), remaining.end(), 0);
         size_t committed_this_iteration = 0;
         size_t replaced_old_this_iteration = 0;
         size_t blocks_before_iteration = pool_editor.activeCount();
@@ -3516,47 +3566,24 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             return result;
         };
 
-        while (!remaining.empty()) {
-            std::vector<size_t> batch;
-            std::vector<size_t> deferred;
-            std::unordered_set<const Block*> batch_reads;
-            batch.reserve(std::min<size_t>(
-                kZeroGapBatchMaximumWindows, remaining.size()));
-            deferred.reserve(remaining.size());
-            size_t anchor_records = 0;
-            for (const size_t index : remaining) {
-                const auto reads = read_blocks(zero_gap_candidates[index]);
-                const bool conflicts_committed = std::any_of(
-                    reads.begin(), reads.end(), [&](const Block* block) {
-                        return block &&
-                            reserved_read_blocks.count(block) != 0;
-                    });
-                if (conflicts_committed) {
-                    ++overlap_this_iteration;
-                    ++zero_gap_rejections[static_cast<size_t>(
-                        MissingWindowReject::OVERLAPPING_PREPARED_WINDOW)];
-                    continue;
-                }
-                const bool conflicts_batch = std::any_of(
-                    reads.begin(), reads.end(), [&](const Block* block) {
-                        return block && batch_reads.count(block) != 0;
-                    });
-                const size_t next_anchors =
-                    zero_gap_candidates[index].boundary_species_count;
-                const bool batch_full =
-                    batch.size() >= kZeroGapBatchMaximumWindows ||
-                    (!batch.empty() &&
-                     anchor_records + next_anchors >
-                         kZeroGapBatchMaximumAnchors);
-                if (conflicts_batch || batch_full) {
-                    deferred.push_back(index);
-                    continue;
-                }
-                batch.push_back(index);
-                anchor_records += next_anchors;
-                batch_reads.insert(reads.begin(), reads.end());
-            }
-            remaining = std::move(deferred);
+        std::vector<Realignment::PlannerConflictFootprint> footprints;
+        std::vector<size_t> anchor_counts;
+        footprints.reserve(zero_gap_candidates.size());
+        anchor_counts.reserve(zero_gap_candidates.size());
+        for (const auto& candidate : zero_gap_candidates) {
+            auto reads = read_blocks(candidate);
+            footprints.push_back({reads, std::move(reads)});
+            anchor_counts.push_back(candidate.boundary_species_count);
+        }
+        std::vector<size_t> ordered(zero_gap_candidates.size());
+        std::iota(ordered.begin(), ordered.end(), 0);
+        Realignment::MissingWindowBatchScheduler scheduler(
+            std::move(ordered), footprints, anchor_counts);
+
+        while (!scheduler.empty()) {
+            const std::vector<size_t> batch = scheduler.nextBatch(
+                kZeroGapBatchMaximumWindows,
+                kZeroGapBatchMaximumAnchors, true);
             if (batch.empty()) break;
 
             const uint_t effective_threads = static_cast<uint_t>(
@@ -3631,10 +3658,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
             std::vector<MissingWindowCandidate> accepted_candidates;
             std::vector<PreparedChain> prepared;
+            std::vector<bool> batch_succeeded(batch.size(), false);
             accepted_candidates.reserve(batch.size());
             prepared.reserve(batch.size());
             for (size_t slot = 0; slot < batch.size(); ++slot) {
-                const size_t candidate_index = batch[slot];
                 if (!prepared_slots[slot]) {
                     auto result = prepare_results[slot];
                     if (result == MissingWindowReject::COUNT) {
@@ -3647,9 +3674,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 ++prepared_this_iteration;
                 ++g_allocation_prepared;
                 auto& candidate = *materialized_candidates[slot];
-                const auto reads =
-                    read_blocks(zero_gap_candidates[candidate_index]);
-                reserved_read_blocks.insert(reads.begin(), reads.end());
+                batch_succeeded[slot] = true;
                 if (detailed_stats) {
                     for (const auto& species : candidate.missing_species) {
                         ++zero_gap_accepted_by_missing_species[species];
@@ -3664,43 +3689,58 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 accepted_candidates.push_back(std::move(candidate));
                 prepared.push_back(std::move(*prepared_slots[slot]));
             }
-            if (prepared.empty()) continue;
-
-            const auto commit_start = std::chrono::steady_clock::now();
-            MissingWindowCommitResult commit;
-            {
-                AllocationPhaseScope commit_phase("zero-gap-commit-audit");
-                commit = commitPreparedMissingWindows(
-                    *this, accepted_candidates, prepared, pool_editor,
-                    affected_paths,
-                    seqpro_managers.size(), "zero-gap", true);
-            }
-            zero_gap_commit_seconds += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - commit_start).count();
-            committed_this_iteration += commit.replaced_windows;
-            replaced_old_this_iteration += commit.replaced_old_blocks;
-            for (const auto& chain : prepared) {
-                const auto reference_path = std::find_if(
-                    chain.paths.begin(), chain.paths.end(),
-                    [&](const PathReplacement& path) {
-                        return path.key.first == reference_species;
-                    });
-                if (reference_path == chain.paths.end() ||
-                    !reference_path->merged_segment) {
-                    continue;
+            if (!prepared.empty()) {
+                const auto commit_start = std::chrono::steady_clock::now();
+                MissingWindowCommitResult commit;
+                {
+                    AllocationPhaseScope commit_phase(
+                        "zero-gap-commit-audit");
+                    commit = commitPreparedMissingWindows(
+                        *this, accepted_candidates, prepared, pool_editor,
+                        affected_paths,
+                        seqpro_managers.size(), "zero-gap", true);
                 }
-                auto start = reference_path->merged_segment;
-                for (size_t distance = 0; distance < 3 && start;
-                     ++distance) {
-                    if (!start->isHead() && !start->isTail()) {
-                        zero_gap_dirty_starts.emplace_back(
-                            chain.candidate.reference_chromosome, start);
+                zero_gap_commit_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - commit_start).count();
+                committed_this_iteration += commit.replaced_windows;
+                replaced_old_this_iteration += commit.replaced_old_blocks;
+                for (const auto& chain : prepared) {
+                    const auto reference_path = std::find_if(
+                        chain.paths.begin(), chain.paths.end(),
+                        [&](const PathReplacement& path) {
+                            return path.key.first == reference_species;
+                        });
+                    if (reference_path == chain.paths.end() ||
+                        !reference_path->merged_segment) {
+                        continue;
                     }
-                    start = start->primary_path.prev.load(
-                        std::memory_order_acquire);
+                    auto start = reference_path->merged_segment;
+                    for (size_t distance = 0; distance < 3 && start;
+                         ++distance) {
+                        if (!start->isHead() && !start->isTail()) {
+                            zero_gap_dirty_starts.emplace_back(
+                                chain.candidate.reference_chromosome,
+                                start);
+                        }
+                        start = start->primary_path.prev.load(
+                            std::memory_order_acquire);
+                    }
                 }
             }
+            scheduler.completeBatch(batch, batch_succeeded);
+            maybeLogRealignmentProgress(
+                reference_species, "zero-gap-schedule",
+                zero_gap_scan_count, zero_gap_reference_visits,
+                zero_gap_candidates.size(),
+                scheduler.pendingCandidates(),
+                committed_this_iteration, batch.size(),
+                zero_gap_started, zero_gap_last_report);
         }
+
+        overlap_this_iteration = scheduler.droppedConflicts();
+        zero_gap_rejections[static_cast<size_t>(
+            MissingWindowReject::OVERLAPPING_PREPARED_WINDOW)] +=
+            overlap_this_iteration;
 
         zero_gap_prepare_seconds += prepare_seconds;
         zero_gap_prepared_events += prepared_this_iteration;
@@ -3738,6 +3778,16 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             replaced_old_this_iteration, blocks_before_iteration,
             pool_editor.activeCount());
     }
+
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=zero-gap "
+        "status=done scans={} visited={} candidates={} committed={} "
+        "wall_seconds={:.3f}",
+        reference_species, zero_gap_scan_count,
+        zero_gap_reference_visits, zero_gap_candidate_events,
+        zero_gap_replaced_windows,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - zero_gap_started).count());
 
     RejectionCounts rejections{};
     std::map<SpeciesName, size_t> accepted_by_missing_species;
@@ -3804,6 +3854,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             : static_cast<size_t>(minipoa_iteration_bound);
     bool minipoa_full_scan = true;
     std::vector<std::pair<ChrName, SegPtr>> minipoa_dirty_starts;
+    size_t minipoa_reference_visits = 0;
+    const auto minipoa_started = std::chrono::steady_clock::now();
+    auto minipoa_last_report = minipoa_started;
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=minipoa "
+        "status=start",
+        reference_species);
 
     while (true) {
         AllocationPhaseScope round_phase("minipoa-scan");
@@ -3830,6 +3887,15 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 const SegPtr& left_reference) {
                 if (!left_reference || left_reference->isTail()) {
                     return;
+                }
+                ++minipoa_reference_visits;
+                if ((minipoa_reference_visits & 65535U) == 0) {
+                    maybeLogRealignmentProgress(
+                        reference_species, "minipoa-scan",
+                        minipoa_rounds, minipoa_reference_visits,
+                        candidate_slots.size(), 0,
+                        ordinary_committed_total + hybrid_committed_total,
+                        0, minipoa_started, minipoa_last_report);
                 }
                 const auto next_reference =
                     left_reference->primary_path.next.load(
@@ -3899,7 +3965,16 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 auto cursor = next_reference;
                 SegPtr right_reference;
                 bool incompatible_boundary = false;
+                bool reference_span_exceeded = false;
+                const uint64_t left_reference_end =
+                    segmentEnd(left_reference);
                 while (cursor && !cursor->isTail()) {
+                    if (static_cast<uint64_t>(cursor->start) >
+                        left_reference_end +
+                            static_cast<uint64_t>(maximum_span)) {
+                        reference_span_exceeded = true;
+                        break;
+                    }
                     BlockView cursor_view;
                     if (!getCachedRealignBlockView(
                             cursor->parent_block, reference_species,
@@ -3923,7 +3998,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                         std::memory_order_acquire);
                 }
                 if (!right_reference) {
-                    if (incompatible_boundary) {
+                    if (reference_span_exceeded) {
+                        ++rejections[static_cast<size_t>(
+                            MissingWindowReject::INTERVAL_INVALID)];
+                    } else if (incompatible_boundary) {
                         ++rejections[static_cast<size_t>(
                             MissingWindowReject::
                                 INCOMPATIBLE_BOUNDARY_SIGNATURE)];
@@ -4055,8 +4133,6 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                        candidate_slots[rhs].boundary_species_count;
             });
 
-        std::unordered_set<const Block*> reserved_read_blocks;
-        std::unordered_set<const Block*> reserved_write_blocks;
         size_t round_batches = 0;
         size_t round_invocations = 0;
         size_t round_bypasses = 0;
@@ -4070,6 +4146,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         std::unordered_set<const Block*>
             failed_full_k_triple_blocks;
         minipoa_dirty_starts.clear();
+        std::unordered_set<const Segment*> minipoa_dirty_seen;
+        minipoa_dirty_seen.reserve(65536);
 
         const auto read_blocks = [](const MissingWindowPlan& candidate) {
             std::vector<const Block*> result;
@@ -4101,49 +4179,24 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         };
 
         std::vector<Realignment::PlannerConflictFootprint> footprints;
+        std::vector<size_t> anchor_counts;
         footprints.reserve(candidate_slots.size());
+        anchor_counts.reserve(candidate_slots.size());
         for (const auto& candidate : candidate_slots) {
             footprints.push_back(
                 {read_blocks(candidate), write_blocks(candidate)});
+            anchor_counts.push_back(candidate.boundary_species_count);
         }
+        Realignment::MissingWindowBatchScheduler scheduler(
+            std::move(remaining), footprints, anchor_counts);
 
-        while (!remaining.empty()) {
-            const std::vector<const Block*> reserved_reads(
-                reserved_read_blocks.begin(), reserved_read_blocks.end());
-            const std::vector<const Block*> reserved_writes(
-                reserved_write_blocks.begin(), reserved_write_blocks.end());
-            const std::vector<size_t> selected =
-                Realignment::MissingWindowPlanner::selectConflictFreeBatch(
-                    remaining, footprints, reserved_reads, reserved_writes);
-            std::vector<size_t> batch;
-            batch.reserve(std::min<size_t>(
-                kMinipoaBatchMaximumWindows, selected.size()));
-            size_t anchor_records = 0;
-            for (const size_t index : selected) {
-                const size_t next_anchors =
-                    candidate_slots[index].boundary_species_count;
-                if (batch.size() >= kMinipoaBatchMaximumWindows ||
-                    (!batch.empty() &&
-                     anchor_records + next_anchors >
-                         kMinipoaBatchMaximumAnchors)) {
-                    break;
-                }
-                batch.push_back(index);
-                anchor_records += next_anchors;
-            }
-            const std::unordered_set<size_t> selected_indices(
-                batch.begin(), batch.end());
-            std::vector<size_t> deferred;
-            for (const size_t index : remaining) {
-                if (selected_indices.count(index) == 0) {
-                    deferred.push_back(index);
-                }
-            }
+        while (!scheduler.empty()) {
+            const std::vector<size_t> batch = scheduler.nextBatch(
+                kMinipoaBatchMaximumWindows,
+                kMinipoaBatchMaximumAnchors);
             if (batch.empty()) {
-                conflict_deferred_total += deferred.size();
                 break;
             }
-            remaining = std::move(deferred);
             ++round_batches;
 
             const uint_t effective_threads = static_cast<uint_t>(
@@ -4239,6 +4292,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
 
             std::vector<MissingWindowCandidate> accepted_candidates;
             std::vector<PreparedChain> prepared;
+            std::vector<bool> batch_succeeded(batch.size(), false);
             accepted_candidates.reserve(batch.size());
             prepared.reserve(batch.size());
             for (size_t slot = 0; slot < batch.size(); ++slot) {
@@ -4302,8 +4356,7 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                         "Unified minipoa candidate write set changed "
                         "during preparation");
                 }
-                reserved_read_blocks.insert(reads.begin(), reads.end());
-                reserved_write_blocks.insert(writes.begin(), writes.end());
+                batch_succeeded[slot] = true;
                 if (detailed_stats) {
                     for (const auto& species : candidate.missing_species) {
                         ++accepted_by_missing_species[species];
@@ -4382,6 +4435,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     bool is_replacement = true;
                     while (start && !start->isHead()) {
                         if (!start->isTail()) {
+                            if (!minipoa_dirty_seen.insert(
+                                    start.get()).second) {
+                                break;
+                            }
                             minipoa_dirty_starts.emplace_back(
                                 chain.candidate.reference_chromosome,
                                 start);
@@ -4402,7 +4459,16 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     }
                 }
             }
+            scheduler.completeBatch(batch, batch_succeeded);
+            maybeLogRealignmentProgress(
+                reference_species, "minipoa-schedule",
+                minipoa_rounds, minipoa_reference_visits,
+                candidate_slots.size(), scheduler.pendingCandidates(),
+                round_ordinary_committed + round_hybrid_committed,
+                batch.size(), minipoa_started, minipoa_last_report);
         }
+
+        conflict_deferred_total += scheduler.droppedConflicts();
 
         minipoa_invocations_total += round_invocations;
         reference_only_bypass_total += round_bypasses;
@@ -4448,7 +4514,23 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             round_prepare_seconds);
     }
 
+    spdlog::info(
+        "[species-mismatch-realign][phase] reference={} phase=minipoa "
+        "status=done rounds={} visited={} candidates={} committed={} "
+        "calls={} wall_seconds={:.3f}",
+        reference_species, minipoa_rounds, minipoa_reference_visits,
+        ordinary_candidates_total + hybrid_candidates_total,
+        ordinary_committed_total + hybrid_committed_total,
+        minipoa_invocations_total,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - minipoa_started).count());
+
     {
+        spdlog::info(
+            "[species-mismatch-realign][phase] reference={} "
+            "phase=final-audit status=start affected_paths={}",
+            reference_species, affected_paths.size());
+        const auto final_audit_started = std::chrono::steady_clock::now();
         AllocationPhaseScope audit_phase("final-pool-audit");
         if (!rebuildSamplingAndAuditPaths(
                 *this, affected_paths, pool_editor)) {
@@ -4460,6 +4542,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
             throw std::runtime_error(
                 "Species-mismatch final Block pool audit failed");
         }
+        spdlog::info(
+            "[species-mismatch-realign][phase] reference={} "
+            "phase=final-audit status=done blocks={} wall_seconds={:.3f}",
+            reference_species, pool_editor.activeCount(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - final_audit_started)
+                .count());
     }
 
     const size_t minipoa_committed_total =
@@ -4517,7 +4606,8 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     spdlog::info(
         "[species-mismatch-realign] reference={} replaced={} "
         "zero_gap={} minipoa={} calls={} bypass={} "
-        "time(scan/prepare/commit)={:.3f}/{:.3f}/{:.3f}s",
+        "time(scan/prepare/commit)={:.3f}/{:.3f}/{:.3f}s "
+        "total_seconds={:.3f}",
         reference_species,
         zero_gap_replaced_windows + minipoa_committed_total,
         zero_gap_replaced_windows, minipoa_committed_total,
@@ -4525,7 +4615,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         reference_only_bypass_total + reference_empty_bypass_total,
         zero_gap_scan_seconds + minipoa_scan_seconds,
         zero_gap_prepare_seconds + minipoa_prepare_seconds,
-        zero_gap_commit_seconds + minipoa_commit_seconds);
+        zero_gap_commit_seconds + minipoa_commit_seconds,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - realignment_started).count());
     spdlog::debug(
         "[species-mismatch-realign][adjacent-pair] reference={} "
         "minipoa_candidates={} minipoa_committed={} "
