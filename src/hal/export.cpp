@@ -6,6 +6,7 @@
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/maximum_weighted_matching.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -28,6 +29,7 @@
 #include <tuple>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -69,6 +71,7 @@ struct BlockMSA {
     uint64_t block_id = 0;
     std::string ref_row_id;
     size_t alignment_length = 0;
+    bool secondary_homology = false;
     ExportBlockOrderKey order_key;
     std::vector<LeafRow> leaf_rows;
 };
@@ -96,6 +99,7 @@ struct ColumnRun {
     uint64_t block_id = 0;
     uint32_t col_beg = 0;
     uint32_t col_end = 0;
+    bool secondary_homology = false;
     std::vector<uint8_t> leaf_present;
     std::vector<LeafRunSpan> leaf_spans;
     std::vector<uint8_t> present_by_node;
@@ -271,8 +275,15 @@ std::vector<std::string> fetchSequenceNames(const VariantLike& shared_mv) {
     }, *shared_mv);
 }
 
-std::string makeLeafSequenceName(const std::string& species, const std::string& chr) {
-    return species + "." + chr;
+std::string makeLeafSequenceName(
+    const std::string& species,
+    const std::string& chr) {
+    const std::string prefix =
+        species + ".";
+    if (chr.starts_with(prefix)) {
+        return chr;
+    }
+    return prefix + chr;
 }
 
 std::string makeLeafRowId(const std::string& species, const std::string& chr) {
@@ -435,15 +446,20 @@ BlockMSA buildBlockMSA(
     const BlockPtr& block,
     const TreeMeta& tree,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-    const SoftMask::IndexMap& softmask_indexes) {
+    const SoftMask::IndexMap* softmask_indexes) {
     if (!block) {
         throw std::runtime_error("Null block passed to buildBlockMSA");
     }
 
     std::unordered_map<std::string, std::string> sequences;
+    // Alignment decisions must not depend on output-only soft-mask case.
+    // Keep an oriented case-preserving copy and overlay it only after the
+    // uppercase rows have been aligned.
+    std::unordered_map<std::string, std::string> output_sequences;
     std::unordered_map<ChrName, Cigar_t> cigars;
     std::unordered_map<std::string, LeafRow> rows;
     std::vector<std::pair<SpeciesChrPair, SegPtr>> occurrences;
+    bool secondary_homology = false;
 
     {
         std::shared_lock block_lock(block->rw);
@@ -453,89 +469,104 @@ BlockMSA buildBlockMSA(
             if (node_it == tree.name_to_id.end() || !tree.nodes[node_it->second].is_leaf) {
                 continue;
             }
+            secondary_homology =
+                secondary_homology ||
+                !segment->isPrimary();
             occurrences.emplace_back(species_chr, segment);
         }
     }
-    std::sort(occurrences.begin(), occurrences.end(), [](const auto& lhs, const auto& rhs) {
-        const auto& lhs_key = lhs.first;
-        const auto& rhs_key = rhs.first;
-        const auto& lhs_segment = lhs.second;
-        const auto& rhs_segment = rhs.second;
-        return std::tie(
-                   lhs_key.first,
-                   lhs_key.second,
-                   lhs_segment->start,
-                   lhs_segment->length,
-                   lhs_segment->strand) <
-               std::tie(
-                   rhs_key.first,
-                   rhs_key.second,
-                   rhs_segment->start,
-                   rhs_segment->length,
-                   rhs_segment->strand);
-    });
+    std::sort(occurrences.begin(), occurrences.end(),
+              [](const auto &lhs, const auto &rhs) {
+                const auto &lhs_key = lhs.first;
+                const auto &rhs_key = rhs.first;
+                const auto &lhs_segment = lhs.second;
+                const auto &rhs_segment = rhs.second;
+                return std::tie(lhs_key.first, lhs_key.second,
+                                lhs_segment->start, lhs_segment->length,
+                                lhs_segment->strand, lhs_segment->align_role) <
+                       std::tie(rhs_key.first, rhs_key.second,
+                                rhs_segment->start, rhs_segment->length,
+                                rhs_segment->strand, rhs_segment->align_role);
+              });
 
     std::unordered_map<std::string, uint32_t> next_occurrence;
     std::vector<std::string> reference_rows;
-    for (const auto& [species_chr, segment] : occurrences) {
-        auto mgr_it = seqpro_managers.find(species_chr.first);
-        if (mgr_it == seqpro_managers.end()) {
-            continue;
-        }
+    for (const auto &[species_chr, segment] : occurrences) {
+      auto mgr_it = seqpro_managers.find(species_chr.first);
+      if (mgr_it == seqpro_managers.end()) {
+        continue;
+      }
 
-        const std::string sequence_key = makeLeafRowId(species_chr.first, species_chr.second);
-        const uint32_t occurrence = next_occurrence[sequence_key]++;
-        const std::string row_id = sequence_key + '\1' + std::to_string(occurrence);
-        std::string dna = fetchSubSequence(
-            mgr_it->second, species_chr.second, segment->start, segment->length);
-        const auto softmask_it = softmask_indexes.find(species_chr.first);
-        if (softmask_it == softmask_indexes.end() || !softmask_it->second) {
-            throw std::runtime_error(
-                "Missing soft-mask index for leaf genome: " + species_chr.first);
+      const std::string sequence_key =
+          makeLeafRowId(species_chr.first, species_chr.second);
+      const uint32_t occurrence = next_occurrence[sequence_key]++;
+      const std::string row_id =
+          sequence_key + '\1' + std::to_string(occurrence);
+      std::string dna = fetchSubSequence(mgr_it->second, species_chr.second,
+                                         segment->start, segment->length);
+      std::string output_dna;
+      if (softmask_indexes != nullptr) {
+        const auto softmask_it =
+            softmask_indexes->find(species_chr.first);
+        if (softmask_it == softmask_indexes->end() ||
+            !softmask_it->second) {
+          throw std::runtime_error("Missing soft-mask index for leaf genome: " +
+                                   species_chr.first);
         }
+        output_dna = dna;
         softmask_it->second->restore(
-            species_chr.second, segment->start, dna);
-        if (segment->strand == Strand::REVERSE) {
-            reverseComplement(dna);
+            species_chr.second, segment->start, output_dna);
+      }
+      if (segment->strand == Strand::REVERSE) {
+        reverseComplement(dna);
+        if (!output_dna.empty()) {
+          reverseComplement(output_dna);
         }
-        sequences.emplace(row_id, std::move(dna));
-        cigars.emplace(row_id, segment->cigar);
+      }
+      sequences.emplace(row_id, std::move(dna));
+      if (!output_dna.empty()) {
+        output_sequences.emplace(
+            row_id, std::move(output_dna));
+      }
+      cigars.emplace(row_id, segment->cigar);
 
-        LeafRow row;
-        row.row_id = row_id;
-        row.leaf_name = species_chr.first;
-        row.chr_name = species_chr.second;
-        row.hal_sequence_name = makeLeafSequenceName(species_chr.first, species_chr.second);
-        row.segment_start = segment->start;
-        row.segment_length = segment->length;
-        row.reversed = (segment->strand == Strand::REVERSE);
-        rows.emplace(row_id, std::move(row));
-        if (species_chr.first == block->ref_species &&
-            species_chr.second == block->ref_chr) {
-            reference_rows.push_back(row_id);
-        }
+      LeafRow row;
+      row.row_id = row_id;
+      row.leaf_name = species_chr.first;
+      row.chr_name = species_chr.second;
+      row.hal_sequence_name =
+          makeLeafSequenceName(species_chr.first, species_chr.second);
+      row.segment_start = segment->start;
+      row.segment_length = segment->length;
+      row.reversed = (segment->strand == Strand::REVERSE);
+      rows.emplace(row_id, std::move(row));
+      if (species_chr.first == block->ref_species &&
+          species_chr.second == block->ref_chr && segment->isPrimary()) {
+        reference_rows.push_back(row_id);
+      }
     }
 
     if (sequences.empty()) {
-        return {};
+      return {};
     }
     if (reference_rows.size() != 1) {
-        throw std::runtime_error(
-            "HAL export failed: block " + std::to_string(block->block_id) +
-            " must contain exactly one declared reference occurrence '" +
-            block->ref_species + "." + block->ref_chr + "', found " +
-            std::to_string(reference_rows.size()));
+      throw std::runtime_error(
+          "HAL export failed: block " + std::to_string(block->block_id) +
+          " must contain exactly one primary declared reference occurrence '" +
+          block->ref_species + "." + block->ref_chr + "', found " +
+          std::to_string(reference_rows.size()));
     }
-    const std::string& ref_row_id = reference_rows.front();
+    const std::string &ref_row_id = reference_rows.front();
     const auto ref_row_it = rows.find(ref_row_id);
 
     try {
-        mergeAlignmentByRef(ref_row_id, sequences, cigars);
-    } catch (const std::exception& e) {
-        std::ostringstream oss;
-        oss << "HAL export failed: mergeAlignmentByRef on block " << block->block_id
-            << " (" << block->ref_species << "," << block->ref_chr << ") threw: " << e.what();
-        throw std::runtime_error(oss.str());
+      mergeAlignmentByRef(ref_row_id, sequences, cigars);
+    } catch (const std::exception &e) {
+      std::ostringstream oss;
+      oss << "HAL export failed: mergeAlignmentByRef on block "
+          << block->block_id << " (" << block->ref_species << ","
+          << block->ref_chr << ") threw: " << e.what();
+      throw std::runtime_error(oss.str());
     }
 
     BlockMSA msa;
@@ -543,6 +574,7 @@ BlockMSA buildBlockMSA(
     msa.block_id = block->block_id;
     msa.ref_row_id = ref_row_id;
     msa.alignment_length = sequences.at(ref_row_id).size();
+    msa.secondary_homology = secondary_homology;
     msa.order_key.ref_species = block->ref_species;
     msa.order_key.ref_chr = block->ref_chr;
     msa.order_key.ref_start = ref_row_it->second.segment_start;
@@ -554,6 +586,30 @@ BlockMSA buildBlockMSA(
             throw std::runtime_error(
                 "HAL export failed: inconsistent aligned row length in block " +
                 std::to_string(block->block_id));
+        }
+        const auto output_it =
+            output_sequences.find(row_id);
+        if (output_it != output_sequences.end()) {
+            size_t source_index = 0;
+            for (char& base : aligned) {
+                if (base == '-') {
+                    continue;
+                }
+                if (source_index >=
+                    output_it->second.size()) {
+                    throw std::runtime_error(
+                        "HAL export failed: aligned occurrence exceeds "
+                        "its soft-mask source");
+                }
+                base = output_it->second[
+                    source_index++];
+            }
+            if (source_index !=
+                output_it->second.size()) {
+                throw std::runtime_error(
+                    "HAL export failed: aligned occurrence did not consume "
+                    "its soft-mask source");
+            }
         }
         auto row_it = rows.find(row_id);
         if (row_it == rows.end()) {
@@ -595,6 +651,8 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
             run.block_id = msa.block_id;
             run.col_beg = projection.col_beg;
             run.col_end = projection.col_end;
+            run.secondary_homology =
+                msa.secondary_homology;
             run.leaf_present.assign(tree.leaf_ids.size(), 0);
             run.leaf_spans.reserve(projection.occurrences.size());
 
@@ -620,6 +678,1745 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
         }
     }
     return runs;
+}
+
+struct RunCoordinateTransform {
+    uint32_t root = 0;
+    int8_t sign = 1;
+    int64_t shift = 0;
+};
+
+class RunCoordinateUnion {
+public:
+    explicit RunCoordinateUnion(size_t count)
+        : parent_(count),
+          rank_(count, 0),
+          component_size_(count, 1),
+          sign_to_parent_(count, 1),
+          shift_to_parent_(count, 0) {
+        if (count > static_cast<size_t>(
+                        std::numeric_limits<uint32_t>::max())) {
+            throw std::overflow_error(
+                "Too many HAL column runs for coordinate unification");
+        }
+        std::iota(parent_.begin(), parent_.end(), 0U);
+    }
+
+    RunCoordinateTransform find(uint32_t node) {
+        const uint32_t parent = parent_.at(node);
+        if (parent == node) {
+            return {node, 1, 0};
+        }
+        const auto parent_transform = find(parent);
+        const int8_t old_sign = sign_to_parent_[node];
+        const int64_t old_shift = shift_to_parent_[node];
+        parent_[node] = parent_transform.root;
+        sign_to_parent_[node] = static_cast<int8_t>(
+            parent_transform.sign * old_sign);
+        shift_to_parent_[node] =
+            static_cast<int64_t>(parent_transform.sign) *
+                old_shift +
+            parent_transform.shift;
+        return {
+            parent_[node],
+            sign_to_parent_[node],
+            shift_to_parent_[node]};
+    }
+
+    bool unite(
+        uint32_t first,
+        uint32_t second,
+        int8_t second_sign_from_first,
+        int64_t second_shift_from_first) {
+        const auto first_transform = find(first);
+        const auto second_transform = find(second);
+        if (first_transform.root == second_transform.root) {
+            const int8_t expected_sign = static_cast<int8_t>(
+                second_transform.sign * second_sign_from_first);
+            const int64_t expected_shift =
+                static_cast<int64_t>(second_transform.sign) *
+                    second_shift_from_first +
+                second_transform.shift;
+            if (first_transform.sign != expected_sign ||
+                first_transform.shift != expected_shift) {
+                throw std::runtime_error(
+                    "HAL run coordinate unification found an "
+                    "inconsistent homology cycle");
+            }
+            return false;
+        }
+
+        const uint32_t first_root = first_transform.root;
+        const uint32_t second_root = second_transform.root;
+        if (rank_[first_root] >= rank_[second_root]) {
+            const int8_t root_sign = static_cast<int8_t>(
+                first_transform.sign *
+                second_sign_from_first *
+                second_transform.sign);
+            const int64_t root_shift =
+                first_transform.shift -
+                static_cast<int64_t>(
+                    first_transform.sign *
+                    second_sign_from_first) *
+                    second_shift_from_first -
+                static_cast<int64_t>(root_sign) *
+                    second_transform.shift;
+            parent_[second_root] = first_root;
+            sign_to_parent_[second_root] = root_sign;
+            shift_to_parent_[second_root] = root_shift;
+            component_size_[first_root] +=
+                component_size_[second_root];
+            if (rank_[first_root] == rank_[second_root]) {
+                ++rank_[first_root];
+            }
+        } else {
+            const int8_t root_sign = static_cast<int8_t>(
+                second_transform.sign *
+                second_sign_from_first *
+                first_transform.sign);
+            const int64_t root_shift =
+                static_cast<int64_t>(second_transform.sign) *
+                    second_shift_from_first +
+                second_transform.shift -
+                static_cast<int64_t>(root_sign) *
+                    first_transform.shift;
+            parent_[first_root] = second_root;
+            sign_to_parent_[first_root] = root_sign;
+            shift_to_parent_[first_root] = root_shift;
+            component_size_[second_root] +=
+                component_size_[first_root];
+        }
+        return true;
+    }
+
+    uint32_t componentSize(uint32_t root) const {
+        return component_size_.at(root);
+    }
+
+private:
+    std::vector<uint32_t> parent_;
+    std::vector<uint8_t> rank_;
+    std::vector<uint32_t> component_size_;
+    std::vector<int8_t> sign_to_parent_;
+    std::vector<int64_t> shift_to_parent_;
+};
+
+
+class RollbackRunConnectivity {
+public:
+    explicit RollbackRunConnectivity(size_t count)
+        : parent_(count),
+          component_size_(count, 1) {
+        std::iota(parent_.begin(), parent_.end(), 0U);
+    }
+
+    size_t snapshot() const noexcept {
+        return history_.size();
+    }
+
+    uint32_t find(uint32_t node) const {
+        while (parent_.at(node) != node) {
+            node = parent_[node];
+        }
+        return node;
+    }
+
+    void unite(uint32_t first, uint32_t second) {
+        first = find(first);
+        second = find(second);
+        if (first == second) {
+            return;
+        }
+        if (component_size_[first] <
+            component_size_[second]) {
+            std::swap(first, second);
+        }
+        history_.push_back(
+            Change{
+                second,
+                first,
+                component_size_[first]});
+        parent_[second] = first;
+        component_size_[first] +=
+            component_size_[second];
+    }
+
+    void rollback(size_t snapshot) {
+        while (history_.size() > snapshot) {
+            const Change change = history_.back();
+            history_.pop_back();
+            parent_[change.child] = change.child;
+            component_size_[change.parent] =
+                change.parent_size;
+        }
+    }
+
+private:
+    struct Change {
+        uint32_t child = 0;
+        uint32_t parent = 0;
+        uint32_t parent_size = 0;
+    };
+
+    std::vector<uint32_t> parent_;
+    std::vector<uint32_t> component_size_;
+    std::vector<Change> history_;
+};
+
+class RollbackRunCoordinateUnion {
+public:
+    explicit RollbackRunCoordinateUnion(size_t count)
+        : parent_(count),
+          component_size_(count, 1),
+          sign_to_parent_(count, 1),
+          shift_to_parent_(count, 0) {
+        if (count > static_cast<size_t>(
+                        std::numeric_limits<uint32_t>::max())) {
+            throw std::overflow_error(
+                "Too many HAL runs for coordinate selection");
+        }
+        std::iota(parent_.begin(), parent_.end(), 0U);
+    }
+
+    size_t snapshot() const noexcept {
+        return history_.size();
+    }
+
+    RunCoordinateTransform find(uint32_t node) const {
+        int8_t sign = 1;
+        int64_t shift = 0;
+        while (parent_.at(node) != node) {
+            const int8_t edge_sign =
+                sign_to_parent_[node];
+            shift =
+                static_cast<int64_t>(edge_sign) *
+                    shift +
+                shift_to_parent_[node];
+            sign = static_cast<int8_t>(
+                edge_sign * sign);
+            node = parent_[node];
+        }
+        return {node, sign, shift};
+    }
+
+    bool unite(
+        uint32_t first,
+        uint32_t second,
+        int8_t second_sign_from_first,
+        int64_t second_shift_from_first) {
+        const auto first_transform = find(first);
+        const auto second_transform = find(second);
+        if (first_transform.root ==
+            second_transform.root) {
+            return first_transform.sign ==
+                       static_cast<int8_t>(
+                           second_transform.sign *
+                           second_sign_from_first) &&
+                   first_transform.shift ==
+                       static_cast<int64_t>(
+                           second_transform.sign) *
+                           second_shift_from_first +
+                           second_transform.shift;
+        }
+
+        uint32_t first_root =
+            first_transform.root;
+        uint32_t second_root =
+            second_transform.root;
+        if (component_size_[first_root] >=
+            component_size_[second_root]) {
+            const int8_t root_sign =
+                static_cast<int8_t>(
+                    first_transform.sign *
+                    second_sign_from_first *
+                    second_transform.sign);
+            const int64_t root_shift =
+                first_transform.shift -
+                static_cast<int64_t>(
+                    first_transform.sign *
+                    second_sign_from_first) *
+                    second_shift_from_first -
+                static_cast<int64_t>(root_sign) *
+                    second_transform.shift;
+            history_.push_back(
+                Change{
+                    second_root,
+                    first_root,
+                    component_size_[first_root],
+                    sign_to_parent_[second_root],
+                    shift_to_parent_[second_root]});
+            parent_[second_root] = first_root;
+            sign_to_parent_[second_root] =
+                root_sign;
+            shift_to_parent_[second_root] =
+                root_shift;
+            component_size_[first_root] +=
+                component_size_[second_root];
+        } else {
+            const int8_t root_sign =
+                static_cast<int8_t>(
+                    second_transform.sign *
+                    second_sign_from_first *
+                    first_transform.sign);
+            const int64_t root_shift =
+                static_cast<int64_t>(
+                    second_transform.sign) *
+                    second_shift_from_first +
+                second_transform.shift -
+                static_cast<int64_t>(root_sign) *
+                    first_transform.shift;
+            history_.push_back(
+                Change{
+                    first_root,
+                    second_root,
+                    component_size_[second_root],
+                    sign_to_parent_[first_root],
+                    shift_to_parent_[first_root]});
+            parent_[first_root] = second_root;
+            sign_to_parent_[first_root] =
+                root_sign;
+            shift_to_parent_[first_root] =
+                root_shift;
+            component_size_[second_root] +=
+                component_size_[first_root];
+        }
+        return true;
+    }
+
+    void rollback(size_t snapshot) {
+        while (history_.size() > snapshot) {
+            const Change change = history_.back();
+            history_.pop_back();
+            parent_[change.child] =
+                change.child;
+            sign_to_parent_[change.child] =
+                change.child_sign;
+            shift_to_parent_[change.child] =
+                change.child_shift;
+            component_size_[change.parent] =
+                change.parent_size;
+        }
+    }
+
+private:
+    struct Change {
+        uint32_t child = 0;
+        uint32_t parent = 0;
+        uint32_t parent_size = 0;
+        int8_t child_sign = 1;
+        int64_t child_shift = 0;
+    };
+
+    std::vector<uint32_t> parent_;
+    std::vector<uint32_t> component_size_;
+    std::vector<int8_t> sign_to_parent_;
+    std::vector<int64_t> shift_to_parent_;
+    std::vector<Change> history_;
+};
+struct RunNormalizationStats {
+    size_t input_runs = 0;
+    size_t output_runs = 0;
+    size_t overlap_constraints = 0;
+    size_t connected_components = 0;
+    size_t duplicate_leaf_occurrences = 0;
+};
+
+int64_t checkedSignedCoordinate(uint64_t coordinate) {
+    if (coordinate >
+        static_cast<uint64_t>(
+            std::numeric_limits<int64_t>::max())) {
+        throw std::overflow_error(
+            "HAL leaf coordinate exceeds signed normalization range");
+    }
+    return static_cast<int64_t>(coordinate);
+}
+
+int64_t runColumnLength(const ColumnRun& run) {
+    if (run.col_end <= run.col_beg) {
+        throw std::runtime_error(
+            "HAL column run has an empty column interval");
+    }
+    return static_cast<int64_t>(run.col_end - run.col_beg);
+}
+
+int64_t leafBoundaryOffset(
+    const LeafRunSpan& span,
+    uint64_t coordinate) {
+    const uint64_t end = span.start + span.length;
+    if (end < span.start ||
+        coordinate < span.start ||
+        coordinate > end) {
+        throw std::runtime_error(
+            "HAL leaf overlap boundary lies outside its run span");
+    }
+    const uint64_t offset = span.reversed
+        ? end - coordinate
+        : coordinate - span.start;
+    return checkedSignedCoordinate(offset);
+}
+
+struct SecondaryRunSelectionStats {
+    size_t candidate_runs = 0;
+    size_t accepted_runs = 0;
+    size_t rejected_runs = 0;
+    size_t conflict_rejected_runs = 0;
+    std::unordered_set<uint64_t>
+        rejected_block_ids;
+    size_t redundant_runs = 0;
+    uint64_t rejected_bases = 0;
+    size_t primary_overlap_constraints = 0;
+};
+
+SecondaryRunSelectionStats
+selectCoordinateConsistentSecondaryRuns(
+    std::vector<ColumnRun>& runs) {
+    SecondaryRunSelectionStats stats;
+    if (runs.empty()) {
+        return stats;
+    }
+
+    struct PrimaryWindow {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        uint32_t run_index = 0;
+        uint32_t span_index = 0;
+    };
+    struct PrimaryConstraint {
+        uint32_t primary_run = 0;
+        uint32_t secondary_run = 0;
+        int8_t secondary_sign_from_primary = 1;
+        int64_t secondary_shift_from_primary = 0;
+    };
+
+    std::unordered_map<
+        std::string,
+        std::vector<PrimaryWindow>>
+        primary_windows_by_sequence;
+    std::vector<uint32_t> secondary_runs;
+    for (uint32_t run_index = 0;
+         run_index < runs.size();
+         ++run_index) {
+        const auto& run = runs[run_index];
+        const int64_t length = runColumnLength(run);
+        if (run.secondary_homology) {
+            secondary_runs.push_back(run_index);
+            continue;
+        }
+        if (run.leaf_spans.size() >
+            static_cast<size_t>(
+                std::numeric_limits<uint32_t>::max())) {
+            throw std::overflow_error(
+                "Too many leaf spans in a primary HAL run");
+        }
+        for (uint32_t span_index = 0;
+             span_index < run.leaf_spans.size();
+             ++span_index) {
+            const auto& span =
+                run.leaf_spans[span_index];
+            if (span.length != length) {
+                throw std::runtime_error(
+                    "Primary HAL run span length is inconsistent");
+            }
+            const uint64_t end =
+                span.start + span.length;
+            if (end < span.start) {
+                throw std::overflow_error(
+                    "Primary HAL leaf span coordinate overflow");
+            }
+            primary_windows_by_sequence[
+                span.hal_sequence_name]
+                .push_back(
+                    PrimaryWindow{
+                        span.start,
+                        end,
+                        run_index,
+                        span_index});
+        }
+    }
+    stats.candidate_runs = secondary_runs.size();
+    if (secondary_runs.empty()) {
+        return stats;
+    }
+
+    for (auto& [sequence_name, windows] :
+         primary_windows_by_sequence) {
+        std::sort(
+            windows.begin(),
+            windows.end(),
+            [](const PrimaryWindow& lhs,
+               const PrimaryWindow& rhs) {
+                return std::tie(
+                           lhs.start,
+                           lhs.end,
+                           lhs.run_index,
+                           lhs.span_index) <
+                       std::tie(
+                           rhs.start,
+                           rhs.end,
+                           rhs.run_index,
+                           rhs.span_index);
+            });
+        uint64_t covered_until = 0;
+        bool have_window = false;
+        for (const auto& window : windows) {
+            if (have_window &&
+                window.start < covered_until) {
+                throw std::runtime_error(
+                    "HAL primary runs overlap on leaf sequence " +
+                    sequence_name);
+            }
+            covered_until = window.end;
+            have_window = true;
+        }
+    }
+
+    std::unordered_map<
+        uint32_t,
+        std::vector<PrimaryConstraint>>
+        constraints_by_secondary;
+    constraints_by_secondary.reserve(
+        secondary_runs.size());
+    std::vector<uint8_t> secondary_has_novel_span(
+        runs.size(),
+        0);
+    for (uint32_t secondary_run :
+         secondary_runs) {
+        const auto& run = runs[secondary_run];
+        const int64_t length = runColumnLength(run);
+        for (const auto& secondary_span :
+             run.leaf_spans) {
+            bool overlaps_primary = false;
+            if (secondary_span.length != length) {
+                throw std::runtime_error(
+                    "Secondary HAL run span length is inconsistent");
+            }
+            const auto windows_it =
+                primary_windows_by_sequence.find(
+                    secondary_span
+                        .hal_sequence_name);
+            if (windows_it ==
+                primary_windows_by_sequence.end()) {
+                secondary_has_novel_span[
+                    secondary_run] = 1;
+                continue;
+            }
+            const uint64_t secondary_end =
+                secondary_span.start +
+                secondary_span.length;
+            const auto& windows =
+                windows_it->second;
+            auto window_it = std::partition_point(
+                windows.begin(),
+                windows.end(),
+                [&](const PrimaryWindow& window) {
+                    return window.end <=
+                           secondary_span.start;
+                });
+            while (window_it != windows.end() &&
+                   window_it->start <
+                       secondary_end) {
+                overlaps_primary = true;
+                const auto& primary_span =
+                    runs[window_it->run_index]
+                        .leaf_spans[
+                            window_it->span_index];
+                const uint64_t shared_coordinate =
+                    std::max(
+                        window_it->start,
+                        secondary_span.start);
+                const int64_t primary_offset =
+                    leafBoundaryOffset(
+                        primary_span,
+                        shared_coordinate);
+                const int64_t secondary_offset =
+                    leafBoundaryOffset(
+                        secondary_span,
+                        shared_coordinate);
+                const int8_t sign =
+                    primary_span.reversed ==
+                            secondary_span.reversed
+                        ? 1
+                        : -1;
+                constraints_by_secondary[
+                    secondary_run]
+                    .push_back(
+                        PrimaryConstraint{
+                            window_it->run_index,
+                            secondary_run,
+                            sign,
+                            secondary_offset -
+                                static_cast<int64_t>(
+                                    sign) *
+                                    primary_offset});
+                ++stats.primary_overlap_constraints;
+                ++window_it;
+            }
+            if (!overlaps_primary) {
+                secondary_has_novel_span[
+                    secondary_run] = 1;
+            }
+        }
+    }
+
+    for (auto& [secondary_run, constraints] :
+         constraints_by_secondary) {
+        (void)secondary_run;
+        std::sort(
+            constraints.begin(),
+            constraints.end(),
+            [](const PrimaryConstraint& lhs,
+               const PrimaryConstraint& rhs) {
+                return std::tie(
+                           lhs.primary_run,
+                           lhs.secondary_sign_from_primary,
+                           lhs.secondary_shift_from_primary) <
+                       std::tie(
+                           rhs.primary_run,
+                           rhs.secondary_sign_from_primary,
+                           rhs.secondary_shift_from_primary);
+            });
+        constraints.erase(
+            std::unique(
+                constraints.begin(),
+                constraints.end(),
+                [](const PrimaryConstraint& lhs,
+                   const PrimaryConstraint& rhs) {
+                    return lhs.primary_run ==
+                               rhs.primary_run &&
+                           lhs.secondary_sign_from_primary ==
+                               rhs.secondary_sign_from_primary &&
+                           lhs.secondary_shift_from_primary ==
+                               rhs.secondary_shift_from_primary;
+                }),
+            constraints.end());
+    }
+
+    const auto support_weight =
+        [&](uint32_t run_index) {
+            const auto& run = runs[run_index];
+            const unsigned __int128 occurrence_count =
+                run.leaf_spans.size();
+            const unsigned __int128 pair_count =
+                occurrence_count > 1
+                ? occurrence_count *
+                      (occurrence_count - 1) /
+                      2
+                : 1;
+            return pair_count *
+                   static_cast<unsigned __int128>(
+                       run.col_end - run.col_beg);
+        };
+    const auto run_content_less =
+        [&](uint32_t lhs_index,
+            uint32_t rhs_index) {
+            const auto& lhs = runs[lhs_index];
+            const auto& rhs = runs[rhs_index];
+            const auto span_less =
+                [](const LeafRunSpan& left,
+                   const LeafRunSpan& right) {
+                    return std::tie(
+                               left.leaf_name,
+                               left.chr_name,
+                               left.start,
+                               left.length,
+                               left.reversed,
+                               left.row_id) <
+                           std::tie(
+                               right.leaf_name,
+                               right.chr_name,
+                               right.start,
+                               right.length,
+                               right.reversed,
+                               right.row_id);
+                };
+            if (std::lexicographical_compare(
+                    lhs.leaf_spans.begin(),
+                    lhs.leaf_spans.end(),
+                    rhs.leaf_spans.begin(),
+                    rhs.leaf_spans.end(),
+                    span_less)) {
+                return true;
+            }
+            if (std::lexicographical_compare(
+                    rhs.leaf_spans.begin(),
+                    rhs.leaf_spans.end(),
+                    lhs.leaf_spans.begin(),
+                    lhs.leaf_spans.end(),
+                    span_less)) {
+                return false;
+            }
+            return std::tie(
+                       lhs.col_beg,
+                       lhs.col_end) <
+                   std::tie(
+                       rhs.col_beg,
+                       rhs.col_end);
+        };
+    struct SecondaryRunGroup {
+        uint64_t block_id = 0;
+        unsigned __int128 support = 0;
+        std::vector<uint32_t> runs;
+    };
+    std::map<uint64_t, SecondaryRunGroup>
+        group_by_block;
+    for (uint32_t secondary_run :
+         secondary_runs) {
+        const uint64_t block_id =
+            runs[secondary_run].block_id;
+        auto& group =
+            group_by_block[block_id];
+        group.block_id = block_id;
+        const auto weight =
+            support_weight(secondary_run);
+        if (std::numeric_limits<
+                unsigned __int128>::max() -
+                group.support <
+            weight) {
+            throw std::overflow_error(
+                "HAL secondary block support weight overflow");
+        }
+        group.support += weight;
+        group.runs.push_back(secondary_run);
+    }
+    std::vector<SecondaryRunGroup> groups;
+    groups.reserve(group_by_block.size());
+    for (auto& [block_id, group] :
+         group_by_block) {
+        (void)block_id;
+        std::sort(
+            group.runs.begin(),
+            group.runs.end(),
+            run_content_less);
+        groups.push_back(std::move(group));
+    }
+    std::sort(
+        groups.begin(),
+        groups.end(),
+        [&](const SecondaryRunGroup& lhs,
+            const SecondaryRunGroup& rhs) {
+            if (lhs.support != rhs.support) {
+                return lhs.support > rhs.support;
+            }
+            if (std::lexicographical_compare(
+                    lhs.runs.begin(),
+                    lhs.runs.end(),
+                    rhs.runs.begin(),
+                    rhs.runs.end(),
+                    run_content_less)) {
+                return true;
+            }
+            if (std::lexicographical_compare(
+                    rhs.runs.begin(),
+                    rhs.runs.end(),
+                    lhs.runs.begin(),
+                    lhs.runs.end(),
+                    run_content_less)) {
+                return false;
+            }
+            return lhs.block_id <
+                   rhs.block_id;
+        });
+
+    RollbackRunCoordinateUnion coordinates(
+        runs.size());
+    std::vector<uint8_t> rejected(
+        runs.size(),
+        0);
+    for (const auto& group : groups) {
+        const size_t snapshot =
+            coordinates.snapshot();
+        bool consistent = true;
+        bool contributes_homology = false;
+        for (uint32_t secondary_run :
+             group.runs) {
+            contributes_homology =
+                contributes_homology ||
+                secondary_has_novel_span[
+                    secondary_run] != 0;
+            const auto constraints_it =
+                constraints_by_secondary.find(
+                    secondary_run);
+            if (constraints_it ==
+                constraints_by_secondary.end()) {
+                continue;
+            }
+            const auto& constraints =
+                constraints_it->second;
+            const auto& anchor =
+                constraints.front();
+            for (size_t constraint_index = 1;
+                 constraint_index <
+                     constraints.size();
+                 ++constraint_index) {
+                const auto& constraint =
+                    constraints[constraint_index];
+                const int8_t sign =
+                    static_cast<int8_t>(
+                        constraint
+                            .secondary_sign_from_primary *
+                        anchor
+                            .secondary_sign_from_primary);
+                const __int128 shift_wide =
+                    static_cast<__int128>(
+                        constraint
+                            .secondary_sign_from_primary) *
+                    (static_cast<__int128>(
+                         anchor
+                             .secondary_shift_from_primary) -
+                     static_cast<__int128>(
+                         constraint
+                             .secondary_shift_from_primary));
+                if (shift_wide <
+                        std::numeric_limits<int64_t>::min() ||
+                    shift_wide >
+                        std::numeric_limits<int64_t>::max()) {
+                    throw std::overflow_error(
+                        "HAL secondary homology relation "
+                        "exceeds signed coordinate range");
+                }
+                const bool separate_components =
+                    coordinates.find(
+                        anchor.primary_run).root !=
+                    coordinates.find(
+                        constraint.primary_run).root;
+                if (!coordinates.unite(
+                        anchor.primary_run,
+                        constraint.primary_run,
+                        sign,
+                        static_cast<int64_t>(
+                            shift_wide))) {
+                    consistent = false;
+                    break;
+                }
+                contributes_homology =
+                    contributes_homology ||
+                    separate_components;
+            }
+            if (!consistent) {
+                break;
+            }
+        }
+        if (consistent &&
+            contributes_homology) {
+            stats.accepted_runs +=
+                group.runs.size();
+            continue;
+        }
+
+        coordinates.rollback(snapshot);
+        stats.rejected_block_ids.insert(
+            group.block_id);
+        stats.rejected_runs +=
+            group.runs.size();
+        if (consistent) {
+            stats.redundant_runs +=
+                group.runs.size();
+        } else {
+            stats.conflict_rejected_runs +=
+                group.runs.size();
+        }
+        for (uint32_t secondary_run :
+             group.runs) {
+            rejected[secondary_run] = 1;
+            const uint64_t run_length =
+                runs[secondary_run].col_end -
+                runs[secondary_run].col_beg;
+            if (std::numeric_limits<uint64_t>::max() -
+                    stats.rejected_bases <
+                run_length) {
+                throw std::overflow_error(
+                    "HAL rejected secondary base count overflow");
+            }
+            stats.rejected_bases +=
+                run_length;
+        }
+    }
+
+    size_t output_index = 0;
+    for (size_t input_index = 0;
+         input_index < runs.size();
+         ++input_index) {
+        if (rejected[input_index] != 0) {
+            continue;
+        }
+        if (output_index != input_index) {
+            runs[output_index] =
+                std::move(runs[input_index]);
+        }
+        ++output_index;
+    }
+    runs.resize(output_index);
+    return stats;
+}
+
+TreeMeta buildLeafOnlyTree(
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers) {
+    TreeMeta leaf_tree;
+    leaf_tree.nodes.reserve(
+        seqpro_managers.size());
+    leaf_tree.leaf_ids.reserve(
+        seqpro_managers.size());
+    int leaf_index = 0;
+    for (const auto& [species, unused_manager] :
+         seqpro_managers) {
+        (void)unused_manager;
+        const int node_id =
+            static_cast<int>(
+                leaf_tree.nodes.size());
+        leaf_tree.nodes.push_back(
+            TreeNodeMeta{
+                .id = node_id,
+                .name = species,
+                .parent = -1,
+                .children = {},
+                .branch_length_to_parent = 0.0,
+                .is_leaf = true,
+                .leaf_index = leaf_index++});
+        leaf_tree.name_to_id.emplace(
+            species,
+            node_id);
+        leaf_tree.leaf_ids.push_back(
+            node_id);
+    }
+    return leaf_tree;
+}
+
+std::vector<BlockMSA> buildLeafBlockMSAs(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const TreeMeta& leaf_tree,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers) {
+    std::vector<BlockMSA> block_msas;
+    block_msas.reserve(blocks.size());
+    for (const auto& weak_block : blocks) {
+        const auto block =
+            weak_block.lock();
+        if (!block) {
+            continue;
+        }
+        auto msa = buildBlockMSA(
+            block,
+            leaf_tree,
+            seqpro_managers,
+            nullptr);
+        if (msa.block &&
+            !msa.leaf_rows.empty()) {
+            block_msas.push_back(
+                std::move(msa));
+        }
+    }
+    std::sort(
+        block_msas.begin(),
+        block_msas.end(),
+        [](const BlockMSA& lhs,
+           const BlockMSA& rhs) {
+            return exportBlockOrderLess(
+                lhs.order_key,
+                rhs.order_key);
+        });
+    return block_msas;
+}
+
+std::unordered_set<uint64_t>
+findRejectedSecondaryHomologyBlocksImpl(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers) {
+    const TreeMeta leaf_tree =
+        buildLeafOnlyTree(
+            seqpro_managers);
+    const auto block_msas =
+        buildLeafBlockMSAs(
+            blocks,
+            leaf_tree,
+            seqpro_managers);
+    auto runs =
+        buildColumnRuns(
+            block_msas,
+            leaf_tree);
+    auto selection =
+        selectCoordinateConsistentSecondaryRuns(
+            runs);
+    return std::move(
+        selection.rejected_block_ids);
+}
+
+ColumnRun sliceColumnRun(
+    const ColumnRun& run,
+    uint32_t local_begin,
+    uint32_t local_end) {
+    const uint32_t run_length = run.col_end - run.col_beg;
+    if (local_begin >= local_end ||
+        local_end > run_length) {
+        throw std::runtime_error(
+            "HAL column run slice lies outside its source run");
+    }
+
+    ColumnRun result;
+    result.run_id = run.run_id;
+    result.block_id = run.block_id;
+    result.col_beg = run.col_beg + local_begin;
+    result.col_end = run.col_beg + local_end;
+    result.secondary_homology =
+        run.secondary_homology;
+    result.leaf_spans.reserve(run.leaf_spans.size());
+    const uint32_t slice_length = local_end - local_begin;
+    for (const auto& span : run.leaf_spans) {
+        if (span.length != run_length ||
+            span.dna.size() != run_length) {
+            throw std::runtime_error(
+                "HAL elementary run span length is inconsistent");
+        }
+        LeafRunSpan sliced = span;
+        sliced.start += span.reversed
+            ? span.length - local_end
+            : local_begin;
+        sliced.length = slice_length;
+        sliced.dna =
+            span.dna.substr(local_begin, slice_length);
+        result.leaf_spans.push_back(std::move(sliced));
+    }
+    return result;
+}
+
+void reverseColumnRun(ColumnRun& run) {
+    for (auto& span : run.leaf_spans) {
+        reverseComplement(span.dna);
+        span.reversed = !span.reversed;
+    }
+}
+
+void finalizeNormalizedRun(
+    ColumnRun& run,
+    const TreeMeta& tree,
+    RunNormalizationStats& stats) {
+    std::sort(
+        run.leaf_spans.begin(),
+        run.leaf_spans.end(),
+        [](const LeafRunSpan& lhs, const LeafRunSpan& rhs) {
+            return std::tie(
+                       lhs.hal_sequence_name,
+                       lhs.start,
+                       lhs.length,
+                       lhs.row_id) <
+                   std::tie(
+                       rhs.hal_sequence_name,
+                       rhs.start,
+                       rhs.length,
+                       rhs.row_id);
+        });
+
+    std::vector<LeafRunSpan> unique_spans;
+    unique_spans.reserve(run.leaf_spans.size());
+    for (auto& span : run.leaf_spans) {
+        if (span.length != run.col_end - run.col_beg ||
+            span.dna.size() != span.length) {
+            throw std::runtime_error(
+                "HAL normalized leaf span length is inconsistent");
+        }
+        if (!unique_spans.empty()) {
+            const auto& previous = unique_spans.back();
+            const bool same_occurrence =
+                previous.hal_sequence_name ==
+                    span.hal_sequence_name &&
+                previous.start == span.start &&
+                previous.length == span.length;
+            if (same_occurrence) {
+                if (previous.reversed != span.reversed ||
+                    previous.dna != span.dna) {
+                    throw std::runtime_error(
+                        "HAL homology links assign conflicting "
+                        "orientations or DNA to one leaf occurrence");
+                }
+                ++stats.duplicate_leaf_occurrences;
+                continue;
+            }
+        }
+        unique_spans.push_back(std::move(span));
+    }
+    run.leaf_spans = std::move(unique_spans);
+    run.leaf_present.assign(tree.leaf_ids.size(), 0);
+    for (const auto& span : run.leaf_spans) {
+        const auto node_it =
+            tree.name_to_id.find(span.leaf_name);
+        if (node_it == tree.name_to_id.end()) {
+            throw std::runtime_error(
+                "HAL normalized leaf is absent from the phylogeny");
+        }
+        const auto& node = tree.nodes[node_it->second];
+        if (!node.is_leaf || node.leaf_index < 0) {
+            throw std::runtime_error(
+                "HAL normalized occurrence belongs to a non-leaf node");
+        }
+        run.leaf_present[
+            static_cast<size_t>(node.leaf_index)] = 1;
+    }
+}
+
+RunNormalizationStats normalizeOverlappingColumnRuns(
+    std::vector<ColumnRun>& runs,
+    const TreeMeta& tree) {
+    RunNormalizationStats stats;
+    stats.input_runs = runs.size();
+    if (runs.empty()) {
+        return stats;
+    }
+
+    struct LeafWindow {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        uint32_t run_index = 0;
+        uint32_t span_index = 0;
+    };
+    struct OverlapConstraint {
+        uint32_t first_run = 0;
+        uint32_t second_run = 0;
+        int64_t first_local_begin = 0;
+        int64_t first_local_end = 0;
+    };
+
+    std::vector<OverlapConstraint> overlap_constraints;
+
+    RunCoordinateUnion coordinates(runs.size());
+    std::unordered_map<
+        std::string,
+        std::vector<LeafWindow>>
+        windows_by_sequence;
+    for (uint32_t run_index = 0;
+         run_index < runs.size();
+         ++run_index) {
+        const auto& run = runs[run_index];
+        const int64_t run_length = runColumnLength(run);
+        if (run.leaf_spans.size() >
+            static_cast<size_t>(
+                std::numeric_limits<uint32_t>::max())) {
+            throw std::overflow_error(
+                "Too many leaf spans in one HAL column run");
+        }
+        for (uint32_t span_index = 0;
+             span_index < run.leaf_spans.size();
+             ++span_index) {
+            const auto& span = run.leaf_spans[span_index];
+            if (span.length != run_length ||
+                span.length == 0) {
+                throw std::runtime_error(
+                    "HAL elementary run span length is inconsistent");
+            }
+            const uint64_t end = span.start + span.length;
+            if (end < span.start) {
+                throw std::overflow_error(
+                    "HAL leaf span coordinate overflow");
+            }
+            windows_by_sequence[
+                span.hal_sequence_name]
+                .push_back(
+                    LeafWindow{
+                        span.start,
+                        end,
+                        run_index,
+                        span_index});
+        }
+    }
+
+    for (auto& [sequence_name, windows] :
+         windows_by_sequence) {
+        std::sort(
+            windows.begin(),
+            windows.end(),
+            [](const LeafWindow& lhs,
+               const LeafWindow& rhs) {
+                return std::tie(
+                           lhs.start,
+                           lhs.end,
+                           lhs.run_index,
+                           lhs.span_index) <
+                       std::tie(
+                           rhs.start,
+                           rhs.end,
+                           rhs.run_index,
+                           rhs.span_index);
+            });
+        std::vector<size_t> active;
+        for (size_t window_index = 0;
+             window_index < windows.size();
+             ++window_index) {
+            const auto& current = windows[window_index];
+            std::erase_if(
+                active,
+                [&](size_t active_index) {
+                    return windows[active_index].end <=
+                           current.start;
+                });
+            for (size_t active_index : active) {
+                const auto& previous =
+                    windows[active_index];
+                if (previous.end <= current.start) {
+                    continue;
+                }
+                if (previous.run_index ==
+                    current.run_index) {
+                    throw std::runtime_error(
+                        "HAL column run contains overlapping "
+                        "copies of leaf sequence " +
+                        sequence_name);
+                }
+
+                const uint64_t shared_coordinate =
+                    std::max(
+                        previous.start,
+                        current.start);
+                const uint64_t shared_end =
+                    std::min(
+                        previous.end,
+                        current.end);
+                const auto& previous_span =
+                    runs[previous.run_index]
+                        .leaf_spans[
+                            previous.span_index];
+                const auto& current_span =
+                    runs[current.run_index]
+                        .leaf_spans[
+                            current.span_index];
+                const int64_t previous_offset =
+                    leafBoundaryOffset(
+                        previous_span,
+                        shared_coordinate);
+                const int64_t current_offset =
+                    leafBoundaryOffset(
+                        current_span,
+                        shared_coordinate);
+                const int8_t sign =
+                    previous_span.reversed ==
+                            current_span.reversed
+                        ? 1
+                        : -1;
+                const int64_t shift =
+                    current_offset -
+                    static_cast<int64_t>(sign) *
+                        previous_offset;
+                coordinates.unite(
+                    previous.run_index,
+                    current.run_index,
+                    sign,
+                    shift);
+                const int64_t previous_end_offset =
+                    leafBoundaryOffset(
+                        previous_span,
+                        shared_end);
+                overlap_constraints.push_back(
+                    OverlapConstraint{
+                        previous.run_index,
+                        current.run_index,
+                        std::min(
+                            previous_offset,
+                            previous_end_offset),
+                        std::max(
+                            previous_offset,
+                            previous_end_offset)});
+                ++stats.overlap_constraints;
+            }
+            active.push_back(window_index);
+        }
+    }
+    windows_by_sequence.clear();
+
+    std::map<uint32_t, std::vector<uint32_t>>
+        members_by_root;
+    std::vector<RunCoordinateTransform> transforms(
+        runs.size());
+    for (uint32_t run_index = 0;
+         run_index < runs.size();
+         ++run_index) {
+        transforms[run_index] =
+            coordinates.find(run_index);
+        if (coordinates.componentSize(
+                transforms[run_index].root) > 1) {
+            members_by_root[
+                transforms[run_index].root]
+                .push_back(run_index);
+        }
+    }
+    stats.connected_components =
+        members_by_root.size();
+
+    std::map<
+        uint32_t,
+        std::vector<const OverlapConstraint*>>
+        constraints_by_root;
+    for (const auto& constraint :
+         overlap_constraints) {
+        const uint32_t first_root =
+            transforms[constraint.first_run].root;
+        const uint32_t second_root =
+            transforms[constraint.second_run].root;
+        if (first_root != second_root) {
+            throw std::runtime_error(
+                "HAL overlap constraint endpoints were not unified");
+        }
+        constraints_by_root[first_root].push_back(
+            &constraint);
+    }
+
+    std::vector<ColumnRun> normalized;
+    normalized.reserve(runs.size());
+    for (uint32_t run_index = 0;
+         run_index < runs.size();
+         ++run_index) {
+        if (coordinates.componentSize(
+                transforms[run_index].root) == 1) {
+            normalized.push_back(
+                std::move(runs[run_index]));
+        }
+    }
+
+    for (auto& [root, members] : members_by_root) {
+        std::sort(members.begin(), members.end());
+        std::unordered_map<uint32_t, uint32_t>
+            local_index_by_run;
+        local_index_by_run.reserve(members.size());
+        for (uint32_t local_index = 0;
+             local_index < members.size();
+             ++local_index) {
+            local_index_by_run.emplace(
+                members[local_index],
+                local_index);
+        }
+
+        const auto constraint_it =
+            constraints_by_root.find(root);
+        if (constraint_it ==
+            constraints_by_root.end()) {
+            throw std::runtime_error(
+                "HAL connected run component has no overlap constraints");
+        }
+        const auto& component_constraints =
+            constraint_it->second;
+        std::vector<int64_t> boundaries;
+        boundaries.reserve(
+            2 * (members.size() +
+                 component_constraints.size()));
+        for (uint32_t run_index : members) {
+            const auto& transform =
+                transforms[run_index];
+            const int64_t length =
+                runColumnLength(runs[run_index]);
+            const int64_t first =
+                transform.shift;
+            const int64_t second =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    length +
+                transform.shift;
+            boundaries.push_back(
+                std::min(first, second));
+            boundaries.push_back(
+                std::max(first, second));
+        }
+        for (const auto* constraint :
+             component_constraints) {
+            const auto& transform =
+                transforms[
+                    constraint->first_run];
+            const int64_t first =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    constraint->first_local_begin +
+                transform.shift;
+            const int64_t second =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    constraint->first_local_end +
+                transform.shift;
+            boundaries.push_back(
+                std::min(first, second));
+            boundaries.push_back(
+                std::max(first, second));
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(
+            std::unique(
+                boundaries.begin(),
+                boundaries.end()),
+            boundaries.end());
+        if (boundaries.size() < 2) {
+            throw std::runtime_error(
+                "HAL connected run component has no positive span");
+        }
+
+        const size_t cell_count =
+            boundaries.size() - 1;
+        size_t tree_size = 1;
+        while (tree_size < cell_count) {
+            if (tree_size >
+                std::numeric_limits<size_t>::max() /
+                    2) {
+                throw std::overflow_error(
+                    "HAL overlap event tree size overflow");
+            }
+            tree_size *= 2;
+        }
+        struct LocalEdge {
+            uint32_t first = 0;
+            uint32_t second = 0;
+        };
+        struct IntervalEvents {
+            std::vector<uint32_t> active_runs;
+            std::vector<LocalEdge> edges;
+        };
+        std::vector<IntervalEvents> events(
+            tree_size * 2);
+
+        auto boundaryRange = [&](
+            int64_t low,
+            int64_t high) {
+            const size_t begin =
+                static_cast<size_t>(
+                    std::lower_bound(
+                        boundaries.begin(),
+                        boundaries.end(),
+                        low) -
+                    boundaries.begin());
+            const size_t end =
+                static_cast<size_t>(
+                    std::lower_bound(
+                        boundaries.begin(),
+                        boundaries.end(),
+                        high) -
+                    boundaries.begin());
+            if (begin >= end ||
+                begin >= cell_count ||
+                end > cell_count ||
+                boundaries[begin] != low ||
+                boundaries[end] != high) {
+                throw std::runtime_error(
+                    "HAL overlap event boundary is absent "
+                    "from its coordinate component");
+            }
+            return std::pair{begin, end};
+        };
+        auto addRunInterval = [&](
+            size_t begin,
+            size_t end,
+            uint32_t local_run) {
+            begin += tree_size;
+            end += tree_size;
+            while (begin < end) {
+                if ((begin & 1U) != 0) {
+                    events[begin++].active_runs
+                        .push_back(local_run);
+                }
+                if ((end & 1U) != 0) {
+                    events[--end].active_runs
+                        .push_back(local_run);
+                }
+                begin /= 2;
+                end /= 2;
+            }
+        };
+        auto addEdgeInterval = [&](
+            size_t begin,
+            size_t end,
+            LocalEdge edge) {
+            begin += tree_size;
+            end += tree_size;
+            while (begin < end) {
+                if ((begin & 1U) != 0) {
+                    events[begin++].edges
+                        .push_back(edge);
+                }
+                if ((end & 1U) != 0) {
+                    events[--end].edges
+                        .push_back(edge);
+                }
+                begin /= 2;
+                end /= 2;
+            }
+        };
+
+        for (uint32_t local_index = 0;
+             local_index < members.size();
+             ++local_index) {
+            const uint32_t run_index =
+                members[local_index];
+            const auto& transform =
+                transforms[run_index];
+            const int64_t length =
+                runColumnLength(runs[run_index]);
+            const int64_t first =
+                transform.shift;
+            const int64_t second =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    length +
+                transform.shift;
+            const auto [begin, end] =
+                boundaryRange(
+                    std::min(first, second),
+                    std::max(first, second));
+            addRunInterval(
+                begin,
+                end,
+                local_index);
+        }
+        for (const auto* constraint :
+             component_constraints) {
+            const auto& transform =
+                transforms[
+                    constraint->first_run];
+            const int64_t first =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    constraint->first_local_begin +
+                transform.shift;
+            const int64_t second =
+                static_cast<int64_t>(
+                    transform.sign) *
+                    constraint->first_local_end +
+                transform.shift;
+            const auto [begin, end] =
+                boundaryRange(
+                    std::min(first, second),
+                    std::max(first, second));
+            addEdgeInterval(
+                begin,
+                end,
+                LocalEdge{
+                    local_index_by_run.at(
+                        constraint->first_run),
+                    local_index_by_run.at(
+                        constraint->second_run)});
+        }
+
+        auto emitGroup = [&](
+            const std::vector<uint32_t>&
+                local_members,
+            int64_t global_begin,
+            int64_t global_end) {
+            if (local_members.empty() ||
+                global_begin >= global_end) {
+                throw std::runtime_error(
+                    "HAL normalized homology group is empty");
+            }
+            ColumnRun combined;
+            bool initialized = false;
+            for (uint32_t local_index :
+                 local_members) {
+                const uint32_t run_index =
+                    members.at(local_index);
+                const auto& source =
+                    runs[run_index];
+                const auto& transform =
+                    transforms[run_index];
+                const int64_t length =
+                    runColumnLength(source);
+                const int64_t local_begin =
+                    transform.sign > 0
+                    ? global_begin -
+                          transform.shift
+                    : transform.shift -
+                          global_end;
+                const int64_t local_end =
+                    transform.sign > 0
+                    ? global_end -
+                          transform.shift
+                    : transform.shift -
+                          global_begin;
+                if (local_begin < 0 ||
+                    local_end > length ||
+                    local_begin >= local_end ||
+                    local_end >
+                        std::numeric_limits<
+                            uint32_t>::max()) {
+                    throw std::runtime_error(
+                        "HAL normalized run boundary is invalid");
+                }
+                ColumnRun fragment =
+                    sliceColumnRun(
+                        source,
+                        static_cast<uint32_t>(
+                            local_begin),
+                        static_cast<uint32_t>(
+                            local_end));
+                if (transform.sign < 0) {
+                    reverseColumnRun(fragment);
+                }
+                combined.secondary_homology =
+                    combined.secondary_homology ||
+                    fragment.secondary_homology;
+                if (!initialized ||
+                    std::tie(
+                        fragment.block_id,
+                        fragment.col_beg,
+                        fragment.run_id) <
+                    std::tie(
+                        combined.block_id,
+                        combined.col_beg,
+                        combined.run_id)) {
+                    combined.run_id =
+                        fragment.run_id;
+                    combined.block_id =
+                        fragment.block_id;
+                    combined.col_beg =
+                        fragment.col_beg;
+                    combined.col_end =
+                        fragment.col_end;
+                    initialized = true;
+                }
+                combined.leaf_spans.insert(
+                    combined.leaf_spans.end(),
+                    std::make_move_iterator(
+                        fragment.leaf_spans.begin()),
+                    std::make_move_iterator(
+                        fragment.leaf_spans.end()));
+            }
+            finalizeNormalizedRun(
+                combined,
+                tree,
+                stats);
+            normalized.push_back(
+                std::move(combined));
+        };
+
+        RollbackRunConnectivity connectivity(
+            members.size());
+        std::vector<uint32_t> active_runs;
+        std::map<std::vector<uint32_t>, int64_t>
+            open_groups;
+        auto consumeCell = [&](size_t cell_index) {
+            std::map<
+                uint32_t,
+                std::vector<uint32_t>>
+                members_by_local_root;
+            for (uint32_t local_run : active_runs) {
+                members_by_local_root[
+                    connectivity.find(local_run)]
+                    .push_back(local_run);
+            }
+            std::vector<std::vector<uint32_t>>
+                current_groups;
+            current_groups.reserve(
+                members_by_local_root.size());
+            for (auto& [local_root, group] :
+                 members_by_local_root) {
+                (void)local_root;
+                std::sort(group.begin(), group.end());
+                current_groups.push_back(
+                    std::move(group));
+            }
+            std::sort(
+                current_groups.begin(),
+                current_groups.end());
+
+            const int64_t global_begin =
+                boundaries[cell_index];
+            for (auto open_it = open_groups.begin();
+                 open_it != open_groups.end();) {
+                if (!std::binary_search(
+                        current_groups.begin(),
+                        current_groups.end(),
+                        open_it->first)) {
+                    emitGroup(
+                        open_it->first,
+                        open_it->second,
+                        global_begin);
+                    open_it =
+                        open_groups.erase(open_it);
+                } else {
+                    ++open_it;
+                }
+            }
+            for (const auto& group :
+                 current_groups) {
+                open_groups.try_emplace(
+                    group,
+                    global_begin);
+            }
+        };
+
+        std::function<void(size_t, size_t, size_t)>
+            visitEventTree;
+        visitEventTree = [&](
+            size_t node,
+            size_t cell_begin,
+            size_t cell_end) {
+            if (cell_begin >= cell_count) {
+                return;
+            }
+            const size_t connectivity_snapshot =
+                connectivity.snapshot();
+            const size_t active_snapshot =
+                active_runs.size();
+            active_runs.insert(
+                active_runs.end(),
+                events[node].active_runs.begin(),
+                events[node].active_runs.end());
+            for (const auto& edge :
+                 events[node].edges) {
+                connectivity.unite(
+                    edge.first,
+                    edge.second);
+            }
+            if (cell_end - cell_begin == 1) {
+                consumeCell(cell_begin);
+            } else {
+                const size_t middle =
+                    cell_begin +
+                    (cell_end - cell_begin) / 2;
+                visitEventTree(
+                    node * 2,
+                    cell_begin,
+                    middle);
+                visitEventTree(
+                    node * 2 + 1,
+                    middle,
+                    cell_end);
+            }
+            active_runs.resize(active_snapshot);
+            connectivity.rollback(
+                connectivity_snapshot);
+        };
+        visitEventTree(1, 0, tree_size);
+        for (const auto& [group, global_begin] :
+             open_groups) {
+            emitGroup(
+                group,
+                global_begin,
+                boundaries.back());
+        }
+    }
+
+    std::sort(
+        normalized.begin(),
+        normalized.end(),
+        [](const ColumnRun& lhs,
+           const ColumnRun& rhs) {
+            return std::tie(
+                       lhs.block_id,
+                       lhs.col_beg,
+                       lhs.col_end,
+                       lhs.run_id) <
+                   std::tie(
+                       rhs.block_id,
+                       rhs.col_beg,
+                       rhs.col_end,
+                       rhs.run_id);
+        });
+    for (size_t run_index = 0;
+         run_index < normalized.size();
+         ++run_index) {
+        normalized[run_index].run_id =
+            run_index + 1;
+    }
+    runs = std::move(normalized);
+    stats.output_runs = runs.size();
+    return stats;
 }
 
 void sanitizeLeafCoverage(
@@ -664,6 +2461,173 @@ void sanitizeLeafCoverage(
             (void)fetchSequenceLength(shared_mgr, chr_name);
         }
     }
+}
+
+void exportCanonicalMafImpl(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::filesystem::path& maf_path,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers,
+    bool pairwise_mode) {
+    const TreeMeta leaf_tree =
+        buildLeafOnlyTree(
+            seqpro_managers);
+    const auto block_msas =
+        buildLeafBlockMSAs(
+            blocks,
+            leaf_tree,
+            seqpro_managers);
+    auto runs =
+        buildColumnRuns(
+            block_msas,
+            leaf_tree);
+    const size_t projected_run_count =
+        runs.size();
+    const auto selection =
+        selectCoordinateConsistentSecondaryRuns(
+            runs);
+    const auto normalization =
+        normalizeOverlappingColumnRuns(
+            runs,
+            leaf_tree);
+    sanitizeLeafCoverage(
+        runs,
+        seqpro_managers);
+
+    if (!maf_path.parent_path().empty()) {
+        std::filesystem::create_directories(
+            maf_path.parent_path());
+    }
+    std::ofstream output(
+        maf_path,
+        std::ios::binary |
+            std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error(
+            "Cannot open: " +
+            maf_path.string());
+    }
+    output << "##maf version=1 scoring=none\n";
+    size_t emitted_blocks = 0;
+    for (const auto& run : runs) {
+        if (run.leaf_spans.size() < 2) {
+            continue;
+        }
+        output << "a score=0\n";
+        // Emit every leaf's first copy before any second copy.  Pairwise
+        // presence is therefore independent of high paralog multiplicity in
+        // downstream streaming coverage consumers.
+        std::map<
+            SpeciesName,
+            std::vector<
+                const LeafRunSpan*>>
+            spans_by_leaf;
+        size_t maximum_copy_count = 0;
+        for (const auto& span :
+             run.leaf_spans) {
+            auto& copies =
+                spans_by_leaf[
+                    span.leaf_name];
+            copies.push_back(&span);
+            maximum_copy_count =
+                std::max(
+                    maximum_copy_count,
+                    copies.size());
+        }
+        std::vector<const LeafRunSpan*>
+            ordered_spans;
+        ordered_spans.reserve(
+            run.leaf_spans.size());
+        for (size_t copy_index = 0;
+             copy_index <
+                 maximum_copy_count;
+             ++copy_index) {
+            for (const auto& [
+                     leaf_name,
+                     copies] :
+                 spans_by_leaf) {
+                (void)leaf_name;
+                if (copy_index <
+                    copies.size()) {
+                    ordered_spans.push_back(
+                        copies[copy_index]);
+                }
+            }
+        }
+        for (const auto* span_ptr :
+             ordered_spans) {
+            const auto& span =
+                *span_ptr;
+            const auto manager_it =
+                seqpro_managers.find(
+                    span.leaf_name);
+            if (manager_it ==
+                seqpro_managers.end()) {
+                throw std::runtime_error(
+                    "MAF normalized run references "
+                    "an unknown leaf genome: " +
+                    span.leaf_name);
+            }
+            const uint64_t sequence_length =
+                fetchSequenceLength(
+                    manager_it->second,
+                    span.chr_name);
+            if (span.start >
+                    sequence_length ||
+                span.length >
+                    sequence_length -
+                        span.start ||
+                span.dna.size() !=
+                    span.length) {
+                throw std::runtime_error(
+                    "MAF normalized run lies outside "
+                    "its leaf sequence");
+            }
+            const uint64_t maf_start =
+                span.reversed
+                ? sequence_length -
+                      span.start -
+                      span.length
+                : span.start;
+            const std::string& source =
+                pairwise_mode
+                ? span.chr_name
+                : span.hal_sequence_name;
+            output << "s " << std::left
+                   << std::setw(20)
+                   << source << std::right
+                   << std::setw(12)
+                   << maf_start
+                   << std::setw(12)
+                   << span.length << ' '
+                   << (span.reversed
+                           ? '-'
+                           : '+')
+                   << std::setw(12)
+                   << sequence_length << ' '
+                   << span.dna << '\n';
+        }
+        output << '\n';
+        ++emitted_blocks;
+    }
+    spdlog::info(
+        "MAF export split {} elementary column runs; "
+        "selected {}/{} secondary runs "
+        "({} conflicting and {} redundant runs rejected, "
+        "{} bp), normalized to {} runs across {} "
+        "homology components, and emitted {} multi-leaf "
+        "blocks",
+        projected_run_count,
+        selection.accepted_runs,
+        selection.candidate_runs,
+        selection.conflict_rejected_runs,
+        selection.redundant_runs,
+        selection.rejected_bases,
+        normalization.output_runs,
+        normalization.connected_components,
+        emitted_blocks);
 }
 
 std::string buildConsensusDNAImpl(
@@ -1320,12 +3284,12 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
         contributions.size());
     for (const auto& [key, by_lineage] :
          contributions) {
-        TerminalEndSupport support{
-            OccurrenceEnd{
-                key.first,
-                static_cast<
-                    OccurrenceEndSide>(
-                    key.second)}};
+        TerminalEndSupport support{};
+        support.end = OccurrenceEnd{
+            key.first,
+            static_cast<
+                OccurrenceEndSide>(
+                key.second)};
         for (const auto& [lineage_id,
                           contribution] :
              by_lineage) {
@@ -1619,6 +3583,13 @@ NodeModel buildNodeModel(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - candidate_filter_begin)
             .count());
+    spdlog::info(
+        "HAL export ancestor {} prepared {} runs and {} occurrences "
+        "in {} ms",
+        model.genome_name,
+        candidate_runs.size(),
+        candidate_occurrences.size(),
+        candidate_filter_ms);
 
     model.run_dna.reserve(candidate_runs.size());
     model.placements.reserve(candidate_occurrences.size());
@@ -1707,6 +3678,12 @@ NodeModel buildNodeModel(
     }
     uint64_t run_dna_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - run_dna_begin).count());
+    spdlog::info(
+        "HAL export ancestor {} reconstructed {} run sequences "
+        "in {} ms",
+        model.genome_name,
+        model.run_dna.size(),
+        run_dna_ms);
 
     auto edge_collect_begin = Clock::now();
     auto edges = collectAdjacencySupport(
@@ -1723,6 +3700,12 @@ NodeModel buildNodeModel(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - edge_collect_begin)
             .count());
+    spdlog::info(
+        "HAL export ancestor {} collected {} adjacency candidates "
+        "in {} ms",
+        model.genome_name,
+        edges.size(),
+        edge_collect_ms);
     std::unordered_map<OccurrenceId, RunOrderKey>
         occurrence_order_keys;
     occurrence_order_keys.reserve(candidate_occurrences.size());
@@ -1745,6 +3728,10 @@ NodeModel buildNodeModel(
             prior_models,
             leaf_paths,
             config);
+    spdlog::info(
+        "HAL export ancestor {} collected {} terminal-end candidates",
+        model.genome_name,
+        model.terminal_ends.size());
     AncestralSequenceAssembly assembly =
         buildAncestralSequenceAssembly(
             candidate_occurrences,
@@ -1753,6 +3740,12 @@ NodeModel buildNodeModel(
             model.terminal_ends,
             config.scaffold_gap_length,
             stats);
+    spdlog::info(
+        "HAL export ancestor {} decomposed {} occurrences into {} "
+        "reference intervals",
+        model.genome_name,
+        candidate_occurrences.size(),
+        assembly.sequences.size());
     size_t supported_fragment_count = 0;
     for (const auto& sequence : assembly.sequences) {
         supported_fragment_count += sequence.supported_fragments.size();
@@ -3002,6 +4995,33 @@ void runHalAppend(const std::filesystem::path& c2h_path,
 
 } // namespace
 
+void exportToMaf(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::filesystem::path& maf_path,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers,
+    bool pairwise_mode) {
+    exportCanonicalMafImpl(
+        blocks,
+        maf_path,
+        seqpro_managers,
+        pairwise_mode);
+}
+
+std::unordered_set<uint64_t>
+findRejectedSecondaryHomologyBlocks(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers) {
+    return findRejectedSecondaryHomologyBlocksImpl(
+        blocks,
+        seqpro_managers);
+}
+
 TreeMeta buildTreeMeta(const NewickParser& parser) {
     TreeMeta meta;
     const auto& nodes = parser.getNodes();
@@ -3315,6 +5335,393 @@ bool sparseSelectionIsBetter(
         rhs.payloads.end());
 }
 
+struct BinaryLongDouble {
+    unsigned __int128 significand = 0;
+    int scale_exponent = 0;
+};
+
+BinaryLongDouble decomposeBinaryLongDouble(
+    long double value) {
+    if (value < 0.0L ||
+        !std::isfinite(value)) {
+        throw std::runtime_error(
+            "Ancestral matching edge has invalid weight");
+    }
+    if (value == 0.0L) {
+        return {};
+    }
+    static_assert(
+        std::numeric_limits<long double>::radix == 2);
+    static_assert(
+        std::numeric_limits<long double>::digits <=
+        128);
+    int exponent = 0;
+    const long double fraction =
+        std::frexp(value, &exponent);
+    const long double scaled_significand =
+        std::ldexp(
+            fraction,
+            std::numeric_limits<long double>::
+                digits);
+    const auto significand =
+        static_cast<unsigned __int128>(
+            scaled_significand);
+    if (significand == 0) {
+        throw std::runtime_error(
+            "Positive ancestral matching weight "
+            "lost its binary significand");
+    }
+    return BinaryLongDouble{
+        significand,
+        exponent -
+            std::numeric_limits<long double>::
+                digits};
+}
+
+template<class ExactWeight>
+ExactWeight exactScaledWeight(
+    const BinaryLongDouble& binary,
+    int minimum_scale_exponent) {
+    if (binary.significand == 0) {
+        return 0;
+    }
+    const int shift =
+        binary.scale_exponent -
+        minimum_scale_exponent;
+    if (shift < 0) {
+        throw std::runtime_error(
+            "Ancestral matching exact weight has "
+            "a negative scale shift");
+    }
+    ExactWeight result =
+        static_cast<uint64_t>(
+            binary.significand);
+    const uint64_t high =
+        static_cast<uint64_t>(
+            binary.significand >> 64U);
+    if (high != 0) {
+        if constexpr (
+            std::numeric_limits<
+                ExactWeight>::digits <= 64) {
+            throw std::overflow_error(
+                "Ancestral matching significand exceeds "
+                "the selected exact weight type");
+        } else {
+            result +=
+                static_cast<ExactWeight>(high) <<
+                64U;
+        }
+    }
+    result <<= static_cast<unsigned>(shift);
+    return result;
+}
+
+template<class ExactWeight>
+SparseMatchingSelection solveExactBlossomMatching(
+    const std::vector<uint32_t>& vertices,
+    const std::vector<
+        std::pair<uint32_t, uint32_t>>&
+        component_edges,
+    size_t component_begin,
+    size_t component_end,
+    const std::vector<SparseMatchingEdge>& edges,
+    int minimum_scale_exponent) {
+    using MatchingGraph =
+        boost::adjacency_list<
+            boost::vecS,
+            boost::vecS,
+            boost::undirectedS,
+            boost::no_property,
+            boost::property<
+                boost::edge_weight_t,
+                ExactWeight>>;
+    MatchingGraph graph(vertices.size());
+    std::unordered_map<uint32_t, uint32_t>
+        local_index;
+    local_index.reserve(vertices.size());
+    for (uint32_t index = 0;
+         index < vertices.size();
+         ++index) {
+        local_index.emplace(vertices[index], index);
+    }
+
+    std::vector<ExactWeight> exact_scores;
+    exact_scores.reserve(
+        component_end - component_begin);
+    ExactWeight score_sum = 0;
+    for (size_t index = component_begin;
+         index < component_end;
+         ++index) {
+        const auto binary =
+            decomposeBinaryLongDouble(
+                edges[
+                    component_edges[index]
+                        .second]
+                    .weight);
+        auto score =
+            exactScaledWeight<ExactWeight>(
+                binary,
+                minimum_scale_exponent);
+        score_sum += score;
+        exact_scores.push_back(
+            std::move(score));
+    }
+    const ExactWeight cardinality_bonus =
+        score_sum + 1;
+
+    std::map<
+        std::pair<uint32_t, uint32_t>,
+        uint32_t>
+        payload_by_vertices;
+    for (size_t index = component_begin;
+         index < component_end;
+         ++index) {
+        const auto& edge =
+            edges[component_edges[index].second];
+        uint32_t first =
+            local_index.at(edge.first_vertex);
+        uint32_t second =
+            local_index.at(edge.second_vertex);
+        if (second < first) {
+            std::swap(first, second);
+        }
+        payload_by_vertices.emplace(
+            std::pair{first, second},
+            edge.payload);
+        boost::add_edge(
+            first,
+            second,
+            cardinality_bonus +
+                exact_scores[
+                    index - component_begin],
+            graph);
+    }
+
+    using Vertex =
+        boost::graph_traits<
+            MatchingGraph>::vertex_descriptor;
+    std::vector<Vertex> mate(
+        boost::num_vertices(graph));
+    auto mate_map =
+        boost::make_iterator_property_map(
+            mate.begin(),
+            boost::get(
+                boost::vertex_index,
+                graph));
+    boost::maximum_weighted_matching(
+        graph,
+        mate_map);
+    const Vertex null_vertex =
+        boost::graph_traits<
+            MatchingGraph>::null_vertex();
+
+    SparseMatchingSelection result;
+    for (uint32_t local = 0;
+         local < mate.size();
+         ++local) {
+        if (mate[local] == null_vertex ||
+            local >=
+                static_cast<uint32_t>(
+                    mate[local])) {
+            continue;
+        }
+        result.payloads.push_back(
+            payload_by_vertices.at(
+                {local,
+                 static_cast<uint32_t>(
+                     mate[local])}));
+    }
+    std::sort(
+        result.payloads.begin(),
+        result.payloads.end());
+    return result;
+}
+
+SparseMatchingSelection solveTreeMaximumWeightMatching(
+    const std::vector<uint32_t>& vertices,
+    const std::vector<
+        std::pair<uint32_t, uint32_t>>&
+        component_edges,
+    size_t component_begin,
+    size_t component_end,
+    const std::vector<SparseMatchingEdge>& edges) {
+    const uint32_t no_vertex =
+        std::numeric_limits<uint32_t>::max();
+    std::unordered_map<uint32_t, uint32_t>
+        local_index;
+    local_index.reserve(vertices.size());
+    for (uint32_t index = 0;
+         index < vertices.size();
+         ++index) {
+        local_index.emplace(vertices[index], index);
+    }
+
+    std::vector<
+        std::vector<
+            std::pair<uint32_t, uint32_t>>>
+        adjacency(vertices.size());
+    for (size_t index = component_begin;
+         index < component_end;
+         ++index) {
+        const uint32_t edge_index =
+            component_edges[index].second;
+        const auto& edge = edges[edge_index];
+        const uint32_t first =
+            local_index.at(edge.first_vertex);
+        const uint32_t second =
+            local_index.at(edge.second_vertex);
+        adjacency[first].emplace_back(
+            second,
+            edge_index);
+        adjacency[second].emplace_back(
+            first,
+            edge_index);
+    }
+
+    std::vector<uint32_t> parent(
+        vertices.size(),
+        no_vertex);
+    std::vector<uint32_t> parent_edge(
+        vertices.size(),
+        no_vertex);
+    std::vector<uint32_t> order;
+    order.reserve(vertices.size());
+    parent[0] = 0;
+    order.push_back(0);
+    for (size_t cursor = 0;
+         cursor < order.size();
+         ++cursor) {
+        const uint32_t vertex = order[cursor];
+        for (const auto& [neighbor, edge_index] :
+             adjacency[vertex]) {
+            if (parent[neighbor] != no_vertex) {
+                continue;
+            }
+            parent[neighbor] = vertex;
+            parent_edge[neighbor] = edge_index;
+            order.push_back(neighbor);
+        }
+    }
+    if (order.size() != vertices.size()) {
+        throw std::runtime_error(
+            "Sparse tree matching component is disconnected");
+    }
+
+    struct TreeObjective {
+        uint64_t cardinality = 0;
+        long double weight = 0.0L;
+    };
+    const auto objective_is_better =
+        [](const TreeObjective& lhs,
+           const TreeObjective& rhs) {
+            return lhs.cardinality != rhs.cardinality
+                ? lhs.cardinality > rhs.cardinality
+                : lhs.weight > rhs.weight;
+        };
+
+    std::vector<TreeObjective>
+        free_at_parent(vertices.size());
+    std::vector<TreeObjective>
+        matched_to_parent(vertices.size());
+    std::vector<uint32_t> chosen_child(
+        vertices.size(),
+        no_vertex);
+    for (auto order_it = order.rbegin();
+         order_it != order.rend();
+         ++order_it) {
+        const uint32_t vertex = *order_it;
+        TreeObjective baseline;
+        for (const auto& [neighbor, edge_index] :
+             adjacency[vertex]) {
+            (void)edge_index;
+            if (parent[neighbor] != vertex) {
+                continue;
+            }
+            baseline.cardinality +=
+                free_at_parent[neighbor]
+                    .cardinality;
+            baseline.weight +=
+                free_at_parent[neighbor]
+                    .weight;
+        }
+        matched_to_parent[vertex] = baseline;
+        free_at_parent[vertex] = baseline;
+        for (const auto& [child, edge_index] :
+             adjacency[vertex]) {
+            if (parent[child] != vertex) {
+                continue;
+            }
+            if (baseline.cardinality <
+                free_at_parent[child]
+                    .cardinality) {
+                throw std::runtime_error(
+                    "Sparse tree matching cardinality underflow");
+            }
+            TreeObjective candidate{
+                baseline.cardinality -
+                    free_at_parent[child]
+                        .cardinality +
+                    matched_to_parent[child]
+                        .cardinality +
+                    1,
+                baseline.weight -
+                    free_at_parent[child]
+                        .weight +
+                    matched_to_parent[child]
+                        .weight +
+                    edges[edge_index].weight};
+            if (objective_is_better(
+                    candidate,
+                    free_at_parent[vertex])) {
+                free_at_parent[vertex] =
+                    candidate;
+                chosen_child[vertex] =
+                    child;
+            }
+        }
+    }
+
+    SparseMatchingSelection result;
+    result.weight =
+        free_at_parent.front().weight;
+    std::vector<std::pair<uint32_t, bool>>
+        reconstruction{{0, false}};
+    while (!reconstruction.empty()) {
+        const auto [vertex, matched_by_parent] =
+            reconstruction.back();
+        reconstruction.pop_back();
+        const uint32_t selected_child =
+            matched_by_parent
+            ? no_vertex
+            : chosen_child[vertex];
+        for (const auto& [child, edge_index] :
+             adjacency[vertex]) {
+            if (parent[child] != vertex) {
+                continue;
+            }
+            const bool child_matched =
+                child == selected_child;
+            if (child_matched) {
+                result.payloads.push_back(
+                    edges[edge_index].payload);
+            }
+            reconstruction.emplace_back(
+                child,
+                child_matched);
+        }
+    }
+    if (result.payloads.size() !=
+        free_at_parent.front().cardinality) {
+        throw std::runtime_error(
+            "Sparse tree matching reconstruction "
+            "cardinality mismatch");
+    }
+    std::sort(
+        result.payloads.begin(),
+        result.payloads.end());
+    return result;
+}
+
 std::vector<uint32_t> solveSparseMaximumWeightMatching(
     uint32_t vertex_count,
     const std::vector<SparseMatchingEdge>& edges) {
@@ -3462,6 +5869,11 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
         };
 
     std::vector<uint32_t> selected_payloads;
+    size_t singleton_components = 0;
+    size_t degree_two_components = 0;
+    size_t tree_components = 0;
+    size_t blossom_components = 0;
+    size_t maximum_blossom_vertices = 0;
     size_t component_begin = 0;
     while (component_begin <
            component_edges.size()) {
@@ -3474,6 +5886,7 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
             ++component_end;
         }
         if (component_end - component_begin == 1) {
+            ++singleton_components;
             selected_payloads.push_back(
                 edges[component_edges[
                           component_begin]
@@ -3510,6 +5923,7 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
 
         SparseMatchingSelection selection;
         if (degree_at_most_two) {
+            ++degree_two_components;
             const bool is_cycle =
                 degree[start_vertex] == 2;
             std::vector<uint32_t> ordered_edges;
@@ -3588,125 +6002,172 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
                     vertices.begin(),
                     vertices.end()),
                 vertices.end());
-            constexpr size_t
-                maximum_blossom_component_vertices =
-                    2048;
-            if (vertices.size() >
-                maximum_blossom_component_vertices) {
-                throw std::runtime_error(
-                    "Ancestral matching component exceeds the exact sparse-topology limit");
-            }
-            using MatchingGraph =
-                boost::adjacency_list<
-                    boost::vecS,
-                    boost::vecS,
-                    boost::undirectedS,
-                    boost::no_property,
-                    boost::property<
-                        boost::edge_weight_t,
-                        long double>>;
-            MatchingGraph graph(vertices.size());
-            std::unordered_map<uint32_t, uint32_t>
-                local_index;
-            local_index.reserve(vertices.size());
-            for (uint32_t index = 0;
-                 index < vertices.size();
-                 ++index) {
-                local_index.emplace(
-                    vertices[index],
-                    index);
-            }
-            std::map<
-                std::pair<uint32_t, uint32_t>,
-                uint32_t>
-                payload_by_vertices;
-            long double component_weight_sum = 0.0L;
-            for (size_t index = component_begin;
-                 index < component_end;
-                 ++index) {
-                const long double weight =
-                    edges[component_edges[index].second]
-                        .weight;
-                if (weight < 0.0L ||
-                    !std::isfinite(weight)) {
+            if (component_end -
+                        component_begin +
+                    1 ==
+                vertices.size()) {
+                ++tree_components;
+                const auto tree_begin =
+                    std::chrono::steady_clock::now();
+                if (vertices.size() >= 64) {
+                    spdlog::info(
+                        "HAL ancestral sparse matching started tree "
+                        "component with {} vertices and {} edges",
+                        vertices.size(),
+                        component_end - component_begin);
+                }
+                selection =
+                    solveTreeMaximumWeightMatching(
+                        vertices,
+                        component_edges,
+                        component_begin,
+                        component_end,
+                        edges);
+                if (vertices.size() >= 64) {
+                    spdlog::info(
+                        "HAL ancestral sparse matching finished tree "
+                        "component with {} vertices in {} ms",
+                        vertices.size(),
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() -
+                            tree_begin)
+                            .count());
+                }
+            } else {
+                const auto blossom_begin =
+                    std::chrono::steady_clock::now();
+                if (vertices.size() >= 64) {
+                    spdlog::info(
+                        "HAL ancestral sparse matching started exact "
+                        "blossom component with {} vertices and {} edges",
+                        vertices.size(),
+                        component_end - component_begin);
+                }
+                ++blossom_components;
+                maximum_blossom_vertices =
+                    std::max(
+                        maximum_blossom_vertices,
+                        vertices.size());
+                constexpr size_t
+                    maximum_blossom_component_vertices =
+                        2048;
+                if (vertices.size() >
+                    maximum_blossom_component_vertices) {
                     throw std::runtime_error(
-                        "Ancestral matching edge has invalid weight");
+                        "Ancestral matching component exceeds the exact sparse-topology limit");
                 }
-                component_weight_sum += weight;
-            }
-            if (!std::isfinite(
-                    component_weight_sum)) {
-                throw std::overflow_error(
-                    "Ancestral matching component weight overflow");
-            }
-            const long double cardinality_bonus =
-                std::nextafter(
-                    component_weight_sum,
-                    std::numeric_limits<long double>::
-                        infinity());
-            for (size_t index = component_begin;
-                 index < component_end;
-                 ++index) {
-                const auto& edge =
-                    edges[component_edges[index].second];
-                uint32_t first =
-                    local_index.at(edge.first_vertex);
-                uint32_t second =
-                    local_index.at(edge.second_vertex);
-                if (second < first) {
-                    std::swap(first, second);
+
+                int minimum_scale_exponent =
+                    std::numeric_limits<int>::max();
+                int maximum_scale_exponent =
+                    std::numeric_limits<int>::min();
+                bool have_positive_weight = false;
+                for (size_t index = component_begin;
+                     index < component_end;
+                     ++index) {
+                    const auto binary =
+                        decomposeBinaryLongDouble(
+                            edges[
+                                component_edges[index]
+                                    .second]
+                                .weight);
+                    if (binary.significand == 0) {
+                        continue;
+                    }
+                    have_positive_weight = true;
+                    minimum_scale_exponent =
+                        std::min(
+                            minimum_scale_exponent,
+                            binary.scale_exponent);
+                    maximum_scale_exponent =
+                        std::max(
+                            maximum_scale_exponent,
+                            binary.scale_exponent);
                 }
-                payload_by_vertices.emplace(
-                    std::pair{first, second},
-                    edge.payload);
-                const long double matching_weight =
-                    cardinality_bonus + edge.weight;
-                if (!std::isfinite(
-                        matching_weight)) {
-                    throw std::overflow_error(
-                        "Ancestral matching edge weight overflow");
+                if (!have_positive_weight) {
+                    minimum_scale_exponent = 0;
+                    maximum_scale_exponent = 0;
                 }
-                boost::add_edge(
-                    first,
-                    second,
-                    matching_weight,
-                    graph);
-            }
-            using Vertex =
-                boost::graph_traits<
-                    MatchingGraph>::vertex_descriptor;
-            std::vector<Vertex> mate(
-                boost::num_vertices(graph));
-            auto mate_map =
-                boost::make_iterator_property_map(
-                    mate.begin(),
-                    boost::get(
-                        boost::vertex_index,
-                        graph));
-            boost::maximum_weighted_matching(
-                graph,
-                mate_map);
-            const Vertex null_vertex =
-                boost::graph_traits<
-                    MatchingGraph>::null_vertex();
-            for (uint32_t local = 0;
-                 local < mate.size();
-                 ++local) {
-                if (mate[local] == null_vertex ||
-                    local >=
-                        static_cast<uint32_t>(
-                            mate[local])) {
-                    continue;
+                size_t edge_count_bits = 0;
+                for (size_t count =
+                         component_end -
+                         component_begin;
+                     count != 0;
+                     count >>= 1U) {
+                    ++edge_count_bits;
                 }
-                selection.payloads.push_back(
-                    payload_by_vertices.at(
-                        {local,
-                         static_cast<uint32_t>(
-                             mate[local])}));
+                const size_t required_bits =
+                    static_cast<size_t>(
+                        std::numeric_limits<
+                            long double>::digits) +
+                    static_cast<size_t>(
+                        maximum_scale_exponent -
+                        minimum_scale_exponent) +
+                    edge_count_bits +
+                    8;
+                if (required_bits <= 62) {
+                    selection =
+                        solveExactBlossomMatching<
+                            int64_t>(
+                            vertices,
+                            component_edges,
+                            component_begin,
+                            component_end,
+                            edges,
+                            minimum_scale_exponent);
+                } else if (required_bits <= 126) {
+                    selection =
+                        solveExactBlossomMatching<
+                            __int128_t>(
+                            vertices,
+                            component_edges,
+                            component_begin,
+                            component_end,
+                            edges,
+                            minimum_scale_exponent);
+                } else {
+                    constexpr size_t
+                        wide_weight_bits = 32768;
+                    if (required_bits >
+                        wide_weight_bits - 8) {
+                        throw std::overflow_error(
+                            "Ancestral matching exact weight exceeds "
+                            "the supported binary exponent range");
+                    }
+                    using WideExactWeight =
+                        boost::multiprecision::number<
+                            boost::multiprecision::
+                                cpp_int_backend<
+                                    wide_weight_bits,
+                                    wide_weight_bits,
+                                    boost::multiprecision::
+                                        signed_magnitude,
+                                    boost::multiprecision::
+                                        unchecked,
+                                    void>>;
+                    selection =
+                        solveExactBlossomMatching<
+                            WideExactWeight>(
+                            vertices,
+                            component_edges,
+                            component_begin,
+                            component_end,
+                            edges,
+                            minimum_scale_exponent);
+                }
+                if (vertices.size() >= 64) {
+                    spdlog::info(
+                        "HAL ancestral sparse matching finished exact "
+                        "blossom component with {} vertices in {} ms",
+                        vertices.size(),
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() -
+                            blossom_begin)
+                            .count());
+                }
             }
-            std::sort(
-                selection.payloads.begin(),
-                selection.payloads.end());
         }
         selected_payloads.insert(
             selected_payloads.end(),
@@ -3717,6 +6178,16 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
     std::sort(
         selected_payloads.begin(),
         selected_payloads.end());
+    spdlog::info(
+        "HAL ancestral sparse matching solved {} edges in {} "
+        "singleton, {} degree-two, {} tree, and {} blossom "
+        "components (largest blossom {} vertices)",
+        edges.size(),
+        singleton_components,
+        degree_two_components,
+        tree_components,
+        blossom_components,
+        maximum_blossom_vertices);
     return selected_payloads;
 }
 
@@ -4635,7 +7106,7 @@ void exportToHal(
                 live_blocks[static_cast<size_t>(i)],
                 tree,
                 seqpro_managers,
-                softmask_indexes);
+                &softmask_indexes);
             if (msa.block && !msa.leaf_rows.empty()) {
                 block_results[static_cast<size_t>(i)] = std::move(msa);
             }
@@ -4667,12 +7138,33 @@ void exportToHal(
 
     auto build_runs_begin = Clock::now();
     auto runs = buildColumnRuns(block_msas, tree);
+    const size_t projected_run_count = runs.size();
+    const auto secondary_selection =
+        selectCoordinateConsistentSecondaryRuns(runs);
+    const auto normalization =
+        normalizeOverlappingColumnRuns(runs, tree);
     local_stats.run_count = runs.size();
     for (const auto& run : runs) {
         local_stats.observed_occurrence_count +=
             run.leaf_spans.size();
     }
-    spdlog::info("HAL export split {} elementary column runs", runs.size());
+    spdlog::info(
+        "HAL export split {} elementary column runs; selected {}/{} "
+        "secondary runs for the coordinate-consistent maximum-support "
+        "forest ({} conflicting and {} redundant runs rejected, {} bp), "
+        "then normalized to {} runs across {} overlapping homology "
+        "components ({} overlap constraints, {} duplicate leaf "
+        "occurrences removed)",
+        projected_run_count,
+        secondary_selection.accepted_runs,
+        secondary_selection.candidate_runs,
+        secondary_selection.conflict_rejected_runs,
+        secondary_selection.redundant_runs,
+        secondary_selection.rejected_bases,
+        normalization.output_runs,
+        normalization.connected_components,
+        normalization.overlap_constraints,
+        normalization.duplicate_leaf_occurrences);
     sanitizeLeafCoverage(runs, seqpro_managers);
     local_stats.build_runs_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_runs_begin).count());

@@ -254,6 +254,176 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 	return result;          // NRVO / move-elided
 }
 
+std::shared_ptr<PreparedAnchorSearch>
+PairRareAligner::prepareQueryFileAnchor(
+    SeqPro::ManagerVariant& query_fasta_manager,
+    SearchMode search_mode,
+    bool allow_mem,
+    bool allow_short_mum,
+    sdsl::int_vector<0>& ref_global_cache,
+    SeqPro::Length sampling_interval,
+    bool is_multiple,
+    bool include_masked_regions) {
+    auto plan =
+        std::make_shared<PreparedAnchorSearch>();
+    plan->query_manager =
+        &query_fasta_manager;
+    plan->search_mode = search_mode;
+    plan->allow_mem = allow_mem;
+    plan->allow_short_mum =
+        allow_short_mum;
+    plan->ref_global_cache =
+        &ref_global_cache;
+    plan->sampling_interval =
+        sampling_interval;
+
+    RegionVec chunks;
+    if (include_masked_regions) {
+        chunks =
+            preAllocateOriginalChunksBySize(
+                query_fasta_manager,
+                chunk_size,
+                overlap_size,
+                10000);
+    } else if (is_multiple) {
+        chunks =
+            preAllocateChunksBySize(
+                query_fasta_manager,
+                chunk_size,
+                overlap_size,
+                10000,
+                true);
+    } else {
+        chunks =
+            preAllocateChunks(
+                query_fasta_manager,
+                chunk_size,
+                overlap_size,
+                1000,
+                10000);
+    }
+
+    plan->tasks.reserve(
+        chunks.size() * 2);
+    for (const auto& chunk : chunks) {
+        plan->tasks.push_back(
+            {chunk, Strand::FORWARD});
+        plan->tasks.push_back(
+            {chunk, Strand::REVERSE});
+    }
+    plan->task_results.resize(
+        plan->tasks.size());
+    plan->task_errors.resize(
+        plan->tasks.size());
+    return plan;
+}
+
+void PairRareAligner::
+executePreparedAnchorTask(
+    PreparedAnchorSearch& plan,
+    size_t task_index) {
+    if (task_index >=
+        plan.tasks.size()) {
+        throw std::out_of_range(
+            "Prepared anchor task index is out of range");
+    }
+    try {
+        if (plan.query_manager == nullptr ||
+            plan.ref_global_cache == nullptr ||
+            !ref_index) {
+            throw std::logic_error(
+                "Prepared anchor search is not fully initialized");
+        }
+        const auto& task =
+            plan.tasks[task_index];
+        const auto& chunk =
+            task.chunk;
+        std::string sequence =
+            std::visit(
+                [&](auto&& manager_ptr)
+                    -> std::string {
+                    using PtrType =
+                        std::decay_t<
+                            decltype(manager_ptr)>;
+                    if constexpr (
+                        std::is_same_v<
+                            PtrType,
+                            std::unique_ptr<
+                                SeqPro::SequenceManager>>) {
+                        return manager_ptr
+                            ->getSubSequence(
+                                chunk.chr_index,
+                                chunk.start,
+                                chunk.length);
+                    } else {
+                        return manager_ptr
+                            ->getOriginalManager()
+                            .getSubSequence(
+                                chunk.chr_index,
+                                chunk.start,
+                                chunk.length);
+                    }
+                },
+                *plan.query_manager);
+
+        if (sequence.length() <
+            chunk.length) {
+            plan.task_results[task_index] =
+                std::make_shared<
+                    MatchVec2D>();
+            return;
+        }
+        const SearchMode task_search_mode =
+            task.strand ==
+                    Strand::FORWARD
+                ? plan.search_mode
+                : ACCURATE_SEARCH;
+        plan.task_results[task_index] =
+            ref_index->findAnchors(
+                chunk.chr_index,
+                sequence,
+                task_search_mode,
+                task.strand,
+                plan.allow_mem,
+                chunk.start,
+                min_anchor_length,
+                plan.allow_short_mum,
+                max_anchor_frequency,
+                *plan.ref_global_cache,
+                plan.sampling_interval);
+    } catch (...) {
+        plan.task_errors[task_index] =
+            std::current_exception();
+    }
+}
+
+MatchVec3DPtr PairRareAligner::
+collectPreparedAnchorSearch(
+    PreparedAnchorSearch& plan) {
+    for (const auto& error :
+         plan.task_errors) {
+        if (error) {
+            std::rethrow_exception(
+                error);
+        }
+    }
+    auto result =
+        std::make_shared<MatchVec3D>();
+    result->reserve(
+        plan.task_results.size());
+    for (auto& task_result :
+         plan.task_results) {
+        if (!task_result) {
+            task_result =
+                std::make_shared<
+                    MatchVec2D>();
+        }
+        result->emplace_back(
+            std::move(*task_result));
+    }
+    return result;
+}
+
 // ========== 工具：快速取子串 ==========
 static std::string subSeq(const SeqPro::ManagerVariant& mv,
                                  ChrIndex chr, int_t b, int_t l) {
@@ -505,6 +675,43 @@ AnchorPtrVec extendClustersToAnchors(
 }
 
 
+AnchorPtrVec PairRareAligner::
+extendClusterGroupToAnchors(
+    SeqPro::ManagerVariant&
+        query_seqpro_manager,
+    MatchClusterVecPtr cluster_group,
+    bool is_first) {
+    AnchorPtrVec anchors;
+    if (!cluster_group ||
+        cluster_group->empty()) {
+        return anchors;
+    }
+    if (!is_first) {
+        for (auto& cluster :
+             *cluster_group) {
+            for (auto& match : cluster) {
+                MatchVec single_match{
+                    match};
+                Anchor anchor =
+                    extendClusterToAnchor(
+                        single_match,
+                        *ref_seqpro_manager,
+                        query_seqpro_manager);
+                anchors.push_back(
+                    std::make_shared<Anchor>(
+                        std::move(anchor)));
+            }
+        }
+    } else {
+        anchors = linkClusters(
+            *cluster_group,
+            *ref_seqpro_manager,
+            query_seqpro_manager);
+    }
+    return anchors;
+}
+
+
 AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first)
 {
     // 输出结构
@@ -528,27 +735,11 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
     for (long long t = 0; t < static_cast<long long>(cluster_num); ++t) {
     	MatchClusterVecPtr tmp_p = tmp_cluster_vec[t];
     	if (!tmp_p || tmp_p->empty()) continue;
-        AnchorPtrVec anchors;
-        anchors.reserve(1);
-
-        if (!is_first) {
-            for (auto& c : (*tmp_p)) {
-                for (auto& sub_c : c) {
-                    MatchVec mc;
-                    mc.push_back(sub_c);
-
-                    Anchor anchor = extendClusterToAnchor(
-                        mc, *ref_seqpro_manager, query_seqpro_manager
-                    );
-                    anchors.push_back(std::make_shared<Anchor>(std::move(anchor)));
-                }
-            }
-        } else {
-            anchors = extendClustersToAnchors(
-                tmp_p, *ref_seqpro_manager, query_seqpro_manager);
-            linkClusters(
-                anchors, *ref_seqpro_manager, query_seqpro_manager);
-        }
+        AnchorPtrVec anchors =
+            extendClusterGroupToAnchors(
+                query_seqpro_manager,
+                tmp_p,
+                is_first);
 
         if (!anchors.empty()) {
             tmp_res[t] = std::move(anchors);
@@ -775,35 +966,29 @@ static void filterChrByDP(
 #endif
 }
 
+void PairRareAligner::
+filterAnchorByDPDimension(
+    AnchorBySQR_SparsePtr anchor_map,
+    uint_t chromosome_id,
+    bool filter_ref) {
+    filterChrByDP(
+        std::move(anchor_map),
+        chromosome_id,
+        filter_ref);
+}
+
+
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < ref_chr_cnt; i++) {
-		filterChrByDP(anchor_map, i, true);
+		filterAnchorByDPDimension(anchor_map, i, true);
 	}
 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < qry_chr_cnt; i++) {
-		filterChrByDP(anchor_map, i, false);
+		filterAnchorByDPDimension(anchor_map, i, false);
 	}
-
-	if (const char* dump_path = std::getenv("RAMAX_ANCHOR_DUMP")) {
-		std::ofstream dump(dump_path);
-		dump << "group\tref_chr\tref_start\tref_len\tqry_chr\tqry_start\tqry_len\tstrand\talignment_length\taligned_base\tref_selected\tqry_selected\tcigar\n";
-		for (size_t group = 0; group < anchor_map->size(); ++group) {
-			for (const auto& anchor : anchor_map->at(group)) {
-				dump << group << '\t'
-				     << anchor->ref_chr_index << '\t' << anchor->ref_start << '\t' << anchor->ref_len << '\t'
-				     << anchor->qry_chr_index << '\t' << anchor->qry_start << '\t' << anchor->qry_len << '\t'
-				     << (anchor->strand == FORWARD ? '+' : '-') << '\t'
-				     << anchor->alignment_length << '\t' << anchor->aligned_base << '\t'
-				     << anchor->ref_selected << '\t' << anchor->qry_selected << '\t'
-				     << cigarToString(anchor->cigar) << '\n';
-			}
-		}
-	}
-
-	return;
 
 }
 
@@ -811,62 +996,26 @@ void PairRareAligner::constructGraphByDP(
     SpeciesName query_name,
     SeqPro::ManagerVariant& query_seqpro_manager,
     AnchorBySQR_SparsePtr anchor_ptr,
-    RaMesh::RaMeshMultiGenomeGraph& graph,
-    bool initial_round) {
-    const auto chromosome_name = [](
-        SeqPro::ManagerVariant& manager,
-        const ChrIndex chromosome_index) -> ChrName {
-        return std::visit(
-            [&](auto& manager_ptr) -> ChrName {
-                using ManagerPtr =
-                    std::decay_t<decltype(manager_ptr)>;
-                if constexpr (std::is_same_v<
-                                  ManagerPtr,
-                                  std::unique_ptr<
-                                      SeqPro::SequenceManager>>) {
-                    return manager_ptr->getSequenceName(
-                        chromosome_index);
-                } else {
-                    return manager_ptr->getOriginalManager()
-                        .getSequenceName(chromosome_index);
-                }
-            },
-            manager);
-    };
-
+    RaMesh::RaMeshMultiGenomeGraph& graph) {
     for (auto& anchor_group : *anchor_ptr) {
         for (const auto& anchor : anchor_group) {
-            if (anchor->ref_selected && anchor->qry_selected) {
-                try {
-                    graph.insertAnchorIntoGraph(
-                        *ref_seqpro_manager,
-                        query_seqpro_manager,
-                        ref_name,
-                        query_name,
-                        *anchor,
-                        false);
-                } catch (const std::exception& error) {
-                    spdlog::error(
-                        "Error inserting anchor into graph: {}",
-                        error.what());
-                }
+            if (!anchor->ref_selected ||
+                !anchor->qry_selected) {
                 continue;
             }
-            if (anchor->ref_selected == anchor->qry_selected) {
-                continue;
-            }
-            graph.registerSecondaryAnchorCandidate(
-                ref_name,
-                chromosome_name(
+            try {
+                graph.insertAnchorIntoGraph(
                     *ref_seqpro_manager,
-                    anchor->ref_chr_index),
-                query_name,
-                chromosome_name(
                     query_seqpro_manager,
-                    anchor->qry_chr_index),
-                *anchor,
-                initial_round,
-                !anchor->ref_selected);
+                    ref_name,
+                    query_name,
+                    *anchor,
+                    false);
+            } catch (const std::exception& error) {
+                spdlog::error(
+                    "Error inserting anchor into graph: {}",
+                    error.what());
+            }
         }
     }
 }

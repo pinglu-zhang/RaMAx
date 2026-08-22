@@ -353,7 +353,6 @@ void testScaffoldGapSegmentsTileSequences(
     graph.exportToMaf(
         maf_path,
         managers,
-        true,
         false);
     const uint64_t hal_leaf_a_coverage =
         halPairCoverage(

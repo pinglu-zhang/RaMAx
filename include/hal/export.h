@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace RaMesh::hal_export {
@@ -76,6 +77,23 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
 std::vector<GenomeSequenceName> buildOutputSequenceOrder(
     const std::vector<std::string>& genome_order,
     const std::vector<GenomeSequenceName>& genome_sequences);
+void exportToMaf(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::filesystem::path& maf_path,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers,
+    bool pairwise_mode = false);
+
+std::unordered_set<uint64_t>
+findRejectedSecondaryHomologyBlocks(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers);
+
 
 void exportToHal(
     const std::vector<std::weak_ptr<Block>>& blocks,

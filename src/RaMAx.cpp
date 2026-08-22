@@ -1069,68 +1069,51 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
 // 导出结果（MAF / HAL）
 // ------------------------------
 static void exportResults(
-    const CommonArgs& common_args,
-    const NewickParser& newick_tree,
-    std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-    const SoftMask::PathMap& softmask_path_map,
-    RaMesh::RaMeshMultiGenomeGraph* graph
-) {
-    // 清理遮蔽区间（导出前）
-    clearAllMaskedRegions(seqpro_managers);
+    const CommonArgs &common_args, const NewickParser &newick_tree,
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> &seqpro_managers,
+    const SoftMask::PathMap &softmask_path_map,
+    RaMesh::RaMeshMultiGenomeGraph *graph) {
+  // 清理遮蔽区间（导出前）
+  clearAllMaskedRegions(seqpro_managers);
 
-    // Both direct MAF export and HAL construction reconstruct multiway
-    // columns through mergeAlignmentByRef().  Configure the shared repair
-    // once so the two output paths make the same local insertion decisions.
-    configureCrossAnchorInsertionRepair(
-        requiredMinipoaExecutable(),
-        common_args.species_mismatch_realign_max_span);
-    const bool include_secondary_alignments =
-        std::getenv("RAMAX_SECONDARY_ALIGNMENTS") != nullptr;
-    if (include_secondary_alignments) {
-        graph->materializeSecondaryAlignments();
-        if (common_args.merge_exact_contiguous_blocks &&
-            !common_args.ref_name.empty()) {
-            const size_t eliminated_boundaries =
-                graph->mergeExactContiguousBlocks(
-                    common_args.ref_name, 1000000,
-                    common_args.merge_query_gap_max);
-            spdlog::info(
-                "[secondary-alignments] post-materialization "
-                "eliminated_boundaries={} max_query_gap={}",
-                eliminated_boundaries,
-                common_args.merge_query_gap_max);
-        }
-    }
+  // Both direct MAF export and HAL construction reconstruct multiway
+  // columns through mergeAlignmentByRef().  Configure the shared repair
+  // once so the two output paths make the same local insertion decisions.
+  configureCrossAnchorInsertionRepair(
+      requiredMinipoaExecutable(),
+      common_args.species_mismatch_realign_max_span);
+  graph->materializeSecondaryAlignments();
+  if (common_args.merge_exact_contiguous_blocks &&
+      !common_args.ref_name.empty()) {
+    const size_t eliminated_boundaries = graph->mergeExactContiguousBlocks(
+        common_args.ref_name, 1000000, common_args.merge_query_gap_max);
+    spdlog::info("[secondary-alignments] post-materialization "
+                 "eliminated_boundaries={} max_query_gap={}",
+                 eliminated_boundaries, common_args.merge_query_gap_max);
+  }
 
-    // 根据输出格式选择导出方法
-    switch (common_args.output_format) {
-    case MultipleGenomeOutputFormat::MAF:
-        spdlog::info("Exporting to MAF format...");
-        graph->exportToMaf(
-            common_args.output_path,
-            seqpro_managers,
-            !include_secondary_alignments,
-            false);
-        break;
+  // 根据输出格式选择导出方法
+  switch (common_args.output_format) {
+  case MultipleGenomeOutputFormat::MAF:
+    spdlog::info("Exporting to MAF format...");
+    graph->exportToMaf(common_args.output_path, seqpro_managers, false);
+    break;
 
-    case MultipleGenomeOutputFormat::HAL:
-        spdlog::info("Exporting to HAL format...");
-        // 使用已解析并可能裁剪过的 newick_tree，避免重复读取导致 --root 子树失效
-        graph->exportToHal(
-            common_args.output_path,
-            seqpro_managers,
-            newick_tree,
-            common_args.root_name,
-            static_cast<int>(common_args.thread_num),
-            softmask_path_map
-        );
-        break;
+  case MultipleGenomeOutputFormat::HAL:
+    spdlog::info("Exporting to HAL format...");
+    // 使用已解析并可能裁剪过的 newick_tree，避免重复读取导致 --root 子树失效
+    graph->exportToHal(common_args.output_path, seqpro_managers, newick_tree,
+                       common_args.root_name,
+                       static_cast<int>(common_args.thread_num),
+                       softmask_path_map);
+    break;
 
-    default:
-        throw std::runtime_error("Unsupported output format for multiple genome alignment");
-    }
-    logCrossAnchorInsertionRepairStats();
-    RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
+  default:
+    throw std::runtime_error(
+        "Unsupported output format for multiple genome alignment");
+  }
+  logCrossAnchorInsertionRepairStats();
+  RaMesh::Alignment::ExternalMsaRunner::instance().logSummary();
 }
 
 // ------------------------------
