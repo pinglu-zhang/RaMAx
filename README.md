@@ -64,6 +64,10 @@ ramax \
 
 Use an output name ending in `.maf` or `.hal`. Intermediate graph state, logs,
 and minipoa scratch files are kept under the work directory.
+The two serializers use the same normalized multiway homology relation:
+changing only the output suffix does not change leaf-to-leaf alignment
+coverage. HAL soft-mask restoration is applied after alignment decisions, so
+letter case cannot change the homology graph.
 
 The graph optimizations are enabled by default. `--optimize-blocks` is an
 explicit, repeatable way to request the same default set. The defaults are:

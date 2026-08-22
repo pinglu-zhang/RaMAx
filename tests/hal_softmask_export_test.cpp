@@ -118,28 +118,72 @@ uint64_t mafPairCoverage(
     const std::filesystem::path& maf_path,
     const std::string& reference_name,
     const std::string& target_name) {
+    struct MafRow {
+        std::string source;
+        uint64_t start = 0;
+        char strand = '+';
+        uint64_t source_size = 0;
+        std::string dna;
+    };
     std::ifstream input(maf_path);
     if (!input) {
         throw std::runtime_error(
             "cannot open coverage-contract MAF");
     }
-    uint64_t covered = 0;
-    std::map<std::string, std::string> rows;
+    std::set<
+        std::pair<std::string, uint64_t>>
+        covered_positions;
+    std::map<std::string, std::vector<MafRow>>
+        rows;
     auto flush = [&] {
-        const auto reference = rows.find(reference_name);
-        const auto target = rows.find(target_name);
-        if (reference != rows.end() &&
-            target != rows.end()) {
-            require(
-                reference->second.size() ==
-                    target->second.size(),
-                "coverage-contract MAF row lengths differ");
+        const auto reference =
+            rows.find(reference_name);
+        const auto target =
+            rows.find(target_name);
+        if (reference == rows.end() ||
+            target == rows.end()) {
+            rows.clear();
+            return;
+        }
+        for (const auto& reference_row :
+             reference->second) {
+            uint64_t non_gap_before = 0;
             for (size_t column = 0;
-                 column < reference->second.size();
+                 column <
+                     reference_row.dna.size();
                  ++column) {
-                covered += static_cast<uint64_t>(
-                    reference->second[column] != '-' &&
-                    target->second[column] != '-');
+                if (reference_row.dna[column] ==
+                    '-') {
+                    continue;
+                }
+                const bool target_present =
+                    std::any_of(
+                        target->second.begin(),
+                        target->second.end(),
+                        [&](const MafRow& row) {
+                            require(
+                                row.dna.size() ==
+                                    reference_row
+                                        .dna.size(),
+                                "coverage-contract MAF "
+                                "row lengths differ");
+                            return row.dna[column] !=
+                                   '-';
+                        });
+                if (target_present) {
+                    const uint64_t position =
+                        reference_row.strand == '+'
+                        ? reference_row.start +
+                              non_gap_before
+                        : reference_row.source_size -
+                              reference_row.start -
+                              non_gap_before -
+                              1;
+                    covered_positions.emplace(
+                        reference_row.source,
+                        position);
+                }
+                ++non_gap_before;
             }
         }
         rows.clear();
@@ -155,70 +199,290 @@ uint64_t mafPairCoverage(
         }
         std::istringstream fields(line);
         char tag = '\0';
-        std::string source;
-        uint64_t start = 0;
+        MafRow row;
         uint64_t size = 0;
-        char strand = '+';
-        uint64_t source_size = 0;
-        std::string dna;
-        fields >> tag >> source >> start >> size >>
-            strand >> source_size >> dna;
+        fields >> tag >> row.source >>
+            row.start >> size >>
+            row.strand >>
+            row.source_size >>
+            row.dna;
         require(
             fields && tag == 's',
             "cannot parse coverage-contract MAF row");
-        const size_t delimiter = source.find('.');
+        const size_t delimiter =
+            row.source.find('.');
         const std::string species =
-            source.substr(0, delimiter);
-        rows.emplace(species, std::move(dna));
+            row.source.substr(
+                0,
+                delimiter);
+        rows[species].push_back(
+            std::move(row));
     }
     flush();
-    return covered;
+    return covered_positions.size();
 }
-void testParalogousOccurrencesRemainThreaded(
-    const std::filesystem::path& temp,
-    const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
-        managers,
-    const SoftMask::PathMap& softmask_paths) {
-    auto block = RaMesh::Block::create(3);
-    block->ref_species = "leafA";
-    block->ref_chr = "chr1";
-    const Cigar_t cigar{cigarToInt('M', 4)};
-    auto reference = RaMesh::Segment::create(
-        0,
-        4,
-        Strand::FORWARD,
-        cigar,
-        RaMesh::AlignRole::PRIMARY,
-        RaMesh::SegmentRole::SEGMENT,
-        block);
-    auto first_copy = RaMesh::Segment::create(
-        0,
-        4,
-        Strand::FORWARD,
-        cigar,
-        RaMesh::AlignRole::PRIMARY,
-        RaMesh::SegmentRole::SEGMENT,
-        block);
-    auto second_copy = RaMesh::Segment::create(
-        4,
-        4,
-        Strand::FORWARD,
-        cigar,
-        RaMesh::AlignRole::PRIMARY,
-        RaMesh::SegmentRole::SEGMENT,
-        block);
-    block->anchors.emplace(
-        RaMesh::SpeciesChrPair{"leafA", "chr1"},
-        reference);
-    block->anchors.emplace(
-        RaMesh::SpeciesChrPair{"leafB", "chr1"},
-        first_copy);
-    block->anchors.emplace(
-        RaMesh::SpeciesChrPair{"leafB", "chr1"},
-        second_copy);
+void testNamespacedLeafSequenceIsNotDuplicated(
+    const std::filesystem::path& temp) {
+    std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>
+        managers;
+    for (const auto& species :
+         std::array<std::string, 2>{
+             "leafA", "leafB"}) {
+        const auto fasta =
+            temp /
+            (species + ".namespaced.fa");
+        std::ofstream output(fasta);
+        output << '>' << species
+               << ".chr1\nACGT\n";
+        output.close();
+        SeqPro::ManagerVariant manager =
+            std::make_unique<
+                SeqPro::SequenceManager>(
+                fasta);
+        managers[species] =
+            std::make_shared<
+                SeqPro::ManagerVariant>(
+                std::move(manager));
+    }
 
-    const auto hal_path = temp / "paralogy.hal";
-    std::vector<std::weak_ptr<RaMesh::Block>> blocks{block};
+    auto block = RaMesh::Block::create(2);
+    block->ref_species = "leafA";
+    block->ref_chr = "leafA.chr1";
+    const Cigar_t cigar{
+        cigarToInt('M', 4)};
+    for (const auto& species :
+         std::array<std::string, 2>{
+             "leafA", "leafB"}) {
+        auto segment =
+            RaMesh::Segment::create(
+                0,
+                4,
+                Strand::FORWARD,
+                cigar,
+                RaMesh::AlignRole::PRIMARY,
+                RaMesh::SegmentRole::SEGMENT,
+                block);
+        block->anchors.emplace(
+            RaMesh::SpeciesChrPair{
+                species,
+                species + ".chr1"},
+            std::move(segment));
+    }
+
+    auto graph_managers = managers;
+    RaMesh::RaMeshMultiGenomeGraph graph(
+        graph_managers);
+    graph.blocks.emplace_back(block);
+    const auto maf_path =
+        temp / "namespaced.maf";
+    graph.exportToMaf(maf_path, managers, false);
+    std::ifstream maf_input(maf_path);
+    const std::string maf{
+        std::istreambuf_iterator<char>(
+            maf_input),
+        std::istreambuf_iterator<char>()};
+    require(
+        maf.find("leafA.chr1") !=
+                std::string::npos &&
+            maf.find(
+                "leafA.leafA.chr1") ==
+                std::string::npos &&
+            maf.find(
+                "leafB.leafB.chr1") ==
+                std::string::npos,
+        "MAF duplicated an existing species "
+        "namespace in a leaf sequence name");
+}
+
+void testParalogousOccurrencesRemainThreaded(
+    const std::filesystem::path &temp,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant> &managers,
+    const SoftMask::PathMap &softmask_paths) {
+  auto block = RaMesh::Block::create(4);
+  block->ref_species = "leafA";
+  block->ref_chr = "chr1";
+  const Cigar_t cigar{cigarToInt('M', 4)};
+  auto reference = RaMesh::Segment::create(0, 4, Strand::FORWARD, cigar,
+                                           RaMesh::AlignRole::PRIMARY,
+                                           RaMesh::SegmentRole::SEGMENT, block);
+  auto secondary_reference = RaMesh::Segment::create(
+      4, 4, Strand::FORWARD, cigar, RaMesh::AlignRole::SECONDARY,
+      RaMesh::SegmentRole::SEGMENT, block);
+  auto first_copy = RaMesh::Segment::create(
+      0, 4, Strand::FORWARD, cigar, RaMesh::AlignRole::PRIMARY,
+      RaMesh::SegmentRole::SEGMENT, block);
+  auto second_copy = RaMesh::Segment::create(
+      4, 4, Strand::FORWARD, cigar, RaMesh::AlignRole::PRIMARY,
+      RaMesh::SegmentRole::SEGMENT, block);
+  block->anchors.emplace(RaMesh::SpeciesChrPair{"leafA", "chr1"}, reference);
+  block->anchors.emplace(RaMesh::SpeciesChrPair{"leafA", "chr1"},
+                         secondary_reference);
+  block->anchors.emplace(RaMesh::SpeciesChrPair{"leafB", "chr1"}, first_copy);
+  block->anchors.emplace(RaMesh::SpeciesChrPair{"leafB", "chr1"}, second_copy);
+  auto maf_managers = managers;
+  RaMesh::RaMeshMultiGenomeGraph maf_graph(maf_managers);
+  maf_graph.blocks.emplace_back(block);
+  const auto maf_path = temp / "paralogy.maf";
+  maf_graph.exportToMaf(maf_path, managers, false);
+  std::ifstream maf_input(maf_path);
+  size_t maf_rows = 0;
+  std::vector<std::string> maf_sources;
+  std::string maf_line;
+  while (std::getline(maf_input, maf_line)) {
+    if (!maf_line.starts_with("s ")) {
+      continue;
+    }
+    ++maf_rows;
+    std::istringstream fields(maf_line);
+    std::string tag;
+    std::string source;
+    fields >> tag >> source;
+    maf_sources.push_back(std::move(source));
+  }
+  require(maf_rows == 4, "MAF export dropped a primary or secondary occurrence "
+                         "sharing the declared reference key");
+  require(
+      maf_sources.size() == 4 &&
+          maf_sources[0].starts_with("leafA.") &&
+          maf_sources[1].starts_with("leafB.") &&
+          maf_sources[2].starts_with("leafA.") &&
+          maf_sources[3].starts_with("leafB."),
+      "MAF paralog rows are not interleaved by copy rank");
+
+  const auto hal_path = temp / "paralogy.hal";
+  std::vector<std::weak_ptr<RaMesh::Block>> blocks{block};
+  RaMesh::hal_export::ExportStats stats;
+  RaMesh::hal_export::exportToHal(
+      blocks, hal_path, managers, NewickParser("(leafA:0.1,leafB:0.1)anc0;"),
+      "anc0", SoftMask::loadIndexes(softmask_paths), {}, &stats);
+  require(stats.observed_occurrence_count == 4 &&
+              stats.ancestor_occurrence_count == 2,
+          "copy-number reconciliation must keep primary and secondary "
+          "occurrences distinct while inferring both ancestral copies");
+  require(stats.paralogous_top_count == 0 &&
+              stats.paralogy_self_adjacency_count == 0,
+          "balanced copies in both children must not be mislabeled as child-only paralogy");
+
+  hal::AlignmentPtr alignment =
+      hal::openHalAlignment(hal_path.string(), nullptr, hal::READ_ACCESS);
+  require(static_cast<bool>(alignment), "cannot reopen paralogy HAL");
+  hal::Genome *ancestor = alignment->openGenome("anc0");
+  hal::Genome *leaf_b = alignment->openGenome("leafB");
+  require(ancestor != nullptr && leaf_b != nullptr,
+          "paralogy HAL is missing expected genomes");
+  require(ancestor->getNumSequences() == 1 &&
+              ancestor->getNumBottomSegments() == 2 &&
+              leaf_b->getNumTopSegments() == 3,
+          "paralogy HAL segment cardinalities are inconsistent");
+  alignment->closeGenome(leaf_b);
+  alignment->closeGenome(ancestor);
+  alignment.reset();
+}
+void testSecondaryLinkRunsUnifyPrimaryOccurrences(
+    const std::filesystem::path& temp,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+    const SoftMask::PathMap& softmask_paths) {
+    const Cigar_t base_cigar{cigarToInt('M', 8)};
+    const Cigar_t link_cigar{cigarToInt('M', 4)};
+    auto make_leaf_block = [&](const SpeciesName& species) {
+        auto block = RaMesh::Block::create(1);
+        block->ref_species = species;
+        block->ref_chr = "chr1";
+        auto segment = RaMesh::Segment::create(
+            0,
+            8,
+            Strand::FORWARD,
+            base_cigar,
+            RaMesh::AlignRole::PRIMARY,
+            RaMesh::SegmentRole::SEGMENT,
+            block);
+        block->anchors.emplace(
+            RaMesh::SpeciesChrPair{species, "chr1"},
+            segment);
+        return block;
+    };
+
+    auto leaf_a_block = make_leaf_block("leafA");
+    auto leaf_b_block = make_leaf_block("leafB");
+    auto make_link_block = [&](Strand leaf_b_strand) {
+        auto block = RaMesh::Block::create(2);
+        block->ref_species = "leafA";
+        block->ref_chr = "chr1";
+        auto leaf_a_link = RaMesh::Segment::create(
+            2,
+            4,
+            Strand::FORWARD,
+            link_cigar,
+            RaMesh::AlignRole::PRIMARY,
+            RaMesh::SegmentRole::SEGMENT,
+            block);
+        auto leaf_b_link = RaMesh::Segment::create(
+            2,
+            4,
+            leaf_b_strand,
+            link_cigar,
+            RaMesh::AlignRole::SECONDARY,
+            RaMesh::SegmentRole::SEGMENT,
+            block);
+        block->anchors.emplace(
+            RaMesh::SpeciesChrPair{"leafA", "chr1"},
+            leaf_a_link);
+        block->anchors.emplace(
+            RaMesh::SpeciesChrPair{"leafB", "chr1"},
+            leaf_b_link);
+        return block;
+    };
+    auto link_block =
+        make_link_block(Strand::FORWARD);
+    auto conflicting_link_block =
+        make_link_block(Strand::REVERSE);
+
+    const auto hal_path = temp / "secondary-link.hal";
+    std::vector<std::weak_ptr<RaMesh::Block>> blocks{
+        leaf_a_block,
+        leaf_b_block,
+        link_block,
+        conflicting_link_block};
+    const auto rejected_blocks =
+        RaMesh::hal_export::
+            findRejectedSecondaryHomologyBlocks(
+                blocks,
+                managers);
+    require(
+        rejected_blocks.size() == 1 &&
+            rejected_blocks.contains(
+                conflicting_link_block->block_id) &&
+            !rejected_blocks.contains(
+                link_block->block_id),
+        "secondary homology selection did not reject the "
+        "conflicting block atomically");
+
+    auto graph_managers = managers;
+    RaMesh::RaMeshMultiGenomeGraph graph(
+        graph_managers);
+    graph.blocks = blocks;
+    const auto maf_path =
+        temp / "secondary-link.maf";
+    graph.exportToMaf(maf_path, managers, false);
+    std::ifstream maf_stream(maf_path);
+    require(
+        static_cast<bool>(maf_stream),
+        "failed to open filtered secondary-link MAF");
+    size_t maf_block_count = 0;
+    std::string maf_line;
+    while (std::getline(
+        maf_stream,
+        maf_line)) {
+        if (maf_line.starts_with("a ")) {
+            ++maf_block_count;
+        }
+    }
+    require(
+        maf_block_count == 1,
+        "direct MAF export did not apply the shared "
+        "secondary-homology block selection");
     RaMesh::hal_export::ExportStats stats;
     RaMesh::hal_export::exportToHal(
         blocks,
@@ -229,33 +493,121 @@ void testParalogousOccurrencesRemainThreaded(
         SoftMask::loadIndexes(softmask_paths),
         {},
         &stats);
-    require(
-        stats.observed_occurrence_count == 3 &&
-            stats.ancestor_occurrence_count == 1,
-        "copy-number reconciliation must keep observed copies distinct while inferring one shared ancestor copy");
-    require(
-        stats.paralogous_top_count == 1 &&
-            stats.paralogy_self_adjacency_count == 1,
-        "duplicated child occurrences must map as HAL paralogy");
 
-    hal::AlignmentPtr alignment = hal::openHalAlignment(
-        hal_path.string(), nullptr, hal::READ_ACCESS);
     require(
-        static_cast<bool>(alignment),
-        "cannot reopen paralogy HAL");
-    hal::Genome* ancestor = alignment->openGenome("anc0");
-    hal::Genome* leaf_b = alignment->openGenome("leafB");
+        halPairCoverage(hal_path, "leafA", "leafB") == 4 &&
+            halPairCoverage(hal_path, "leafB", "leafA") == 4,
+        "partial secondary homology link was lost or "
+        "incorrectly extrapolated into unsupported flanks");
     require(
-        ancestor != nullptr && leaf_b != nullptr,
-        "paralogy HAL is missing expected genomes");
+        mafPairCoverage(
+            maf_path,
+            "leafA",
+            "leafB") ==
+                halPairCoverage(
+                    hal_path,
+                    "leafA",
+                    "leafB") &&
+            mafPairCoverage(
+                maf_path,
+                "leafB",
+                "leafA") ==
+                halPairCoverage(
+                    hal_path,
+                    "leafB",
+                    "leafA"),
+        "secondary homology coverage differs between "
+        "direct MAF and HAL");
     require(
-        ancestor->getNumSequences() == 1 &&
-            ancestor->getNumBottomSegments() == 1 &&
-            leaf_b->getNumTopSegments() == 3,
-        "paralogy HAL segment cardinalities are inconsistent");
-    alignment->closeGenome(leaf_b);
-    alignment->closeGenome(ancestor);
-    alignment.reset();
+        stats.observed_occurrence_count == 6,
+        "secondary homology normalization did not split and deduplicate "
+        "the two primary leaf intervals at the link boundaries");
+}
+void testSecondaryMaterializationBridgesReferenceGap(
+    const std::filesystem::path& temp,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers) {
+    auto graph_managers = managers;
+    RaMesh::RaMeshMultiGenomeGraph graph(graph_managers);
+    const Cigar_t gapped_cigar{
+        cigarToInt('M', 2),
+        cigarToInt('D', 4),
+        cigarToInt('M', 2)};
+    Anchor gapped_primary(
+        0,
+        0,
+        8,
+        0,
+        0,
+        4,
+        Strand::FORWARD,
+        8,
+        4,
+        gapped_cigar);
+    Anchor second_primary(
+        0,
+        8,
+        4,
+        0,
+        8,
+        4,
+        Strand::FORWARD,
+        4,
+        4,
+        Cigar_t{cigarToInt('M', 4)});
+    graph.insertAnchorIntoGraph(
+        *managers.at("leafA"),
+        *managers.at("leafB"),
+        "leafA",
+        "leafB",
+        gapped_primary);
+    graph.insertAnchorIntoGraph(
+        *managers.at("leafA"),
+        *managers.at("leafB"),
+        "leafA",
+        "leafB",
+        second_primary);
+
+    Anchor secondary(
+        0,
+        2,
+        4,
+        0,
+        8,
+        4,
+        Strand::FORWARD,
+        4,
+        4,
+        Cigar_t{cigarToInt('M', 4)});
+    graph.registerSecondaryAnchorCandidate(
+        "leafA",
+        "chr1",
+        "leafB",
+        "chr1",
+        secondary,
+        true,
+        true);
+    graph.registerSecondaryAnchorCandidate(
+        "leafA",
+        "chr1",
+        "leafB",
+        "chr1",
+        secondary,
+        true,
+        false);
+    require(
+        graph.materializeSecondaryAlignments() == 1,
+        "reciprocal secondary anchors did not bridge a primary reference gap");
+
+    const auto maf_path =
+        temp / "secondary-reference-gap.maf";
+    graph.exportToMaf(maf_path, managers, false);
+    require(
+        mafPairCoverage(
+            maf_path,
+            "leafA",
+            "leafB") == 12,
+        "secondary reference-gap bridge did not restore all supported "
+        "pairwise reference bases");
 }
 void testScaffoldGapSegmentsTileSequences(
     const std::filesystem::path& temp,
@@ -350,10 +702,7 @@ void testScaffoldGapSegmentsTileSequences(
     graph.blocks = blocks;
     const auto maf_path =
         temp / "scaffold-gap.maf";
-    graph.exportToMaf(
-        maf_path,
-        managers,
-        false);
+    graph.exportToMaf(maf_path, managers, false);
     const uint64_t hal_leaf_a_coverage =
         halPairCoverage(
             hal_path,
@@ -1071,10 +1420,19 @@ int main() {
         require(hasUpperAndLower(leaf_b), "exported leafB lacks mixed case");
         require(hasUpperAndLower(ancestor), "exported ancestor lacks mixed case");
         alignment.reset();
+        testNamespacedLeafSequenceIsNotDuplicated(
+            temp);
         testParalogousOccurrencesRemainThreaded(
             temp,
             managers,
             softmask_paths);
+        testSecondaryLinkRunsUnifyPrimaryOccurrences(
+            temp,
+            managers,
+            softmask_paths);
+        testSecondaryMaterializationBridgesReferenceGap(
+            temp,
+            managers);
         testScaffoldGapSegmentsTileSequences(
             temp,
             managers,

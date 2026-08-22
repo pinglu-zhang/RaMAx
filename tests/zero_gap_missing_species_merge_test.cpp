@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <random>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -696,7 +697,7 @@ void verifyShortBlockRepairKeepsCurrentReferenceKey(
     bool maf_rejected_invalid_reference = false;
     try {
         graph.exportToMaf(
-            temp / "invalid-reference.maf", managers, true, false);
+            temp / "invalid-reference.maf", managers, false);
     } catch (const std::runtime_error&) {
         maf_rejected_invalid_reference = true;
     }
@@ -705,6 +706,114 @@ void verifyShortBlockRepairKeepsCurrentReferenceKey(
     merged->ref_chr = "simHuman.chr1";
     require(graph.verifyGraphCorrectness(false),
             "restoring the declared reference did not restore graph validity");
+}
+
+void verifyOverlapMergeRetainsConflictingParticipant(
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers) {
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> pair_managers = {
+        {"simChimp", managers.at("simChimp")},
+        {"simGorilla", managers.at("simGorilla")}};
+    RaMesh::RaMeshMultiGenomeGraph graph(pair_managers);
+
+    auto left = Block::createEmpty("simChimp", "chr1", 2);
+    auto right = Block::createEmpty("simChimp", "chr1", 2);
+    const auto chimp_left =
+        addSegment(left, "simChimp", 0, 100, Strand::FORWARD);
+    const auto chimp_right =
+        addSegment(right, "simChimp", 50, 100, Strand::FORWARD);
+    const auto gorilla_left =
+        addSegment(left, "simGorilla", 0, 100, Strand::FORWARD);
+    const auto gorilla_right =
+        addSegment(right, "simGorilla", 200, 100, Strand::FORWARD);
+
+    linkPath(graph.species_graphs.at("simChimp").chr2end.at("chr1"),
+             {chimp_left, chimp_right});
+    linkPath(graph.species_graphs.at("simGorilla").chr2end.at("chr1"),
+             {gorilla_left, gorilla_right});
+    graph.blocks = {left, right};
+
+    graph.mergeMultipleGraphs("simChimp", 1);
+
+    size_t active_blocks = 0;
+    for (const auto& weak_block : graph.blocks) {
+        active_blocks += !weak_block.expired();
+    }
+    require(active_blocks == 2,
+            "overlap merge discarded a repeated query-species occurrence");
+    require(uniqueAnchor(left, {"simGorilla", "chr1"}) == gorilla_left &&
+                uniqueAnchor(right, {"simGorilla", "chr1"}) == gorilla_right,
+            "overlap merge replaced a repeated query-species occurrence");
+    const auto& gorilla_end =
+        graph.species_graphs.at("simGorilla").chr2end.at("chr1");
+    require(
+        gorilla_end.head->primary_path.next.load(std::memory_order_acquire) ==
+                gorilla_left &&
+            gorilla_left->primary_path.next.load(std::memory_order_acquire) ==
+                gorilla_right &&
+            gorilla_right->primary_path.next.load(std::memory_order_acquire) ==
+                gorilla_end.tail,
+        "overlap merge corrupted the repeated query-species path");
+}
+
+void verifyOverlapMergePreservesBoundaryInsertions(
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers) {
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> test_managers = {
+        {"simChimp", managers.at("simChimp")},
+        {"simGorilla", managers.at("simGorilla")},
+        {"simHuman", managers.at("simHuman")}};
+    RaMesh::RaMeshMultiGenomeGraph graph(test_managers);
+
+    auto left = Block::createEmpty("simChimp", "chr1", 2);
+    auto right = Block::createEmpty("simChimp", "chr1", 2);
+    const auto chimp_left =
+        addSegment(left, "simChimp", 0, 100, Strand::FORWARD);
+    const auto chimp_right =
+        addSegment(right, "simChimp", 50, 100, Strand::FORWARD);
+    const auto gorilla =
+        Segment::create(0, 110, Strand::FORWARD,
+                        Cigar_t{cigarToInt('M', 100), cigarToInt('I', 10)},
+                        AlignRole::PRIMARY, SegmentRole::SEGMENT, left);
+    left->anchors.emplace(SpeciesChrPair{"simGorilla", "chr1"}, gorilla);
+    const auto human =
+        Segment::create(200, 110, Strand::REVERSE,
+                        Cigar_t{cigarToInt('M', 100), cigarToInt('I', 10)},
+                        AlignRole::PRIMARY, SegmentRole::SEGMENT, right);
+    right->anchors.emplace(SpeciesChrPair{"simHuman", "chr1"}, human);
+
+    linkPath(graph.species_graphs.at("simChimp").chr2end.at("chr1"),
+             {chimp_left, chimp_right});
+    linkPath(graph.species_graphs.at("simGorilla").chr2end.at("chr1"),
+             {gorilla});
+    linkPath(graph.species_graphs.at("simHuman").chr2end.at("chr1"), {human});
+    graph.blocks = {left, right};
+
+    graph.mergeMultipleGraphs("simChimp", 1);
+
+    const auto querySpan = [&](const SpeciesName& species) {
+        const auto& genome_end =
+            graph.species_graphs.at(species).chr2end.at("chr1");
+        uint64_t coordinate_bases = 0;
+        uint64_t reference_bases = 0;
+        uint64_t query_bases = 0;
+        auto segment =
+            genome_end.head->primary_path.next.load(std::memory_order_acquire);
+        while (segment && !segment->isTail()) {
+            coordinate_bases += segment->length;
+            reference_bases += countRefLength(segment->cigar);
+            query_bases += countQryLength(segment->cigar);
+            segment =
+                segment->primary_path.next.load(std::memory_order_acquire);
+        }
+        return std::tuple{coordinate_bases, reference_bases, query_bases};
+    };
+    require(querySpan("simGorilla") ==
+                std::tuple<uint64_t, uint64_t, uint64_t>{110, 100, 110},
+            "overlap merge dropped a trailing query insertion");
+    require(querySpan("simHuman") ==
+                std::tuple<uint64_t, uint64_t, uint64_t>{110, 100, 110},
+            "overlap merge dropped a reverse trailing query insertion");
+    require(graph.verifyGraphCorrectness(false),
+            "boundary-insertion merge produced an invalid graph");
 }
 
 }  // namespace
@@ -730,6 +839,8 @@ int main() {
                 std::make_shared<SeqPro::ManagerVariant>(
                     std::move(manager));
         }
+        verifyOverlapMergeRetainsConflictingParticipant(managers);
+        verifyOverlapMergePreservesBoundaryInsertions(managers);
 
         std::map<SpeciesName, SeqPro::SharedManagerVariant>
             pair_managers = {
@@ -1033,18 +1144,14 @@ int main() {
                     "simChimp", managers, insertion_msa.string(),
                     3000, 4, 200) == 1,
                 "hybrid reference-insertion window was not realigned");
-        const auto insertion_maf = temp / "hybrid-reference-insertion.maf";
-        insertion_graph.exportToMaf(
-            insertion_maf, managers, true, false);
-        std::ifstream insertion_maf_input(insertion_maf);
-        const std::string insertion_maf_text(
-            (std::istreambuf_iterator<char>(insertion_maf_input)),
-            std::istreambuf_iterator<char>());
-        require(insertion_maf_text.find(
-                    "AAAAAAAAAA-------------------------------AAAAAAAAAA") !=
-                    std::string::npos,
+        const auto insertion_block = onlyActiveBlock(insertion_graph);
+        const auto insertion_orang =
+            uniqueAnchor(insertion_block, {"simOrang", "chr1"});
+        const std::string insertion_cigar =
+            cigarToString(insertion_orang->cigar);
+        require(insertion_cigar == "10M30D10M",
                 "empty species did not remain gap-only across an MSA "
-                "reference-insertion column");
+                "reference-insertion column: " + insertion_cigar);
 
         const std::vector<std::vector<std::string>>
             reverse_empty_pattern = {

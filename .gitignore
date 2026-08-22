@@ -436,3 +436,4 @@ bin/output.maf
 /recipe/
 submodule.zip
 /.clang-format
+/tmp/
