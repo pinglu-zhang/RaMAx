@@ -49,7 +49,7 @@ namespace RaMesh {
         }
     };
 
-    using ChrHeadMap = std::unordered_map<SpeciesChrPair, SegPtr, SpeciesChrPairHash>;
+    using ChrHeadMap = std::unordered_multimap<SpeciesChrPair, SegPtr, SpeciesChrPairHash>;
 
     // ────────────────────────────────────────────────
     // Intrusive concurrent list node
@@ -119,6 +119,7 @@ namespace RaMesh {
     public:
         SpeciesName ref_species; // guard: rw
         ChrName   ref_chr;      // guard: rw
+        uint64_t  block_id{ 0 }; // stable export identity
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
         mutable std::shared_mutex rw;
 
@@ -145,7 +146,7 @@ namespace RaMesh {
         // ――― deletion methods ―――
         void removeAllSegments();
         void removeSegmentsBySpecies(const SpeciesName& species);
-        bool removeSegment(const SpeciesName& species, const ChrName& chr);
+        size_t removeSegments(const SpeciesName& species, const ChrName& chr);
 
         Block() = default;
         ~Block() = default;
@@ -235,6 +236,17 @@ namespace RaMesh {
 			//const AnchorVec& anchor_vec);
 
         void insertAnchorIntoGraph(SeqPro::ManagerVariant& ref_mgr, SeqPro::ManagerVariant& qry_mgr, SpeciesName ref_name, SpeciesName qry_name, const Anchor& anchor, bool isMultiple=false);
+
+        void registerSecondaryAnchorCandidate(
+            SpeciesName ref_species,
+            ChrName ref_chromosome,
+            SpeciesName query_species,
+            ChrName query_chromosome,
+            const Anchor& anchor,
+            bool initial_round,
+            bool common_is_reference);
+
+        size_t materializeSecondaryAlignments();
 
         void markAllExtended() {
             std::unique_lock lock(rw); // 锁保护整个 species_graphs
@@ -460,11 +472,10 @@ namespace RaMesh {
         std::vector<WeakBlock>                             blocks;         // guard: rw
         mutable std::shared_mutex                          rw;             // multi‑reader / single‑writer
 
-        void exportToMaf(const FilePath& maf_path, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers, bool only_primary, bool is_pairwise) const;
-
-        void exportToMafWithoutReverse(const FilePath& maf_path, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
-
-        void exportToMultipleMaf(const std::vector<std::pair<SpeciesName, FilePath>>& outs, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
+        void exportToMaf(
+            const FilePath& maf_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+            bool pairwise_mode) const;
 
         Paf::PafExportStats exportToPaf(
             const FilePath& paf_path,
@@ -472,20 +483,13 @@ namespace RaMesh {
                 seqpro_managers,
             const Paf::PafExportOptions& options = {}) const;
 
-        void exportToHal(const FilePath& hal_path,
-                        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-                        const std::string& newick_tree = "",
-                        bool only_primary = true,
-                        const std::string& root_name = "root",
-                        const SoftMask::PathMap& softmask_paths = {}) const;
-
-        // 重载：直接复用已解析的 NewickParser，避免重复读取导致子树选择失效
-        void exportToHal(const FilePath& hal_path,
-                        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-                        const NewickParser& parser,
-                        bool only_primary = true,
-                        const std::string& root_name = "root",
-                        const SoftMask::PathMap& softmask_paths = {}) const;
+        void exportToHal(
+            const FilePath& hal_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+            const NewickParser& parser,
+            const std::string& root_name,
+            int parallel_threads,
+            const SoftMask::PathMap& softmask_paths) const;
 
         
         // ――― high-performance deletion methods ―――
@@ -514,6 +518,18 @@ namespace RaMesh {
         DeletionStats performMaintenance(bool full_gc = false);
 
     private:
+        struct SecondaryAnchorCandidate {
+            SpeciesName ref_species;
+            ChrName ref_chromosome;
+            SpeciesName query_species;
+            ChrName query_chromosome;
+            Anchor anchor;
+            bool initial_round = false;
+            bool common_is_reference = true;
+        };
+
+        std::vector<SecondaryAnchorCandidate> secondary_anchor_candidates;
+
         // ――― Enhanced verification helper methods ―――
         void addVerificationError(VerificationResult& result, const VerificationOptions& options,
                                 VerificationType type, ErrorSeverity severity,

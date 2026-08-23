@@ -309,23 +309,34 @@ ClusterBySQR_SparsePtr clusterAllChrMatchSparse(
     MatchBySQR_SparsePtr& unique_anchors,
     MatchBySQR_SparsePtr& repeat_anchors,
     uint_t min_span,
-    uint_t thread_num) {
-
+    uint_t thread_num,
+    bool include_repeats) {
     auto out = std::make_shared<ClusterBySQR_Sparse>();
 
-    // unique_anchors 为空或无 key：返回空
-    if (!unique_anchors || unique_anchors->empty()) {
+    const bool unique_empty = !unique_anchors || unique_anchors->empty();
+    const bool repeat_empty = !repeat_anchors || repeat_anchors->empty();
+    if (unique_empty && (!include_repeats || repeat_empty)) {
         return out;
     }
 
-    // 预留空间，减少 unordered_map rehash
-    out->reserve(unique_anchors->size());
+    const size_t key_capacity =
+        (unique_empty ? 0 : unique_anchors->size()) +
+        (include_repeats && !repeat_empty ? repeat_anchors->size() : 0);
+    out->reserve(key_capacity);
 
-    // 收集 keys，便于并行遍历
     std::vector<uint64_t> keys;
-    keys.reserve(unique_anchors->size());
-    for (const auto& kv : *unique_anchors) {
-        keys.push_back(kv.first);
+    keys.reserve(key_capacity);
+    if (!unique_empty) {
+        for (const auto& kv : *unique_anchors) {
+            keys.push_back(kv.first);
+        }
+    }
+    if (include_repeats && !repeat_empty) {
+        for (const auto& kv : *repeat_anchors) {
+            if (unique_empty || !unique_anchors->contains(kv.first)) {
+                keys.push_back(kv.first);
+            }
+        }
     }
 
     // 每个 key 对应一个结果（key, clusters）
@@ -335,10 +346,20 @@ ClusterBySQR_SparsePtr clusterAllChrMatchSparse(
     for (long long i = 0; i < (long long)keys.size(); ++i) {
         uint64_t key = keys[i];
 
-        // 复制一份 MatchVec（保持原逻辑）
-        MatchVec mv = unique_anchors->at(key);
+        MatchVec mv;
+        if (!unique_empty) {
+            if (const auto it = unique_anchors->find(key);
+                it != unique_anchors->end()) {
+                mv = it->second;
+            }
+        }
+        if (include_repeats && !repeat_empty) {
+            if (const auto it = repeat_anchors->find(key);
+                it != repeat_anchors->end()) {
+                mv.insert(mv.end(), it->second.begin(), it->second.end());
+            }
+        }
 
-        // 聚类：返回 MatchClusterVecPtr
         auto clusters = clusterChrMatch(mv, min_span);
 
         local_results[i] = { key, std::move(clusters) };

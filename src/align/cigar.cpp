@@ -464,3 +464,140 @@ bool checkGapCigarQuality(const Cigar_t& cigar,
     return (identity >= min_identity);
 }
 
+bool alignmentRowsPreferredToUnaligned(const std::string& reference,
+                                       const std::string& query) {
+    if (reference.empty() || reference.size() != query.size()) {
+        return false;
+    }
+
+    enum class GapSide : uint8_t {
+        NONE = 0,
+        REFERENCE,
+        QUERY
+    };
+    GapSide gap_side = GapSide::NONE;
+    int64_t alignment_score = 0;
+    size_t reference_bases = 0;
+    size_t query_bases = 0;
+    for (size_t index = 0; index < reference.size(); ++index) {
+        const bool reference_gap = reference[index] == '-';
+        const bool query_gap = query[index] == '-';
+        if (reference_gap && query_gap) {
+            continue;
+        }
+        if (reference_gap || query_gap) {
+            const GapSide current_side =
+                reference_gap ? GapSide::REFERENCE : GapSide::QUERY;
+            alignment_score -= current_side == gap_side
+                                   ? GAP_EXTEND_PENALTY
+                                   : GAP_OPEN_PENALTY;
+            gap_side = current_side;
+            reference_bases += !reference_gap;
+            query_bases += !query_gap;
+            continue;
+        }
+        gap_side = GapSide::NONE;
+        alignment_score += subsScore(reference[index], query[index]);
+        ++reference_bases;
+        ++query_bases;
+    }
+
+    const auto unaligned_gap_score = [](size_t length) -> int64_t {
+        if (length == 0) {
+            return 0;
+        }
+        return -static_cast<int64_t>(GAP_OPEN_PENALTY) -
+               static_cast<int64_t>(length - 1) *
+                   GAP_EXTEND_PENALTY;
+    };
+    const int64_t unaligned_score =
+        unaligned_gap_score(reference_bases) +
+        unaligned_gap_score(query_bases);
+    return alignment_score > unaligned_score;
+}
+
+bool alignmentCigarPreferredToUnaligned(
+    const std::string& reference,
+    const std::string& query,
+    const Cigar_t& cigar) {
+    if (cigar.empty()) {
+        return false;
+    }
+
+    enum class GapSide : uint8_t {
+        NONE = 0,
+        REFERENCE,
+        QUERY
+    };
+    const auto unaligned_gap_score = [](size_t length) -> int64_t {
+        if (length == 0) {
+            return 0;
+        }
+        return -static_cast<int64_t>(GAP_OPEN_PENALTY) -
+               static_cast<int64_t>(length - 1) *
+                   GAP_EXTEND_PENALTY;
+    };
+
+    GapSide gap_side = GapSide::NONE;
+    int64_t alignment_score = 0;
+    size_t reference_offset = 0;
+    size_t query_offset = 0;
+    size_t alignment_columns = 0;
+    for (const CigarUnit unit : cigar) {
+        const uint32_t length = unit >> 4;
+        const uint8_t operation = unit & 0xF;
+        if (length == 0) {
+            continue;
+        }
+        if (operation == 0 || operation == 7 || operation == 8) {
+            if (length > reference.size() - reference_offset ||
+                length > query.size() - query_offset) {
+                return false;
+            }
+            gap_side = GapSide::NONE;
+            for (uint32_t index = 0; index < length; ++index) {
+                alignment_score += subsScore(
+                    reference[reference_offset + index],
+                    query[query_offset + index]);
+            }
+            reference_offset += length;
+            query_offset += length;
+            alignment_columns += length;
+        } else if (operation == 1) {
+            if (length > query.size() - query_offset) {
+                return false;
+            }
+            alignment_score -=
+                gap_side == GapSide::REFERENCE
+                    ? static_cast<int64_t>(length) * GAP_EXTEND_PENALTY
+                    : static_cast<int64_t>(GAP_OPEN_PENALTY) +
+                          static_cast<int64_t>(length - 1) *
+                              GAP_EXTEND_PENALTY;
+            gap_side = GapSide::REFERENCE;
+            query_offset += length;
+            alignment_columns += length;
+        } else if (operation == 2) {
+            if (length > reference.size() - reference_offset) {
+                return false;
+            }
+            alignment_score -=
+                gap_side == GapSide::QUERY
+                    ? static_cast<int64_t>(length) * GAP_EXTEND_PENALTY
+                    : static_cast<int64_t>(GAP_OPEN_PENALTY) +
+                          static_cast<int64_t>(length - 1) *
+                              GAP_EXTEND_PENALTY;
+            gap_side = GapSide::QUERY;
+            reference_offset += length;
+            alignment_columns += length;
+        }
+    }
+
+    if (alignment_columns == 0) {
+        return false;
+    }
+    const int64_t unaligned_score =
+        unaligned_gap_score(reference_offset) +
+        unaligned_gap_score(query_offset);
+    return alignment_score > unaligned_score;
+}
+

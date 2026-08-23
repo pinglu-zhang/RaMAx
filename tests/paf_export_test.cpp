@@ -166,7 +166,7 @@ void testMafAtomicPublish(const fs::path& directory) {
         existing << "sentinel-existing-output\n";
     }
 
-    graph.exportToMaf(output, managers, true, false);
+    graph.exportToMaf(output, managers, false);
     const std::string maf = readFile(output);
     require(maf.starts_with("##maf version=1 scoring=none\n"),
             "MAF atomic publish did not replace existing output");

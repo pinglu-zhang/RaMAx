@@ -11,6 +11,7 @@
 #include "rare_aligner.h"
 #include "sequence_utils.h"
 #include "external_msa_runner.h"
+#include <cstdlib>
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
@@ -449,6 +450,7 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->capture_default_str()
         ->group("Graph Optimization")
         ->type_name("<bp>")
+        ->needs(realign_missing_species_flag)
         ->check(CLI::Range(1, 10000));
 
     auto* zero_gap_merge_span_opt = cmd->add_option(
@@ -1022,13 +1024,21 @@ static int preprocessingPhase(
     // 参考序列最短长度（用于后续 sampling_interval 截断）
     reference_min_seq_length = std::numeric_limits<SeqPro::Length>::max();
 
-    // HAL uses the same all-uppercase alignment input as before and stores
-    // original lowercase runs in an export-only sidecar. MAF is unchanged.
-    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL)) {
-        cleanRawDatasetWithSoftMaskIndex(common_args.work_dir_path, species_path_map,
-                                         softmask_path_map, common_args.thread_num);
+    const bool align_softmasked_regions =
+        std::getenv("RAMAX_ALIGN_SOFTMASK") != nullptr;
+    // HAL always records the original lowercase runs for lossless export.
+    // The experimental alignment switch additionally loads those runs as
+    // seed-mask intervals while retaining the complete original coordinate
+    // space for extension and export.
+    if (hasOutputFormat(common_args, MultipleGenomeOutputFormat::HAL) ||
+        align_softmasked_regions) {
+        cleanRawDatasetWithSoftMaskIndex(
+            common_args.work_dir_path, species_path_map,
+            softmask_path_map, common_args.thread_num);
     } else {
-        cleanRawDataset(common_args.work_dir_path, species_path_map, common_args.thread_num);
+        cleanRawDataset(
+            common_args.work_dir_path, species_path_map,
+            common_args.thread_num);
     }
 
     if (common_args.enable_repeat_masking) {
@@ -1103,6 +1113,36 @@ static int preprocessingPhase(
             try {
                 auto original_manager = std::make_unique<SeqPro::SequenceManager>(cleaned_fasta_path);
                 auto manager = std::make_unique<SeqPro::MaskedSequenceManager>(std::move(original_manager));
+                if (align_softmasked_regions) {
+                    const auto softmask_it =
+                        softmask_path_map.find(species_name);
+                    if (softmask_it == softmask_path_map.end()) {
+                        throw std::runtime_error(
+                            "Missing soft-mask index for " + species_name);
+                    }
+                    const SoftMask::Index softmask_index(
+                        softmask_it->second);
+                    uint64_t masked_bases = 0;
+                    for (const auto& sequence_name :
+                         manager->getSequenceNames()) {
+                        const auto indexed_intervals =
+                            softmask_index.intervals(sequence_name);
+                        std::vector<SeqPro::MaskInterval> intervals;
+                        intervals.reserve(indexed_intervals.size());
+                        for (const auto& [start, end] :
+                             indexed_intervals) {
+                            intervals.emplace_back(start, end);
+                            masked_bases += end - start;
+                        }
+                        manager->addMaskIntervals(
+                            sequence_name, intervals);
+                    }
+                    manager->finalizeMaskIntervals();
+                    spdlog::info(
+                        "[{}] Loaded {} soft-masked bases for "
+                        "alignment seeding",
+                        species_name, masked_bases);
+                }
 
                 spdlog::info("[{}] SeqPro Manager created: {}", species_name, cleaned_fasta_path.string());
 
@@ -1161,6 +1201,7 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.max_anchor_frequency,
         common_args.accurate_skip_threshold
     );
+    mra.allow_mem = common_args.allow_MEM;
 
     mra.merge_exact_contiguous_blocks_enabled =
         common_args.merge_exact_contiguous_blocks;
@@ -1233,12 +1274,21 @@ static bool exportResults(
     // 清理遮蔽区间（导出前）
     clearAllMaskedRegions(seqpro_managers);
 
-    // Both direct MAF export and HAL construction reconstruct multiway
-    // columns through mergeAlignmentByRef().  Configure the shared repair
-    // once so the two output paths make the same local insertion decisions.
-    configureCrossAnchorInsertionRepair(
-        requiredMinipoaExecutable(),
-        common_args.species_mismatch_realign_max_span);
+  // Both direct MAF export and HAL construction reconstruct multiway
+  // columns through mergeAlignmentByRef().  Configure the shared repair
+  // once so the two output paths make the same local insertion decisions.
+  configureCrossAnchorInsertionRepair(
+      requiredMinipoaExecutable(),
+      common_args.species_mismatch_realign_max_span);
+  graph->materializeSecondaryAlignments();
+  if (common_args.merge_exact_contiguous_blocks &&
+      !common_args.ref_name.empty()) {
+    const size_t eliminated_boundaries = graph->mergeExactContiguousBlocks(
+        common_args.ref_name, 1000000, common_args.merge_query_gap_max);
+    spdlog::info("[secondary-alignments] post-materialization "
+                 "eliminated_boundaries={} max_query_gap={}",
+                 eliminated_boundaries, common_args.merge_query_gap_max);
+  }
 
     std::vector<ExportAttempt> attempts;
     attempts.reserve(common_args.outputs.size());
@@ -1253,7 +1303,7 @@ static bool exportResults(
             case MultipleGenomeOutputFormat::MAF:
                 spdlog::info("Exporting MAF to {}...", output.path.string());
                 graph->exportToMaf(
-                    output.path, seqpro_managers, true, false);
+                    output.path, seqpro_managers, false);
                 break;
 
             case MultipleGenomeOutputFormat::PAF: {
@@ -1275,10 +1325,9 @@ static bool exportResults(
                     output.path,
                     seqpro_managers,
                     newick_tree,
-                    true,
                     common_args.root_name,
-                    softmask_path_map
-                );
+                    static_cast<int>(common_args.thread_num),
+                    softmask_path_map);
                 break;
 
             case MultipleGenomeOutputFormat::UNKNOWN:

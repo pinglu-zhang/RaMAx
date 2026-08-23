@@ -66,6 +66,10 @@ Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
 information-complete sparse `connected` mode; use `--paf-mode all` for the
 all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
 are kept under the work directory.
+MAF and HAL use the same normalized multiway homology relation, so changing
+only the output suffix does not change leaf-to-leaf alignment coverage. HAL
+soft-mask restoration happens after alignment decisions; letter case cannot
+change the homology graph.
 
 Repeat `-o` to export several formats from the same completed alignment:
 

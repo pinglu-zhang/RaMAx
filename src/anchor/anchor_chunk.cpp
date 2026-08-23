@@ -172,6 +172,38 @@ RegionVec preAllocateChunksBySize(const SeqPro::ManagerVariant& seq_manager,
     return chunks;
 }
 
+RegionVec preAllocateOriginalChunksBySize(
+    const SeqPro::ManagerVariant& seq_manager,
+    uint_t chunk_size,
+    uint_t overlap_size,
+    uint_t min_chunk_size) {
+    RegionVec chunks;
+    std::visit([&](auto&& manager_ptr) {
+        using PtrType = std::decay_t<decltype(manager_ptr)>;
+        const auto seq_names = manager_ptr->getSequenceNames();
+        for (const auto& seq_name : seq_names) {
+            uint64_t seq_length = 0;
+            if constexpr (std::is_same_v<
+                              PtrType,
+                              std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
+                seq_length =
+                    manager_ptr->getOriginalManager().getSequenceLength(
+                        seq_name);
+            } else {
+                seq_length = manager_ptr->getSequenceLength(seq_name);
+            }
+            normalSizeBasedChunking(
+                chunks, seq_name, seq_length, chunk_size, overlap_size,
+                min_chunk_size, seq_manager);
+        }
+    }, seq_manager);
+    spdlog::info(
+        "Generated {} original-coordinate chunks by size "
+        "(chunk_size: {}, overlap_size: {})",
+        chunks.size(), chunk_size, overlap_size);
+    return chunks;
+}
+
 // 辅助函数：常规的基于大小的分块
 void normalSizeBasedChunking(RegionVec& chunks, const std::string& seq_name,
     uint64_t seq_length, uint_t chunk_size,

@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace SoftMask {
 
@@ -28,6 +29,8 @@ public:
     [[nodiscard]] bool hasSequence(const std::string& sequence_name) const;
     [[nodiscard]] uint64_t sequenceLength(const std::string& sequence_name) const;
     [[nodiscard]] uint64_t intervalCount(const std::string& sequence_name) const;
+    [[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>
+    intervals(const std::string& sequence_name) const;
     [[nodiscard]] uint64_t sourceSize() const noexcept { return source_size_; }
     [[nodiscard]] int64_t sourceMtime() const noexcept { return source_mtime_; }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
