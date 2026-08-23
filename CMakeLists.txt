@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.0.5 LANGUAGES C CXX)
+project(RaMAx VERSION 1.0.6 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -167,6 +167,8 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${SOURCE_DIR}/hal/export.cpp"
+    "${GRAPH_DIR}/paf_utils.cpp"
+    "${GRAPH_DIR}/paf_export.cpp"
 )
 
 set(MAIN_X "${SOURCE_DIR}/RaMAx.cpp")
@@ -287,4 +289,36 @@ if(RAMAX_BUILD_TESTS)
     add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
     add_test(NAME ramax_zero_gap_missing_species_merge
         COMMAND ramax_zero_gap_missing_species_merge_test)
+endif()
+
+# Optional companion tools are self-contained under tools/.  A tool that was
+# already built in its own source-local build directory is installed directly,
+# avoiding a second compilation as part of the main RaMAx build.
+option(RAMAX_BUILD_TOOLS "Build and install RaMAx companion tools" ON)
+set(RAMAX_PAF_FASTA_PREBUILT "" CACHE FILEPATH
+    "Prebuilt ramax-paf-fasta executable; skips building the tool")
+
+if(RAMAX_BUILD_TOOLS)
+    set(_ramax_paf_fasta_prebuilt "${RAMAX_PAF_FASTA_PREBUILT}")
+    if(NOT _ramax_paf_fasta_prebuilt)
+        set(_ramax_paf_fasta_auto
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/ramax-paf-fasta/build/ramax-paf-fasta${CMAKE_EXECUTABLE_SUFFIX}")
+        if(EXISTS "${_ramax_paf_fasta_auto}")
+            set(_ramax_paf_fasta_prebuilt "${_ramax_paf_fasta_auto}")
+        endif()
+    elseif(NOT EXISTS "${_ramax_paf_fasta_prebuilt}")
+        message(FATAL_ERROR
+            "RAMAX_PAF_FASTA_PREBUILT does not exist: ${_ramax_paf_fasta_prebuilt}")
+    endif()
+
+    if(_ramax_paf_fasta_prebuilt)
+        message(STATUS
+            "Using prebuilt ramax-paf-fasta: ${_ramax_paf_fasta_prebuilt}; source build skipped")
+        install(PROGRAMS "${_ramax_paf_fasta_prebuilt}"
+            DESTINATION "${CMAKE_INSTALL_BINDIR}"
+            RENAME "ramax-paf-fasta${CMAKE_EXECUTABLE_SUFFIX}")
+    else()
+        message(STATUS "ramax-paf-fasta is not prebuilt; adding standalone tool build")
+        add_subdirectory(tools/ramax-paf-fasta)
+    endif()
 endif()

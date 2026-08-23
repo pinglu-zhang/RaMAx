@@ -1,4 +1,4 @@
-﻿// =============================================================
+// =============================================================
 //  File: ramesh_graph.cpp –  High‑level graph ops (v0.6‑alpha)
 // =============================================================
 #include "align.h"
@@ -2727,6 +2727,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // 1. 创建前缀block和segment（如果存在）
               if (prev_has_prefix || curr_has_prefix) {
                 prefix_block = Block::create(2);
+                prefix_block->ref_species = ref_name;
                 prefix_block->ref_chr = prev_block->ref_chr;
                 prefix_block->ref_species = prev_block->ref_species;
                 prefix_ref_seg = Segment::create(
@@ -2745,6 +2746,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
               // 2. 创建重叠block和segment（必定存在）
               overlap_block = Block::create(2);
+              overlap_block->ref_species = ref_name;
               overlap_block->ref_chr = prev_block->ref_chr;
               overlap_block->ref_species = prev_block->ref_species;
               uint32_t overlap_len = overlap_end - overlap_start;
@@ -2764,6 +2766,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // 3. 创建后缀block和segment（如果存在）
               if (prev_has_suffix || curr_has_suffix) {
                 suffix_block = Block::create(2);
+                suffix_block->ref_species = ref_name;
                 suffix_block->ref_chr = prev_block->ref_chr;
                 suffix_block->ref_species = prev_block->ref_species;
                 suffix_ref_seg = Segment::create(

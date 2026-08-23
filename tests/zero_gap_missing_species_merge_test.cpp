@@ -368,7 +368,7 @@ void writePassthroughMsa(const std::filesystem::path& executable,
     std::ofstream script(executable);
     script << "#!/bin/sh\n"
            << "printf x >> '" << counter.string() << "'\n"
-           << "exec /bin/cat \"$5\"\n";
+           << "exec /bin/cat \"$1\"\n";
     if (!script) {
         throw std::runtime_error("cannot write passthrough MSA script");
     }
@@ -387,8 +387,8 @@ void writeCapturingMsa(const std::filesystem::path& executable,
     std::ofstream script(executable);
     script << "#!/bin/sh\n"
            << "printf x >> '" << counter.string() << "'\n"
-           << "/bin/cp \"$5\" '" << captured_input.string() << "'\n"
-           << "exec /bin/cat \"$5\"\n";
+           << "/bin/cp \"$1\" '" << captured_input.string() << "'\n"
+           << "exec /bin/cat \"$1\"\n";
     if (!script) {
         throw std::runtime_error("cannot write capturing MSA script");
     }
@@ -411,7 +411,7 @@ void writeFailOnceMsa(const std::filesystem::path& executable,
            << "  : > '" << marker.string() << "'\n"
            << "  exit 1\n"
            << "fi\n"
-           << "exec /bin/cat \"$5\"\n";
+           << "exec /bin/cat \"$1\"\n";
     if (!script) {
         throw std::runtime_error("cannot write fail-once MSA script");
     }

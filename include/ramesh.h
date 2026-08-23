@@ -17,6 +17,7 @@
 
 #include "config.hpp"
 #include "anchor.h"
+#include "paf_export.h"
 #include "softmask_index.h"
 
 // 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
@@ -116,15 +117,15 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class Block : public std::enable_shared_from_this<Block> {
     public:
+        SpeciesName ref_species; // guard: rw
         ChrName   ref_chr;      // guard: rw
         uint64_t  block_id{ 0 }; // stable export identity
-        SpeciesName ref_species; // explicit reference occurrence genome
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
         mutable std::shared_mutex rw;
 
         static BlockPtr create(std::size_t hint = 1);
-        static BlockPtr createEmpty(const SpeciesName& species,
-                                    const ChrName& chr,
+        static BlockPtr createEmpty(const SpeciesName& ref_species,
+                                    const ChrName& ref_chr,
                                     std::size_t hint = 1);
 
         // Convenience helper – create both ref&qry segments, register anchors
@@ -475,6 +476,12 @@ namespace RaMesh {
             const FilePath& maf_path,
             const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
             bool pairwise_mode) const;
+
+        Paf::PafExportStats exportToPaf(
+            const FilePath& paf_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const Paf::PafExportOptions& options = {}) const;
 
         void exportToHal(
             const FilePath& hal_path,

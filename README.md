@@ -1,8 +1,8 @@
 # RaMAx
 
-RaMAx aligns multiple genomes and writes whole-genome alignments in MAF or HAL
-format. It accepts the Cactus-style seqfile format: a Newick species tree
-followed by one genome name and FASTA path per line.
+RaMAx aligns multiple genomes and writes whole-genome alignments in MAF, HAL,
+or PAF format. A seqfile contains one genome name and FASTA path per line. HAL
+output additionally requires a Newick species tree as the first record.
 
 ## Install
 
@@ -62,12 +62,53 @@ ramax \
   --optimize-blocks
 ```
 
-Use an output name ending in `.maf` or `.hal`. Intermediate graph state, logs,
-and minipoa scratch files are kept under the work directory.
-The two serializers use the same normalized multiway homology relation:
-changing only the output suffix does not change leaf-to-leaf alignment
-coverage. HAL soft-mask restoration is applied after alignment decisions, so
-letter case cannot change the homology graph.
+Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
+information-complete sparse `connected` mode; use `--paf-mode all` for the
+all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
+are kept under the work directory.
+MAF and HAL use the same normalized multiway homology relation, so changing
+only the output suffix does not change leaf-to-leaf alignment coverage. HAL
+soft-mask restoration happens after alignment decisions; letter case cannot
+change the homology graph.
+
+Repeat `-o` to export several formats from the same completed alignment:
+
+```bash
+ramax -i seqfile.txt -w work -t 16 \
+  -o alignment.maf \
+  -o alignment.paf \
+  -o alignment.hal
+```
+
+Each format may appear once. If HAL is requested anywhere in the output list,
+the seqfile must contain a Newick tree. Export order is MAF, PAF, then HAL.
+
+For seqwish, generate the matching qualified FASTA directly from the same
+seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
+the default `connected` PAF mode:
+
+```bash
+ramax-paf-fasta -i seqfile.txt -o sequences.fa.gz
+ramax -i seqfile.txt -w work -t 16 \
+  -o alignment.paf \
+  -o alignment.maf
+seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa -k 0
+```
+
+For a normalized PGGB graph, write an uncompressed FASTA, index it, and reuse
+the RaMAx PAF with `pggb -a` so PGGB skips wfmash:
+
+```bash
+ramax-paf-fasta -i seqfile.txt -o sequences.fa
+samtools faidx sequences.fa
+mkdir -p pggb-out pggb-tmp
+pggb -i sequences.fa -o pggb-out -a alignment.paf -n <genome-count> \
+  -t 16 -T 8 -k 0 -D pggb-tmp
+```
+
+The detailed operator guide covers directory layout, validation, failure
+handling, the direct seqwish route, the PGGB route, and a completed
+seven-genome Chr09 example: [PAF-to-GFA workflow](docs/paf-to-gfa-workflow.md).
 
 The graph optimizations are enabled by default. `--optimize-blocks` is an
 explicit, repeatable way to request the same default set. The defaults are:
@@ -81,7 +122,29 @@ explicit, repeatable way to request the same default set. The defaults are:
 
 Run `ramax --help` for the complete core-alignment options.
 
+## Documentation
+
+- [Usage guide](docs/usage.md)
+- [Command-line parameters](docs/parameters.md)
+- [Restart and work directories](docs/restart.md)
+- [MAF, HAL, and PAF output](docs/output-formats.md)
+- [PAF-to-GFA workflow](docs/paf-to-gfa-workflow.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Realignment architecture](docs/realignment_architecture.md)
+
+See the [documentation index](docs/README.md) for the complete set.
+
 ## Input format
+
+MAF and PAF output accept a mapping-only seqfile:
+
+```text
+human      /data/genomes/human.fa
+chimp      /data/genomes/chimp.fa
+orangutan  /data/genomes/orangutan.fa.gz
+```
+
+HAL output requires a Newick tree as the first record:
 
 ```text
 ((human:0.005,chimp:0.005):0.02,orangutan:0.025);
@@ -90,7 +153,9 @@ chimp      /data/genomes/chimp.fa
 orangutan  /data/genomes/orangutan.fa.gz
 ```
 
-Leaf names in the tree must match the genome names below it.
+Tree input remains optional for MAF and other non-HAL formats. When a tree is
+provided, its leaf names should match the genome mappings. `--root` is valid
+only for HAL output.
 
 ## Restart compatibility
 

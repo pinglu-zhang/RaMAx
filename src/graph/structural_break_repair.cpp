@@ -896,8 +896,7 @@ bool commitPrepared(RaMeshMultiGenomeGraph& graph, Prepared& prepared) {
     std::vector<Residual> residuals;
     residuals.reserve(old_set.size());
     for (const auto& [key, segment] : prepared.candidate.anomalous_segments) {
-        auto residual =
-            Block::createEmpty(key.first, key.second, 1);
+        auto residual = Block::createEmpty(key.first, key.second, 1);
         residual->anchors.emplace(key, segment);
         residuals.push_back({residual, key, segment, segment->parent_block,
                              segment->cigar, segment->strand});

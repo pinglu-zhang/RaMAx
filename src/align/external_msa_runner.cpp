@@ -165,9 +165,8 @@ size_t cacheHash(const std::string& executable, const std::string& input) {
     const size_t input_hash = std::hash<std::string>{}(input);
     hash ^= input_hash + 0x9e3779b97f4a7c15ULL + (hash << 6U) +
             (hash >> 2U);
-    // The fixed invocation contract is part of the key even though it is not
-    // currently configurable.
-    hash ^= std::hash<std::string_view>{}("-r 1 -t 1") +
+    // The fixed invocation contract is part of the cache key.
+    hash ^= std::hash<std::string_view>{}("input -S -f 0 -r1") +
             (hash << 6U) + (hash >> 2U);
     return hash;
 }
@@ -713,9 +712,9 @@ bool ExternalMsaRunner::align(
     }
 
     std::vector<char*> arguments{
-        const_cast<char*>(executable.c_str()), const_cast<char*>("-r"),
-        const_cast<char*>("1"), const_cast<char*>("-t"),
-        const_cast<char*>("1"), input_path.data(), nullptr};
+        const_cast<char*>(executable.c_str()), input_path.data(),
+        const_cast<char*>("-S"), const_cast<char*>("-f"),
+        const_cast<char*>("0"), const_cast<char*>("-r1"), nullptr};
     pid_t pid = -1;
     const auto process_start = std::chrono::steady_clock::now();
     input_nanoseconds.fetch_add(

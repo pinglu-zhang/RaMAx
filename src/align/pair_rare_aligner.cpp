@@ -13,13 +13,15 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	uint_t chunk_size,
 	uint_t overlap_size,
 	uint_t min_anchor_length,
-	uint_t max_anchor_frequency)
+	uint_t max_anchor_frequency,
+	uint_t accurate_skip_threshold)
 	: work_dir(work_dir)
 	, index_dir(work_dir / INDEX_DIR)
 	, chunk_size(chunk_size)
 	, overlap_size(overlap_size)
 	, min_anchor_length(min_anchor_length)
 	, max_anchor_frequency(max_anchor_frequency)
+	, accurate_skip_threshold(accurate_skip_threshold)
 	, thread_num(thread_num)
 {
 	if (!std::filesystem::exists(index_dir)) {
@@ -197,7 +199,8 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 					allow_short_mum,
 					max_anchor_frequency,
 					ref_global_cache,
-					sampling_interval);
+					sampling_interval,
+					accurate_skip_threshold);
 			}
 		} catch (...) {
 			std::lock_guard<std::mutex> lock(task_exception_mutex);
@@ -786,6 +789,7 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
 
 
 
+
 static void filterChrByDP(
 	AnchorBySQR_SparsePtr anchor_map,
 	uint_t id,
@@ -977,7 +981,6 @@ filterAnchorByDPDimension(
         filter_ref);
 }
 
-
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
@@ -988,6 +991,7 @@ void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t 
 #pragma omp parallel for schedule(dynamic) num_threads(thread_num)
 	for (uint_t i = 0; i < qry_chr_cnt; i++) {
 		filterAnchorByDPDimension(anchor_map, i, false);
+
 	}
 
 }
@@ -1063,5 +1067,4 @@ void PairRareAligner::registerSecondaryAnchors(
         }
     }
 }
-
 

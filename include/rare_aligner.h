@@ -21,12 +21,12 @@ public:
     FilePath index_dir;
 
     SpeciesPathMap species_path_map;
-    NewickParser newick_tree;
 
     uint_t chunk_size;
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold;
     bool allow_mem = false;
     SpeciesClusterMap secondary_cluster_map;
     SpeciesMatchVec3DPtrMap secondary_match_map;
@@ -52,12 +52,12 @@ public:
     MultipleRareAligner(
         const FilePath& work_dir,
         SpeciesPathMap& species_path_map,
-        NewickParser& newick_tree,
         uint_t thread_num,
         uint_t chunk_size,
         uint_t overlap_size,
         uint_t min_anchor_length,
-        uint_t max_anchor_frequency
+        uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold
     );
 
     std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> starAlignment(
@@ -127,12 +127,15 @@ public:
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold = 0;
 
     uint_t group_id;
     uint_t round_id;
 
     uint_t thread_num;
-    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size, uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency);
+    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size,
+        uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold = 0);
 
     // 新增构造函数：从 MultipleRareAligner 初始化
     PairRareAligner(const MultipleRareAligner& mra)
@@ -142,6 +145,7 @@ public:
         overlap_size(mra.overlap_size),
         min_anchor_length(mra.min_anchor_length),
         max_anchor_frequency(mra.max_anchor_frequency),
+        accurate_skip_threshold(mra.accurate_skip_threshold),
         thread_num(mra.thread_num)
     {
         this->group_id = mra.group_id;
@@ -172,6 +176,7 @@ public:
         PreparedAnchorSearch& plan);
 
 
+
     void constructGraphByGreedy(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterVecPtrByStrandByQueryRefPtr cluster_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
 
     void constructGraphByGreedyByRef(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, MatchClusterVecPtr cluster_vec_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, 
@@ -183,6 +188,7 @@ public:
 
     AnchorBySQR_SparsePtr extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first);
 
+
     void filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map,uint_t ref_chr_cnt, uint_t qry_chr_cnt);
     AnchorPtrVec extendClusterGroupToAnchors(
         SeqPro::ManagerVariant& query_seqpro_manager,
@@ -193,6 +199,7 @@ public:
         AnchorBySQR_SparsePtr anchor_map,
         uint_t chromosome_id,
         bool filter_ref);
+
 
     void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
     void registerSecondaryAnchors(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, bool initial_round);

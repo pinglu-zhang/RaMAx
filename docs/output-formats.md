@@ -1,0 +1,128 @@
+# Output formats
+
+RaMAx selects exporters from the suffixes of one or more repeated `-o` paths:
+
+- `.maf` writes a Multiple Alignment Format file;
+- `.hal` writes a Hierarchical Alignment Format file;
+- `.paf` writes pairwise projections of the primary Block alignments;
+- other suffixes are rejected before alignment begins.
+
+Each format may appear once. RaMAx constructs the optimized graph once and
+exports in the fixed order MAF, PAF, HAL. Each file is published independently
+through a temporary file. If one exporter fails, later formats are still
+attempted; successful files remain, the command exits nonzero, and the work
+directory is retained.
+
+## MAF
+
+MAF output does not require a species tree. The seqfile may begin directly with
+genome-to-FASTA mappings. If a tree is supplied for compatibility, it does not
+control alignment reference ordering.
+
+Each MAF alignment Block begins with an `a` line followed by one or more `s`
+rows. RaMAx writes standard zero-based, half-open coordinates:
+
+```text
+s source start size strand sourceSize alignedText
+```
+
+- `size` equals the number of non-gap characters in `alignedText`;
+- all rows in one Block have equal aligned-text length;
+- `strand` is `+` or `-`;
+- `start + size` must not exceed `sourceSize`;
+- removing `-` from a row recovers the represented genomic sequence in its
+  alignment orientation.
+
+## HAL
+
+HAL output stores the same optimized graph in a hierarchy defined by the
+seqfile tree. A valid Newick tree is therefore mandatory for HAL. RaMAx rejects
+a mapping-only seqfile before preprocessing begins. RaMAx reconstructs ancestor
+sequences and writes leaf/ancestor segments without changing the source FASTA
+coordinates. `--root` controls the preferred artificial root name and is valid
+only for HAL output.
+
+Validate a HAL file with the HAL utilities:
+
+```bash
+halValidate /data/project/results/alignment.hal
+halStats /data/project/results/alignment.hal
+```
+
+## PAF
+
+PAF output does not require a species tree. Sequence names are always
+`species.original_contig_name`; RaMAx does not remove an existing species
+prefix from a contig. The FASTA passed to a downstream tool must use exactly
+the same qualified headers. Empty names, whitespace, and qualified-name
+collisions are rejected before export.
+
+Generate that FASTA without manually rewriting headers:
+
+```bash
+ramax-paf-fasta -i genomes.seqfile -o genomes.fa.gz
+```
+
+The tool streams plain or gzip inputs, preserves seqfile/contig order, converts
+sequences to uppercase `A/T/G/C/N` with every non-ATGC symbol represented as
+`N`, and publishes the result atomically. It refuses to overwrite an existing
+file unless `--force` is supplied.
+
+`--paf-mode connected` is the default. It first selects the explicit Block
+reference against every overlapping primary row, then deterministically adds
+pairs until every non-gap, non-`X`, case-normalized same-base set in every MSA
+column is connected. `--paf-mode all` emits all primary row pairs sharing at
+least one non-gap column and is the correctness baseline. A pair selected in a
+Block is emitted once as a complete Block projection.
+
+Records contain the standard 12 PAF fields followed by `cg:Z:`, `tp:A:P`, and
+`NM:i:` tags. MAPQ is 255 and CIGAR operations are limited to `=`, `X`, `I`,
+and `D`. Coordinates always refer to the forward source sequences; the PAF
+strand is the XOR of the two Segment orientations. Column 10 counts `=` bases,
+column 11 counts non-double-gap columns, and `NM` counts `X+I+D` bases.
+
+Malformed Blocks are skipped as complete units and summarized once after
+export. Treat any nonzero `invalid` count as a failed scientific acceptance
+check. Global naming or I/O errors fail the export without replacing an
+existing output file.
+
+The connected-mode completeness guarantee applies to the homologous
+same-base relations already present in valid primary Blocks and to
+`seqwish -k 0`. A nonzero seqwish `-k` intentionally removes short exact
+matches and therefore changes that relation set. See the seqwish
+[graph-induction algorithm](https://github.com/pangenome/seqwish#squish-graph-induction-algorithm)
+and [`-k` usage](https://github.com/pangenome/seqwish#usage).
+
+## Shared Block projection
+
+Direct MAF/PAF export and HAL construction use the shared
+`mergeAlignmentByRef()` reference projection. Nearby homologous insertions may
+be repaired during export, but failure or lack of strict improvement retains
+the original rows. HAL-specific code does not implement a separate insertion
+repair algorithm.
+
+## Comparing MAF results
+
+Use normalized MAF files for reproducible comparisons. Apply the same
+normalization to every candidate and Truth file, including a stable source-name
+mapping, Block/row ordering policy, and whitespace policy. Do not compare a
+normalized candidate against an unnormalized Truth file.
+
+For sampled Truth evaluation, keep the comparator version, sample count, seed,
+and near-distance setting fixed. RaMAx development comparisons use
+`Overall (w/o self)` as the primary F-score rather than inferring accuracy from
+Block count alone.
+
+## Temporary files
+
+External MSA input normally uses an in-memory file descriptor. Any fallback
+input file and minipoa internal file is confined to:
+
+```text
+<work>/minipoa_tmp/
+```
+
+RaMAx removes per-process minipoa files after successful execution, non-zero
+exit, or output-parse failure. A forced process termination can leave files in
+this directory, but should not create them beside the output MAF/HAL/PAF or in the
+launch directory.

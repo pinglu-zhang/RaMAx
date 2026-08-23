@@ -1,5 +1,8 @@
 # Realignment architecture
 
+This is an internal design reference. For user-facing commands and defaults,
+see [Command-line parameters](parameters.md) and [Usage guide](usage.md).
+
 ## Execution order
 
 Block optimization runs after each reference-guided alignment round in a
@@ -11,7 +14,7 @@ deterministic order:
 4. repair high-confidence structural discontinuities;
 5. merge newly compatible contiguous Blocks;
 6. after all rounds, merge short Blocks;
-7. export MAF or HAL, including nearby cross-anchor insertion repair.
+7. export MAF, HAL, or PAF, including nearby cross-anchor insertion repair.
 
 Disabling an optimization module avoids its scan and cache allocation.
 
@@ -28,7 +31,7 @@ Reference-empty windows use the same pairwise graph representation without an
 external MSA call. Other accepted windows invoke minipoa once with:
 
 ```text
-minipoa -r 1 -t 1 input.fa
+minipoa input.fa -S -f 0 -r1
 ```
 
 ## Ownership and graph transactions
