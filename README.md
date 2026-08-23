@@ -39,9 +39,10 @@ cmake --build build -j"$(nproc)"
 cmake --install build --prefix "$HOME/.local"
 ```
 
-Before creating a work directory or reading input genomes, RaMAx requires all
-four external executables to be available: `halAppendCactusSubtree`,
+Before creating a work directory or reading input genomes, RaMAx requires
 `minipoa`, PGGB-compatible wfmash `v0.14.0-0-g517e1bc`, and Mash 2.3.
+`halAppendCactusSubtree` is required only when the output list contains HAL;
+otherwise a missing HAL helper produces a warning and the run continues.
 The lookup order is an explicit CMake path, the directory containing the
 running `ramax` executable, then `PATH`. Configure explicit paths with:
 
@@ -53,8 +54,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
 ```
 
-Missing startup dependencies are reported together and RaMAx exits before
-creating or modifying the work directory. `ramax --help` and
+Missing unconditional startup dependencies are reported together and RaMAx
+exits before creating or modifying the work directory. A missing HAL helper
+also stops HAL runs before normal work-directory initialization. `ramax --help` and
 `ramax --version` remain available without these tools. Mash and wfmash
 retain their strict version checks before use. Samtools/HTSlib 1.24 remains
 required by the wfmash routing stage and can be configured with

@@ -56,7 +56,7 @@ StartupDependencies locateStartupDependencies() {
     };
 }
 
-void validateStartupDependencies(
+void validateUnconditionalStartupDependencies(
     const StartupDependencies& dependencies) {
     struct Requirement {
         std::string_view executable;
@@ -64,10 +64,6 @@ void validateStartupDependencies(
         const std::filesystem::path* resolved;
     };
     const std::array requirements{
-        Requirement{
-            "halAppendCactusSubtree",
-            "RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE",
-            &dependencies.hal_append_cactus_subtree},
         Requirement{
             "minipoa",
             "RAMAX_MINIPOA_EXECUTABLE",
@@ -106,10 +102,28 @@ void validateStartupDependencies(
     }
 }
 
-StartupDependencies requireStartupDependencies() {
-    StartupDependencies dependencies =
-        locateStartupDependencies();
-    validateStartupDependencies(dependencies);
+void validateHalAppendCactusSubtree(
+    const std::filesystem::path& executable,
+    bool hal_output_requested) {
+    if (!hal_output_requested ||
+        RaMAxExternalTool::isExecutable(executable)) {
+        return;
+    }
+    throw std::runtime_error(
+        "HAL output requires halAppendCactusSubtree, but it was not found. "
+        "Configure it with "
+        "-DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=<path>, place it "
+        "beside the ramax executable, or add it to PATH.");
+}
+
+StartupDependencies requireUnconditionalStartupDependencies() {
+    StartupDependencies dependencies{
+        .hal_append_cactus_subtree = {},
+        .minipoa = locateMinipoaExecutable(),
+        .wfmash = locateWfmashExecutable(),
+        .mash = locateMashExecutable(),
+    };
+    validateUnconditionalStartupDependencies(dependencies);
     return dependencies;
 }
 

@@ -949,6 +949,25 @@ bool hasOutputFormat(const CommonArgs& args,
     return RaMAxOutput::hasFormat(args.outputs, format);
 }
 
+void validateHalAppendDependencyForOutputs(const CommonArgs& args) {
+    const bool hal_output_requested =
+        hasOutputFormat(args, MultipleGenomeOutputFormat::HAL);
+    const auto executable =
+        RaMAxDependencies::locateHalAppendCactusSubtreeExecutable();
+    RaMAxDependencies::validateHalAppendCactusSubtree(
+        executable, hal_output_requested);
+
+    if (executable.empty()) {
+        spdlog::warn(
+            "[dependency-preflight] halAppendCactusSubtree was not found; "
+            "continuing because no HAL output was requested");
+    } else {
+        spdlog::info(
+            "[dependency-preflight] halAppendCactusSubtree={}",
+            executable.string());
+    }
+}
+
 std::string requiredMinipoaExecutable() {
     const auto executable =
         RaMesh::Alignment::locateMinipoaExecutable();
@@ -1655,6 +1674,7 @@ static int runRestartMode(CommonArgs& common_args,
     applyRestartOverrides(loaded, overrides);
     applyGraphOptimizationOptions(app, loaded);
     configureOutputs(loaded, loaded.output_paths);
+    validateHalAppendDependencyForOutputs(loaded);
 
     if (loaded.overlap_size >= loaded.chunk_size) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
@@ -1709,6 +1729,7 @@ static int runNormalMode(CommonArgs& common_args, const CLI::App& app) {
 
     applyGraphOptimizationOptions(app, common_args);
     configureOutputs(common_args, common_args.output_paths);
+    validateHalAppendDependencyForOutputs(common_args);
 
     if (!hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF) &&
         common_args.paf_mode_explicit) {
@@ -2380,15 +2401,13 @@ int main(int argc, char** argv) {
     // log policy after loading its configuration.
     configureLogLevel(common_args);
 
-    // Resolve every unconditional external dependency before creating or
+    // Resolve the three unconditional external dependencies before creating or
     // mutating the work directory. CLI11 has already handled --help and
-    // --version, so those informational commands remain dependency-free.
+    // --version, so those informational commands remain dependency-free. The
+    // HAL-only helper is checked after the effective output list is known.
     try {
         const auto dependencies =
-            RaMAxDependencies::requireStartupDependencies();
-        spdlog::info(
-            "[dependency-preflight] halAppendCactusSubtree={}",
-            dependencies.hal_append_cactus_subtree.string());
+            RaMAxDependencies::requireUnconditionalStartupDependencies();
         spdlog::info(
             "[dependency-preflight] minipoa={}",
             dependencies.minipoa.string());
@@ -2399,7 +2418,8 @@ int main(int argc, char** argv) {
             "[dependency-preflight] mash={}",
             dependencies.mash.string());
         spdlog::info(
-            "[dependency-preflight] all required executables are available");
+            "[dependency-preflight] all unconditional required executables "
+            "are available");
     } catch (const std::exception& error) {
         spdlog::critical("{}", error.what());
         return 1;

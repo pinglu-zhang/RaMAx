@@ -34,10 +34,11 @@ that a successful run removes its work directory automatically.
 
 ## Startup dependency check fails
 
-Every normal RaMAx run requires executable copies of
-`halAppendCactusSubtree`, `minipoa`, `wfmash`, and `mash`. RaMAx
-reports every missing program in one error and exits before work-directory
-preparation. Check the launch environment with:
+Every normal RaMAx run requires executable copies of `minipoa`, `wfmash`, and
+`mash`. RaMAx reports missing unconditional programs in one error and exits
+before work-directory preparation. `halAppendCactusSubtree` is mandatory only
+when HAL output is requested; without HAL, its absence is a warning. Check the
+launch environment with:
 
 ```bash
 command -v halAppendCactusSubtree

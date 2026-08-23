@@ -39,12 +39,12 @@ index interface, so independent first-round pairs rebuild the reference index.
 When a tree is present, its leaf names should match the genome mappings. Use
 absolute FASTA paths when jobs may be launched from different directories.
 
-Every normal run performs an unconditional startup preflight for
-`halAppendCactusSubtree`, `minipoa`, `wfmash`, and `mash`. All four
-must be executable even when the selected output format would not reach one of
-them. The check runs after CLI parsing but before work-directory preparation,
-so missing tools cannot leave a partially initialized run. Informational
-`--help` and `--version` commands skip the preflight.
+Every normal run performs an unconditional startup preflight for `minipoa`,
+`wfmash`, and `mash`. `halAppendCactusSubtree` is checked after the effective
+output list is known: it is mandatory for HAL output, while non-HAL runs emit a
+warning and continue when it is unavailable. The checks run before normal
+work-directory preparation. Informational `--help` and `--version` commands
+skip the preflight.
 
 ## Basic commands
 

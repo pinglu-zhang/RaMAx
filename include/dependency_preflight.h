@@ -18,10 +18,16 @@ std::filesystem::path locateMashExecutable();
 
 StartupDependencies locateStartupDependencies();
 
-// Throws one aggregated error that names every missing dependency.
-void validateStartupDependencies(
+// Throws one aggregated error for the three dependencies required by every
+// normal run. halAppendCactusSubtree is output-dependent and checked
+// separately after the effective output list is known.
+void validateUnconditionalStartupDependencies(
     const StartupDependencies& dependencies);
 
-StartupDependencies requireStartupDependencies();
+void validateHalAppendCactusSubtree(
+    const std::filesystem::path& executable,
+    bool hal_output_requested);
+
+StartupDependencies requireUnconditionalStartupDependencies();
 
 }  // namespace RaMAxDependencies
