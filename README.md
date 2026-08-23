@@ -39,21 +39,26 @@ cmake --build build -j"$(nproc)"
 cmake --install build --prefix "$HOME/.local"
 ```
 
-Install `minipoa` separately and place it in `PATH`, next to the installed
-`ramax` executable, or provide its path during configuration:
+Before creating a work directory or reading input genomes, RaMAx requires all
+four external executables to be available: `halAppendCactusSubtree`,
+`minipoa`, PGGB-compatible wfmash `v0.14.0-0-g517e1bc`, and Mash 2.3.
+The lookup order is an explicit CMake path, the directory containing the
+running `ramax` executable, then `PATH`. Configure explicit paths with:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa
-```
-
-RaMAx also requires Mash 2.3 at runtime. Place `mash` in `PATH`, next to the
-installed `ramax`, or configure its exact location with:
-
-```bash
-cmake -S . -B build \
+  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
+  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
+  -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
   -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
 ```
+
+Missing startup dependencies are reported together and RaMAx exits before
+creating or modifying the work directory. `ramax --help` and
+`ramax --version` remain available without these tools. Mash and wfmash
+retain their strict version checks before use. Samtools/HTSlib 1.24 remains
+required by the wfmash routing stage and can be configured with
+`RAMAX_SAMTOOLS_EXECUTABLE`.
 
 After selecting the first reference, RaMAx records whole-genome Mash distances
 using `k=31` and sketch size 20,000 before starting the legacy aligner.

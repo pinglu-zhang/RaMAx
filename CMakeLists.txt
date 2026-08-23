@@ -110,6 +110,8 @@ set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
     "Samtools 1.24 executable; empty searches PATH")
 set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
     "PGGB-compatible wfmash v0.14.0-0-g517e1bc executable; empty searches PATH")
+set(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE "" CACHE FILEPATH
+    "halAppendCactusSubtree executable; empty searches PATH")
 
 if(RAMAX_MASH_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
@@ -159,6 +161,9 @@ resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
                    RAMAX_RESOLVED_SAMTOOLS)
 resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
                    RAMAX_RESOLVED_WFMASH)
+resolve_ramax_tool(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE
+                   halAppendCactusSubtree "halAppendCactusSubtree"
+                   RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE)
 
 if(RAMAX_MINIPOA_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
@@ -210,6 +215,7 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/cross_anchor_repair.cpp"
     "${ALIGN_DIR}/external_msa_runner.cpp"
     "${ALIGN_DIR}/external_tool.cpp"
+    "${ALIGN_DIR}/dependency_preflight.cpp"
     "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"
@@ -317,7 +323,8 @@ target_compile_definitions(ramax_core PRIVATE
     RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
     RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}"
     RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_RESOLVED_SAMTOOLS}"
-    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}")
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}"
+    RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH="${RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)

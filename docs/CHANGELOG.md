@@ -2,6 +2,10 @@
 
 ## 1.0.7 - 2026-08-17
 
+- Added an early aggregated dependency preflight for
+  `halAppendCactusSubtree`, `minipoa`, `wfmash`, and `mash`; missing
+  executables now stop the run before work-directory initialization.
+- Replaced the HAL append shell command with a parameterized subprocess call.
 - Redefined `--restart` as raw/clean FASTA and FM-index cache reuse; alignment,
   clustering, graph construction, and export always restart from the beginning.
 - Added explicit restart parameter overrides, complete repeated-output

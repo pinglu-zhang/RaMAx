@@ -3,6 +3,7 @@
 
 #include "SeqPro.h"
 #include "data_process.h"
+#include "dependency_preflight.h"
 #include "config.hpp"
 #include "index.h"
 #include "minipoa_locator.h"
@@ -2378,6 +2379,31 @@ int main(int argc, char** argv) {
     // Configure early console diagnostics; restart applies the saved/effective
     // log policy after loading its configuration.
     configureLogLevel(common_args);
+
+    // Resolve every unconditional external dependency before creating or
+    // mutating the work directory. CLI11 has already handled --help and
+    // --version, so those informational commands remain dependency-free.
+    try {
+        const auto dependencies =
+            RaMAxDependencies::requireStartupDependencies();
+        spdlog::info(
+            "[dependency-preflight] halAppendCactusSubtree={}",
+            dependencies.hal_append_cactus_subtree.string());
+        spdlog::info(
+            "[dependency-preflight] minipoa={}",
+            dependencies.minipoa.string());
+        spdlog::info(
+            "[dependency-preflight] wfmash={}",
+            dependencies.wfmash.string());
+        spdlog::info(
+            "[dependency-preflight] mash={}",
+            dependencies.mash.string());
+        spdlog::info(
+            "[dependency-preflight] all required executables are available");
+    } catch (const std::exception& error) {
+        spdlog::critical("{}", error.what());
+        return 1;
+    }
 
     // 运行前准备：根据 restart 与否进行目录/参数/配置文件处理
     if (prepareRun(common_args, app, restart_overrides) != 0) {

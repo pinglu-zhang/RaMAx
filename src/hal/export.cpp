@@ -1,6 +1,8 @@
 #include "hal/export.h"
 
 #include "align.h"
+#include "dependency_preflight.h"
+#include "external_tool.h"
 
 #include "halAlignmentInstance.h"
 
@@ -12,7 +14,6 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -379,22 +380,6 @@ std::string stripGaps(const std::string& s) {
             out.push_back(c);
         }
     }
-    return out;
-}
-
-std::string quotePath(const std::filesystem::path& path) {
-    std::string s = path.string();
-    std::string out;
-    out.reserve(s.size() + 2);
-    out.push_back('\'');
-    for (char c : s) {
-        if (c == '\'') {
-            out += "'\\''";
-        } else {
-            out.push_back(c);
-        }
-    }
-    out.push_back('\'');
     return out;
 }
 
@@ -4977,18 +4962,33 @@ void runHalAppend(const std::filesystem::path& c2h_path,
                   const std::filesystem::path& hal_fa_path,
                   const std::filesystem::path& tree_path,
                   const std::filesystem::path& hal_path) {
-    std::ostringstream cmd;
-    cmd << "halAppendCactusSubtree "
-        << quotePath(c2h_path) << ' '
-        << quotePath(hal_fa_path) << ' '
-        << quotePath(tree_path) << ' '
-        << quotePath(hal_path) << ' '
-        << "--hdf5InMemory";
-    int rc = std::system(cmd.str().c_str());
-    if (rc != 0) {
-        std::ostringstream oss;
-        oss << "halAppendCactusSubtree failed with exit code " << rc;
-        throw std::runtime_error(oss.str());
+    const auto executable =
+        RaMAxDependencies::locateHalAppendCactusSubtreeExecutable();
+    if (executable.empty()) {
+        throw std::runtime_error(
+            "halAppendCactusSubtree is required but is no longer available");
+    }
+
+    std::filesystem::path stdout_path = hal_path;
+    stdout_path += ".halAppendCactusSubtree.stdout.log";
+    std::filesystem::path stderr_path = hal_path;
+    stderr_path += ".halAppendCactusSubtree.stderr.log";
+    const auto result = RaMAxExternalTool::run(
+        executable,
+        {
+            c2h_path.string(),
+            hal_fa_path.string(),
+            tree_path.string(),
+            hal_path.string(),
+            "--hdf5InMemory",
+        },
+        stdout_path,
+        stderr_path);
+    if (result.exit_code != 0) {
+        std::ostringstream error;
+        error << "halAppendCactusSubtree failed with exit code "
+              << result.exit_code << "; stderr: " << stderr_path;
+        throw std::runtime_error(error.str());
     }
 }
 

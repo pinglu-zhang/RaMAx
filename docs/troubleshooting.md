@@ -32,6 +32,40 @@ ramax -i seqfile.txt -o results/run2.maf -w work/run2 -t 16
 Use `--restart -w <existing-work>` only for the same interrupted run. Remember
 that a successful run removes its work directory automatically.
 
+## Startup dependency check fails
+
+Every normal RaMAx run requires executable copies of
+`halAppendCactusSubtree`, `minipoa`, `wfmash`, and `mash`. RaMAx
+reports every missing program in one error and exits before work-directory
+preparation. Check the launch environment with:
+
+```bash
+command -v halAppendCactusSubtree
+command -v minipoa
+command -v wfmash
+command -v mash
+```
+
+Runtime lookup order for each tool is:
+
+1. the corresponding `RAMAX_*_EXECUTABLE` path selected by CMake;
+2. an executable with the expected name beside the running `ramax` binary;
+3. the process `PATH`.
+
+For explicit source-build paths:
+
+```bash
+cmake -S . -B build \
+  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
+  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
+  -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
+```
+
+`--help` and `--version` intentionally do not require external tools.
+After existence preflight, Mash 2.3 and wfmash
+`v0.14.0-0-g517e1bc` are still validated before their first use.
+
 ## minipoa is missing
 
 RaMAx requires a separately installed minipoa executable for its MSA-based

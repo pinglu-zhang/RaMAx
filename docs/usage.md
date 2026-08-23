@@ -39,6 +39,13 @@ index interface, so independent first-round pairs rebuild the reference index.
 When a tree is present, its leaf names should match the genome mappings. Use
 absolute FASTA paths when jobs may be launched from different directories.
 
+Every normal run performs an unconditional startup preflight for
+`halAppendCactusSubtree`, `minipoa`, `wfmash`, and `mash`. All four
+must be executable even when the selected output format would not reach one of
+them. The check runs after CLI parsing but before work-directory preparation,
+so missing tools cannot leave a partially initialized run. Informational
+`--help` and `--version` commands skip the preflight.
+
 ## Basic commands
 
 Write MAF:
