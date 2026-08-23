@@ -102,6 +102,7 @@ struct ColumnRun {
     bool secondary_homology = false;
     std::vector<uint8_t> leaf_present;
     std::vector<LeafRunSpan> leaf_spans;
+    std::vector<uint64_t> source_block_ids;
     std::vector<uint8_t> present_by_node;
     std::vector<double> presence_margin;
 };
@@ -649,6 +650,8 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
             ColumnRun run;
             run.run_id = next_run_id++;
             run.block_id = msa.block_id;
+            run.source_block_ids.push_back(
+                msa.block_id);
             run.col_beg = projection.col_beg;
             run.col_end = projection.col_end;
             run.secondary_homology =
@@ -1662,6 +1665,8 @@ ColumnRun sliceColumnRun(
     ColumnRun result;
     result.run_id = run.run_id;
     result.block_id = run.block_id;
+    result.source_block_ids =
+        run.source_block_ids;
     result.col_beg = run.col_beg + local_begin;
     result.col_end = run.col_beg + local_end;
     result.secondary_homology =
@@ -1697,6 +1702,18 @@ void finalizeNormalizedRun(
     ColumnRun& run,
     const TreeMeta& tree,
     RunNormalizationStats& stats) {
+    std::sort(
+        run.source_block_ids.begin(),
+        run.source_block_ids.end());
+    run.source_block_ids.erase(
+        std::unique(
+            run.source_block_ids.begin(),
+            run.source_block_ids.end()),
+        run.source_block_ids.end());
+    if (run.source_block_ids.empty()) {
+        throw std::runtime_error(
+            "HAL normalized run has no source Block provenance");
+    }
     std::sort(
         run.leaf_spans.begin(),
         run.leaf_spans.end(),
@@ -2250,6 +2267,10 @@ RunNormalizationStats normalizeOverlappingColumnRuns(
                 combined.secondary_homology =
                     combined.secondary_homology ||
                     fragment.secondary_homology;
+                combined.source_block_ids.insert(
+                    combined.source_block_ids.end(),
+                    fragment.source_block_ids.begin(),
+                    fragment.source_block_ids.end());
                 if (!initialized ||
                     std::tie(
                         fragment.block_id,
@@ -2463,6 +2484,370 @@ void sanitizeLeafCoverage(
     }
 }
 
+struct MafReblockedRow {
+    std::string row_id;
+    std::string leaf_name;
+    std::string chr_name;
+    std::string hal_sequence_name;
+    uint64_t interval_start = 0;
+    uint64_t interval_end = 0;
+    uint64_t ungapped_length = 0;
+    bool reversed = false;
+    std::string aligned_dna;
+};
+
+struct MafReblockedBlock {
+    bool initialized = false;
+    bool has_multi_occurrence_column = false;
+    uint32_t column_end = 0;
+    size_t alignment_width = 0;
+    std::vector<MafReblockedRow> rows;
+    std::unordered_map<
+        std::string,
+        std::vector<size_t>>
+        row_indices;
+};
+
+bool canAppendMafRun(
+    const MafReblockedBlock& block,
+    const ColumnRun& run) {
+    return !block.initialized ||
+        run.col_beg ==
+            block.column_end;
+}
+
+bool mafRowContinues(
+    const MafReblockedRow& row,
+    const LeafRunSpan& span,
+    uint64_t span_end) {
+    if (row.leaf_name !=
+            span.leaf_name ||
+        row.chr_name !=
+            span.chr_name ||
+        row.hal_sequence_name !=
+            span.hal_sequence_name ||
+        row.reversed !=
+            span.reversed) {
+        return false;
+    }
+    return span.reversed
+        ? span_end ==
+              row.interval_start
+        : span.start ==
+              row.interval_end;
+}
+
+void appendMafRun(
+    MafReblockedBlock& block,
+    const ColumnRun& run,
+    size_t reserve_width) {
+    const uint32_t run_length =
+        run.col_end - run.col_beg;
+    if (run_length == 0) {
+        throw std::runtime_error(
+            "Cannot reblock an empty MAF run");
+    }
+    if (block.initialized &&
+        !canAppendMafRun(block, run)) {
+        throw std::logic_error(
+            "Cannot append a discontinuous MAF run");
+    }
+
+    const size_t old_width =
+        block.alignment_width;
+    for (auto& row : block.rows) {
+        row.aligned_dna.append(
+            run_length,
+            '-');
+    }
+    std::unordered_set<size_t>
+        used_rows;
+    used_rows.reserve(
+        run.leaf_spans.size());
+    for (const auto& span :
+         run.leaf_spans) {
+        if (span.length !=
+                run_length ||
+            span.dna.size() !=
+                run_length) {
+            throw std::runtime_error(
+                "MAF run span length is inconsistent");
+        }
+        const uint64_t span_end =
+            span.start + span.length;
+        if (span_end < span.start) {
+            throw std::overflow_error(
+                "MAF run coordinate overflow");
+        }
+
+        size_t row_index =
+            std::numeric_limits<
+                size_t>::max();
+        const auto row_it =
+            block.row_indices.find(
+                span.row_id);
+        if (row_it !=
+            block.row_indices.end()) {
+            for (const size_t candidate :
+                 row_it->second) {
+                if (used_rows.count(
+                        candidate) == 0 &&
+                    mafRowContinues(
+                        block.rows[candidate],
+                        span,
+                        span_end)) {
+                    row_index = candidate;
+                    break;
+                }
+            }
+        }
+        if (row_index ==
+            std::numeric_limits<
+                size_t>::max()) {
+            MafReblockedRow row;
+            row.row_id = span.row_id;
+            row.leaf_name =
+                span.leaf_name;
+            row.chr_name =
+                span.chr_name;
+            row.hal_sequence_name =
+                span.hal_sequence_name;
+            row.interval_start =
+                span.start;
+            row.interval_end =
+                span_end;
+            row.ungapped_length =
+                span.length;
+            row.reversed =
+                span.reversed;
+            row.aligned_dna.reserve(
+                reserve_width);
+            row.aligned_dna.assign(
+                old_width,
+                '-');
+            row.aligned_dna.append(
+                span.dna);
+            row_index =
+                block.rows.size();
+            block.rows.push_back(
+                std::move(row));
+            block.row_indices[
+                span.row_id].push_back(
+                    row_index);
+            used_rows.insert(
+                row_index);
+            continue;
+        }
+        used_rows.insert(
+            row_index);
+
+        auto& row =
+            block.rows[row_index];
+        std::copy(
+            span.dna.begin(),
+            span.dna.end(),
+            row.aligned_dna.end() -
+                run_length);
+        if (span.reversed) {
+            row.interval_start =
+                span.start;
+        } else {
+            row.interval_end =
+                span_end;
+        }
+        row.ungapped_length +=
+            span.length;
+    }
+
+    block.initialized = true;
+    block.has_multi_occurrence_column =
+        block.has_multi_occurrence_column ||
+        run.leaf_spans.size() >= 2;
+    block.column_end = run.col_end;
+    block.alignment_width +=
+        run_length;
+}
+
+bool emitReblockedMafBlock(
+    std::ostream& output,
+    const MafReblockedBlock& block,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers,
+    bool pairwise_mode) {
+    if (!block.initialized ||
+        !block.has_multi_occurrence_column ||
+        block.rows.size() < 2) {
+        return false;
+    }
+
+    std::map<
+        SpeciesName,
+        std::vector<
+            const MafReblockedRow*>>
+        rows_by_leaf;
+    size_t maximum_copy_count = 0;
+    for (const auto& row :
+         block.rows) {
+        auto& copies =
+            rows_by_leaf[row.leaf_name];
+        copies.push_back(&row);
+        maximum_copy_count =
+            std::max(
+                maximum_copy_count,
+                copies.size());
+    }
+    for (auto& [leaf_name, copies] :
+         rows_by_leaf) {
+        (void)leaf_name;
+        std::sort(
+            copies.begin(),
+            copies.end(),
+            [](const MafReblockedRow* lhs,
+               const MafReblockedRow* rhs) {
+                return std::tie(
+                           lhs->hal_sequence_name,
+                           lhs->interval_start,
+                           lhs->interval_end,
+                           lhs->row_id) <
+                       std::tie(
+                           rhs->hal_sequence_name,
+                           rhs->interval_start,
+                           rhs->interval_end,
+                           rhs->row_id);
+            });
+    }
+
+    output << "a score=0\n";
+    for (size_t copy_index = 0;
+         copy_index <
+             maximum_copy_count;
+         ++copy_index) {
+        for (const auto& [
+                 leaf_name,
+                 copies] :
+             rows_by_leaf) {
+            (void)leaf_name;
+            if (copy_index >=
+                copies.size()) {
+                continue;
+            }
+            const auto& row =
+                *copies[copy_index];
+            const auto manager_it =
+                seqpro_managers.find(
+                    row.leaf_name);
+            if (manager_it ==
+                seqpro_managers.end()) {
+                throw std::runtime_error(
+                    "MAF reblocked row references "
+                    "an unknown leaf genome: " +
+                    row.leaf_name);
+            }
+            const uint64_t sequence_length =
+                fetchSequenceLength(
+                    manager_it->second,
+                    row.chr_name);
+            if (row.interval_end <
+                    row.interval_start ||
+                row.interval_end >
+                    sequence_length ||
+                row.ungapped_length !=
+                    row.interval_end -
+                        row.interval_start ||
+                row.aligned_dna.size() !=
+                    block.alignment_width) {
+                throw std::runtime_error(
+                    "MAF reblocked row has invalid "
+                    "coordinates or alignment width");
+            }
+            const uint64_t maf_start =
+                row.reversed
+                ? sequence_length -
+                      row.interval_end
+                : row.interval_start;
+            const std::string& source =
+                pairwise_mode
+                ? row.chr_name
+                : row.hal_sequence_name;
+            output << "s " <<
+                std::left <<
+                std::setw(20) <<
+                source <<
+                std::right <<
+                std::setw(12) <<
+                maf_start <<
+                std::setw(12) <<
+                row.ungapped_length <<
+                ' ' <<
+                (row.reversed
+                     ? '-'
+                     : '+') <<
+                std::setw(12) <<
+                sequence_length <<
+                ' ' <<
+                row.aligned_dna <<
+                '\n';
+        }
+    }
+    output << '\n';
+    return true;
+}
+
+size_t emitReblockedMafRuns(
+    std::ostream& output,
+    std::vector<ColumnRun>::const_iterator begin,
+    std::vector<ColumnRun>::const_iterator end,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>&
+        seqpro_managers,
+    bool pairwise_mode) {
+    size_t reserve_width = 0;
+    for (auto run = begin;
+         run != end;
+         ++run) {
+        reserve_width +=
+            run->col_end -
+            run->col_beg;
+    }
+
+    size_t emitted_blocks = 0;
+    MafReblockedBlock block;
+    for (auto run = begin;
+         run != end;
+         ++run) {
+        if (block.initialized &&
+            !canAppendMafRun(
+                block,
+                *run)) {
+            emitted_blocks +=
+                emitReblockedMafBlock(
+                    output,
+                    block,
+                    seqpro_managers,
+                    pairwise_mode)
+                ? 1
+                : 0;
+            block = {};
+        }
+        appendMafRun(
+            block,
+            *run,
+            reserve_width);
+    }
+    emitted_blocks +=
+        emitReblockedMafBlock(
+            output,
+            block,
+            seqpro_managers,
+            pairwise_mode)
+        ? 1
+        : 0;
+    return emitted_blocks;
+}
+
 void exportCanonicalMafImpl(
     const std::vector<std::weak_ptr<Block>>& blocks,
     const std::filesystem::path& maf_path,
@@ -2511,114 +2896,41 @@ void exportCanonicalMafImpl(
     }
     output << "##maf version=1 scoring=none\n";
     size_t emitted_blocks = 0;
-    for (const auto& run : runs) {
-        if (run.leaf_spans.size() < 2) {
-            continue;
-        }
-        output << "a score=0\n";
-        // Emit every leaf's first copy before any second copy.  Pairwise
-        // presence is therefore independent of high paralog multiplicity in
-        // downstream streaming coverage consumers.
-        std::map<
-            SpeciesName,
-            std::vector<
-                const LeafRunSpan*>>
-            spans_by_leaf;
-        size_t maximum_copy_count = 0;
-        for (const auto& span :
-             run.leaf_spans) {
-            auto& copies =
-                spans_by_leaf[
-                    span.leaf_name];
-            copies.push_back(&span);
-            maximum_copy_count =
-                std::max(
-                    maximum_copy_count,
-                    copies.size());
-        }
-        std::vector<const LeafRunSpan*>
-            ordered_spans;
-        ordered_spans.reserve(
-            run.leaf_spans.size());
-        for (size_t copy_index = 0;
-             copy_index <
-                 maximum_copy_count;
-             ++copy_index) {
-            for (const auto& [
-                     leaf_name,
-                     copies] :
-                 spans_by_leaf) {
-                (void)leaf_name;
-                if (copy_index <
-                    copies.size()) {
-                    ordered_spans.push_back(
-                        copies[copy_index]);
-                }
+    size_t reblocked_groups = 0;
+    size_t isolated_overlap_runs = 0;
+    auto run = runs.cbegin();
+    while (run != runs.cend()) {
+        auto group_end = run;
+        ++group_end;
+        if (run->source_block_ids.size() ==
+            1) {
+            while (
+                group_end != runs.cend() &&
+                group_end->source_block_ids ==
+                    run->source_block_ids) {
+                ++group_end;
             }
+            ++reblocked_groups;
+        } else {
+            ++isolated_overlap_runs;
         }
-        for (const auto* span_ptr :
-             ordered_spans) {
-            const auto& span =
-                *span_ptr;
-            const auto manager_it =
-                seqpro_managers.find(
-                    span.leaf_name);
-            if (manager_it ==
-                seqpro_managers.end()) {
-                throw std::runtime_error(
-                    "MAF normalized run references "
-                    "an unknown leaf genome: " +
-                    span.leaf_name);
-            }
-            const uint64_t sequence_length =
-                fetchSequenceLength(
-                    manager_it->second,
-                    span.chr_name);
-            if (span.start >
-                    sequence_length ||
-                span.length >
-                    sequence_length -
-                        span.start ||
-                span.dna.size() !=
-                    span.length) {
-                throw std::runtime_error(
-                    "MAF normalized run lies outside "
-                    "its leaf sequence");
-            }
-            const uint64_t maf_start =
-                span.reversed
-                ? sequence_length -
-                      span.start -
-                      span.length
-                : span.start;
-            const std::string& source =
-                pairwise_mode
-                ? span.chr_name
-                : span.hal_sequence_name;
-            output << "s " << std::left
-                   << std::setw(20)
-                   << source << std::right
-                   << std::setw(12)
-                   << maf_start
-                   << std::setw(12)
-                   << span.length << ' '
-                   << (span.reversed
-                           ? '-'
-                           : '+')
-                   << std::setw(12)
-                   << sequence_length << ' '
-                   << span.dna << '\n';
-        }
-        output << '\n';
-        ++emitted_blocks;
+        emitted_blocks +=
+            emitReblockedMafRuns(
+                output,
+                run,
+                group_end,
+                seqpro_managers,
+                pairwise_mode);
+        run = group_end;
     }
     spdlog::info(
         "MAF export split {} elementary column runs; "
         "selected {}/{} secondary runs "
         "({} conflicting and {} redundant runs rejected, "
         "{} bp), normalized to {} runs across {} "
-        "homology components, and emitted {} multi-leaf "
-        "blocks",
+        "homology components, reblocked {} single-source "
+        "groups, kept {} overlap-normalized runs isolated, "
+        "and emitted {} MAF blocks",
         projected_run_count,
         selection.accepted_runs,
         selection.candidate_runs,
@@ -2627,6 +2939,8 @@ void exportCanonicalMafImpl(
         selection.rejected_bases,
         normalization.output_runs,
         normalization.connected_components,
+        reblocked_groups,
+        isolated_overlap_runs,
         emitted_blocks);
 }
 

@@ -296,6 +296,133 @@ void testNamespacedLeafSequenceIsNotDuplicated(
         "namespace in a leaf sequence name");
 }
 
+void testMafReassemblesGappedBlock(
+    const std::filesystem::path& temp) {
+    std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>
+        managers;
+    for (const auto& [species, dna] :
+         std::map<std::string, std::string>{
+             {"leafA", "AACCGGTT"},
+             {"leafB", "AATTGGTT"}}) {
+        const auto fasta =
+            temp / (species + ".gapped.fa");
+        writeInput(fasta, dna);
+        SeqPro::ManagerVariant manager =
+            std::make_unique<
+                SeqPro::SequenceManager>(
+                fasta);
+        managers[species] =
+            std::make_shared<
+                SeqPro::ManagerVariant>(
+                std::move(manager));
+    }
+
+    auto block = RaMesh::Block::create(2);
+    block->ref_species = "leafA";
+    block->ref_chr = "chr1";
+    block->anchors.emplace(
+        RaMesh::SpeciesChrPair{
+            "leafA",
+            "chr1"},
+        RaMesh::Segment::create(
+            0,
+            8,
+            Strand::FORWARD,
+            Cigar_t{cigarToInt('M', 8)},
+            RaMesh::AlignRole::PRIMARY,
+            RaMesh::SegmentRole::SEGMENT,
+            block));
+    block->anchors.emplace(
+        RaMesh::SpeciesChrPair{
+            "leafB",
+            "chr1"},
+        RaMesh::Segment::create(
+            0,
+            8,
+            Strand::FORWARD,
+            Cigar_t{
+                cigarToInt('M', 2),
+                cigarToInt('D', 2),
+                cigarToInt('I', 2),
+                cigarToInt('M', 4)},
+            RaMesh::AlignRole::PRIMARY,
+            RaMesh::SegmentRole::SEGMENT,
+            block));
+
+    auto graph_managers = managers;
+    RaMesh::RaMeshMultiGenomeGraph graph(
+        graph_managers);
+    graph.blocks.emplace_back(block);
+    const auto maf_path =
+        temp / "gapped-reassembled.maf";
+    graph.exportToMaf(
+        maf_path,
+        managers,
+        false);
+
+    std::ifstream input(maf_path);
+    size_t block_count = 0;
+    std::vector<std::string> aligned_rows;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.starts_with("a ")) {
+            ++block_count;
+            continue;
+        }
+        if (!line.starts_with("s ")) {
+            continue;
+        }
+        std::istringstream fields(line);
+        std::string tag;
+        std::string source;
+        uint64_t start = 0;
+        uint64_t size = 0;
+        char strand = '+';
+        uint64_t source_size = 0;
+        std::string dna;
+        fields >> tag >> source >> start >>
+            size >> strand >> source_size >>
+            dna;
+        require(
+            fields &&
+                size ==
+                    static_cast<uint64_t>(
+                        std::count_if(
+                            dna.begin(),
+                            dna.end(),
+                            [](char base) {
+                                return base != '-';
+                            })),
+            "reassembled MAF row has an invalid size");
+        aligned_rows.push_back(
+            std::move(dna));
+    }
+    require(
+        block_count == 1,
+        "one gapped graph Block must remain one MAF block");
+    require(
+        aligned_rows.size() == 2 &&
+            aligned_rows[0].size() == 10 &&
+            aligned_rows[1].size() == 10 &&
+            aligned_rows[0].find('-') !=
+                std::string::npos &&
+            aligned_rows[1].find('-') !=
+                std::string::npos,
+        "reassembled MAF did not preserve the gapped alignment");
+    require(
+        mafPairCoverage(
+            maf_path,
+            "leafA",
+            "leafB") == 6 &&
+            mafPairCoverage(
+                maf_path,
+                "leafB",
+                "leafA") == 6,
+        "reassembled MAF changed pairwise homology");
+}
+
 void testParalogousOccurrencesRemainThreaded(
     const std::filesystem::path &temp,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant> &managers,
@@ -1421,6 +1548,8 @@ int main() {
         require(hasUpperAndLower(ancestor), "exported ancestor lacks mixed case");
         alignment.reset();
         testNamespacedLeafSequenceIsNotDuplicated(
+            temp);
+        testMafReassemblesGappedBlock(
             temp);
         testParalogousOccurrencesRemainThreaded(
             temp,
