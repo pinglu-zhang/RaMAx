@@ -326,7 +326,7 @@ target_link_libraries(ramax PRIVATE ramax_core)
 add_dependencies(ramax hal_library)
 
 include(CTest)
-if(BUILD_TESTING)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(ramax_mash_distance_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
     configure_rama_target(ramax_mash_distance_test)
@@ -358,7 +358,7 @@ endif()
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
-if(RAMAX_BUILD_TESTS)
+if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(ramax_hal_export_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
     configure_rama_target(ramax_hal_export_test)
