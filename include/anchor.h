@@ -242,7 +242,8 @@ ClusterBySQR_SparsePtr clusterAllChrMatchSparse(
     MatchBySQR_SparsePtr& unique_anchors,
     MatchBySQR_SparsePtr& repeat_anchors,  // 按你的要求：占位不用
     uint_t min_span,
-    uint_t thread_num);
+    uint_t thread_num,
+    bool include_repeats);
 
 
 void validateClusters(const ClusterVecPtrByStrandByQueryRefPtr& cluster_vec_ptr);
@@ -353,6 +354,15 @@ RegionVec preAllocateChunksBySize(const SeqPro::ManagerVariant& seq_manager,
                                  uint_t overlap_size = 0,
                                  uint_t min_chunk_size = 10000,
                                  bool isMultiple = false);
+
+/**
+ * @brief 按原始坐标切分全部序列，包括 MaskedSequenceManager 的遮蔽区间
+ */
+RegionVec preAllocateOriginalChunksBySize(
+    const SeqPro::ManagerVariant& seq_manager,
+    uint_t chunk_size,
+    uint_t overlap_size = 0,
+    uint_t min_chunk_size = 10000);
 
 /**
  * @brief 常规的基于大小的分块辅助函数

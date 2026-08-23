@@ -21,6 +21,20 @@
 - Reduced fixed-point, graph-transaction, and external-MSA overhead while
   preserving candidate order, CIGARs, and graph rollback checks.
 - Fixed concurrent external-MSA cache coordination.
+- Parallelized cross-species anchor search, sparse clustering, cluster
+  extension, and both coordinate-DP stages while preserving deterministic
+  result collection and serial graph mutation.
+- Prevented overlapping reference Blocks from merging when repeated
+  non-reference participant species would be discarded by the single-occurrence
+  Block model.
+- Rebuilt HAL export around occurrence-level common refinement and
+  evidence-constrained ancestral paths, eliminating leaf-contig-driven
+  ancestor-sequence fragmentation while preserving direct-MAF leaf coverage.
+- Restricted default graph construction to anchors selected on both reference
+  and query coordinates; repeat-secondary occurrences remain explicit
+  `--allow-mem` behavior.
+- Preserved terminal query-only CIGAR operations when overlapping Blocks are
+  split and merged on both forward and reverse strands.
 - Isolated minipoa scratch files under the RaMAx work directory and removed
   them after each invocation.
 - Simplified the Block-optimization command-line interface and introduced

@@ -3,6 +3,9 @@
 
 #include <optional>
 #include <atomic>
+#include <exception>
+#include <memory>
+#include <vector>
 
 #include "config.hpp"
 #include "index.h"
@@ -33,6 +36,9 @@ public:
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
     uint_t accurate_skip_threshold;
+    bool allow_mem = false;
+    SpeciesClusterMap secondary_cluster_map;
+    SpeciesMatchVec3DPtrMap secondary_match_map;
 
     uint_t thread_num;
     uint_t group_id;
@@ -103,20 +109,24 @@ private:
 struct PreparedAnchorSearch {
     struct Task {
         Region chunk;
-        Strand strand;
+        Strand strand =
+            Strand::FORWARD;
     };
 
-    std::string prefix;
-    SeqPro::ManagerVariant* query_manager{ nullptr };
-    SearchMode search_mode{ ACCURATE_SEARCH };
-    bool allow_MEM{ false };
-    bool allow_short_mum{ false };
-    sdsl::int_vector<0>* ref_global_cache{ nullptr };
-    SeqPro::Length sampling_interval{ 32 };
+    SeqPro::ManagerVariant* query_manager =
+        nullptr;
+    SearchMode search_mode =
+        ACCURATE_SEARCH;
+    bool allow_mem = false;
+    bool allow_short_mum = false;
+    sdsl::int_vector<0>* ref_global_cache =
+        nullptr;
+    SeqPro::Length sampling_interval = 32;
     std::vector<Task> tasks;
     std::vector<MatchVec2DPtr> task_results;
     std::vector<std::exception_ptr> task_errors;
 };
+
 
 
 class PairRareAligner {
@@ -169,22 +179,26 @@ public:
     FilePath buildIndex(const std::string prefix, SeqPro::ManagerVariant& ref_fasta_manager_, bool fast_build);
 
 
-    MatchVec3DPtr findQueryFileAnchor(const std::string prefix, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval, bool isMultiple=false);
-
-    std::shared_ptr<PreparedAnchorSearch> prepareQueryFileAnchor(
-        const std::string& prefix,
+    MatchVec3DPtr findQueryFileAnchor(const std::string prefix, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval, bool isMultiple=false, bool include_masked_regions=false);
+    std::shared_ptr<PreparedAnchorSearch>
+    prepareQueryFileAnchor(
         SeqPro::ManagerVariant& query_fasta_manager,
         SearchMode search_mode,
-        bool allow_MEM,
+        bool allow_mem,
         bool allow_short_mum,
         sdsl::int_vector<0>& ref_global_cache,
         SeqPro::Length sampling_interval,
-        bool isMultiple = false);
+        bool is_multiple = false,
+        bool include_masked_regions = false);
 
-    void executePreparedAnchorTask(PreparedAnchorSearch& plan,
+    void executePreparedAnchorTask(
+        PreparedAnchorSearch& plan,
         size_t task_index);
 
-    MatchVec3DPtr collectPreparedAnchorSearch(PreparedAnchorSearch& plan);
+    MatchVec3DPtr collectPreparedAnchorSearch(
+        PreparedAnchorSearch& plan);
+
+
 
     void constructGraphByGreedy(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterVecPtrByStrandByQueryRefPtr cluster_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
 
@@ -197,18 +211,21 @@ public:
 
     AnchorBySQR_SparsePtr extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first);
 
+
+    void filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map,uint_t ref_chr_cnt, uint_t qry_chr_cnt);
     AnchorPtrVec extendClusterGroupToAnchors(
-        SpeciesName query_name,
         SeqPro::ManagerVariant& query_seqpro_manager,
         MatchClusterVecPtr cluster_group,
         bool is_first);
 
-    void filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map,uint_t ref_chr_cnt, uint_t qry_chr_cnt);
+    void filterAnchorByDPDimension(
+        AnchorBySQR_SparsePtr anchor_map,
+        uint_t chromosome_id,
+        bool filter_ref);
 
-    void filterAnchorByDPDimension(AnchorBySQR_SparsePtr anchor_map,
-        uint_t chromosome_id, bool filter_ref);
 
     void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
+    void registerSecondaryAnchors(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, bool initial_round);
 
 };
 

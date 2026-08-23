@@ -447,6 +447,22 @@ uint64_t Index::intervalCount(const std::string& sequence_name) const {
     return found->second.interval_count;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>>
+Index::intervals(const std::string& sequence_name) const {
+    const auto found = sequences_.find(sequence_name);
+    if (found == sequences_.end()) {
+        throw std::runtime_error(
+            "Sequence missing from soft-mask index: " + sequence_name);
+    }
+    const SequenceEntry& entry = found->second;
+    std::vector<std::pair<uint64_t, uint64_t>> result;
+    result.reserve(entry.interval_count);
+    for (uint64_t index = 0; index < entry.interval_count; ++index) {
+        result.push_back(intervalAt(entry, index));
+    }
+    return result;
+}
+
 void AncestorBaseVote::add(char observation) noexcept {
     static constexpr std::array<char, 4> bases{'A', 'C', 'G', 'T'};
     const auto raw = static_cast<unsigned char>(observation);

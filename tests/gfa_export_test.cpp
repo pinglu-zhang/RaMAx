@@ -184,7 +184,7 @@ void testVersionsAndLosslessWalks(const fs::path& root) {
 
     const fs::path maf_before = root / "before.maf";
     const fs::path paf_before = root / "before.paf";
-    graph.exportToMaf(maf_before, managers, true, false);
+    graph.exportToMaf(maf_before, managers, false);
     graph.exportToPaf(paf_before, managers);
 
     RaMesh::Gfa::GfaExportOptions options;
@@ -197,7 +197,7 @@ void testVersionsAndLosslessWalks(const fs::path& root) {
     const auto stats11 = graph.exportToGfa(gfa11, managers, options);
     const fs::path maf_after = root / "after.maf";
     const fs::path paf_after = root / "after.paf";
-    graph.exportToMaf(maf_after, managers, true, false);
+    graph.exportToMaf(maf_after, managers, false);
     graph.exportToPaf(paf_after, managers);
 
     const ParsedGfa parsed10 = parseGfa(gfa10);

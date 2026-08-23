@@ -4,6 +4,7 @@ project(RaMAx VERSION 1.0.7 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
+enable_testing()
 
 # MSVC 热重载支持
 if(POLICY CMP0141)
@@ -226,9 +227,9 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/aligned_block_view.cpp"
     "${GRAPH_DIR}/gfa_export.cpp"
+    "${SOURCE_DIR}/hal/export.cpp"
     "${GRAPH_DIR}/paf_utils.cpp"
     "${GRAPH_DIR}/paf_export.cpp"
-    "${GRAPH_DIR}/hal_converter.cpp"
 )
 
 set(MAIN_X "${SOURCE_DIR}/RaMAx.cpp")
@@ -355,6 +356,34 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
+if(RAMAX_BUILD_TESTS)
+    add_executable(ramax_hal_export_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
+    configure_rama_target(ramax_hal_export_test)
+    target_link_libraries(ramax_hal_export_test PRIVATE ramax_core)
+    add_dependencies(ramax_hal_export_test hal_library)
+    add_test(NAME ramax_hal_export COMMAND ramax_hal_export_test)
+
+    add_executable(ramax_hal_softmask_export_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp")
+    configure_rama_target(ramax_hal_softmask_export_test)
+    target_link_libraries(ramax_hal_softmask_export_test PRIVATE ramax_core)
+    add_dependencies(ramax_hal_softmask_export_test hal_library)
+    add_test(NAME ramax_hal_softmask_export
+        COMMAND ramax_hal_softmask_export_test)
+
+    add_executable(ramax_zero_gap_missing_species_merge_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp"
+        ${RAMA_COMMON_SOURCES})
+    configure_rama_target(ramax_zero_gap_missing_species_merge_test)
+    target_compile_definitions(ramax_zero_gap_missing_species_merge_test
+        PRIVATE RAMAX_KSW_TEST_HOOKS)
+    add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
+    add_test(NAME ramax_zero_gap_missing_species_merge
+        COMMAND ramax_zero_gap_missing_species_merge_test)
+endif()
 
 # Optional companion tools are self-contained under tools/.  A tool that was
 # already built in its own source-local build directory is installed directly,
