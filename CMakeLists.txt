@@ -201,6 +201,7 @@ set(RAMA_COMMON_SOURCES
     "${PREPROCESS_DIR}/SeqPro.cpp"
     "${PREPROCESS_DIR}/softmask_index.cpp"
     "${INDEX_DIR}/fm_index.cpp"
+    "${INDEX_DIR}/suffix_array_index.cpp"
     "${INDEX_DIR}/bigBWT_build.cpp"
     "${INDEX_DIR}/bigBWT/newscan.cpp"
     "${INDEX_DIR}/bigBWT/utils.c"

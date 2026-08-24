@@ -9,6 +9,7 @@
 
 #include "config.hpp"
 #include "index.h"
+#include "suffix_array_index.h"
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
@@ -137,7 +138,7 @@ public:
     SpeciesName ref_name;
 
     SeqPro::ManagerVariant* ref_seqpro_manager;
-    std::optional<FM_Index> ref_index;
+    std::optional<Suffix_Array_Index> ref_index;
 
     uint_t chunk_size;
     uint_t overlap_size;

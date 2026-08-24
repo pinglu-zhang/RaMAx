@@ -1378,9 +1378,9 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
-    // 复用预处理和 FM-index 缓存；比对与构图始终重新开始
+    // 复用预处理和锚点索引缓存；比对与构图始终重新开始
     auto* restart_flag = cmd->add_flag("--restart", args.restart,
-        "Reuse raw/clean FASTA and FM-index caches, then rerun alignment from the beginning; explicitly supplied options override saved values.")
+        "Reuse raw/clean FASTA and anchor-index caches, then rerun alignment from the beginning; explicitly supplied options override saved values.")
         ->group("Performance");
 
     // ========================

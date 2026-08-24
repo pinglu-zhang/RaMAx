@@ -683,7 +683,7 @@ starAlignment(
     }
 
     // Estimate whole-genome Mash distance once for the first selected
-    // reference. The legacy FM-index aligner remains the only alignment
+    // reference. The native suffix-array aligner remains the only legacy
     // backend in this phase; these records are retained for the future router.
     MashDistanceEstimator mash_estimator(
         locateMashExecutable(), work_dir / "similarity", thread_num);
@@ -692,7 +692,7 @@ starAlignment(
 
     // Route only first-round near genomes through wfmash. Tool/version
     // validation and the public-reference FAI are intentionally completed
-    // before any legacy FM-index can be built.
+    // before any native suffix-array index can be built.
     FirstRoundWfmashRouter wfmash_router(
         locateSamtoolsExecutable(), locateWfmashExecutable(),
         work_dir / "wfmash" / "round_0", thread_num);
@@ -807,11 +807,11 @@ starAlignment(
         } else {
             if (i == 0) {
                 spdlog::info(
-                    "[wfmash-router] all first-round queries succeeded; skipping FM-index, cluster, and DP for {}",
+                    "[wfmash-router] all first-round queries succeeded; skipping suffix-array index, cluster, and DP for {}",
                     current_ref_name);
             } else {
                 spdlog::info(
-                    "No remaining legacy queries for {}; skipping FM-index, cluster, and DP",
+                    "No remaining legacy queries for {}; skipping suffix-array index, cluster, and DP",
                     current_ref_name);
             }
         }
@@ -961,7 +961,7 @@ starAlignment(
     }
 
     spdlog::info(
-        "[cache-summary] FM-index reused={} rebuilt={}",
+        "[cache-summary] suffix-array index reused={} rebuilt={}",
         index_cache_counters->reused.load(),
         index_cache_counters->rebuilt.load());
 

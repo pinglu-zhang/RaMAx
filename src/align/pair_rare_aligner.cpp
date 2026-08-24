@@ -80,32 +80,27 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 
 	// index_dir的路径加上prefix的前缀加上fasta_manager.fasta_path_的扩展名
 	FilePath output_path = ref_index_path / (prefix + std::filesystem::path(fasta_path_str).extension().string());
+	const std::string index_source_identity = fasta_path_str +
+		"|suffix-array-v2|fast-build=" +
+		(fast_build ? "1" : "0");
 
 	ref_index.emplace(prefix, ref_fasta_manager_);
 
-	FilePath idx_file_path = ref_index_path / (prefix + "." + FMINDEX_EXTESION);
-	FilePath sa_file_path = idx_file_path;
-	sa_file_path += ".sa";
-	FilePath wt_file_path = idx_file_path;
-	wt_file_path += ".wt";
+	FilePath idx_file_path = ref_index_path / (prefix + "." + SAINDEX_EXTENSION);
 	const FilePath marker_path =
 		RaMAxCache::completionMarkerPath(idx_file_path);
-	const FilePath sa_marker_path =
-		RaMAxCache::completionMarkerPath(sa_file_path);
-	const FilePath wt_marker_path =
-		RaMAxCache::completionMarkerPath(wt_file_path);
 
-	spdlog::info("Indexing with prefix: {}, index path: {}", prefix, ref_index_path.string());
+	spdlog::info("Suffix-array indexing with prefix: {}, index path: {}", prefix, ref_index_path.string());
 
 	const auto load_existing = [&]() -> bool {
 		try {
 			if (!ref_index->loadFromFile(idx_file_path.string())) return false;
 			++index_cache_counters->reused;
-			spdlog::info("[cache] FM-index reused for {}: {}",
+			spdlog::info("[cache] suffix-array index reused for {}: {}",
 				prefix, idx_file_path.string());
 			return true;
 		} catch (const std::exception& error) {
-			spdlog::warn("[cache] FM-index load failed for {}: {}; rebuilding",
+			spdlog::warn("[cache] suffix-array index load failed for {}: {}; rebuilding",
 				prefix, error.what());
 			ref_index.emplace(prefix, ref_fasta_manager_);
 			return false;
@@ -114,14 +109,8 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 
 	bool loaded = false;
 	if (RaMAxCache::markerMatches(
-			marker_path, "fm-index", 1, fasta_path_str, false,
-			FilePath(fasta_path_str), idx_file_path) &&
-		RaMAxCache::markerMatches(
-			sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
-			FilePath(fasta_path_str), sa_file_path) &&
-		RaMAxCache::markerMatches(
-			wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
-			FilePath(fasta_path_str), wt_file_path)) {
+			marker_path, "suffix-array-index", 2, index_source_identity, false,
+			FilePath(fasta_path_str), idx_file_path)) {
 		loaded = load_existing();
 	} else if (trust_legacy_cache &&
 			   std::filesystem::is_regular_file(idx_file_path) &&
@@ -129,15 +118,9 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 		loaded = load_existing();
 		if (loaded) {
 			RaMAxCache::writeMarker(
-				marker_path, "fm-index", 1, fasta_path_str, false,
+				marker_path, "suffix-array-index", 2, index_source_identity, false,
 				FilePath(fasta_path_str), idx_file_path);
-			RaMAxCache::writeMarker(
-				sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
-				FilePath(fasta_path_str), sa_file_path);
-			RaMAxCache::writeMarker(
-				wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
-				FilePath(fasta_path_str), wt_file_path);
-			spdlog::warn("[cache] trusted legacy FM-index for {}", prefix);
+			spdlog::warn("[cache] trusted unmarked suffix-array index for {}", prefix);
 		}
 	}
 
@@ -145,41 +128,25 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 		ref_index.emplace(prefix, ref_fasta_manager_);
 		FilePath partial = idx_file_path;
 		partial += ".partial";
-		FilePath partial_sa = partial;
-		partial_sa += ".sa";
-		FilePath partial_wt = partial;
-		partial_wt += ".wt";
 		RaMAxCache::removeIfPresent(partial);
-		RaMAxCache::removeIfPresent(partial_sa);
-		RaMAxCache::removeIfPresent(partial_wt);
 		try {
 			ref_index->buildIndex(output_path, fast_build, thread_num);
 			if (!ref_index->saveToFile(partial.string())) {
-				throw std::runtime_error("Failed to save FM-index: " + partial.string());
+				throw std::runtime_error("Failed to save suffix-array index: " + partial.string());
 			}
-			RaMAxCache::publishFile(partial_sa, sa_file_path);
-			RaMAxCache::publishFile(partial_wt, wt_file_path);
 			RaMAxCache::publishFile(partial, idx_file_path);
 			RaMAxCache::writeMarker(
-				marker_path, "fm-index", 1, fasta_path_str, false,
+				marker_path, "suffix-array-index", 2, index_source_identity, false,
 				FilePath(fasta_path_str), idx_file_path);
-			RaMAxCache::writeMarker(
-				sa_marker_path, "fm-index-sa", 1, fasta_path_str, false,
-				FilePath(fasta_path_str), sa_file_path);
-			RaMAxCache::writeMarker(
-				wt_marker_path, "fm-index-wt", 1, fasta_path_str, false,
-				FilePath(fasta_path_str), wt_file_path);
 		} catch (...) {
 			RaMAxCache::removeIfPresent(partial);
-			RaMAxCache::removeIfPresent(partial_sa);
-			RaMAxCache::removeIfPresent(partial_wt);
 			throw;
 		}
 		++index_cache_counters->rebuilt;
-		spdlog::info("[cache] FM-index rebuilt for {}: {}",
+		spdlog::info("[cache] suffix-array index rebuilt for {}: {}",
 			prefix, idx_file_path.string());
 	}
-	spdlog::info("Indexing finished, index path: {}", ref_index_path.string());
+	spdlog::info("Suffix-array indexing finished, index path: {}", ref_index_path.string());
 
 	return ref_index_path;
 }
