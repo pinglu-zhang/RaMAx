@@ -7,8 +7,13 @@ build-*
 build-conda
 cmake-build-*
 recipe/build-conda
-bin
+bin/*
+!bin/halAppendCactusSubtree
 benchmark
+tests
+package
+packaging-sources
+wfmash_router_integration_artifacts
 third_party/hal/bin
 third_party/hal/lib
 third_party/hal/objs

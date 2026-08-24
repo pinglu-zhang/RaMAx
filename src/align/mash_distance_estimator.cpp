@@ -25,6 +25,9 @@ extern char** environ;
 #ifndef RAMAX_MASH_CONFIGURED_PATH
 #define RAMAX_MASH_CONFIGURED_PATH ""
 #endif
+#ifndef RAMAX_TOOL_BIN_CONFIGURED_PATH
+#define RAMAX_TOOL_BIN_CONFIGURED_PATH ""
+#endif
 
 namespace {
 
@@ -257,6 +260,12 @@ std::string validateVersion(std::string_view output) {
 std::filesystem::path locateMashExecutable() {
     const std::filesystem::path configured(RAMAX_MASH_CONFIGURED_PATH);
     if (isExecutable(configured)) return configured;
+    const std::filesystem::path configured_directory(
+        RAMAX_TOOL_BIN_CONFIGURED_PATH);
+    if (!configured_directory.empty()) {
+        const auto candidate = configured_directory / "mash";
+        if (isExecutable(candidate)) return candidate;
+    }
     const auto sibling = executableDirectory() / "mash";
     if (isExecutable(sibling)) return sibling;
     return searchPath("mash");
