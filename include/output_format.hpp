@@ -5,10 +5,11 @@
 #include <string>
 
 enum class MultipleGenomeOutputFormat {
-    HAL,
-    MAF,
-    PAF,
-    UNKNOWN
+    HAL = 0,
+    MAF = 1,
+    PAF = 2,
+    GFA = 3,
+    UNKNOWN = 255
 };
 
 inline MultipleGenomeOutputFormat detectMultipleGenomeOutputFormat(
@@ -17,6 +18,7 @@ inline MultipleGenomeOutputFormat detectMultipleGenomeOutputFormat(
     if (ext == ".hal") return MultipleGenomeOutputFormat::HAL;
     if (ext == ".maf") return MultipleGenomeOutputFormat::MAF;
     if (ext == ".paf") return MultipleGenomeOutputFormat::PAF;
+    if (ext == ".gfa") return MultipleGenomeOutputFormat::GFA;
     return MultipleGenomeOutputFormat::UNKNOWN;
 }
 

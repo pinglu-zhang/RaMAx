@@ -420,7 +420,8 @@ MultipleRareAligner::MultipleRareAligner(
     uint_t overlap_size_,
     uint_t min_anchor_length_,
     uint_t max_anchor_frequency_,
-    uint_t accurate_skip_threshold_
+    uint_t accurate_skip_threshold_,
+    bool trust_legacy_cache_
 )
     : work_dir(work_dir_),                                  // 初始化成员
     index_dir(work_dir_ / INDEX_DIR),
@@ -430,7 +431,8 @@ MultipleRareAligner::MultipleRareAligner(
     min_anchor_length(min_anchor_length_),
     max_anchor_frequency(max_anchor_frequency_),
     accurate_skip_threshold(accurate_skip_threshold_),
-    thread_num(thread_num_)
+    thread_num(thread_num_),
+    trust_legacy_cache(trust_legacy_cache_)
 {
     // 确保工作目录存在
     if (!std::filesystem::exists(work_dir)) {
@@ -680,6 +682,28 @@ starAlignment(
         }
     }
 
+    // Estimate whole-genome Mash distance once for the first selected
+    // reference. The legacy FM-index aligner remains the only alignment
+    // backend in this phase; these records are retained for the future router.
+    MashDistanceEstimator mash_estimator(
+        locateMashExecutable(), work_dir / "similarity", thread_num);
+    first_reference_distances = mash_estimator.estimateFirstReference(
+        reference_order.front(), seqpro_managers);
+
+    // Route only first-round near genomes through wfmash. Tool/version
+    // validation and the public-reference FAI are intentionally completed
+    // before any legacy FM-index can be built.
+    FirstRoundWfmashRouter wfmash_router(
+        locateSamtoolsExecutable(), locateWfmashExecutable(),
+        work_dir / "wfmash" / "round_0", thread_num);
+    const FirstRoundWfmashResult first_round_wfmash = wfmash_router.run(
+        reference_order.front(), first_reference_distances,
+        near_distance_threshold, far_distance_threshold, seqpro_managers);
+    spdlog::info(
+        "[wfmash-router] tools: samtools={} wfmash={} successful_pairs={}",
+        wfmash_router.samtoolsVersion(), wfmash_router.wfmashVersion(),
+        first_round_wfmash.successful_species.size());
+
     // ------------------------------------------------------------
     // 5) 初始化参考缓存 ref_global_cache
     //    - 用于加速 global 坐标定位到序列（避免频繁二分/查询）
@@ -690,6 +714,7 @@ starAlignment(
     // 6) 创建多基因组图（整个 starAlignment 过程使用同一个 multi_graph）
     // ------------------------------------------------------------
     auto multi_graph = std::make_unique<RaMesh::RaMeshMultiGenomeGraph>(seqpro_managers);
+    multi_graph->reference_order = reference_order;
 
     // ------------------------------------------------------------
     // 7) 决定轮数：only_one_round 只跑 1 轮，否则只遍历合法 reference
@@ -719,6 +744,10 @@ starAlignment(
             if (processed_reference_species.count(query_name) > 0) {
                 continue;
             }
+            if (i == 0 && query_name != current_ref_name &&
+                first_round_wfmash.successful_species.contains(query_name)) {
+                continue;
+            }
             auto query_fasta_manager = seqpro_managers.at(query_name);
             species_fasta_manager_map.emplace(query_name, query_fasta_manager);
         }
@@ -733,44 +762,75 @@ starAlignment(
         //      search_mode 固定 ACCURATE_SEARCH（保持原逻辑）
         //      allow_MEM 固定 false
         // --------------------------------------------------------
-        SpeciesMatchVec3DPtrMapPtr match_ptr = alignMultipleGenome(
-            current_ref_name,
-            species_fasta_manager_map,
-            ACCURATE_SEARCH,
-            fast_build,
-            allow_mem,
-            allow_short_mum,
-            ref_global_cache,
-            sampling_interval
-        );
+        const size_t legacy_query_count =
+            species_fasta_manager_map.size() -
+            (species_fasta_manager_map.contains(current_ref_name) ? 1 : 0);
+        if (legacy_query_count > 0) {
+            SpeciesMatchVec3DPtrMapPtr match_ptr = alignMultipleGenome(
+                current_ref_name,
+                species_fasta_manager_map,
+                ACCURATE_SEARCH,
+                fast_build,
+                allow_mem,
+                allow_short_mum,
+                ref_global_cache,
+                sampling_interval
+            );
 
-        spdlog::info("align multiple genome for {} done", current_ref_name);
+            spdlog::info("align multiple genome for {} done", current_ref_name);
 
-        // --------------------------------------------------------
-        // 7-4) 过滤 anchors：对多个物种的 anchors 聚簇/筛选，得到 cluster_map
-        // --------------------------------------------------------
-        spdlog::info("filter multiple species anchors for {}", current_ref_name);
-        SpeciesClusterMapPtr cluster_map = filterMultipeSpeciesAnchors(
-            current_ref_name,
-            species_fasta_manager_map,
-            match_ptr,
-            min_span
-        );
-        spdlog::info("filter multiple species anchors for {} done", current_ref_name);
+            // --------------------------------------------------------
+            // 7-4) 过滤 anchors：对多个物种的 anchors 聚簇/筛选，得到 cluster_map
+            // --------------------------------------------------------
+            spdlog::info("filter multiple species anchors for {}", current_ref_name);
+            SpeciesClusterMapPtr cluster_map = filterMultipeSpeciesAnchors(
+                current_ref_name,
+                species_fasta_manager_map,
+                match_ptr,
+                min_span
+            );
+            spdlog::info("filter multiple species anchors for {} done", current_ref_name);
 
-        // --------------------------------------------------------
-        // 7-5) 构建多基因组图：DP 方式构图（i==0 作为 is_first）
-        // --------------------------------------------------------
-        spdlog::info("construct multiple genome graphs for {}", current_ref_name);
+            // --------------------------------------------------------
+            // 7-5) 构建多基因组图：DP 方式构图（i==0 作为 is_first）
+            // --------------------------------------------------------
+            spdlog::info("construct multiple genome graphs for {}", current_ref_name);
 
-        constructMultipleGraphsByDp(
-            seqpro_managers,
-            current_ref_name,
-            *cluster_map,
-            *multi_graph,
-            min_span,
-            i == 0
-        );
+            constructMultipleGraphsByDp(
+                seqpro_managers,
+                current_ref_name,
+                *cluster_map,
+                *multi_graph,
+                min_span,
+                i == 0
+            );
+        } else {
+            if (i == 0) {
+                spdlog::info(
+                    "[wfmash-router] all first-round queries succeeded; skipping FM-index, cluster, and DP for {}",
+                    current_ref_name);
+            } else {
+                spdlog::info(
+                    "No remaining legacy queries for {}; skipping FM-index, cluster, and DP",
+                    current_ref_name);
+            }
+        }
+
+        if (i == 0) {
+            auto& reference_manager = *seqpro_managers.at(current_ref_name);
+            for (const auto& [query_name, anchors] :
+                 first_round_wfmash.anchors_by_species) {
+                auto& query_manager = *seqpro_managers.at(query_name);
+                for (const auto& anchor : anchors) {
+                    multi_graph->insertAnchorIntoGraph(
+                        reference_manager, query_manager, current_ref_name,
+                        query_name, anchor, true);
+                }
+                spdlog::info(
+                    "[wfmash-router] imported {} anchors for {} before graph extension",
+                    anchors.size(), query_name);
+            }
+        }
 
         // --------------------------------------------------------
         // 7-6) 扩展/优化/验证图结构
@@ -899,6 +959,11 @@ starAlignment(
         RaMesh::ShortBlockRepair::repairFinalShortBlocks(
             *multi_graph, reference_order, seqpro_managers, options);
     }
+
+    spdlog::info(
+        "[cache-summary] FM-index reused={} rebuilt={}",
+        index_cache_counters->reused.load(),
+        index_cache_counters->rebuilt.load());
 
     // 所有轮次完成后，flush logger
     spdlog::default_logger()->flush();

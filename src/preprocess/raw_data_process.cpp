@@ -172,7 +172,8 @@ std::string getFileExtension(const FilePath& file_path) {
 // 主流程函数：复制或下载所有原始数据文件
 // -----------------------------
 bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map,
-    int thread_num) {
+    int thread_num, RaMAxCache::StageStats* cache_stats,
+    bool trust_legacy_cache) {
     try {
         // 预验证文件路径或 URL
         for (const auto& [key, path] : species_path_map) {
@@ -189,40 +190,75 @@ bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map,
         std::filesystem::create_directories(raw_data_dir);
         spdlog::info("Created directory: {}", raw_data_dir.string());
 
-        // 使用线程池并发执行下载或复制
+        struct RawResult {
+            SpeciesName species;
+            FilePath path;
+            bool reused{false};
+        };
+
+        // 使用线程池并发执行下载或复制。工作线程不修改共享 map。
         ThreadPool pool(thread_num);
-        for (auto it = species_path_map.begin(); it != species_path_map.end();
-            ++it) {
-            const std::string& key = it->first;
-            const FilePath& path = it->second;
+        std::vector<std::future<RawResult>> futures;
+        futures.reserve(species_path_map.size());
+        for (const auto& [key, path] : species_path_map) {
             std::string extension = getFileExtension(path);
             std::string final_name = key + extension;
             FilePath final_dest = raw_data_dir / final_name;
+            futures.emplace_back(pool.enqueue(
+                [key, path, final_dest, trust_legacy_cache]() -> RawResult {
+                    const bool source_is_url = isUrl(path.string());
+                    const FilePath marker =
+                        RaMAxCache::completionMarkerPath(final_dest);
+                    if (RaMAxCache::markerMatches(
+                            marker, "raw-fasta", 1, path.string(),
+                            source_is_url, path, final_dest)) {
+                        spdlog::info("[cache] raw FASTA reused for {}: {}",
+                                     key, final_dest.string());
+                        return {key, final_dest, true};
+                    }
+                    if (trust_legacy_cache &&
+                        std::filesystem::is_regular_file(final_dest) &&
+                        !std::filesystem::exists(marker)) {
+                        RaMAxCache::writeMarker(
+                            marker, "raw-fasta", 1, path.string(),
+                            source_is_url, path, final_dest);
+                        spdlog::warn(
+                            "[cache] trusting legacy raw FASTA for {}: {}",
+                            key, final_dest.string());
+                        return {key, final_dest, true};
+                    }
 
-            pool.enqueue([key, path, extension, raw_data_dir, final_dest]() {
-                if (std::filesystem::exists(final_dest)) {
-                    spdlog::warn("File already exists, skipping: {}",
-                        final_dest.string());
-                    return;
-                }
-
-                if (isUrl(path.string())) {
-                    FilePath temp_dest =
-                        raw_data_dir / (key + "_in_download" + extension);
-                    downloadFile(path.string(), temp_dest);
-                    std::filesystem::rename(temp_dest, final_dest);
-                }
-                else {
-                    copyLocalFile(path, final_dest);
-                }
-                spdlog::info("Successfully processed species {} -> {}", key,
-                    final_dest.string());
-                });
-
-            species_path_map[key] = final_dest;
+                    FilePath partial = final_dest;
+                    partial += ".partial";
+                    RaMAxCache::removeIfPresent(partial);
+                    try {
+                        if (source_is_url) {
+                            downloadFile(path.string(), partial);
+                        } else {
+                            copyLocalFile(path, partial);
+                        }
+                        RaMAxCache::publishFile(partial, final_dest);
+                        RaMAxCache::writeMarker(
+                            marker, "raw-fasta", 1, path.string(),
+                            source_is_url, path, final_dest);
+                    } catch (...) {
+                        RaMAxCache::removeIfPresent(partial);
+                        throw;
+                    }
+                    spdlog::info("Successfully processed species {} -> {}",
+                                 key, final_dest.string());
+                    return {key, final_dest, false};
+                }));
         }
 
+        RaMAxCache::StageStats local_stats;
+        for (auto& future : futures) {
+            RawResult result = future.get();
+            species_path_map[result.species] = result.path;
+            result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
+        }
         pool.waitAllTasksDone();
+        if (cache_stats) *cache_stats = local_stats;
         spdlog::info("All raw sequence data copy to work directory successfully.");
         return true;
     }
@@ -236,7 +272,8 @@ bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map,
 // 清洗原始数据：调用 SeqPro 清理并索引
 // -----------------------------
 bool cleanRawDataset(const FilePath workdir_path,
-    SpeciesPathMap& species_path_map, int thread_num) {
+    SpeciesPathMap& species_path_map, int thread_num,
+    RaMAxCache::StageStats* cache_stats, bool trust_legacy_cache) {
     try {
         // 确保清洗数据输出目录存在
         FilePath clean_data_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
@@ -248,30 +285,70 @@ bool cleanRawDataset(const FilePath workdir_path,
             spdlog::info("Cleaned data directory already exists: {}", clean_data_dir.string());
         }
 
+        struct CleanResult {
+            SpeciesName species;
+            FilePath path;
+            bool reused{false};
+        };
         ThreadPool pool(thread_num);
-        for (auto it = species_path_map.begin(); it != species_path_map.end(); ++it) {
-            std::string species = it->first;
-            std::filesystem::path raw_path = it->second;
-
-            pool.enqueue([species, raw_path, &workdir_path, &species_path_map]() {
+        std::vector<std::future<CleanResult>> futures;
+        futures.reserve(species_path_map.size());
+        for (const auto& [species, raw_path] : species_path_map) {
+            futures.emplace_back(pool.enqueue(
+                [species, raw_path, &workdir_path,
+                 trust_legacy_cache]() -> CleanResult {
                 FilePath out_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
                 FilePath out_fasta = out_dir / (species + ".fasta");
+                const FilePath marker =
+                    RaMAxCache::completionMarkerPath(out_fasta);
 
-                // 检查清洗后的文件是否已存在
-                if (std::filesystem::exists(out_fasta)) {
-                    spdlog::warn("Species {} cleaned file already exists, skipping: {}",
+                if (RaMAxCache::markerMatches(
+                        marker, "clean-fasta", 1, raw_path.string(), false,
+                        raw_path, out_fasta)) {
+                    spdlog::info("[cache] cleaned FASTA reused for {}: {}",
+                                 species, out_fasta.string());
+                    return {species, out_fasta, true};
+                }
+                if (trust_legacy_cache &&
+                    std::filesystem::is_regular_file(out_fasta) &&
+                    !std::filesystem::exists(marker)) {
+                    RaMAxCache::writeMarker(
+                        marker, "clean-fasta", 1, raw_path.string(), false,
+                        raw_path, out_fasta);
+                    spdlog::warn(
+                        "[cache] trusting legacy cleaned FASTA for {}: {}",
                         species, out_fasta.string());
-                    species_path_map[species] = out_fasta;
-                    return;
+                    return {species, out_fasta, true};
                 }
 
-                SeqPro::utils::cleanFastaFile(raw_path, out_fasta, 60);
-                species_path_map[species] = out_fasta;
+                FilePath partial = out_fasta;
+                partial += ".partial";
+                RaMAxCache::removeIfPresent(partial);
+                try {
+                    SeqPro::utils::cleanFastaFile(raw_path, partial, 60);
+                    RaMAxCache::publishFile(partial, out_fasta);
+                    RaMAxCache::writeMarker(
+                        marker, "clean-fasta", 1, raw_path.string(), false,
+                        raw_path, out_fasta);
+                } catch (...) {
+                    RaMAxCache::removeIfPresent(partial);
+                    throw;
+                }
+
                 spdlog::info("Species {} cleaned file path updated to: {}", species,
                     out_fasta.string());
-                });
+                return {species, out_fasta, false};
+                }));
+        }
+
+        RaMAxCache::StageStats local_stats;
+        for (auto& future : futures) {
+            CleanResult result = future.get();
+            species_path_map[result.species] = result.path;
+            result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
         }
         pool.waitAllTasksDone();
+        if (cache_stats) *cache_stats = local_stats;
         spdlog::info("All raw sequence data cleaned successfully.");
         return true;
     }
@@ -289,7 +366,8 @@ bool cleanRawDataset(const FilePath workdir_path,
 bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
     SpeciesPathMap& species_path_map,
     SoftMask::PathMap& softmask_path_map,
-    int thread_num) {
+    int thread_num, RaMAxCache::StageStats* cache_stats,
+    bool trust_legacy_cache) {
     try {
         const FilePath clean_data_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
         std::filesystem::create_directories(clean_data_dir);
@@ -299,6 +377,7 @@ bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
             SpeciesName species;
             FilePath fasta;
             FilePath index;
+            bool reused{false};
         };
 
         ThreadPool pool(std::max(1, thread_num));
@@ -306,27 +385,34 @@ bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
         futures.reserve(species_path_map.size());
 
         for (const auto& [species, raw_path] : species_path_map) {
-            futures.emplace_back(pool.enqueue([species, raw_path, clean_data_dir]() -> CleanResult {
+            futures.emplace_back(pool.enqueue(
+                [species, raw_path, clean_data_dir,
+                 trust_legacy_cache]() -> CleanResult {
                 const FilePath out_fasta = clean_data_dir / (species + ".align-v2.fasta");
                 const FilePath out_index = clean_data_dir / (species + ".softmask-v1.bin");
                 const FilePath marker = clean_data_dir / (species + ".softmask-v1.complete.json");
 
-                SoftMask::ensureUppercaseFastaAndIndex(raw_path, out_fasta, out_index, marker);
-                return {species, out_fasta, out_index};
+                const bool reused = SoftMask::ensureUppercaseFastaAndIndex(
+                    raw_path, out_fasta, out_index, marker,
+                    trust_legacy_cache);
+                return {species, out_fasta, out_index, reused};
             }));
         }
 
         // Publish maps only after each task has completed successfully. This
         // avoids concurrent writes to unordered_map/map and propagates worker
         // exceptions instead of silently swallowing them.
+        RaMAxCache::StageStats local_stats;
         for (auto& future : futures) {
             CleanResult result = future.get();
             species_path_map[result.species] = result.fasta;
             softmask_path_map[result.species] = result.index;
+            result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
             spdlog::info("Species {} alignment FASTA: {}; HAL soft-mask index: {}",
                 result.species, result.fasta.string(), result.index.string());
         }
         pool.waitAllTasksDone();
+        if (cache_stats) *cache_stats = local_stats;
 
         if (softmask_path_map.size() != species_path_map.size()) {
             throw std::runtime_error("Not every species received a HAL soft-mask index");

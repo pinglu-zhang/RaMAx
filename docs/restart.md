@@ -1,80 +1,115 @@
 # Restart and work directories
 
-## Configuration schema
+## What restart means
 
-RaMAx 1.0.5 writes all restartable user settings to:
+RaMAx 1.0.7 uses `--restart` to reuse expensive input preparation and
+FM-index caches. It is not an alignment checkpoint system.
 
-```text
-<work>/config.json
-```
+Reusable state:
 
-The root object is `common_args` and contains `schema_version: 1`. It retains
-the first output path for compatibility and records the thread count, anchor
-and graph parameters, optimization flags and spans, logging settings, and HAL
-root/reference selection.
+- copied or downloaded raw FASTA;
+- normalized alignment FASTA;
+- HAL softmask sidecars;
+- FM-index main, sampled-SA, and wavelet-tree files.
 
-The complete repeated `-o` list is stored in `<work>/outputs.json`. Restart
-loads this list before input validation. A legacy work directory without this
-sidecar restores the single output stored in `config.json`.
+Anchor search, clustering, extension, DP, Block construction, graph
+optimization, and every requested export always run again from the beginning.
+RaMAx does not serialize these large in-memory objects.
 
-PAF pair-selection mode is stored separately in `<work>/paf_mode.txt` whenever
-the output list contains PAF. Restart uses the saved value; an older PAF work
-directory without this sidecar defaults to `connected`.
+## Starting and restarting
 
-## Starting a new run
-
-Use a new or empty work directory:
+A new Release run requires a new or empty work directory:
 
 ```bash
 ramax \
   -i /data/project/seqfile.txt \
+  -w /data/project/work/ramax-run \
   -o /data/project/results/alignment.maf \
   -o /data/project/results/alignment.paf \
-  -w /data/project/work/ramax-run \
   -t 16
 ```
 
-In a Release build, an existing non-empty work directory is rejected. This
-prevents accidental reuse of indexes or graph state from a different run.
-
-RaMAx removes the entire work directory only after every requested export
-succeeds. If one exporter fails, the remaining formats are still attempted,
-successful files are retained, the process exits nonzero, and the work
-directory is preserved.
-
-## Restarting an interrupted run
-
-If a run fails or is interrupted after creating its work state, restart with:
+After interruption or export failure, reuse the work directory:
 
 ```bash
 ramax --restart -w /data/project/work/ramax-run
 ```
 
-RaMAx loads the saved paths and parameters from `config.json`. Do not repeat
-`--input`, `--output`, `--threads`, optimization options, or other algorithm
-settings on the restart command. The saved configuration is authoritative.
+Saved values are the defaults for restart. Explicit options override them:
 
-Restart reuses compatible indexes and intermediate files; it does not promise
-to resume inside an individual alignment operation that was interrupted.
+```bash
+ramax --restart -w /data/project/work/ramax-run \
+  -t 24 \
+  --min_anchor_length 30 \
+  -o /data/project/results/retry.maf \
+  -o /data/project/results/retry.paf \
+  --paf-mode connected
+```
 
-## Compatibility
+`-i` cannot be used with `--restart`. If at least one `-o` is present, the
+complete new repeated-output list replaces the saved list. Otherwise all saved
+outputs are retained. Existing boolean flags keep their current one-way
+behavior; for example `--one-round` can enable one-round mode but there is no
+new restart-only flag to disable it.
 
-Only schema version 1 is accepted by RaMAx 1.0.5. Older experimental work
-directories that lack `schema_version` or use a different schema are rejected
-with an explicit incompatibility error. They are not silently upgraded or
-interpreted with current defaults.
+The merged configuration is validated against the final output set. An
+explicit `--paf-mode` requires PAF, an explicit `--gfa-version` requires GFA,
+an explicit `--gfa-profile` requires GFA, and an explicit `--root` requires HAL.
+After input validation, the latest effective configuration is saved atomically
+and becomes the default for a later restart.
 
-To rerun an old job, create a fresh work directory and provide the original
-seqfile and desired current parameters as a new command.
+## Configuration and input identity
 
-## Files useful after failure
+`<work>/config.json` uses `schema_version: 5` and contains the complete output
+list and all public alignment, graph, export, performance, and logging values.
+`<work>/input_manifest.json` records the seqfile, species mappings, and the
+size/mtime of local inputs.
 
-Before deleting a failed work directory, retain:
+The seqfile path and contents, species mappings, and local FASTA metadata must
+remain unchanged. A mismatch stops before preprocessing and instructs the user
+to start with a new work directory. A valid cached URL snapshot can be reused
+without contacting the URL; the URL is accessed again only when that snapshot
+is absent or invalid.
 
-- `config.json` for the legacy primary output and effective settings;
-- `outputs.json` for the complete output list, when present;
-- `paf_mode.txt` for the effective PAF pair-selection mode, when present;
-- `RaMAx.log` for the last completed stage and error;
-- index and graph state when attempting `--restart`;
-- `minipoa_tmp/` only when diagnosing a forced termination, because normal
-  minipoa invocations clean their own temporary files.
+RaMAx reads schema-1 through schema-4 work directories. Parameters absent from
+older schemas use their compatibility defaults; in particular GFA profile
+migrates to `exact`, and schemas before 4 migrate GFA version to `1.1`. Legacy schema-1 `outputs.json`,
+`paf_mode.txt`, and `accurate_skip_threshold.txt` are read when present.
+Existing legacy caches are trusted once, completion metadata is generated, and
+the effective configuration is migrated to schema 5 with a warning.
+
+## Cache validation and lifecycle
+
+New raw, clean, softmask, and FM-index artifacts are written through partial
+files and published only after successful completion. Their completion markers
+record cache format, source identity, file size, and mtime. A missing,
+incomplete, changed, or unloadable cache item is rebuilt independently.
+
+FM indexes are still created lazily at the beginning of each reference round.
+An index already completed by an earlier attempt is reused; missing later-round
+indexes are built when reached. `--slow-build` affects only indexes that need to
+be built or rebuilt.
+
+Before restarted alignment begins, RaMAx:
+
+1. archives the previous log as `RaMAx.restart.N.log`;
+2. retains `data/`, `index/`, configuration, and completion markers;
+3. removes stale `result/`, `mask_interval/`, and `minipoa_tmp/` directories;
+4. logs that alignment is restarting from the beginning.
+
+After every requested export succeeds, the complete work directory is removed.
+If any exporter fails, other formats are still attempted, successful output
+files are retained, the process exits nonzero, and the work directory remains
+available for another restart.
+
+## Useful failure evidence
+
+Before manually deleting a failed work directory, retain:
+
+- `config.json` and `input_manifest.json`;
+- `RaMAx.log` and any `RaMAx.restart.N.log` archives;
+- cache completion markers next to raw, clean, softmask, and FM-index files;
+- the exact binary version and restart command.
+
+`result/`, `mask_interval/`, and `minipoa_tmp/` are diagnostic artifacts only;
+they are deliberately not used as restart checkpoints.

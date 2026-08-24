@@ -1,6 +1,6 @@
 # Command-line parameters
 
-This page documents the public RaMAx 1.0.5 interface. Values and ranges follow
+This page documents the public RaMAx 1.0.7 interface. Values and ranges follow
 the current CLI implementation. Run `ramax --help` to inspect the installed
 binary.
 
@@ -21,9 +21,11 @@ binary.
 
 | Option | Type/default | Description |
 |---|---|---|
-| `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, or `.paf`, and each format may appear once. |
-| `-w`, `--workdir` | path; required | Intermediate work directory. It must be empty for a new Release run and is removed after success. |
+| `-o`, `--output` | repeatable path; at least one required | Output file. Repeat `-o` to export several formats from one alignment. Each suffix must be `.maf`, `.hal`, `.paf`, or `.gfa`, and each format may appear once. Export order is MAF, PAF, GFA, HAL. |
+| `-w`, `--workdir` | path; required | Intermediate and routing-artifact directory. It must be empty for a new Release run and is preserved after success. |
 | `--paf-mode` | `connected`; `connected` or `all` | PAF pair-selection policy. Valid when any `-o` is `.paf`; `connected` adds the minimum deterministic supplemental pairs needed for column-wise same-base connectivity, while `all` is the all-pairs baseline. |
+| `--gfa-version` | `1.1`; exactly `1.0` or `1.1` | Native GFA path encoding. `1.0` writes P-lines; `1.1` writes structured W-lines. Valid only when any `-o` is `.gfa`. |
+| `--gfa-profile` | `exact`; exactly `exact` or `compact` | Native GFA graph construction. `exact` preserves every maximal exact-run relation. `compact` enables compact-v2-balanced while preserving every cleaned path base and writes an exact audit shadow plus staged transform reports under `work/gfa/`. Valid only with `.gfa` output. |
 | `--root` | string; automatic | Preferred HAL root name. Valid when any `-o` is `.hal`; HAL requires a Newick tree. If an artificial unnamed root is required and no name is supplied, RaMAx uses `ancestor`. |
 
 ## Software Parameters
@@ -41,6 +43,17 @@ binary.
 | `--slow-build` | flag; off | Use the slower index-building implementation. |
 | `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference index. |
 | `--min-span` | integer; `65`; `1..INT_MAX` bp | Minimum span used during graph construction. |
+| `--near-distance` | float; `0.01`; `0..1` | In the first round, route a query to wfmash only when its Mash distance is strictly smaller than this value. Equality stays on the RaMAx backend. |
+| `--far-distance` | float; `0.02`; `0..1` | Reserved distant-species threshold. It is persisted and logged but does not route queries in this release. |
+
+The thresholds must satisfy
+`0 <= --near-distance < --far-distance <= 1`. First-round pairwise mapping
+uses PGGB-compatible wfmash `v0.14.0-0-g517e1bc` with
+`-s 5000 -l 25000 -p 95 -n 1 -k 19 -H 0.001 -Y '#'
+--hg-filter-ani-diff 30 --approx-map`; precise alignment reuses the mapping
+PAF with `--invert-filtering`. Later reference rounds always use the RaMAx
+FM-index backend. Unlike PGGB, RaMAx launches independent reference/query
+pairs and therefore does not use `--lower-triangular`.
 
 Parameter names containing underscores are retained in the current public CLI
 for the anchor/chunk settings shown above.
@@ -80,11 +93,13 @@ modules are enabled by default, the normal numeric-only overrides are valid.
 | Option | Type/default/range | Description |
 |---|---|---|
 | `-t`, `--threads` | integer; hardware concurrency; `1..INT_MAX` | Worker-thread count. It may also be supplied by `RAMAx_THREADS`. |
-| `--restart` | flag; off | Load the saved configuration and intermediate state from `--workdir`. |
+| `--restart` | flag; off | Reuse validated raw/clean FASTA and FM-index caches, then rerun alignment from the beginning. |
 
-In restart mode, provide only `--restart -w <workdir>`. Input, output,
-algorithm, optimization, thread, root, and log-level settings are restored from
-`config.json` and are rejected as command-line overrides.
+In restart mode, `-w` identifies the interrupted run and `-i` is forbidden.
+Explicit output, algorithm, optimization, thread, root, PAF-mode, GFA-version, GFA-profile, and logging
+options override the latest saved configuration. If any `-o` is supplied, the
+complete repeated `-o` list replaces the saved output list. Existing boolean
+flags retain their current one-way behavior; no new negative forms are added.
 
 ## Output Control
 

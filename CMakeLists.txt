@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.0.6 LANGUAGES C CXX)
+project(RaMAx VERSION 1.0.7 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -104,6 +104,66 @@ option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 
 set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
     "Existing minipoa executable; empty searches PATH")
+set(RAMAX_MASH_EXECUTABLE "" CACHE FILEPATH
+    "Mash 2.3 executable; empty searches PATH")
+set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
+    "Samtools 1.24 executable; empty searches PATH")
+set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
+    "PGGB-compatible wfmash v0.14.0-0-g517e1bc executable; empty searches PATH")
+set(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE "" CACHE FILEPATH
+    "halAppendCactusSubtree executable; empty searches PATH")
+
+if(RAMAX_MASH_EXECUTABLE)
+    if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
+        message(FATAL_ERROR
+            "RAMAX_MASH_EXECUTABLE does not exist: ${RAMAX_MASH_EXECUTABLE}")
+    endif()
+    get_filename_component(RAMAX_RESOLVED_MASH
+        "${RAMAX_MASH_EXECUTABLE}" REALPATH)
+    message(STATUS "Using configured Mash: ${RAMAX_RESOLVED_MASH}")
+else()
+    find_program(RAMAX_SYSTEM_MASH NAMES mash)
+    if(RAMAX_SYSTEM_MASH)
+        set(RAMAX_RESOLVED_MASH "${RAMAX_SYSTEM_MASH}")
+        message(STATUS "Using Mash from PATH: ${RAMAX_RESOLVED_MASH}")
+    else()
+        set(RAMAX_RESOLVED_MASH "")
+        message(STATUS
+            "Mash was not found during configuration; runtime alignment will "
+            "require Mash 2.3 next to ramax or in PATH")
+    endif()
+endif()
+
+function(resolve_ramax_tool configured_variable tool_name display_name output_variable)
+    if(${configured_variable})
+        if(NOT EXISTS "${${configured_variable}}")
+            message(FATAL_ERROR
+                "${configured_variable} does not exist: ${${configured_variable}}")
+        endif()
+        get_filename_component(_resolved "${${configured_variable}}" REALPATH)
+        message(STATUS "Using configured ${display_name}: ${_resolved}")
+    else()
+        find_program(_system_tool NAMES "${tool_name}" NO_CACHE)
+        if(_system_tool)
+            set(_resolved "${_system_tool}")
+            message(STATUS "Using ${display_name} from PATH: ${_resolved}")
+        else()
+            set(_resolved "")
+            message(STATUS
+                "${display_name} was not found during configuration; runtime "
+                "alignment will require it next to ramax or in PATH")
+        endif()
+    endif()
+    set(${output_variable} "${_resolved}" PARENT_SCOPE)
+endfunction()
+
+resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
+                   RAMAX_RESOLVED_SAMTOOLS)
+resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
+                   RAMAX_RESOLVED_WFMASH)
+resolve_ramax_tool(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE
+                   halAppendCactusSubtree "halAppendCactusSubtree"
+                   RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE)
 
 if(RAMAX_MINIPOA_EXECUTABLE)
     if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
@@ -134,6 +194,7 @@ add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort" EXCLUDE_FROM_ALL)
 
 # ================= 公共源文件 =================
 set(RAMA_COMMON_SOURCES
+    "${PREPROCESS_DIR}/cache_manifest.cpp"
     "${PREPROCESS_DIR}/raw_data_process.cpp"
     "${PREPROCESS_DIR}/newick_tree.cpp"
     "${PREPROCESS_DIR}/sequence_utils.cpp"
@@ -153,12 +214,16 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/align.cpp"
     "${ALIGN_DIR}/cross_anchor_repair.cpp"
     "${ALIGN_DIR}/external_msa_runner.cpp"
+    "${ALIGN_DIR}/external_tool.cpp"
+    "${ALIGN_DIR}/dependency_preflight.cpp"
     "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
     "${ALIGN_DIR}/ksw2_extz2_sse.c"
     "${ALIGN_DIR}/pair_rare_aligner.cpp"
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${ALIGN_DIR}/minipoa_locator.cpp"
+    "${ALIGN_DIR}/mash_distance_estimator.cpp"
+    "${ALIGN_DIR}/wfmash_router.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
     "${GRAPH_DIR}/direct_block_merger.cpp"
@@ -166,6 +231,8 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/structural_break_repair.cpp"
     "${GRAPH_DIR}/short_block_repair.cpp"
     "${GRAPH_DIR}/ramesh_export.cpp"
+    "${GRAPH_DIR}/aligned_block_view.cpp"
+    "${GRAPH_DIR}/gfa_export.cpp"
     "${SOURCE_DIR}/hal/export.cpp"
     "${GRAPH_DIR}/paf_utils.cpp"
     "${GRAPH_DIR}/paf_export.cpp"
@@ -253,18 +320,52 @@ add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
 configure_rama_target(ramax_core)
 add_dependencies(ramax_core hal_library)
 target_compile_definitions(ramax_core PRIVATE
-    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}")
+    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
+    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}"
+    RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_RESOLVED_SAMTOOLS}"
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}"
+    RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH="${RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
 target_link_libraries(ramax PRIVATE ramax_core)
 
-add_dependencies(ramax  hal_library)
+add_dependencies(ramax hal_library)
+
+include(CTest)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    add_executable(ramax_mash_distance_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
+    configure_rama_target(ramax_mash_distance_test)
+    target_link_libraries(ramax_mash_distance_test PRIVATE ramax_core)
+    add_test(NAME ramax_mash_distance_test
+        COMMAND ramax_mash_distance_test)
+    set_tests_properties(ramax_mash_distance_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_wfmash_router_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/wfmash_router_test.cpp")
+    configure_rama_target(ramax_wfmash_router_test)
+    target_link_libraries(ramax_wfmash_router_test PRIVATE ramax_core)
+    add_test(NAME ramax_wfmash_router_test
+        COMMAND ramax_wfmash_router_test)
+    set_tests_properties(ramax_wfmash_router_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_gfa_export_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfa_export_test.cpp")
+    configure_rama_target(ramax_gfa_export_test)
+    target_link_libraries(ramax_gfa_export_test PRIVATE ramax_core)
+    add_test(NAME ramax_gfa_export_test
+        COMMAND ramax_gfa_export_test)
+    set_tests_properties(ramax_gfa_export_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
 
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
-if(RAMAX_BUILD_TESTS)
+if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(ramax_hal_export_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
     configure_rama_target(ramax_hal_export_test)

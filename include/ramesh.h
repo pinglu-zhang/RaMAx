@@ -18,6 +18,7 @@
 #include "config.hpp"
 #include "anchor.h"
 #include "paf_export.h"
+#include "gfa_export.h"
 #include "softmask_index.h"
 
 // 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
@@ -470,6 +471,7 @@ namespace RaMesh {
 
         std::unordered_map<SpeciesName, RaMeshGenomeGraph> species_graphs; // guard: rw
         std::vector<WeakBlock>                             blocks;         // guard: rw
+        std::vector<SpeciesName>                           reference_order;
         mutable std::shared_mutex                          rw;             // multi‑reader / single‑writer
 
         void exportToMaf(
@@ -482,6 +484,12 @@ namespace RaMesh {
             const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
                 seqpro_managers,
             const Paf::PafExportOptions& options = {}) const;
+
+        Gfa::GfaExportStats exportToGfa(
+            const FilePath& gfa_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const Gfa::GfaExportOptions& options = {}) const;
 
         void exportToHal(
             const FilePath& hal_path,

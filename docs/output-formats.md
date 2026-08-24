@@ -5,10 +5,11 @@ RaMAx selects exporters from the suffixes of one or more repeated `-o` paths:
 - `.maf` writes a Multiple Alignment Format file;
 - `.hal` writes a Hierarchical Alignment Format file;
 - `.paf` writes pairwise projections of the primary Block alignments;
+- `.gfa` writes a native lossless sequence graph;
 - other suffixes are rejected before alignment begins.
 
 Each format may appear once. RaMAx constructs the optimized graph once and
-exports in the fixed order MAF, PAF, HAL. Each file is published independently
+exports in the fixed order MAF, PAF, GFA, HAL. Each file is published independently
 through a temporary file. If one exporter fails, later formats are still
 attempted; successful files remain, the command exits nonzero, and the work
 directory is retained.
@@ -93,9 +94,61 @@ matches and therefore changes that relation set. See the seqwish
 [graph-induction algorithm](https://github.com/pangenome/seqwish#squish-graph-induction-algorithm)
 and [`-k` usage](https://github.com/pangenome/seqwish#usage).
 
+## GFA
+
+Native GFA export uses the same cleaned FASTA and primary Block projection as
+the other direct exporters. `--gfa-version 1.1` is the default and emits one
+W-line per input contig. `--gfa-version 1.0` emits the same logical walks as
+P-lines for compatibility with GFA 1.0 consumers. The option is rejected when
+the output list has no `.gfa` path.
+
+`--gfa-profile exact` is the current default and preserves every maximal exact
+run as the audit graph. `--gfa-profile compact` enables
+compact-v2-balanced: exact runs shorter than the selected balanced threshold
+are left private, occurrence-equivalent chains are unitigged, and conservative
+dense small-variant intervals may be rewritten as observed compound alleles.
+The profile favors SV accuracy among configurations with PGGB-like graph
+granularity. It never invents an allele or removes sequence from an input path.
+Compact export keeps the same-version exact graph at `work/gfa/exact.gfa` and
+writes `compact_transform.tsv`, `compact_stats.tsv`,
+`compact_rejections.tsv`, and `compact_parameters.tsv` beside it.
+
+`compact_stats.tsv` reports the exact graph, short-relation filtering, first
+unitig pass, compound-allele pass, and final unitig pass separately. The
+effective fixed policy and profile version are recorded in
+`compact_parameters.tsv`; these implementation parameters are not runtime CLI
+options.
+
+Both versions use byte-identical S-lines, L-lines, deterministic numeric node
+IDs, and `0M` link overlap. They differ only in path serialization:
+
+- GFA 1.0 writes `H VN:Z:1.0` and path names `species.contig`;
+- GFA 1.1 writes `H VN:Z:1.1 RS:Z:<first-reference>` and structured W fields
+  `SampleId=species`, `HapIndex=0`, `SeqId=contig`, `SeqStart=0`, and
+  `SeqEnd=contig-length`.
+
+The exporter divides each cleaned contig at propagated exact-run boundaries.
+Only homologous, column-supported, identical A/C/G/T runs are shared; N bases,
+unaligned intervals, and private sequence remain private. It never merges
+unrelated repeats merely because their strings are equal. Before publication,
+every logical walk is reconstructed in memory and compared base-for-base and
+length-for-length with its cleaned input contig. Thus every input base occurs
+once in its walk, including contigs with no alignment Block.
+
+Compact transforms additionally retain at least 99.5% of the exact graph's
+direction-aware homology mass and limit graph sequence growth to 2%. A budget
+or invariant failure leaves the exact shadow available, does not publish the
+requested compact GFA, and makes RaMAx exit nonzero.
+
+GFA 1.0 rejects a collision between qualified `species.contig` path names.
+GFA 1.1 keeps species and contig in separate W fields and can represent that
+case as long as each field is valid. A failed GFA export does not publish its
+temporary file; other successful output formats remain available and RaMAx
+exits nonzero.
+
 ## Shared Block projection
 
-Direct MAF/PAF export and HAL construction use the shared
+Direct MAF/PAF/GFA export and HAL construction use the shared
 `mergeAlignmentByRef()` reference projection. Nearby homologous insertions may
 be repaired during export, but failure or lack of strict improvement retains
 the original rows. HAL-specific code does not implement a separate insertion
@@ -124,5 +177,5 @@ input file and minipoa internal file is confined to:
 
 RaMAx removes per-process minipoa files after successful execution, non-zero
 exit, or output-parse failure. A forced process termination can leave files in
-this directory, but should not create them beside the output MAF/HAL/PAF or in the
+this directory, but should not create them beside the output MAF/HAL/PAF/GFA or in the
 launch directory.

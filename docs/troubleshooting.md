@@ -32,6 +32,41 @@ ramax -i seqfile.txt -o results/run2.maf -w work/run2 -t 16
 Use `--restart -w <existing-work>` only for the same interrupted run. Remember
 that a successful run removes its work directory automatically.
 
+## Startup dependency check fails
+
+Every normal RaMAx run requires executable copies of `minipoa`, `wfmash`, and
+`mash`. RaMAx reports missing unconditional programs in one error and exits
+before work-directory preparation. `halAppendCactusSubtree` is mandatory only
+when HAL output is requested; without HAL, its absence is a warning. Check the
+launch environment with:
+
+```bash
+command -v halAppendCactusSubtree
+command -v minipoa
+command -v wfmash
+command -v mash
+```
+
+Runtime lookup order for each tool is:
+
+1. the corresponding `RAMAX_*_EXECUTABLE` path selected by CMake;
+2. an executable with the expected name beside the running `ramax` binary;
+3. the process `PATH`.
+
+For explicit source-build paths:
+
+```bash
+cmake -S . -B build \
+  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
+  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
+  -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
+```
+
+`--help` and `--version` intentionally do not require external tools.
+After existence preflight, Mash 2.3 and wfmash
+`v0.14.0-0-g517e1bc` are still validated before their first use.
+
 ## minipoa is missing
 
 RaMAx requires a separately installed minipoa executable for its MSA-based
@@ -60,10 +95,16 @@ cmake -S . -B build \
 
 ## Restart schema is incompatible
 
-RaMAx 1.0.5 accepts `schema_version: 1`. A missing or different version means
-the work directory came from an incompatible build. Start a new run in a fresh
-directory; do not add fields manually to an old configuration because its
-other intermediate files may also be incompatible.
+RaMAx 1.0.7 writes `schema_version: 4`. It can read schema-1, schema-2, and
+schema-3 work directories, recover schema-1 legacy sidecars, trust legacy
+caches once, and write schema 4 after input validation. Parameters absent from
+an older schema use compatibility defaults, including GFA 1.1. Missing schema
+information or any other schema version is rejected.
+
+Restart also rejects a changed seqfile, species mapping, or local FASTA
+size/mtime. Use a new work directory when changing input data. A damaged cache
+artifact is different: RaMAx rebuilds only that raw, clean, softmask, or
+FM-index artifact.
 
 ## MAF validation fails
 

@@ -39,13 +39,31 @@ cmake --build build -j"$(nproc)"
 cmake --install build --prefix "$HOME/.local"
 ```
 
-Install `minipoa` separately and place it in `PATH`, next to the installed
-`ramax` executable, or provide its path during configuration:
+Before creating a work directory or reading input genomes, RaMAx requires
+`minipoa`, PGGB-compatible wfmash `v0.14.0-0-g517e1bc`, and Mash 2.3.
+`halAppendCactusSubtree` is required only when the output list contains HAL;
+otherwise a missing HAL helper produces a warning and the run continues.
+The lookup order is an explicit CMake path, the directory containing the
+running `ramax` executable, then `PATH`. Configure explicit paths with:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa
+  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
+  -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
+  -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
 ```
+
+Missing unconditional startup dependencies are reported together and RaMAx
+exits before creating or modifying the work directory. A missing HAL helper
+also stops HAL runs before normal work-directory initialization. `ramax --help` and
+`ramax --version` remain available without these tools. Mash and wfmash
+retain their strict version checks before use. Samtools/HTSlib 1.24 remains
+required by the wfmash routing stage and can be configured with
+`RAMAX_SAMTOOLS_EXECUTABLE`.
+
+After selecting the first reference, RaMAx records whole-genome Mash distances
+using `k=31` and sketch size 20,000 before starting the legacy aligner.
 
 Set `-DRAMAX_NATIVE_ARCH=OFF` for a portable x86-64 RaMAx build. Configuration
 and compilation do not write to `/usr/local`; installation is controlled only
@@ -62,10 +80,11 @@ ramax \
   --optimize-blocks
 ```
 
-Use an output name ending in `.maf`, `.hal`, or `.paf`. PAF defaults to the
+Use an output name ending in `.maf`, `.hal`, `.paf`, or `.gfa`. PAF defaults to the
 information-complete sparse `connected` mode; use `--paf-mode all` for the
-all-pairs baseline. Intermediate graph state, logs, and minipoa scratch files
-are kept under the work directory.
+all-pairs baseline. Logs and reusable preprocessing/index caches are kept under
+the work directory, together with intermediate graph state and minipoa scratch
+files; in-memory graph state is not serialized for restart.
 MAF and HAL use the same normalized multiway homology relation, so changing
 only the output suffix does not change leaf-to-leaf alignment coverage. HAL
 soft-mask restoration happens after alignment decisions; letter case cannot
@@ -81,7 +100,12 @@ ramax -i seqfile.txt -w work -t 16 \
 ```
 
 Each format may appear once. If HAL is requested anywhere in the output list,
-the seqfile must contain a Newick tree. Export order is MAF, PAF, then HAL.
+the seqfile must contain a Newick tree. Export order is MAF, PAF, GFA, then HAL.
+Native GFA export defaults to GFA 1.1 W-lines; use `--gfa-version 1.0` for
+GFA 1.0 P-line compatibility. The graph profile currently defaults to the
+audit-preserving `--gfa-profile exact`; `--gfa-profile compact` enables the
+lossless compact-v2-balanced transforms and keeps an exact shadow under
+`work/gfa/`.
 
 For seqwish, generate the matching qualified FASTA directly from the same
 seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
@@ -159,15 +183,22 @@ only for HAL output.
 
 ## Restart compatibility
 
-RaMAx 1.0.5 stores all restart settings in `<work>/config.json` with
-`schema_version: 1`. Restart with:
+RaMAx 1.0.7 treats restart as cache reuse, not alignment checkpointing. It
+reuses validated raw/clean FASTA and FM-index artifacts, then reruns anchor
+search, clustering, graph construction, and export from the beginning:
 
 ```bash
 ramax --restart -w work
+
+# Explicit settings override the latest saved values.
+ramax --restart -w work -t 24 --min_anchor_length 30 \
+  -o results/retry.maf -o results/retry.paf
 ```
 
-Restart directories created by older experimental configurations are not
-compatible with 1.0.5 and are rejected with an explicit schema error.
+The seqfile cannot be replaced. Schema-1 through schema-4 work directories are
+loaded with explicit compatibility defaults and migrated to schema 5; older
+work directories use `--gfa-profile exact`, and schemas before 4 default to
+GFA 1.1 when no GFA version was persisted.
 
 ## License and dependencies
 
