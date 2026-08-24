@@ -2,6 +2,9 @@
 
 ## 1.0.7 - 2026-08-17
 
+- Packaged environments use Samtools/HTSlib 1.23.1, the newest release that
+  coexists with the PGGB-compatible wfmash 0.14 build. RaMAx uses only the
+  stable `samtools faidx --fai-idx` interface.
 - Added an early aggregated dependency preflight for `minipoa`, `wfmash`, and
   `mash`. `halAppendCactusSubtree` is required only for HAL output; non-HAL
   runs warn and continue when it is unavailable.

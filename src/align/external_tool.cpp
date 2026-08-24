@@ -15,6 +15,10 @@
 
 extern char** environ;
 
+#ifndef RAMAX_TOOL_BIN_CONFIGURED_PATH
+#define RAMAX_TOOL_BIN_CONFIGURED_PATH ""
+#endif
+
 namespace RaMAxExternalTool {
 
 bool isExecutable(const std::filesystem::path& candidate) {
@@ -59,6 +63,14 @@ std::filesystem::path locateExecutable(
     const std::filesystem::path& configured_path) {
     if (isExecutable(configured_path)) {
         return std::filesystem::absolute(configured_path);
+    }
+    const std::filesystem::path configured_directory(
+        RAMAX_TOOL_BIN_CONFIGURED_PATH);
+    if (!configured_directory.empty()) {
+        const auto candidate = configured_directory / name;
+        if (isExecutable(candidate)) {
+            return std::filesystem::absolute(candidate);
+        }
     }
     const auto sibling = executableDirectory() / name;
     if (isExecutable(sibling)) return std::filesystem::absolute(sibling);

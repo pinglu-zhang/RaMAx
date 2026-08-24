@@ -19,5 +19,8 @@ directories or upstream distributions.
 | minipoa v1.4.2 | External partial-order MSA | MIT |
 
 Bundled full license texts are available under `third_party/` where supplied.
-minipoa is a separate runtime dependency and is not downloaded or installed by
-the RaMAx build.
+A normal source build treats minipoa and halAppendCactusSubtree as external
+runtime dependencies. The official Conda and Docker packaging configurations
+install minipoa 1.4.2 from the malab Conda channel and copy the validated,
+precompiled cactus-bin-v2.9.9 halAppendCactusSubtree executable together with
+the applicable HAL license.

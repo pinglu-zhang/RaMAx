@@ -628,12 +628,13 @@ std::string validateSamtoolsVersion(std::string_view output) {
     std::getline(input, second);
     if (!first.empty() && first.back() == '\r') first.pop_back();
     if (!second.empty() && second.back() == '\r') second.pop_back();
-    if (first != "samtools 1.24" || second != "Using htslib 1.24") {
+    if (first != "samtools 1.23.1" ||
+        second != "Using htslib 1.23.1") {
         throw std::runtime_error(
-            "RaMAx requires samtools 1.24 with HTSlib 1.24; observed: " +
+            "RaMAx requires samtools 1.23.1 with HTSlib 1.23.1; observed: " +
             first + (second.empty() ? "" : " / " + second));
     }
-    return "samtools 1.24; HTSlib 1.24";
+    return "samtools 1.23.1; HTSlib 1.23.1";
 }
 
 std::string validateWfmashVersion(std::string_view output) {
@@ -1132,7 +1133,7 @@ std::filesystem::path locateSamtoolsExecutable() {
         "samtools", RAMAX_SAMTOOLS_CONFIGURED_PATH);
     if (executable.empty()) {
         throw std::runtime_error(
-            "samtools 1.24 was not found at the configured path, next to ramax, or in PATH");
+            "samtools 1.23.1 was not found at the configured path, next to ramax, or in PATH");
     }
     return executable;
 }

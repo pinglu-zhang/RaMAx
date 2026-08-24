@@ -45,15 +45,26 @@ command -v halAppendCactusSubtree
 command -v minipoa
 command -v wfmash
 command -v mash
+command -v samtools
 ```
 
 Runtime lookup order for each tool is:
 
 1. the corresponding `RAMAX_*_EXECUTABLE` path selected by CMake;
-2. an executable with the expected name beside the running `ramax` binary;
-3. the process `PATH`.
+2. `RAMAX_TOOL_BIN_DIR/<tool-name>` selected by CMake;
+3. an executable with the expected name beside the running `ramax` binary;
+4. the process `PATH`.
 
-For explicit source-build paths:
+For a common source-build directory:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DRAMAX_TOOL_BIN_DIR="$PWD/bin"
+```
+
+The common directory defaults to the source tree `bin/`. For individual
+overrides:
 
 ```bash
 cmake -S . -B build \
@@ -64,8 +75,9 @@ cmake -S . -B build \
 ```
 
 `--help` and `--version` intentionally do not require external tools.
-After existence preflight, Mash 2.3 and wfmash
-`v0.14.0-0-g517e1bc` are still validated before their first use.
+After existence preflight, Mash 2.3, wfmash
+`v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.23.1 are still validated
+before their first use.
 
 ## minipoa is missing
 
@@ -75,8 +87,9 @@ realignment and shared export path. RaMAx does not download or install it.
 Runtime lookup order is:
 
 1. `RAMAX_MINIPOA_EXECUTABLE` selected when configuring the RaMAx build;
-2. an executable named `minipoa` beside the running `ramax` binary;
-3. `minipoa` in `PATH`.
+2. `RAMAX_TOOL_BIN_DIR/minipoa`;
+3. an executable named `minipoa` beside the running `ramax` binary;
+4. `minipoa` in `PATH`.
 
 Check the installation with:
 
