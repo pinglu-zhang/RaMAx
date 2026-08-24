@@ -130,7 +130,7 @@ public:
     uint_t LF(uint_t pos) const;              // LF 映射函数
     SAInterval backwardExtend(const SAInterval& I, char c); // 扩展后缀区间
 
-    MatchVec2DPtr findAnchors(ChrIndex query_chr_index, std::string query, SearchMode search_mode, Strand strand, bool allow_MEM, uint_t query_offset, uint_t min_anchor_length, bool allow_short_mum, uint_t max_anchor_frequency, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval);
+    MatchVec2DPtr findAnchors(ChrIndex query_chr_index, std::string query, SearchMode search_mode, Strand strand, bool allow_MEM, uint_t query_offset, uint_t min_anchor_length, bool allow_short_mum, uint_t max_anchor_frequency, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval, uint_t accurate_skip_threshold = 0);
 
     MatchVec2DPtr findAnchorsFast(ChrIndex query_chr_index, std::string query,
         Strand strand, bool allow_MEM,
@@ -147,7 +147,8 @@ public:
         bool allow_short_mum,
         uint_t max_anchor_frequency,
         sdsl::int_vector<0>& ref_global_cache,
-        SeqPro::Length sampling_interval);
+        SeqPro::Length sampling_interval,
+        uint_t accurate_skip_threshold);
 
     MatchVec2DPtr findAnchorsMiddle(ChrIndex query_chr_index, std::string query,
         Strand strand, bool allow_MEM,
@@ -241,10 +242,6 @@ public:
     uint_t sample_rate{ 32 };
     uint_t total_size{ 0 };
     std::array<uint8_t, 256> char2idx{};
-    // TODO 到时候删除T
-    // uint_t kmer_size;
-    // KmerTable_t kmer_table_left;
-    // KmerTable_t kmer_table_right;
 };
 
 #endif

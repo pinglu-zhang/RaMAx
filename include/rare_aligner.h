@@ -2,12 +2,26 @@
 #define RARE_ALIGNER_H
 
 #include <optional>
+#include <atomic>
+#include <exception>
+#include <memory>
+#include <vector>
 
 #include "config.hpp"
 #include "index.h"
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
+#include "structural_break_repair.h"
+#include "short_block_repair.h"
+#include "cache_manifest.h"
+#include "mash_distance_estimator.h"
+#include "wfmash_router.h"
+
+struct IndexCacheCounters {
+    std::atomic_size_t reused{0};
+    std::atomic_size_t rebuilt{0};
+};
 
 // 多基因组比对核心调度类
 class MultipleRareAligner {
@@ -16,31 +30,50 @@ public:
     FilePath index_dir;
 
     SpeciesPathMap species_path_map;
-    NewickParser newick_tree;
 
     uint_t chunk_size;
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold;
+    bool allow_mem = false;
+    SpeciesClusterMap secondary_cluster_map;
+    SpeciesMatchVec3DPtrMap secondary_match_map;
 
     uint_t thread_num;
     uint_t group_id;
     uint_t round_id;
+    bool trust_legacy_cache{false};
+    std::shared_ptr<IndexCacheCounters> index_cache_counters{
+        std::make_shared<IndexCacheCounters>()};
 
     bool enable_mask_export = false;
     bool mask_export_done = false;
     FilePath mask_export_dir;
 
+    bool merge_exact_contiguous_blocks_enabled = true;
+    uint_t merge_query_gap_max = 100;
+    bool realign_single_missing_species_enabled = true;
+    uint_t species_mismatch_realign_max_span = 3000;
+    uint_t species_mismatch_zero_gap_max_span = 200;
+    std::string species_mismatch_msa_executable;
+    RaMesh::StructuralBreakRepair::Options structural_break_repair_options;
+    RaMesh::ShortBlockRepair::Options short_block_repair_options;
+    std::vector<MashDistanceRecord> first_reference_distances;
+    double near_distance_threshold{0.01};
+    double far_distance_threshold{0.02};
+
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(
         const FilePath& work_dir,
         SpeciesPathMap& species_path_map,
-        NewickParser& newick_tree,
         uint_t thread_num,
         uint_t chunk_size,
         uint_t overlap_size,
         uint_t min_anchor_length,
-        uint_t max_anchor_frequency
+        uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold,
+        bool trust_legacy_cache = false
     );
 
     std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> starAlignment(
@@ -73,6 +106,28 @@ private:
 
 };
 
+struct PreparedAnchorSearch {
+    struct Task {
+        Region chunk;
+        Strand strand =
+            Strand::FORWARD;
+    };
+
+    SeqPro::ManagerVariant* query_manager =
+        nullptr;
+    SearchMode search_mode =
+        ACCURATE_SEARCH;
+    bool allow_mem = false;
+    bool allow_short_mum = false;
+    sdsl::int_vector<0>* ref_global_cache =
+        nullptr;
+    SeqPro::Length sampling_interval = 32;
+    std::vector<Task> tasks;
+    std::vector<MatchVec2DPtr> task_results;
+    std::vector<std::exception_ptr> task_errors;
+};
+
+
 
 class PairRareAligner {
 public:
@@ -88,12 +143,16 @@ public:
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
+    uint_t accurate_skip_threshold = 0;
 
     uint_t group_id;
     uint_t round_id;
 
     uint_t thread_num;
-    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size, uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency);
+    PairRareAligner(const FilePath work_dir, const uint_t thread_num, uint_t chunk_size,
+        uint_t overlap_size, uint_t min_anchor_length, uint_t max_anchor_frequency,
+        uint_t accurate_skip_threshold = 0,
+        bool trust_legacy_cache = false);
 
     // 新增构造函数：从 MultipleRareAligner 初始化
     PairRareAligner(const MultipleRareAligner& mra)
@@ -103,17 +162,43 @@ public:
         overlap_size(mra.overlap_size),
         min_anchor_length(mra.min_anchor_length),
         max_anchor_frequency(mra.max_anchor_frequency),
-        thread_num(mra.thread_num)
+        accurate_skip_threshold(mra.accurate_skip_threshold),
+        thread_num(mra.thread_num),
+        trust_legacy_cache(mra.trust_legacy_cache),
+        index_cache_counters(mra.index_cache_counters)
     {
         this->group_id = mra.group_id;
         this->round_id = mra.round_id;
     }
 
+    bool trust_legacy_cache{false};
+    std::shared_ptr<IndexCacheCounters> index_cache_counters{
+        std::make_shared<IndexCacheCounters>()};
+
     MatchVec3DPtr alignPairGenome(SpeciesName query_name, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval);
     FilePath buildIndex(const std::string prefix, SeqPro::ManagerVariant& ref_fasta_manager_, bool fast_build);
 
 
-    MatchVec3DPtr findQueryFileAnchor(const std::string prefix, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval, bool isMultiple=false);
+    MatchVec3DPtr findQueryFileAnchor(const std::string prefix, SeqPro::ManagerVariant& query_fasta_manager, SearchMode search_mode, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval, bool isMultiple=false, bool include_masked_regions=false);
+    std::shared_ptr<PreparedAnchorSearch>
+    prepareQueryFileAnchor(
+        SeqPro::ManagerVariant& query_fasta_manager,
+        SearchMode search_mode,
+        bool allow_mem,
+        bool allow_short_mum,
+        sdsl::int_vector<0>& ref_global_cache,
+        SeqPro::Length sampling_interval,
+        bool is_multiple = false,
+        bool include_masked_regions = false);
+
+    void executePreparedAnchorTask(
+        PreparedAnchorSearch& plan,
+        size_t task_index);
+
+    MatchVec3DPtr collectPreparedAnchorSearch(
+        PreparedAnchorSearch& plan);
+
+
 
     void constructGraphByGreedy(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterVecPtrByStrandByQueryRefPtr cluster_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
 
@@ -126,14 +211,23 @@ public:
 
     AnchorBySQR_SparsePtr extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first);
 
+
     void filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map,uint_t ref_chr_cnt, uint_t qry_chr_cnt);
+    AnchorPtrVec extendClusterGroupToAnchors(
+        SeqPro::ManagerVariant& query_seqpro_manager,
+        MatchClusterVecPtr cluster_group,
+        bool is_first);
+
+    void filterAnchorByDPDimension(
+        AnchorBySQR_SparsePtr anchor_map,
+        uint_t chromosome_id,
+        bool filter_ref);
+
 
     void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
+    void registerSecondaryAnchors(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, bool initial_round);
 
 };
 
 
 #endif
-
-
-

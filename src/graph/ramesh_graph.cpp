@@ -1,4 +1,4 @@
-﻿// =============================================================
+// =============================================================
 //  File: ramesh_graph.cpp –  High‑level graph ops (v0.6‑alpha)
 // =============================================================
 #include "align.h"
@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cstdint>
 #include <curl/curl.h>
-#include <iomanip>
+#include <optional>
 #include <shared_mutex>
 #include <spdlog/spdlog.h>
+#include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 
 namespace RaMesh {
@@ -25,50 +27,6 @@ RaMeshGenomeGraph::RaMeshGenomeGraph(const SpeciesName &sp,
   chr2end.reserve(chrs.size());
   for (const auto &c : chrs)
     chr2end.try_emplace(c);
-}
-
-size_t RaMeshGenomeGraph::debugPrint(bool show_detail) const {
-  std::shared_lock lg(rw);
-  size_t total_idx = 0;
-
-  std::cout << "=== GenomeGraph <" << species_name << "> ===\n";
-
-  for (const auto &[chr, end] : chr2end) {
-    SegPtr first = end.head->primary_path.next.load(std::memory_order_acquire);
-
-    /*----------- 统计这一条染色体的段数 -----------*/
-    size_t chr_count = 0;
-    for (SegPtr p = first; p && !p->isTail();
-         p = p->primary_path.next.load(std::memory_order_acquire))
-      ++chr_count;
-
-    std::cout << "\n[Chromosome " << chr << "]\n";
-
-    if (show_detail) {
-      /*----------- 打印表头 -----------*/
-      std::cout << std::left << std::setw(6) << "Idx" << std::setw(12)
-                << "Start" << std::setw(12) << "End" << std::setw(10) << "Len"
-                << std::setw(4) << "Str" << std::setw(6) << "Role"
-                << std::setw(14) << "Ptr" << '\n';
-
-      /*----------- 打印明细 -----------*/
-      size_t idx = 0;
-      for (SegPtr p = first; p && !p->isTail();
-           p = p->primary_path.next.load(std::memory_order_acquire)) {
-        std::cout << std::setw(6) << idx++ << std::setw(12) << p->start
-                  << std::setw(12) << (p->start + p->length - 1)
-                  << std::setw(10) << p->length << std::setw(4)
-                  << (p->strand == Strand::FORWARD ? "+" : "-") << std::setw(6)
-                  << (p->isPrimary() ? "Pri" : "Sec") << '\n';
-      }
-    }
-
-    std::cout << "Total segments: " << chr_count << '\n';
-    total_idx += chr_count;
-  }
-
-  std::cout << "=== End of Graph ===\n";
-  return total_idx;
 }
 
 /* =============================================================
@@ -141,6 +99,7 @@ void RaMeshMultiGenomeGraph::insertAnchorIntoGraph(
 
   BlockPtr blk = Block::create(2);
   blk->ref_chr = ref_chr;
+  blk->ref_species = ref_name;
 
   auto [r_seg, q_seg] = Block::createSegmentPair(anchor, ref_name, qry_name,
                                                  ref_chr, qry_chr, blk);
@@ -153,6 +112,894 @@ void RaMeshMultiGenomeGraph::insertAnchorIntoGraph(
 
   ref_end.insertSegment(r_seg);
   qry_end.insertSegment(q_seg);
+}
+
+namespace {
+
+struct IndexedPrimarySegment {
+  uint64_t start = 0;
+  uint64_t end = 0;
+  SegPtr segment;
+};
+struct PrimaryBlockPair {
+  uint64_t first = 0;
+  uint64_t second = 0;
+
+  bool operator==(const PrimaryBlockPair&) const = default;
+};
+
+struct PrimaryBlockPairHash {
+  size_t operator()(const PrimaryBlockPair& pair) const noexcept {
+    const size_t first_hash = std::hash<uint64_t>{}(pair.first);
+    const size_t second_hash = std::hash<uint64_t>{}(pair.second);
+    return first_hash ^
+           (second_hash + 0x9e3779b9U + (first_hash << 6U) +
+            (first_hash >> 2U));
+  }
+};
+
+bool blocksShareNonReferenceSpecies(const BlockPtr &left, const BlockPtr &right,
+                                    const SpeciesName &reference_species) {
+  if (!left || !right) {
+    return true;
+  }
+  for (const auto &[left_key, unused_left] : left->anchors) {
+    (void)unused_left;
+    if (left_key.first == reference_species) {
+      continue;
+    }
+    for (const auto &[right_key, unused_right] : right->anchors) {
+      (void)unused_right;
+      if (right_key.first == reference_species) {
+        continue;
+      }
+      if (left_key.first == right_key.first) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+using PrimarySegmentIndex =
+    std::unordered_map<SpeciesChrPair, std::vector<IndexedPrimarySegment>,
+                       SpeciesChrPairHash>;
+
+bool cigarOperationConsumesReference(char operation) {
+  return operation == 'M' || operation == '=' || operation == 'X' ||
+         operation == 'D' || operation == 'N';
+}
+
+bool cigarOperationConsumesQuery(char operation) {
+  return operation == 'M' || operation == '=' || operation == 'X' ||
+         operation == 'I' || operation == 'S';
+}
+
+bool cigarOperationAlignsBases(char operation) {
+  return operation == 'M' || operation == '=' || operation == 'X';
+}
+
+void appendTerminalQueryOnlyRemainder(const SegPtr &segment,
+                                      const std::string &cigar_remainder) {
+  if (cigar_remainder.empty()) {
+    return;
+  }
+  if (!segment) {
+    throw std::logic_error(
+        "overlap merge has no segment for terminal CIGAR operations");
+  }
+  Cigar_t remainder;
+  parseCigarString(cigar_remainder, remainder);
+  if (countRefLength(remainder) != 0) {
+    throw std::logic_error(
+        "overlap merge left reference-consuming CIGAR operations "
+        "unassigned");
+  }
+  segment->length += countQryLength(remainder);
+  appendCigar(segment->cigar, remainder);
+}
+
+std::optional<uint64_t> orientedSegmentOffset(
+    const SegPtr& segment, uint64_t coordinate) {
+  if (!segment || coordinate < segment->start ||
+      coordinate >= static_cast<uint64_t>(segment->start) +
+                        segment->length) {
+    return std::nullopt;
+  }
+  if (segment->strand == Strand::FORWARD) {
+    return coordinate - segment->start;
+  }
+  return static_cast<uint64_t>(segment->start) + segment->length - 1 -
+         coordinate;
+}
+
+std::optional<uint64_t> segmentCoordinateToReferenceOffset(
+    const SegPtr& segment, const SegPtr& reference_segment,
+    uint64_t coordinate) {
+  const auto query_offset = orientedSegmentOffset(segment, coordinate);
+  if (!query_offset) {
+    return std::nullopt;
+  }
+  if (segment == reference_segment) {
+    return query_offset;
+  }
+
+  uint64_t reference_offset = 0;
+  uint64_t current_query_offset = 0;
+  for (const auto unit : segment->cigar) {
+    uint32_t length = 0;
+    char operation = '\0';
+    intToCigar(unit, operation, length);
+    if (cigarOperationAlignsBases(operation) &&
+        *query_offset >= current_query_offset &&
+        *query_offset < current_query_offset + length) {
+      return reference_offset + (*query_offset - current_query_offset);
+    }
+    if (cigarOperationConsumesReference(operation)) {
+      reference_offset += length;
+    }
+    if (cigarOperationConsumesQuery(operation)) {
+      current_query_offset += length;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<uint64_t> referenceOffsetToSegmentCoordinate(
+    const SegPtr& segment, const SegPtr& reference_segment,
+    uint64_t target_reference_offset) {
+  uint64_t query_offset = 0;
+  if (segment == reference_segment) {
+    query_offset = target_reference_offset;
+  } else {
+    uint64_t reference_offset = 0;
+    uint64_t current_query_offset = 0;
+    bool mapped = false;
+    for (const auto unit : segment->cigar) {
+      uint32_t length = 0;
+      char operation = '\0';
+      intToCigar(unit, operation, length);
+      if (cigarOperationAlignsBases(operation) &&
+          target_reference_offset >= reference_offset &&
+          target_reference_offset < reference_offset + length) {
+        query_offset =
+            current_query_offset +
+            (target_reference_offset - reference_offset);
+        mapped = true;
+        break;
+      }
+      if (cigarOperationConsumesReference(operation)) {
+        reference_offset += length;
+      }
+      if (cigarOperationConsumesQuery(operation)) {
+        current_query_offset += length;
+      }
+    }
+    if (!mapped) {
+      return std::nullopt;
+    }
+  }
+
+  if (query_offset >= segment->length) {
+    return std::nullopt;
+  }
+  if (segment->strand == Strand::FORWARD) {
+    return static_cast<uint64_t>(segment->start) + query_offset;
+  }
+  return static_cast<uint64_t>(segment->start) + segment->length - 1 -
+         query_offset;
+}
+
+bool isReferenceCompatibleSegment(const SegPtr& segment) {
+  if (!segment) {
+    return false;
+  }
+  if (segment->cigar.empty()) {
+    return true;
+  }
+  uint64_t consumed = 0;
+  for (const auto unit : segment->cigar) {
+    uint32_t length = 0;
+    char operation = '\0';
+    intToCigar(unit, operation, length);
+    if (!cigarOperationAlignsBases(operation)) {
+      return false;
+    }
+    consumed += length;
+  }
+  return consumed == segment->length;
+}
+
+SegPtr findAlignmentReferenceSegment(const BlockPtr& block) {
+  if (!block) {
+    return nullptr;
+  }
+  for (const auto& [species_chr, segment] : block->anchors) {
+    if (species_chr.first == block->ref_species &&
+        species_chr.second == block->ref_chr &&
+        segment->isPrimary() &&
+        isReferenceCompatibleSegment(segment)) {
+      return segment;
+    }
+  }
+  return nullptr;
+}
+
+const IndexedPrimarySegment* findPrimarySegment(
+    const PrimarySegmentIndex& index, const SpeciesChrPair& key,
+    uint64_t coordinate) {
+  const auto index_it = index.find(key);
+  if (index_it == index.end()) {
+    return nullptr;
+  }
+  const auto& intervals = index_it->second;
+  auto upper = std::upper_bound(
+      intervals.begin(), intervals.end(), coordinate,
+      [](uint64_t value, const IndexedPrimarySegment& interval) {
+        return value < interval.start;
+      });
+  while (upper != intervals.begin()) {
+    --upper;
+    if (coordinate >= upper->start && coordinate < upper->end) {
+      return &*upper;
+    }
+    if (upper->end <= coordinate) {
+      break;
+    }
+  }
+  return nullptr;
+}
+
+struct SecondaryOccurrencePoint {
+  SpeciesName species;
+  ChrName chromosome;
+  int step = 1;
+  int64_t diagonal = 0;
+  uint64_t coordinate = 0;
+  AlignRole role = AlignRole::PRIMARY;
+};
+
+struct SecondaryHomologyPoint {
+  SpeciesName common_species;
+  ChrName common_chromosome;
+  uint64_t common_coordinate = 0;
+  std::vector<SecondaryOccurrencePoint> occurrences;
+  PrimaryBlockPair primary_block_pair;
+};
+
+struct SecondaryHomologyRun {
+  SpeciesName common_species;
+  ChrName common_chromosome;
+  uint64_t common_start = 0;
+  uint64_t length = 0;
+  std::vector<SecondaryOccurrencePoint> occurrences;
+  PrimaryBlockPair primary_block_pair;
+};
+
+auto secondaryOccurrenceRunKey(
+    const SecondaryOccurrencePoint& occurrence) {
+  return std::tie(
+      occurrence.species, occurrence.chromosome, occurrence.step,
+      occurrence.diagonal, occurrence.role);
+}
+
+bool secondaryOccurrenceRunLess(
+    const SecondaryOccurrencePoint& lhs,
+    const SecondaryOccurrencePoint& rhs) {
+  return secondaryOccurrenceRunKey(lhs) <
+         secondaryOccurrenceRunKey(rhs);
+}
+
+template <typename Left, typename Right>
+bool secondaryHomologySameRun(
+    const Left& lhs,
+    const Right& rhs) {
+  return lhs.common_species == rhs.common_species &&
+         lhs.common_chromosome == rhs.common_chromosome &&
+         lhs.primary_block_pair == rhs.primary_block_pair &&
+         lhs.occurrences.size() == rhs.occurrences.size() &&
+         std::equal(
+             lhs.occurrences.begin(), lhs.occurrences.end(),
+             rhs.occurrences.begin(),
+             [](const SecondaryOccurrencePoint& left,
+                const SecondaryOccurrencePoint& right) {
+               return secondaryOccurrenceRunKey(left) ==
+                      secondaryOccurrenceRunKey(right);
+             });
+}
+
+bool secondaryRunLess(
+    const SecondaryHomologyRun& lhs,
+    const SecondaryHomologyRun& rhs) {
+  const auto lhs_common = std::tie(
+      lhs.common_species,
+      lhs.common_chromosome,
+      lhs.primary_block_pair.first,
+      lhs.primary_block_pair.second);
+  const auto rhs_common = std::tie(
+      rhs.common_species,
+      rhs.common_chromosome,
+      rhs.primary_block_pair.first,
+      rhs.primary_block_pair.second);
+  if (lhs_common != rhs_common) {
+    return lhs_common < rhs_common;
+  }
+  if (std::lexicographical_compare(
+          lhs.occurrences.begin(), lhs.occurrences.end(),
+          rhs.occurrences.begin(), rhs.occurrences.end(),
+          secondaryOccurrenceRunLess)) {
+    return true;
+  }
+  if (std::lexicographical_compare(
+          rhs.occurrences.begin(), rhs.occurrences.end(),
+          lhs.occurrences.begin(), lhs.occurrences.end(),
+          secondaryOccurrenceRunLess)) {
+    return false;
+  }
+  return lhs.common_start < rhs.common_start;
+}
+
+}  // namespace
+
+void RaMeshMultiGenomeGraph::registerSecondaryAnchorCandidate(
+    SpeciesName ref_species, ChrName ref_chromosome,
+    SpeciesName query_species, ChrName query_chromosome,
+    const Anchor& anchor, bool initial_round,
+    bool common_is_reference) {
+  std::unique_lock lock(rw);
+  secondary_anchor_candidates.push_back(SecondaryAnchorCandidate{
+      std::move(ref_species), std::move(ref_chromosome),
+      std::move(query_species), std::move(query_chromosome), anchor,
+      initial_round, common_is_reference});
+}
+
+size_t RaMeshMultiGenomeGraph::materializeSecondaryAlignments() {
+  std::vector<SecondaryAnchorCandidate> candidates;
+  {
+    std::unique_lock lock(rw);
+    candidates.swap(secondary_anchor_candidates);
+  }
+  if (candidates.empty()) {
+    return 0;
+  }
+
+  PrimarySegmentIndex primary_index;
+  for (const auto& [species, genome] : species_graphs) {
+    for (const auto& [chromosome, genome_end] : genome.chr2end) {
+      auto& intervals =
+          primary_index[SpeciesChrPair{species, chromosome}];
+      for (SegPtr segment =
+               genome_end.head->primary_path.next.load(
+                   std::memory_order_acquire);
+           segment && !segment->isTail();
+           segment = segment->primary_path.next.load(
+               std::memory_order_acquire)) {
+        if (!segment->isPrimary() || !segment->parent_block ||
+            segment->length == 0) {
+          continue;
+        }
+        intervals.push_back(IndexedPrimarySegment{
+            segment->start,
+            static_cast<uint64_t>(segment->start) + segment->length,
+            segment});
+      }
+    }
+  }
+  for (auto& [key, intervals] : primary_index) {
+    (void)key;
+    std::sort(
+        intervals.begin(), intervals.end(),
+        [](const IndexedPrimarySegment& lhs,
+           const IndexedPrimarySegment& rhs) {
+          return std::tie(lhs.start, lhs.end) <
+                 std::tie(rhs.start, rhs.end);
+        });
+  }
+
+  std::vector<SecondaryHomologyRun> secondary_runs;
+  size_t mapped_point_observations = 0;
+  size_t candidate_aligned_bases = 0;
+  size_t missing_primary_segment_points = 0;
+  size_t missing_reference_segment_points = 0;
+  size_t unmappable_reference_offset_points = 0;
+  size_t missing_duplicate_primary_points = 0;
+  size_t secondary_already_present_points = 0;
+  size_t initial_round_candidates = 0;
+  for (const auto &candidate : candidates) {
+    if (candidate.initial_round) {
+      ++initial_round_candidates;
+    }
+    const bool common_is_reference = candidate.common_is_reference;
+    const SpeciesName &common_species =
+        common_is_reference ? candidate.ref_species : candidate.query_species;
+    const ChrName &common_chromosome = common_is_reference
+                                           ? candidate.ref_chromosome
+                                           : candidate.query_chromosome;
+    const SpeciesName &duplicate_species =
+        common_is_reference ? candidate.query_species : candidate.ref_species;
+    const ChrName& secondary_chromosome =
+        common_is_reference ? candidate.query_chromosome
+                            : candidate.ref_chromosome;
+    const int anchor_step =
+        candidate.anchor.strand == Strand::FORWARD ? 1 : -1;
+
+    uint64_t reference_coordinate = candidate.anchor.ref_start;
+    int64_t query_coordinate =
+        candidate.anchor.strand == Strand::FORWARD
+            ? static_cast<int64_t>(candidate.anchor.qry_start)
+            : static_cast<int64_t>(candidate.anchor.qry_start) +
+                  candidate.anchor.qry_len - 1;
+
+    for (const auto unit : candidate.anchor.cigar) {
+      uint32_t length = 0;
+      char operation = '\0';
+      intToCigar(unit, operation, length);
+      if (cigarOperationAlignsBases(operation)) {
+        std::optional<SecondaryHomologyRun> active_run;
+        const auto flush_active_run = [&]() {
+          if (active_run) {
+            secondary_runs.push_back(std::move(*active_run));
+            active_run.reset();
+          }
+        };
+        candidate_aligned_bases += length;
+        for (uint32_t offset = 0; offset < length; ++offset) {
+          const uint64_t ref_position = reference_coordinate + offset;
+          const int64_t qry_position =
+              query_coordinate +
+              static_cast<int64_t>(anchor_step) * offset;
+          if (qry_position < 0) {
+            flush_active_run();
+            continue;
+          }
+          const uint64_t common_coordinate =
+              common_is_reference
+                  ? ref_position
+                  : static_cast<uint64_t>(qry_position);
+          const uint64_t secondary_coordinate =
+              common_is_reference
+                  ? static_cast<uint64_t>(qry_position)
+                  : ref_position;
+
+          const auto* indexed_segment = findPrimarySegment(
+              primary_index,
+              SpeciesChrPair{common_species, common_chromosome},
+              common_coordinate);
+          if (!indexed_segment) {
+            ++missing_primary_segment_points;
+            flush_active_run();
+            continue;
+          }
+          const SegPtr& common_segment = indexed_segment->segment;
+          const BlockPtr common_block =
+              common_segment->parent_block;
+          const SegPtr common_reference_segment =
+              findAlignmentReferenceSegment(common_block);
+          if (!common_reference_segment) {
+            ++missing_reference_segment_points;
+            flush_active_run();
+            continue;
+          }
+          const auto common_reference_offset =
+              segmentCoordinateToReferenceOffset(
+                  common_segment, common_reference_segment,
+                  common_coordinate);
+          if (!common_reference_offset) {
+            ++unmappable_reference_offset_points;
+            flush_active_run();
+            continue;
+          }
+          const auto common_reference_coordinate =
+              referenceOffsetToSegmentCoordinate(
+                  common_reference_segment,
+                  common_reference_segment,
+                  *common_reference_offset);
+          if (!common_reference_coordinate) {
+            ++unmappable_reference_offset_points;
+            flush_active_run();
+            continue;
+          }
+
+          bool secondary_already_present = false;
+          for (const auto& [species_chr, primary_segment] :
+               common_block->anchors) {
+            if (!primary_segment->isPrimary() ||
+                species_chr.first != duplicate_species ||
+                species_chr.second != secondary_chromosome) {
+              continue;
+            }
+            const auto primary_coordinate =
+                referenceOffsetToSegmentCoordinate(
+                    primary_segment, common_reference_segment,
+                    *common_reference_offset);
+            if (!primary_coordinate) {
+              continue;
+            }
+            if (*primary_coordinate == secondary_coordinate) {
+              secondary_already_present = true;
+            }
+          }
+          if (secondary_already_present) {
+            ++secondary_already_present_points;
+            flush_active_run();
+            continue;
+          }
+
+          const auto* duplicate_indexed_segment =
+              findPrimarySegment(
+                  primary_index,
+                  SpeciesChrPair{
+                      duplicate_species,
+                      secondary_chromosome},
+                  secondary_coordinate);
+          if (!duplicate_indexed_segment) {
+            ++missing_duplicate_primary_points;
+            flush_active_run();
+            continue;
+          }
+          const SegPtr& duplicate_segment =
+              duplicate_indexed_segment->segment;
+          const BlockPtr duplicate_block =
+              duplicate_segment->parent_block;
+          if (!duplicate_block ||
+              duplicate_block == common_block) {
+            ++secondary_already_present_points;
+            flush_active_run();
+            continue;
+          }
+          const SegPtr duplicate_reference_segment =
+              findAlignmentReferenceSegment(duplicate_block);
+          if (!duplicate_reference_segment) {
+            ++missing_reference_segment_points;
+            flush_active_run();
+            continue;
+          }
+          const auto duplicate_reference_offset =
+              segmentCoordinateToReferenceOffset(
+                  duplicate_segment,
+                  duplicate_reference_segment,
+                  secondary_coordinate);
+          if (!duplicate_reference_offset) {
+            ++unmappable_reference_offset_points;
+            flush_active_run();
+            continue;
+          }
+          const auto duplicate_reference_coordinate =
+              referenceOffsetToSegmentCoordinate(
+                  duplicate_reference_segment,
+                  duplicate_reference_segment,
+                  *duplicate_reference_offset);
+          if (!duplicate_reference_coordinate) {
+            ++unmappable_reference_offset_points;
+            flush_active_run();
+            continue;
+          }
+
+          const int common_reference_orientation =
+              common_reference_segment->strand ==
+                      Strand::FORWARD
+                  ? 1
+                  : -1;
+          const int common_segment_orientation =
+              common_segment->strand == Strand::FORWARD
+                  ? 1
+                  : -1;
+          const int duplicate_reference_orientation =
+              duplicate_reference_segment->strand ==
+                      Strand::FORWARD
+                  ? 1
+                  : -1;
+          const int duplicate_segment_orientation =
+              duplicate_segment->strand == Strand::FORWARD
+                  ? 1
+                  : -1;
+          const int duplicate_axis_step =
+              common_reference_orientation *
+              common_segment_orientation * anchor_step *
+              duplicate_reference_orientation *
+              duplicate_segment_orientation;
+
+          const PrimaryBlockPair primary_block_pair{
+              std::min(
+                  common_block->block_id,
+                  duplicate_block->block_id),
+              std::max(
+                  common_block->block_id,
+                  duplicate_block->block_id)};
+          const bool common_is_canonical =
+              common_block->block_id ==
+              primary_block_pair.first;
+          const BlockPtr& canonical_block =
+              common_is_canonical ? common_block
+                                  : duplicate_block;
+          const uint64_t canonical_coordinate =
+              common_is_canonical
+                  ? *common_reference_coordinate
+                  : *duplicate_reference_coordinate;
+          const int common_axis_step =
+              common_is_canonical ? 1 : duplicate_axis_step;
+          const int duplicate_axis_from_canonical =
+              common_is_canonical ? duplicate_axis_step : 1;
+
+          std::vector<SecondaryOccurrencePoint> occurrences;
+          occurrences.reserve(
+              common_block->anchors.size() +
+              duplicate_block->anchors.size());
+          const auto append_block_occurrences =
+              [&](const BlockPtr& source_block,
+                  const SegPtr& source_reference_segment,
+                  const uint64_t source_reference_offset,
+                  const int source_axis_step,
+                  const AlignRole role) {
+                const int source_reference_orientation =
+                    source_reference_segment->strand ==
+                            Strand::FORWARD
+                        ? 1
+                        : -1;
+                for (const auto& [species_chr, segment] :
+                     source_block->anchors) {
+                  if (!segment->isPrimary()) {
+                    continue;
+                  }
+                  const auto coordinate =
+                      referenceOffsetToSegmentCoordinate(
+                          segment,
+                          source_reference_segment,
+                          source_reference_offset);
+                  if (!coordinate) {
+                    continue;
+                  }
+                  const int segment_orientation =
+                      segment->strand == Strand::FORWARD
+                          ? 1
+                          : -1;
+                  const int step =
+                      source_axis_step *
+                      source_reference_orientation *
+                      segment_orientation;
+                  occurrences.push_back(
+                      SecondaryOccurrencePoint{
+                          species_chr.first,
+                          species_chr.second,
+                          step,
+                          static_cast<int64_t>(*coordinate) -
+                              static_cast<int64_t>(step) *
+                                  static_cast<int64_t>(
+                                      canonical_coordinate),
+                          *coordinate,
+                          role});
+                }
+              };
+
+          if (common_is_canonical) {
+            append_block_occurrences(
+                common_block, common_reference_segment,
+                *common_reference_offset, common_axis_step,
+                AlignRole::PRIMARY);
+            append_block_occurrences(
+                duplicate_block,
+                duplicate_reference_segment,
+                *duplicate_reference_offset,
+                duplicate_axis_from_canonical,
+                AlignRole::SECONDARY);
+          } else {
+            append_block_occurrences(
+                duplicate_block,
+                duplicate_reference_segment,
+                *duplicate_reference_offset,
+                duplicate_axis_from_canonical,
+                AlignRole::PRIMARY);
+            append_block_occurrences(
+                common_block, common_reference_segment,
+                *common_reference_offset, common_axis_step,
+                AlignRole::SECONDARY);
+          }
+          std::sort(
+              occurrences.begin(), occurrences.end(),
+              secondaryOccurrenceRunLess);
+          occurrences.erase(
+              std::unique(
+                  occurrences.begin(), occurrences.end(),
+                  [](const SecondaryOccurrencePoint& lhs,
+                     const SecondaryOccurrencePoint& rhs) {
+                    return secondaryOccurrenceRunKey(lhs) ==
+                           secondaryOccurrenceRunKey(rhs);
+                  }),
+              occurrences.end());
+          SecondaryHomologyPoint point{
+              canonical_block->ref_species,
+              canonical_block->ref_chr,
+              canonical_coordinate,
+              std::move(occurrences),
+              primary_block_pair};
+          ++mapped_point_observations;
+          const bool extends_right =
+              active_run &&
+              secondaryHomologySameRun(*active_run, point) &&
+              active_run->common_start <=
+                  std::numeric_limits<uint64_t>::max() -
+                      active_run->length &&
+              point.common_coordinate ==
+                  active_run->common_start +
+                      active_run->length;
+          const bool extends_left =
+              active_run &&
+              secondaryHomologySameRun(*active_run, point) &&
+              point.common_coordinate <
+                  active_run->common_start &&
+              point.common_coordinate + 1 ==
+                  active_run->common_start;
+          if (extends_right) {
+            ++active_run->length;
+          } else if (extends_left) {
+            active_run->common_start =
+                point.common_coordinate;
+            ++active_run->length;
+          } else {
+            flush_active_run();
+            active_run = SecondaryHomologyRun{
+                std::move(point.common_species),
+                std::move(point.common_chromosome),
+                point.common_coordinate,
+                1,
+                std::move(point.occurrences),
+                point.primary_block_pair};
+          }
+        }
+        flush_active_run();
+      }
+      if (cigarOperationConsumesReference(operation)) {
+        reference_coordinate += length;
+      }
+      if (cigarOperationConsumesQuery(operation)) {
+        query_coordinate +=
+            static_cast<int64_t>(anchor_step) * length;
+      }
+    }
+  }
+  const size_t unfiltered_pair_points =
+      mapped_point_observations;
+  std::sort(
+      secondary_runs.begin(),
+      secondary_runs.end(),
+      secondaryRunLess);
+  std::vector<SecondaryHomologyRun> merged_runs;
+  merged_runs.reserve(secondary_runs.size());
+  for (auto& run : secondary_runs) {
+    if (run.length == 0 ||
+        run.common_start >
+            std::numeric_limits<uint64_t>::max() -
+                run.length) {
+      throw std::runtime_error(
+          "Secondary homology run coordinate overflow");
+    }
+    if (!merged_runs.empty() &&
+        secondaryHomologySameRun(
+            merged_runs.back(),
+            run)) {
+      auto& previous = merged_runs.back();
+      const uint64_t previous_end =
+          previous.common_start + previous.length;
+      const uint64_t current_end =
+          run.common_start + run.length;
+      if (run.common_start <= previous_end) {
+        previous.length =
+            std::max(previous_end, current_end) -
+            previous.common_start;
+        continue;
+      }
+    }
+    merged_runs.push_back(std::move(run));
+  }
+  secondary_runs = std::move(merged_runs);
+
+  size_t mapped_points = 0;
+  std::vector<BlockPtr> secondary_blocks;
+  secondary_blocks.reserve(secondary_runs.size());
+  size_t materialized_bases = 0;
+  constexpr uint64_t maximum_cigar_operation_length =
+      (1ULL << 28U) - 1U;
+  for (const auto& run : secondary_runs) {
+    if (run.length == 0 ||
+        run.length > maximum_cigar_operation_length ||
+        run.common_start >
+            std::numeric_limits<uint_t>::max() ||
+        run.length >
+            std::numeric_limits<uint_t>::max()) {
+      continue;
+    }
+    if (run.length >
+        std::numeric_limits<size_t>::max() -
+            mapped_points) {
+      throw std::overflow_error(
+          "Secondary homology mapped-point count overflow");
+    }
+    mapped_points += static_cast<size_t>(run.length);
+
+    auto block = Block::create(run.occurrences.size());
+    block->ref_species = run.common_species;
+    block->ref_chr = run.common_chromosome;
+    bool coordinates_fit = true;
+    for (const auto& occurrence : run.occurrences) {
+      const __int128 coordinate_wide =
+          static_cast<__int128>(occurrence.step) *
+              static_cast<__int128>(run.common_start) +
+          static_cast<__int128>(occurrence.diagonal);
+      if (coordinate_wide < 0 ||
+          coordinate_wide >
+              std::numeric_limits<uint_t>::max()) {
+        coordinates_fit = false;
+        break;
+      }
+      const uint64_t coordinate =
+          static_cast<uint64_t>(coordinate_wide);
+      if (occurrence.step < 0 &&
+          coordinate < run.length - 1) {
+        coordinates_fit = false;
+        break;
+      }
+      const uint64_t start =
+          occurrence.step > 0
+              ? coordinate
+              : coordinate - (run.length - 1);
+      if (start >
+          std::numeric_limits<uint_t>::max()) {
+        coordinates_fit = false;
+        break;
+      }
+      auto segment = Segment::create(
+          static_cast<uint_t>(start),
+          static_cast<uint_t>(run.length),
+          occurrence.step > 0 ? Strand::FORWARD
+                              : Strand::REVERSE,
+          Cigar_t{
+              cigarToInt(
+                  'M',
+                  static_cast<uint32_t>(run.length))},
+          occurrence.role,
+          SegmentRole::SEGMENT,
+          block);
+      block->anchors.emplace(
+          SpeciesChrPair{
+              occurrence.species,
+              occurrence.chromosome},
+          std::move(segment));
+    }
+    if (coordinates_fit) {
+      if (run.length >
+          std::numeric_limits<size_t>::max() -
+              materialized_bases) {
+        throw std::overflow_error(
+            "Secondary homology materialized-base count overflow");
+      }
+      materialized_bases += run.length;
+      secondary_blocks.push_back(std::move(block));
+    }
+  }
+
+  {
+    std::unique_lock lock(rw);
+    blocks.reserve(blocks.size() + secondary_blocks.size());
+    for (const auto& block : secondary_blocks) {
+      blocks.emplace_back(block);
+    }
+  }
+  spdlog::info(
+      "[secondary-alignments] candidates={} initial_round_candidates={} "
+      "candidate_aligned_bases={} unfiltered_pair_points={} "
+      "mapped_points={} blocks={} materialized_bases={} "
+      "missing_primary_segment_points={} "
+      "missing_reference_segment_points={} "
+      "unmappable_reference_offset_points={} "
+      "missing_duplicate_primary_points={} "
+      "secondary_already_present_points={}",
+      candidates.size(), initial_round_candidates, candidate_aligned_bases,
+      unfiltered_pair_points, mapped_points, secondary_blocks.size(),
+      materialized_bases, missing_primary_segment_points,
+      missing_reference_segment_points,
+      unmappable_reference_offset_points, missing_duplicate_primary_points,
+      secondary_already_present_points);
+  return secondary_blocks.size();
 }
 
 void RaMeshMultiGenomeGraph::extendRefNodes(
@@ -238,40 +1085,6 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
     }
   }
   return;
-}
-
-/* ==============================================================
- * 4.  debugPrint (multi-genome)  -- 新版，参数改为 show_detail
- * ==============================================================*/
-void RaMeshMultiGenomeGraph::debugPrint(bool show_detail) const {
-  std::shared_lock gLock(rw);
-
-  /*------------- 页眉 -------------*/
-  std::cout << "\n********  Multi-Genome Graph  ********\n";
-
-  /*------------- 逐物种打印 + 计数 -------------*/
-  std::vector<std::pair<std::string, size_t>> per_species; // {species, seg_cnt}
-  size_t grand_total = 0;
-
-  for (const auto &[sp, g] : species_graphs) {
-    // 假设 g.debugPrint 有重载：size_t debugPrint(std::ostream&, bool
-    // show_detail) const
-    size_t seg_cnt = g.debugPrint(show_detail);
-    per_species.emplace_back(sp, seg_cnt);
-    grand_total += seg_cnt;
-  }
-
-  /*------------- 汇总区 -------------*/
-  std::cout << "\n----------  Summary  ----------\n";
-  for (const auto &[sp, cnt] : per_species) {
-    std::cout << std::left << std::setw(15) << sp << ": " << cnt
-              << " segments\n";
-  }
-  std::cout << "--------------------------------\n";
-  std::cout << "Grand total  : " << grand_total << " segments in "
-            << per_species.size() << " genome(s)\n";
-
-  std::cout << "********  End of Graphs  ********\n";
 }
 
 /* ==============================================================
@@ -962,10 +1775,8 @@ void RaMeshMultiGenomeGraph::verifyBlockConsistency(
                 current->primary_path.next.load(std::memory_order_acquire);
           }
 
-          bool found_reference = false;
           while (current && !current->isTail()) {
             if (current->isSegment() && current->parent_block == block_ptr) {
-              found_reference = true;
               SpeciesChrPair key{species_name, chr_name};
               referenced_species_chrs.insert(key);
 
@@ -1109,7 +1920,7 @@ void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
         return detail;
       };
 
-      if (block_ptr->ref_chr.empty()) {
+      if (block_ptr->ref_species.empty() || block_ptr->ref_chr.empty()) {
         missing_ref_definition++;
         std::string hint_species;
         std::string hint_chr;
@@ -1122,35 +1933,33 @@ void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
         addVerificationError(
             result, options, VerificationType::BLOCK_REFERENCE_CHR,
             ErrorSeverity::ERROR, hint_species, hint_chr, 0, 0,
-            "Block missing reference chromosome assignment",
+            "Block missing reference species/chromosome assignment",
             "anchors=" + makeAnchorSummary(block_ptr->anchors));
         continue;
       }
 
-      bool has_ref_anchor = false;
-      SpeciesName first_species;
-      for (const auto &entry : block_ptr->anchors) {
-        const auto &species_chr = entry.first;
-        if (first_species.empty()) {
-          first_species = species_chr.first;
-        }
-        if (species_chr.second == block_ptr->ref_chr) {
-          has_ref_anchor = true;
-          break;
-        }
-      }
+      const SpeciesChrPair reference_key{block_ptr->ref_species,
+                                         block_ptr->ref_chr};
+      const auto [reference_begin, reference_end] =
+          block_ptr->anchors.equal_range(reference_key);
+      const size_t primary_reference_occurrences = static_cast<size_t>(
+          std::count_if(reference_begin, reference_end, [](const auto &entry) {
+            return entry.second && entry.second->isPrimary();
+          }));
 
-      if (!has_ref_anchor) {
+      if (primary_reference_occurrences != 1) {
         missing_ref_anchor++;
-        addVerificationError(result, options,
-                             VerificationType::BLOCK_REFERENCE_CHR,
-                             ErrorSeverity::ERROR, first_species,
-                             block_ptr->ref_chr, 0, 0,
-                             "Block missing anchor entry for reference "
-                             "chromosome",
-                             "ref_chr=" + block_ptr->ref_chr +
-                                 ", anchors=" +
-                                 makeAnchorSummary(block_ptr->anchors));
+        addVerificationError(
+            result, options, VerificationType::BLOCK_REFERENCE_CHR,
+            ErrorSeverity::ERROR, block_ptr->ref_species, block_ptr->ref_chr, 0,
+            0,
+            "Block must contain exactly one primary declared reference "
+            "occurrence",
+            "primary_occurrences=" +
+                std::to_string(primary_reference_occurrences) +
+                ", ref_species=" + block_ptr->ref_species +
+                ", ref_chr=" + block_ptr->ref_chr +
+                ", anchors=" + makeAnchorSummary(block_ptr->anchors));
       }
     }
   }
@@ -1158,7 +1967,8 @@ void RaMeshMultiGenomeGraph::verifyBlockReferenceChromosome(
   if (options.verbose) {
     spdlog::debug("Blocks without ref_chr: {} (checked {})",
                   missing_ref_definition, checked_blocks);
-    spdlog::debug("Blocks without ref_chr anchor: {}", missing_ref_anchor);
+    spdlog::debug("Blocks with invalid reference occurrence: {}",
+                  missing_ref_anchor);
   }
 }
 
@@ -1368,7 +2178,7 @@ void RaMeshMultiGenomeGraph::verifyPerformanceIssues(
   }
 }
 
-// ✂ BEGIN: safeLink 实现
+// Safe path-linking implementation.
 void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
   if (!prev || !next)
     return;
@@ -1383,8 +2193,6 @@ void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
   /* 3) 发布内存屏障，保证两侧对所有线程可见 */
   std::atomic_thread_fence(std::memory_order_release);
 }
-
-// ✂ END
 
 /* =============================================================
  * 6.  Merge multiple graphs (public API)
@@ -1532,9 +2340,10 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
     uint64_t current_chr_processed = 0;    // 当前染色体已处理长度
     size_t total_merges = 0;               // 总合并操作数量
     size_t completed_merges = 0;           // 已完成合并操作数量
-    std::string current_species;           // 当前处理的物种
-    std::string current_chromosome;        // 当前处理的染色体
-    uint64_t current_position = 0;         // 当前处理位置
+    size_t participant_conflict_rejections = 0;
+    std::string current_species;    // 当前处理的物种
+    std::string current_chromosome; // 当前处理的染色体
+    uint64_t current_position = 0;  // 当前处理位置
 
     // 上次日志输出时间（避免过于频繁的日志输出）
     mutable std::chrono::steady_clock::time_point last_log_time;
@@ -1571,18 +2380,10 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
         spdlog::info(
             "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) Chromosomes: {}/{} "
             "Current: {}.{} ({:.1f}%) Position: {} Merges: {}",
-            overall_percentage,
-            processed_genomic_length / 1000000.0,
-            total_genomic_length / 1000000.0,
-            completed_chromosomes,
-            total_chromosomes,
-            current_species,
-            current_chromosome,
-            chr_percentage,
-            current_position,
-            completed_merges
-        );
-
+            overall_percentage, processed_genomic_length / 1000000.0,
+            total_genomic_length / 1000000.0, completed_chromosomes,
+            total_chromosomes, current_species, current_chromosome,
+            chr_percentage, current_position, completed_merges);
 
         last_log_time = now;
         last_logged_percentage = overall_percentage;
@@ -1598,7 +2399,8 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       current_chr_processed = 0;
       current_position = 0;
 
-      // spdlog::info("Starting to process chromosome: {}.{} (Length: {:.1f} MB)",
+      // spdlog::info("Starting to process chromosome: {}.{} (Length: {:.1f}
+      // MB)",
       //              species,
       //              chromosome,
       //              chr_length / 1000000.0);
@@ -1638,17 +2440,18 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
     // 记录合并操作
     void recordMerge() { completed_merges++; }
+    void recordParticipantConflict() { participant_conflict_rejections++; }
 
     // 完成所有处理
     void finish() {
       spdlog::info(
           "Merge completed! Processed a total of {} chromosomes, {:.1f} MB of "
           "genomic data, with {} merge operations executed.",
-          total_chromosomes,
-          total_genomic_length / 1000000.0,
-          completed_merges
-      );
-
+          total_chromosomes, total_genomic_length / 1000000.0,
+          completed_merges);
+      spdlog::info("Merge retained {} overlapping Block pairs because their "
+                   "non-reference participant species conflict.",
+                   participant_conflict_rejections);
     }
   };
 
@@ -1866,7 +2669,11 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
             const uint_t curr_start = curr_seg->start;
 
             // 发现重叠
-            if (prev_end > curr_start) {
+            if (prev_end > curr_start &&
+                blocksShareNonReferenceSpecies(prev_block, current_block,
+                                               ref_name)) {
+              progress.recordParticipantConflict();
+            } else if (prev_end > curr_start) {
               // ═══════════════════════════════════════════════════════════
               // 性能分析：重叠检测完成，开始处理
               // ═══════════════════════════════════════════════════════════
@@ -1881,11 +2688,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // ═══════════════════════════════════════════════════════════
               progress.recordMerge();
 
-              // 处理合并
-              // 确定重叠区间
-              if (prev_seg->cigar.size() != 0 || curr_seg->cigar.size() != 0) {
-                std::cout << "";
-              }
+              // 处理合并并确定重叠区间。
               uint_t overlap_start = std::max(prev_seg->start, curr_seg->start);
               uint_t overlap_end = std::min(prev_seg->start + prev_seg->length,
                                             curr_seg->start + curr_seg->length);
@@ -1924,7 +2727,9 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
               // 1. 创建前缀block和segment（如果存在）
               if (prev_has_prefix || curr_has_prefix) {
                 prefix_block = Block::create(2);
+                prefix_block->ref_species = ref_name;
                 prefix_block->ref_chr = prev_block->ref_chr;
+                prefix_block->ref_species = prev_block->ref_species;
                 prefix_ref_seg = Segment::create(
                     prefix_start, prefix_len,
                     Strand::FORWARD, // ref总是正向
@@ -1934,14 +2739,16 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                     SegmentRole::SEGMENT, // 前缀是segment，所以是segment
                     prefix_block);
                 // 将ref segment注册到block
-                prefix_block->anchors[ref_key] = prefix_ref_seg;
+                prefix_block->anchors.emplace(ref_key, prefix_ref_seg);
                 perf_stats.total_blocks_created++;
                 perf_stats.total_segments_created++;
               }
 
               // 2. 创建重叠block和segment（必定存在）
               overlap_block = Block::create(2);
+              overlap_block->ref_species = ref_name;
               overlap_block->ref_chr = prev_block->ref_chr;
+              overlap_block->ref_species = prev_block->ref_species;
               uint32_t overlap_len = overlap_end - overlap_start;
               overlap_ref_seg = Segment::create(
                   overlap_start, overlap_len,
@@ -1952,14 +2759,16 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                   SegmentRole::SEGMENT, // 重叠是segment，所以是segment
                   overlap_block);
               // 将ref segment注册到block
-              overlap_block->anchors[ref_key] = overlap_ref_seg;
+              overlap_block->anchors.emplace(ref_key, overlap_ref_seg);
               perf_stats.total_blocks_created++;
               perf_stats.total_segments_created++;
 
               // 3. 创建后缀block和segment（如果存在）
               if (prev_has_suffix || curr_has_suffix) {
                 suffix_block = Block::create(2);
+                suffix_block->ref_species = ref_name;
                 suffix_block->ref_chr = prev_block->ref_chr;
+                suffix_block->ref_species = prev_block->ref_species;
                 suffix_ref_seg = Segment::create(
                     suffix_start, suffix_len,
                     Strand::FORWARD, // ref总是正向
@@ -1969,7 +2778,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                     SegmentRole::SEGMENT, // 后缀是segment，所以是segment
                     suffix_block);
                 // 将ref segment注册到block
-                suffix_block->anchors[ref_key] = suffix_ref_seg;
+                suffix_block->anchors.emplace(ref_key, suffix_ref_seg);
                 perf_stats.total_blocks_created++;
                 perf_stats.total_segments_created++;
               }
@@ -1982,8 +2791,6 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                   block_creation_end - block_creation_start);
 
               TimePoint cigar_processing_start = HighResClock::now();
-              TimePoint segment_creation_start = HighResClock::now();
-
               // 准备开始处理对应的query，首先处理prev_block，然后处理current_block
               // 1. 处理prev_block
               // 遍历prev_block非ref的anchors
@@ -2030,7 +2837,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                           );
                           // 将query segment注册到prefix_block
                           if (prefix_block) {
-                            prefix_block->anchors[species_chr] = prefix_qry_seg;
+                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
                           }
                         }
                         if (prefix_done && !overlap_done &&
@@ -2050,7 +2857,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               overlap_block // 使用新创建的overlap_block
                           );
                           // 将query segment注册到overlap_block
-                          overlap_block->anchors[species_chr] = overlap_qry_seg;
+                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
                         }
                         if (overlap_done && !suffix_done &&
                             sum >= suffix_length) {
@@ -2068,11 +2875,15 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                           );
                           // 将query segment注册到suffix_block
                           if (suffix_block) {
-                            suffix_block->anchors[species_chr] = suffix_qry_seg;
+                            suffix_block->anchors.emplace(species_chr,
+                                                          suffix_qry_seg);
                           }
                         }
                       }
                     }
+                    appendTerminalQueryOnlyRemainder(
+                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
+                        cigar_str);
                   } else {
                     // segment->strand == Strand::REVERSE
                     std::string cigar_str;
@@ -2110,7 +2921,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, prefix_block);
                           // 将query segment注册到prefix_block
                           if (prefix_block) {
-                            prefix_block->anchors[species_chr] = prefix_qry_seg;
+                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
                           }
                         }
                         if (prefix_done && !overlap_done &&
@@ -2126,7 +2937,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               split_cigar, segment->align_role,
                               SegmentRole::SEGMENT, overlap_block);
                           // 将query segment注册到overlap_block
-                          overlap_block->anchors[species_chr] = overlap_qry_seg;
+                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
                         }
                         if (overlap_done && !suffix_done &&
                             sum >= suffix_length) {
@@ -2142,11 +2953,15 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, suffix_block);
                           // 将query segment注册到suffix_block
                           if (suffix_block) {
-                            suffix_block->anchors[species_chr] = suffix_qry_seg;
+                            suffix_block->anchors.emplace(species_chr,
+                                                          suffix_qry_seg);
                           }
                         }
                       }
                     }
+                    appendTerminalQueryOnlyRemainder(
+                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
+                        cigar_str);
 
                     // 反向链坐标修正：从segment末端开始，向前计算
                     uint_t segment_end = segment->start + segment->length;
@@ -2220,7 +3035,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, prefix_block);
                           // 将query segment注册到prefix_block
                           if (prefix_block) {
-                            prefix_block->anchors[species_chr] = prefix_qry_seg;
+                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
                           }
                         }
                         if (prefix_done && !overlap_done &&
@@ -2237,7 +3052,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               segment->strand, split_cigar, segment->align_role,
                               SegmentRole::SEGMENT, overlap_block);
                           // 将query segment注册到overlap_block
-                          overlap_block->anchors[species_chr] = overlap_qry_seg;
+                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
                         }
                         if (overlap_done && !suffix_done &&
                             sum >= suffix_length) {
@@ -2259,11 +3074,15 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, suffix_block);
                           // 将query segment注册到suffix_block
                           if (suffix_block) {
-                            suffix_block->anchors[species_chr] = suffix_qry_seg;
+                            suffix_block->anchors.emplace(species_chr,
+                                                          suffix_qry_seg);
                           }
                         }
                       }
                     }
+                    appendTerminalQueryOnlyRemainder(
+                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
+                        cigar_str);
                   } else {
                     // segment->strand == Strand::REVERSE
                     std::string cigar_str;
@@ -2301,7 +3120,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, prefix_block);
                           // 将query segment注册到prefix_block
                           if (prefix_block) {
-                            prefix_block->anchors[species_chr] = prefix_qry_seg;
+                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
                           }
                         }
                         if (prefix_done && !overlap_done &&
@@ -2317,7 +3136,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               split_cigar, segment->align_role,
                               SegmentRole::SEGMENT, overlap_block);
                           // 将query segment注册到overlap_block
-                          overlap_block->anchors[species_chr] = overlap_qry_seg;
+                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
                         }
                         if (overlap_done && !suffix_done &&
                             sum >= suffix_length) {
@@ -2333,11 +3152,15 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                               SegmentRole::SEGMENT, suffix_block);
                           // 将query segment注册到suffix_block
                           if (suffix_block) {
-                            suffix_block->anchors[species_chr] = suffix_qry_seg;
+                            suffix_block->anchors.emplace(species_chr,
+                                                          suffix_qry_seg);
                           }
                         }
                       }
                     }
+                    appendTerminalQueryOnlyRemainder(
+                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
+                        cigar_str);
 
                     // 反向链坐标修正：从segment末端开始，向前计算
                     uint_t segment_end = segment->start + segment->length;
@@ -3220,7 +4043,7 @@ void RaMeshMultiGenomeGraph::removeChromosome(const SpeciesName &species,
     SpeciesChrPair target_key{species, chr};
 
     if (block->anchors.find(target_key) != block->anchors.end()) {
-      if (block->anchors.size() == 1) {
+      if (block->anchors.count(target_key) == block->anchors.size()) {
         // 如果block只包含这一个染色体，删除整个block
         blocks_to_remove.emplace_back(block);
       } else {
@@ -3235,7 +4058,7 @@ void RaMeshMultiGenomeGraph::removeChromosome(const SpeciesName &species,
 
   // 3. 更新相关blocks
   for (const auto &block : blocks_to_update) {
-    block->removeSegment(species, chr);
+    block->removeSegments(species, chr);
   }
 
   // 4. 删除只包含该染色体的blocks
@@ -3273,7 +4096,6 @@ void RaMeshMultiGenomeGraph::clearAllGraphs() {
 size_t RaMeshMultiGenomeGraph::compactBlockPool() {
   std::unique_lock graph_lock(rw);
 
-  size_t original_size = blocks.size();
   size_t compacted = removeExpiredBlocks();
 
   // 可以在这里添加更多的内存优化逻辑
@@ -3300,8 +4122,14 @@ void RaMeshMultiGenomeGraph::optimizeGraphStructure() {
       // 清理零长度 segment 并同步 block/采样状态
       SegPtr current =
           genome_end.head->primary_path.next.load(std::memory_order_acquire);
+      std::unordered_set<const Segment*> cleanup_visited;
 
       while (current && !current->isTail()) {
+        if (!cleanup_visited.emplace(current.get()).second) {
+          throw std::runtime_error(
+              "optimizeGraphStructure detected a cycle during cleanup for " +
+              species + "." + chr);
+        }
         if (current->isSegment() && current->length == 0) {
           SegPtr next_ptr =
               current->primary_path.next.load(std::memory_order_acquire);
@@ -3333,7 +4161,13 @@ void RaMeshMultiGenomeGraph::optimizeGraphStructure() {
       genome_end.sample_vec.clear();
       SegPtr rebuild =
           genome_end.head->primary_path.next.load(std::memory_order_acquire);
+      std::unordered_set<const Segment*> rebuild_visited;
       while (rebuild && !rebuild->isTail()) {
+        if (!rebuild_visited.emplace(rebuild.get()).second) {
+          throw std::runtime_error(
+              "optimizeGraphStructure detected a cycle during sampling for " +
+              species + "." + chr);
+        }
         genome_end.setToSampling(rebuild);
         rebuild =
             rebuild->primary_path.next.load(std::memory_order_acquire);
@@ -3751,126 +4585,6 @@ inline std::string getSubSeq(const SeqPro::ManagerVariant& mv,
             throw std::runtime_error("Unsupported ManagerVariant type in getSubSeq()");
         }
         }, mv);
-}
-
-inline std::string applyCigarToQuery(const std::string& qry, const Cigar_t& cigar)
-{
-    std::string aligned;
-    aligned.reserve(qry.size() * 2); // 预留空间
-
-    size_t qpos = 0;
-    for (auto c : cigar) {
-        char op; uint32_t len;
-        intToCigar(c, op, len);
-
-        switch (op) {
-        case 'M': case '=': case 'X':
-            for (uint32_t i = 0; i < len && qpos < qry.size(); ++i)
-                aligned.push_back(qry[qpos++]);
-            break;
-        case 'I': // 插入：直接保留
-            for (uint32_t i = 0; i < len && qpos < qry.size(); ++i)
-                aligned.push_back(qry[qpos++]);
-            break;
-        case 'D': // 缺口：在 query 里表现为 '-'
-            aligned.append(len, '-');
-            break;
-        default:
-            break;
-        }
-    }
-}
-
-void reportUnalignedRegions(const GenomeEnd& end,
-    const SeqPro::SharedManagerVariant& mgr,
-    const ChrName& chr_name)
-{
-    std::vector<std::pair<uint_t, uint_t>> covered;
-
-    // 1) 收集所有 segment 的区间
-    SegPtr cur = end.head->primary_path.next.load(std::memory_order_acquire);
-
-    while (cur && !cur->isTail()) {
-   //     if (cur->start == 212285) {
-   //         // 打印出比对的序列，可以不用管参考序列
-
-			//std::string seq = getSubSeq((*mgr), chr_name, cur->start, cur->length);
-   //         Cigar_t c = cur->cigar;
-
-   //         //std::string aligned_query = applyCigarToQuery(seq, c);
-
-   //         //spdlog::info("=== Alignment at pos {} ===", cur->start);
-   //         //spdlog::info("Raw query  (len={}): {}", seq.size(), seq);
-   //         //spdlog::info("Aligned qry (len={}): {}", aligned_query.size(), aligned_query);
-   //         spdlog::info("CIGAR: {}", cigarToString(c));
-   //         std::cout << "";
-
-   //     }
-        covered.emplace_back(cur->start, cur->start + cur->length);
-        cur = cur->primary_path.next.load(std::memory_order_acquire);
-    }
-
-    // 2) 排序 & 合并
-    std::sort(covered.begin(), covered.end());
-    std::vector<std::pair<uint_t, uint_t>> merged;
-    for (auto& iv : covered) {
-        if (merged.empty() || iv.first > merged.back().second) {
-            merged.push_back(iv);
-        }
-        else {
-            merged.back().second = std::max(merged.back().second, iv.second);
-        }
-    }
-
-    //// 打开文件（覆盖写）
-    //std::ofstream ofs("/mnt/d/code/RaMAx/unaligned.txt");
-    //if (!ofs) {
-    //    std::cerr << "Error: cannot open output file." << std::endl;
-    //    return;
-    //}
-
-    // 3) 求补集（未覆盖区间）
-    uint_t chr_len = std::visit([&](auto& p) { return p->getSequenceLength(chr_name); }, *mgr);
-    uint_t prev = 0;
-    std::vector<double> lens;  // 只存 >1000 的区间长度
-
-    for (auto& iv : merged) {
-        if (iv.first > prev) {
-            uint_t len = iv.first - prev;
-            //ofs << chr_name << "\t" << prev << "\t" << len << "\n";  // ✅ 文件写所有区间
-            if (len > 1000) {
-				std::cout << chr_name << "\t" << prev << "\t" << len << "\n"; // ✅ 控制台打印 >1000
-            }
-            lens.push_back(static_cast<double>(len));            // ✅ 统计只收集 >1000
-        }
-        prev = iv.second;
-    }
-    if (prev < chr_len) {
-        uint_t len = chr_len - prev;
-        //ofs << chr_name << "\t" << prev << "\t" << len << "\n";      // ✅ 文件写所有区间
-        if (len > 1000) {
-            std::cout << chr_name << "\t" << prev << "\t" << len << "\n"; // ✅ 控制台打印 >1000
-        }
-        lens.push_back(static_cast<double>(len));                // ✅ 统计只收集 >1000
-    }
-
-    // 4) 打印统计信息（只针对 >1000 的区间）
-    if (!lens.empty()) {
-        double sum = std::accumulate(lens.begin(), lens.end(), 0.0);
-        double mean = sum / lens.size();
-        double sq_sum = 0.0;
-        for (double x : lens) sq_sum += (x - mean) * (x - mean);
-        double variance = sq_sum / lens.size();
-
-        std::cout << "Unaligned regions (>1000 bp) in " << chr_name
-            << " - count: " << lens.size()
-            << ", sum length: " << sum
-            << ", mean length: " << mean
-            << ", variance: " << variance << "\n";
-    }
-    else {
-        std::cout << "No unaligned regions (>1000 bp) found in " << chr_name << ".\n";
-    }
 }
 
 } // namespace RaMesh

@@ -408,7 +408,9 @@ FodyWeavers.xsd
 /.vscode/
 /launch.vs.json
 /cmake-build-debug/
+/tools/*/build/
 /ramax_contig_temp/
+/plan
 cactus-alignathon-primates.hal
 evolverMammals.hal
 install.sh
@@ -433,3 +435,6 @@ bin/output.maf
 # Local-only packaging and CI files
 /.github/
 /recipe/
+submodule.zip
+/.clang-format
+/tmp/

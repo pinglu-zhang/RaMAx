@@ -17,6 +17,9 @@
 
 #include "config.hpp"
 #include "anchor.h"
+#include "paf_export.h"
+#include "gfa_export.h"
+#include "softmask_index.h"
 
 // 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
 class NewickParser;
@@ -47,7 +50,7 @@ namespace RaMesh {
         }
     };
 
-    using ChrHeadMap = std::unordered_map<SpeciesChrPair, SegPtr, SpeciesChrPairHash>;
+    using ChrHeadMap = std::unordered_multimap<SpeciesChrPair, SegPtr, SpeciesChrPairHash>;
 
     // ────────────────────────────────────────────────
     // Intrusive concurrent list node
@@ -115,12 +118,16 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class Block : public std::enable_shared_from_this<Block> {
     public:
+        SpeciesName ref_species; // guard: rw
         ChrName   ref_chr;      // guard: rw
+        uint64_t  block_id{ 0 }; // stable export identity
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
         mutable std::shared_mutex rw;
 
         static BlockPtr create(std::size_t hint = 1);
-        static BlockPtr createEmpty(const ChrName& chr, std::size_t hint = 1);
+        static BlockPtr createEmpty(const SpeciesName& ref_species,
+                                    const ChrName& ref_chr,
+                                    std::size_t hint = 1);
 
         // Convenience helper – create both ref&qry segments, register anchors
         static std::pair<SegPtr, SegPtr> createSegmentPair(const Match& match,
@@ -140,7 +147,7 @@ namespace RaMesh {
         // ――― deletion methods ―――
         void removeAllSegments();
         void removeSegmentsBySpecies(const SpeciesName& species);
-        bool removeSegment(const SpeciesName& species, const ChrName& chr);
+        size_t removeSegments(const SpeciesName& species, const ChrName& chr);
 
         Block() = default;
         ~Block() = default;
@@ -211,8 +218,6 @@ namespace RaMesh {
         explicit RaMeshGenomeGraph(const SpeciesName& sp);
         RaMeshGenomeGraph(const SpeciesName& sp, const std::vector<ChrName>& chrs);
 
-        size_t debugPrint(bool show_detail) const;
-
         SpeciesName                             species_name;
         std::unordered_map<ChrName, GenomeEnd>  chr2end;   // guard: rw
         mutable std::shared_mutex               rw;        // multi‑reader / single‑writer
@@ -232,6 +237,17 @@ namespace RaMesh {
 			//const AnchorVec& anchor_vec);
 
         void insertAnchorIntoGraph(SeqPro::ManagerVariant& ref_mgr, SeqPro::ManagerVariant& qry_mgr, SpeciesName ref_name, SpeciesName qry_name, const Anchor& anchor, bool isMultiple=false);
+
+        void registerSecondaryAnchorCandidate(
+            SpeciesName ref_species,
+            ChrName ref_chromosome,
+            SpeciesName query_species,
+            ChrName query_chromosome,
+            const Anchor& anchor,
+            bool initial_round,
+            bool common_is_reference);
+
+        size_t materializeSecondaryAlignments();
 
         void markAllExtended() {
             std::unique_lock lock(rw); // 锁保护整个 species_graphs
@@ -255,7 +271,6 @@ namespace RaMesh {
 
 
 		void extendRefNodes(const SpeciesName& ref_name, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, int_t zdrop);
-        void debugPrint(bool show_detail) const;
         
         // 图正确性验证函数
         bool verifyGraphCorrectness(bool verbose = false, bool show_detailed_segments = false) const;
@@ -435,29 +450,54 @@ namespace RaMesh {
         void safeLink(SegPtr prev, SegPtr next);
 
         void mergeMultipleGraphs(const SpeciesName& ref_name, uint_t thread_num);
+        size_t mergeExactContiguousBlocks(
+            const SpeciesName& reference_species,
+            uint_t maximum_reference_span = 1000000,
+            uint_t maximum_query_gap = 0);
+        size_t realignSingleMissingSpeciesWindows(
+            const SpeciesName& reference_species,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const std::string& msa_executable,
+            uint_t maximum_span = 10000,
+            uint_t parallel_threads = 1,
+            uint_t zero_gap_maximum_span = 200,
+            uint_t adjacent_pair_gap_max = 0);
+        void inspectExactContiguousBlockBoundaries(
+            const SpeciesName& reference_species,
+            const std::string& stage,
+            uint_t maximum_reference_span = 1000000) const;
+
 
         std::unordered_map<SpeciesName, RaMeshGenomeGraph> species_graphs; // guard: rw
         std::vector<WeakBlock>                             blocks;         // guard: rw
+        std::vector<SpeciesName>                           reference_order;
         mutable std::shared_mutex                          rw;             // multi‑reader / single‑writer
 
-        void exportToMaf(const FilePath& maf_path, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers, bool only_primary, bool is_pairwise) const;
+        void exportToMaf(
+            const FilePath& maf_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+            bool pairwise_mode) const;
 
-        void exportToMafWithoutReverse(const FilePath& maf_path, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
+        Paf::PafExportStats exportToPaf(
+            const FilePath& paf_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const Paf::PafExportOptions& options = {}) const;
 
-        void exportToMultipleMaf(const std::vector<std::pair<SpeciesName, FilePath>>& outs, const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seq_mgrs, bool only_primary, bool pairwise_mode) const;
+        Gfa::GfaExportStats exportToGfa(
+            const FilePath& gfa_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
+                seqpro_managers,
+            const Gfa::GfaExportOptions& options = {}) const;
 
-        void exportToHal(const FilePath& hal_path,
-                        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-                        const std::string& newick_tree = "",
-                        bool only_primary = true,
-                        const std::string& root_name = "root") const;
-
-        // 重载：直接复用已解析的 NewickParser，避免重复读取导致子树选择失效
-        void exportToHal(const FilePath& hal_path,
-                        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-                        const NewickParser& parser,
-                        bool only_primary = true,
-                        const std::string& root_name = "root") const;
+        void exportToHal(
+            const FilePath& hal_path,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+            const NewickParser& parser,
+            const std::string& root_name,
+            int parallel_threads,
+            const SoftMask::PathMap& softmask_paths) const;
 
         
         // ――― high-performance deletion methods ―――
@@ -486,6 +526,18 @@ namespace RaMesh {
         DeletionStats performMaintenance(bool full_gc = false);
 
     private:
+        struct SecondaryAnchorCandidate {
+            SpeciesName ref_species;
+            ChrName ref_chromosome;
+            SpeciesName query_species;
+            ChrName query_chromosome;
+            Anchor anchor;
+            bool initial_round = false;
+            bool common_is_reference = true;
+        };
+
+        std::vector<SecondaryAnchorCandidate> secondary_anchor_candidates;
+
         // ――― Enhanced verification helper methods ―――
         void addVerificationError(VerificationResult& result, const VerificationOptions& options,
                                 VerificationType type, ErrorSeverity severity,
@@ -509,10 +561,6 @@ namespace RaMesh {
         // 优化的统一遍历函数
         void verifyWithUnifiedTraversal(VerificationResult& result, const VerificationOptions& options) const;
     };
-
-    void reportUnalignedRegions(const GenomeEnd& end,
-        const SeqPro::SharedManagerVariant& mgr,
-		const ChrName& chr_name);
 
 } // namespace RaMesh
 

@@ -3,6 +3,7 @@
 
 #include "ksw2.h"
 #include "config.hpp"              // 包含基本类型定义，如 int_t、uint_t 等
+#include <cstdlib>
 // ------------------------------------------------------------------
 // 类型定义
 // ------------------------------------------------------------------
@@ -195,6 +196,13 @@ bool checkGapCigarQuality(const Cigar_t& cigar,
     size_t qry_len,
     double min_identity);
 
+bool alignmentRowsPreferredToUnaligned(const std::string& reference,
+                                      const std::string& query);
+bool alignmentCigarPreferredToUnaligned(
+    const std::string& reference,
+    const std::string& query,
+    const Cigar_t& cigar);
+
 struct AlignCount {
     size_t ref_bases = 0;
     size_t query_bases = 0;
@@ -219,16 +227,69 @@ struct KSW2AlignConfig {
     int flag = 0;      // 默认使用全替换矩阵
 };
 
+inline constexpr int KSW2_SCORE_SCALE = 10;
+inline constexpr int KSW2_GAP_OPEN_PENALTY = 40;
+inline constexpr int KSW2_GAP_EXTEND_PENALTY = 3;
+inline int ksw2GapOpenPenalty() {
+    static const int value = [] {
+        const char* configured = std::getenv("RAMAX_KSW2_GAP_OPEN");
+        return configured ? std::atoi(configured) : KSW2_GAP_OPEN_PENALTY;
+    }();
+    return value;
+}
+
+inline int ksw2GapExtendPenalty() {
+    static const int value = [] {
+        const char* configured = std::getenv("RAMAX_KSW2_GAP_EXTEND");
+        return configured ? std::atoi(configured) : KSW2_GAP_EXTEND_PENALTY;
+    }();
+    return value;
+}
+
+inline int ksw2ScoreScale() {
+    static const int value = [] {
+        const char* configured = std::getenv("RAMAX_KSW2_SCORE_SCALE");
+        return configured ? std::atoi(configured) : KSW2_SCORE_SCALE;
+    }();
+    return value;
+}
+
+inline int ksw2MismatchScale() {
+    static const int value = [] {
+        const char* configured = std::getenv("RAMAX_KSW2_MISMATCH_SCALE");
+        return configured ? std::atoi(configured) : ksw2ScoreScale();
+    }();
+    return value;
+}
+
+
 static int8_t dna5_simd_mat[25];
 static void init_simd_mat() {
-    static bool done = false;
-    if (done) return;
-    const int8_t MATCH = 2, MISMATCH = -3, AMBIG = 0;   // N 给 0 分
-    for (int i = 0; i < 5; ++i)
-        for (int j = 0; j < 5; ++j)
-            dna5_simd_mat[i * 5 + j] =
-            (i == 4 || j == 4) ? AMBIG : (i == j ? MATCH : MISMATCH);
-    done = true;
+    static const bool initialized = [] {
+        const int scale = ksw2ScoreScale();
+        const int mismatch_scale = ksw2MismatchScale();
+        const char* transition_configured =
+            std::getenv("RAMAX_KSW2_TRANSITION_PENALTY");
+        const char* transversion_configured =
+            std::getenv("RAMAX_KSW2_TRANSVERSION_PENALTY");
+        for (int i = 0; i < 5; ++i) {
+            for (int j = 0; j < 5; ++j) {
+                const int score = HOXD70[i][j];
+                const int divisor = score >= 0 ? scale : mismatch_scale;
+                int scaled = (score +
+                    (score >= 0 ? divisor / 2 : -divisor / 2)) / divisor;
+                if (score < 0 && std::abs(score) < 50 &&
+                    transition_configured) {
+                    scaled = -std::atoi(transition_configured);
+                } else if (score < 0 && transversion_configured) {
+                    scaled = -std::atoi(transversion_configured);
+                }
+                dna5_simd_mat[i * 5 + j] = static_cast<int8_t>(scaled);
+            }
+        }
+        return true;
+    }();
+    (void)initialized;
 }
 
 //------------------------------------------- 带宽估计
@@ -268,8 +329,8 @@ inline KSW2AlignConfig makeTurboKSW2Config(int qlen, int tlen,
     return {
         .mat = dna5_simd_mat,                         // A/C/G/T/N 5×5
         .alphabet_size = 5,
-        .gap_open = 5,                                     // -8 -1 model
-        .gap_extend = 2,
+        .gap_open = ksw2GapOpenPenalty(),
+        .gap_extend = ksw2GapExtendPenalty(),
         .end_bonus = 0,
         .zdrop = 100,
         .band_width = auto_band(qlen, tlen, indel_rate),     // 根据 indel 率自动
@@ -295,8 +356,8 @@ inline KSW2AlignConfig makeTurboKSW2Config2(int qlen, int tlen,
     return {
         .mat = dna5_simd_mat,                         // A/C/G/T/N 5×5
         .alphabet_size = 5,
-        .gap_open = 5,                                     // -8 -1 model
-        .gap_extend = 2,
+        .gap_open = ksw2GapOpenPenalty(),
+        .gap_extend = ksw2GapExtendPenalty(),
         .end_bonus = 0,
         .zdrop = -1,
         .band_width = auto_band(qlen, tlen, indel_rate),     // 根据 indel 率自动
@@ -322,8 +383,8 @@ inline KSW2AlignConfig makeTurboKSW2Config3(int qlen, int tlen,
     return {
         .mat = dna5_simd_mat,                         // A/C/G/T/N 5×5
         .alphabet_size = 5,
-        .gap_open = 5,                                     // -8 -1 model
-        .gap_extend = 2,
+        .gap_open = ksw2GapOpenPenalty(),
+        .gap_extend = ksw2GapExtendPenalty(),
         .end_bonus = 0,
         .zdrop = -1,
         .band_width = auto_band(qlen, tlen, indel_rate),     // 根据 indel 率自动
@@ -331,15 +392,11 @@ inline KSW2AlignConfig makeTurboKSW2Config3(int qlen, int tlen,
     };
 }
 
-KSW2AlignConfig makeDefaultKSW2Config();
 
 Cigar_t globalAlignKSW2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2_2(const std::string& ref, const std::string& query);
-// Cigar_t globalAlignWFA2(const std::string& ref, const std::string& query);
-//
-// Cigar_t extendAlignWFA2(const std::string& ref,
-//     const std::string& query, int zdrop = 200);
-
+Cigar_t globalAlignKSW2BandedPublic(const std::string& ref,
+                                    const std::string& query);
 Cigar_t extendAlignKSW2(const std::string& ref,
     const std::string& query,
     int zdrop = 200);
@@ -352,37 +409,30 @@ uint_t mergeAlignmentByRef(
     std::unordered_map<ChrName, std::string>& seqs,
     const std::unordered_map<ChrName, Cigar_t>& cigars);
 
+bool alignSequencesWithExternalMsa(
+    const std::string& executable,
+    std::unordered_map<ChrName, std::string>& sequences);
+
+void configureExternalInsertionMsa(const std::string& executable);
+
+// Configure the export-time repair for homologous insertions whose CIGAR
+// anchors differ by only a few reference bases.  The 10 bp insertion and
+// 5 bp anchor-distance thresholds are intentionally fixed internally; only
+// the existing realignment span and executable are supplied by the caller.
+void configureCrossAnchorInsertionRepair(
+    const std::string& executable,
+    uint_t maximum_window_span);
+
+void logCrossAnchorInsertionRepairStats();
+
 struct InsertInfo {
     bool aligned = false;
     uint_t total_length = 0;
 	ChrName ref_name = ""; // 参考序列名称
     std::unordered_map<ChrName, std::string> seqs = {}; // key -> CIGAR (query 侧)
 
-    void alignSeqs() {
-		if (aligned) return; // 已经对齐过了
-		if (seqs.empty()) return; // 没有序列可对齐
-
-        size_t max_len = 0;
-        ChrName longest_key;
-        for (const auto& [key, s] : seqs) {
-            if (s.size() > max_len) {
-                max_len = s.size();
-                longest_key = key;
-            }
-        }
-        ref_name = longest_key;
-
-        std::unordered_map<ChrName, Cigar_t> cigars;
-        for (const auto& [key, s] : seqs) {
-			if (key == ref_name) continue;
-			cigars[key] = globalAlignKSW2(seqs[ref_name], s);
-        }
-        total_length = mergeAlignmentByRef(ref_name, seqs, cigars);
-        aligned = true;
-    }
+    void alignSeqs();
 };
 
 using RefAlignInfo = std::map<uint_t, InsertInfo>;
 #endif
-
-
