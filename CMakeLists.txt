@@ -101,38 +101,29 @@ endif()
 # Local builds can opt into native CPU tuning for better performance. Conda
 # packages disable this in recipe/build.sh so the binary remains portable.
 option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
+option(RAMAX_EMBED_TOOL_PATHS
+    "Embed resolved external-tool paths in the RaMAx binary" ON)
+set(RAMAX_TOOL_BIN_DIR "${CMAKE_SOURCE_DIR}/bin" CACHE PATH
+    "Directory containing RaMAx external tools for source builds")
+if(NOT RAMAX_TOOL_BIN_DIR OR NOT IS_DIRECTORY "${RAMAX_TOOL_BIN_DIR}")
+    message(FATAL_ERROR
+        "RAMAX_TOOL_BIN_DIR is not an existing directory: ${RAMAX_TOOL_BIN_DIR}")
+endif()
+get_filename_component(RAMAX_RESOLVED_TOOL_BIN_DIR
+    "${RAMAX_TOOL_BIN_DIR}" REALPATH)
+message(STATUS
+    "RaMAx external-tool directory: ${RAMAX_RESOLVED_TOOL_BIN_DIR}")
 
 set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
-    "Existing minipoa executable; empty searches PATH")
+    "Explicit minipoa executable; empty uses the shared tool lookup order")
 set(RAMAX_MASH_EXECUTABLE "" CACHE FILEPATH
-    "Mash 2.3 executable; empty searches PATH")
+    "Explicit Mash 2.3 executable; empty uses the shared tool lookup order")
 set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
-    "Samtools 1.24 executable; empty searches PATH")
+    "Explicit Samtools 1.23.1 executable; empty uses shared tool lookup")
 set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
-    "PGGB-compatible wfmash v0.14.0-0-g517e1bc executable; empty searches PATH")
+    "Explicit PGGB-compatible wfmash v0.14 executable; empty uses shared lookup")
 set(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE "" CACHE FILEPATH
-    "halAppendCactusSubtree executable; empty searches PATH")
-
-if(RAMAX_MASH_EXECUTABLE)
-    if(NOT EXISTS "${RAMAX_MASH_EXECUTABLE}")
-        message(FATAL_ERROR
-            "RAMAX_MASH_EXECUTABLE does not exist: ${RAMAX_MASH_EXECUTABLE}")
-    endif()
-    get_filename_component(RAMAX_RESOLVED_MASH
-        "${RAMAX_MASH_EXECUTABLE}" REALPATH)
-    message(STATUS "Using configured Mash: ${RAMAX_RESOLVED_MASH}")
-else()
-    find_program(RAMAX_SYSTEM_MASH NAMES mash)
-    if(RAMAX_SYSTEM_MASH)
-        set(RAMAX_RESOLVED_MASH "${RAMAX_SYSTEM_MASH}")
-        message(STATUS "Using Mash from PATH: ${RAMAX_RESOLVED_MASH}")
-    else()
-        set(RAMAX_RESOLVED_MASH "")
-        message(STATUS
-            "Mash was not found during configuration; runtime alignment will "
-            "require Mash 2.3 next to ramax or in PATH")
-    endif()
-endif()
+    "Explicit halAppendCactusSubtree executable; empty uses shared lookup")
 
 function(resolve_ramax_tool configured_variable tool_name display_name output_variable)
     if(${configured_variable})
@@ -143,21 +134,34 @@ function(resolve_ramax_tool configured_variable tool_name display_name output_va
         get_filename_component(_resolved "${${configured_variable}}" REALPATH)
         message(STATUS "Using configured ${display_name}: ${_resolved}")
     else()
-        find_program(_system_tool NAMES "${tool_name}" NO_CACHE)
-        if(_system_tool)
-            set(_resolved "${_system_tool}")
-            message(STATUS "Using ${display_name} from PATH: ${_resolved}")
-        else()
-            set(_resolved "")
+        set(_resolved "")
+        set(_bundled_candidate
+            "${RAMAX_RESOLVED_TOOL_BIN_DIR}/${tool_name}")
+        if(EXISTS "${_bundled_candidate}")
             message(STATUS
-                "${display_name} was not found during configuration; runtime "
-                "alignment will require it next to ramax or in PATH")
+                "Using ${display_name} from RAMAX_TOOL_BIN_DIR: "
+                "${_bundled_candidate}")
+        else()
+            find_program(_system_tool NAMES "${tool_name}" NO_CACHE)
+            if(_system_tool)
+                message(WARNING
+                    "${display_name} is absent from RAMAX_TOOL_BIN_DIR; it is "
+                    "currently available through PATH at ${_system_tool}, but "
+                    "that PATH result will not be embedded")
+            else()
+                message(WARNING
+                    "${display_name} is absent from RAMAX_TOOL_BIN_DIR and "
+                    "PATH; it must be provided before the corresponding "
+                    "runtime stage")
+            endif()
         endif()
     endif()
     set(${output_variable} "${_resolved}" PARENT_SCOPE)
 endfunction()
 
-resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.24"
+resolve_ramax_tool(RAMAX_MASH_EXECUTABLE mash "Mash 2.3"
+                   RAMAX_RESOLVED_MASH)
+resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.23.1"
                    RAMAX_RESOLVED_SAMTOOLS)
 resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
                    RAMAX_RESOLVED_WFMASH)
@@ -165,26 +169,26 @@ resolve_ramax_tool(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE
                    halAppendCactusSubtree "halAppendCactusSubtree"
                    RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE)
 
-if(RAMAX_MINIPOA_EXECUTABLE)
-    if(NOT EXISTS "${RAMAX_MINIPOA_EXECUTABLE}")
-        message(FATAL_ERROR
-            "RAMAX_MINIPOA_EXECUTABLE does not exist: "
-            "${RAMAX_MINIPOA_EXECUTABLE}")
-    endif()
-    get_filename_component(RAMAX_RESOLVED_MINIPOA
-        "${RAMAX_MINIPOA_EXECUTABLE}" REALPATH)
-    message(STATUS "Using configured minipoa: ${RAMAX_RESOLVED_MINIPOA}")
-else()
-    find_program(RAMAX_SYSTEM_MINIPOA NAMES minipoa)
-    if(RAMAX_SYSTEM_MINIPOA)
-        set(RAMAX_RESOLVED_MINIPOA "${RAMAX_SYSTEM_MINIPOA}")
-        message(STATUS "Using minipoa from PATH: ${RAMAX_RESOLVED_MINIPOA}")
-    else()
-        set(RAMAX_RESOLVED_MINIPOA "")
-        message(STATUS
-            "minipoa was not found during configuration; install it in PATH "
-            "or set RAMAX_MINIPOA_EXECUTABLE before using MSA-based options")
-    endif()
+resolve_ramax_tool(RAMAX_MINIPOA_EXECUTABLE minipoa "minipoa"
+                   RAMAX_RESOLVED_MINIPOA)
+
+set(RAMAX_COMPILED_MINIPOA "${RAMAX_RESOLVED_MINIPOA}")
+set(RAMAX_COMPILED_MASH "${RAMAX_RESOLVED_MASH}")
+set(RAMAX_COMPILED_SAMTOOLS "${RAMAX_RESOLVED_SAMTOOLS}")
+set(RAMAX_COMPILED_WFMASH "${RAMAX_RESOLVED_WFMASH}")
+set(RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE
+    "${RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE}")
+set(RAMAX_COMPILED_TOOL_BIN_DIR "${RAMAX_RESOLVED_TOOL_BIN_DIR}")
+if(NOT RAMAX_EMBED_TOOL_PATHS)
+    set(RAMAX_COMPILED_MINIPOA "")
+    set(RAMAX_COMPILED_MASH "")
+    set(RAMAX_COMPILED_SAMTOOLS "")
+    set(RAMAX_COMPILED_WFMASH "")
+    set(RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE "")
+    set(RAMAX_COMPILED_TOOL_BIN_DIR "")
+    message(STATUS
+        "External-tool paths will not be embedded; runtime lookup uses the "
+        "ramax executable directory and PATH")
 endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build bundled libraries statically" FORCE)
@@ -321,11 +325,12 @@ add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
 configure_rama_target(ramax_core)
 add_dependencies(ramax_core hal_library)
 target_compile_definitions(ramax_core PRIVATE
-    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_RESOLVED_MINIPOA}"
-    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_RESOLVED_MASH}"
-    RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_RESOLVED_SAMTOOLS}"
-    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_RESOLVED_WFMASH}"
-    RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH="${RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE}")
+    RAMAX_TOOL_BIN_CONFIGURED_PATH="${RAMAX_COMPILED_TOOL_BIN_DIR}"
+    RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_COMPILED_MINIPOA}"
+    RAMAX_MASH_CONFIGURED_PATH="${RAMAX_COMPILED_MASH}"
+    RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_COMPILED_SAMTOOLS}"
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_COMPILED_WFMASH}"
+    RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH="${RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
