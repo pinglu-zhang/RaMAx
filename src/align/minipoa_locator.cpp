@@ -9,6 +9,9 @@
 #ifndef RAMAX_MINIPOA_CONFIGURED_PATH
 #define RAMAX_MINIPOA_CONFIGURED_PATH ""
 #endif
+#ifndef RAMAX_TOOL_BIN_CONFIGURED_PATH
+#define RAMAX_TOOL_BIN_CONFIGURED_PATH ""
+#endif
 
 namespace RaMesh::Alignment {
 namespace {
@@ -54,6 +57,12 @@ std::filesystem::path searchPath() {
 std::filesystem::path locateMinipoaExecutable() {
     const std::filesystem::path configured(RAMAX_MINIPOA_CONFIGURED_PATH);
     if (isExecutable(configured)) return configured;
+    const std::filesystem::path configured_directory(
+        RAMAX_TOOL_BIN_CONFIGURED_PATH);
+    if (!configured_directory.empty()) {
+        const auto candidate = configured_directory / "minipoa";
+        if (isExecutable(candidate)) return candidate;
+    }
     const auto sibling = executableDirectory() / "minipoa";
     if (isExecutable(sibling)) return sibling;
     return searchPath();

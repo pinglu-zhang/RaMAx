@@ -43,24 +43,52 @@ Before creating a work directory or reading input genomes, RaMAx requires
 `minipoa`, PGGB-compatible wfmash `v0.14.0-0-g517e1bc`, and Mash 2.3.
 `halAppendCactusSubtree` is required only when the output list contains HAL;
 otherwise a missing HAL helper produces a warning and the run continues.
-The lookup order is an explicit CMake path, the directory containing the
-running `ramax` executable, then `PATH`. Configure explicit paths with:
+The source build uses `RAMAX_TOOL_BIN_DIR` as a shared external-tool
+directory. It defaults to the source tree's `bin/` and expects `mash`,
+`minipoa`, `wfmash`, `samtools`, and `halAppendCactusSubtree` there:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DRAMAX_TOOL_BIN_DIR="$PWD/bin"
+cmake --build build --parallel 16
+```
+
+The explicit `RAMAX_TOOL_BIN_DIR` argument can be omitted for the standard
+source layout. Runtime lookup order is a per-tool CMake override, the shared
+tool directory, the directory containing the running `ramax` executable,
+then `PATH`. Per-tool overrides remain available:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
   -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
   -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
-  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash
+  -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash \
+  -DRAMAX_SAMTOOLS_EXECUTABLE=/opt/samtools/bin/samtools
 ```
+
+To move a source-built bundle to another machine, place `ramax` and the five
+tools in the same destination `bin/`; sibling lookup remains available if the
+original configured directory no longer exists. CMake records tool locations
+but does not make dynamically linked executables self-contained. A Conda
+executable must retain its complete prefix/library closure or be reinstalled
+on the destination. The bundled `halAppendCactusSubtree` is static and can be
+copied directly.
 
 Missing unconditional startup dependencies are reported together and RaMAx
 exits before creating or modifying the work directory. A missing HAL helper
 also stops HAL runs before normal work-directory initialization. `ramax --help` and
 `ramax --version` remain available without these tools. Mash and wfmash
-retain their strict version checks before use. Samtools/HTSlib 1.24 remains
+retain their strict version checks before use. Samtools/HTSlib 1.23.1 remains
 required by the wfmash routing stage and can be configured with
 `RAMAX_SAMTOOLS_EXECUTABLE`.
+The official Conda and Docker packages install minipoa 1.4.2 from the
+`malab` channel and bundle the validated cactus-bin-v2.9.9
+`halAppendCactusSubtree` helper.
+Conda builds set `RAMAX_EMBED_TOOL_PATHS=OFF`; the installed executable finds
+all dependencies beside itself in the active environment's `$PREFIX/bin`
+without retaining conda-build's temporary path.
 
 After selecting the first reference, RaMAx records whole-genome Mash distances
 using `k=31` and sketch size 20,000 before starting the legacy aligner.
