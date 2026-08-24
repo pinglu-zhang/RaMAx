@@ -31,7 +31,7 @@ removes a query from the first-round FM-index path. Failed wfmash queries fall
 back to RaMAx, and all later rounds use the original RaMAx algorithm. The
 reserved `--far-distance` default is `0.02` and does not yet affect routing.
 RaMAx requires Mash 2.3, PGGB-compatible wfmash
-`v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.24. All wfmash
+`v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.23.1. All wfmash
 FAI files are produced by `samtools faidx`, including indexes for multi-FASTA
 inputs and collision-safe query views. wfmash 0.14 has no persistent reference
 index interface, so independent first-round pairs rebuild the reference index.

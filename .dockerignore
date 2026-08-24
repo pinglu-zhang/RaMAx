@@ -2,10 +2,15 @@
 .github
 .gitmodules
 
-bin
+bin/*
+!bin/halAppendCactusSubtree
 benchmark
 recipe
 scripts
+tests
+package
+packaging-sources
+wfmash_router_integration_artifacts
 
 build
 build-*
