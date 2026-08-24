@@ -3,14 +3,14 @@
 ## What restart means
 
 RaMAx 1.0.7 uses `--restart` to reuse expensive input preparation and
-FM-index caches. It is not an alignment checkpoint system.
+suffix-array index caches. It is not an alignment checkpoint system.
 
 Reusable state:
 
 - copied or downloaded raw FASTA;
 - normalized alignment FASTA;
 - HAL softmask sidecars;
-- FM-index main, sampled-SA, and wavelet-tree files.
+- native suffix-array index files and their completion markers.
 
 Anchor search, clustering, extension, DP, Block construction, graph
 optimization, and every requested export always run again from the beginning.
@@ -41,6 +41,7 @@ Saved values are the defaults for restart. Explicit options override them:
 ramax --restart -w /data/project/work/ramax-run \
   -t 24 \
   --min_anchor_length 30 \
+  --sa-sampling-rate 1 \
   -o /data/project/results/retry.maf \
   -o /data/project/results/retry.paf \
   --paf-mode connected
@@ -60,7 +61,7 @@ and becomes the default for a later restart.
 
 ## Configuration and input identity
 
-`<work>/config.json` uses `schema_version: 5` and contains the complete output
+`<work>/config.json` uses `schema_version: 6` and contains the complete output
 list and all public alignment, graph, export, performance, and logging values.
 `<work>/input_manifest.json` records the seqfile, species mappings, and the
 size/mtime of local inputs.
@@ -71,21 +72,22 @@ to start with a new work directory. A valid cached URL snapshot can be reused
 without contacting the URL; the URL is accessed again only when that snapshot
 is absent or invalid.
 
-RaMAx reads schema-1 through schema-4 work directories. Parameters absent from
-older schemas use their compatibility defaults; in particular GFA profile
-migrates to `exact`, and schemas before 4 migrate GFA version to `1.1`. Legacy schema-1 `outputs.json`,
+RaMAx reads schema-1 through schema-5 work directories. Parameters absent from
+older schemas use their compatibility defaults; in particular schema 1-5
+workdirs migrate to `--sa-sampling-rate 1`, GFA profile migrates to `exact`,
+and schemas before 4 migrate GFA version to `1.1`. Legacy schema-1 `outputs.json`,
 `paf_mode.txt`, and `accurate_skip_threshold.txt` are read when present.
 Existing legacy caches are trusted once, completion metadata is generated, and
-the effective configuration is migrated to schema 5 with a warning.
+the effective configuration is migrated to schema 6 with a warning.
 
 ## Cache validation and lifecycle
 
-New raw, clean, softmask, and FM-index artifacts are written through partial
+New raw, clean, softmask, and suffix-array artifacts are written through partial
 files and published only after successful completion. Their completion markers
 record cache format, source identity, file size, and mtime. A missing,
 incomplete, changed, or unloadable cache item is rebuilt independently.
 
-FM indexes are still created lazily at the beginning of each reference round.
+Suffix-array indexes are still created lazily at the beginning of each reference round. The persisted `--sa-sampling-rate` value must be `1`; other values are rejected before index construction. The hybrid builder provenance and 1024 MiB threshold are part of each index completion marker, so caches created by older builders are rebuilt.
 An index already completed by an earlier attempt is reused; missing later-round
 indexes are built when reached. `--slow-build` affects only indexes that need to
 be built or rebuilt.

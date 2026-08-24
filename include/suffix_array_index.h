@@ -14,7 +14,8 @@
 class Suffix_Array_Index {
 public:
     Suffix_Array_Index(SpeciesName species_name,
-        SeqPro::ManagerVariant& fasta_manager);
+        SeqPro::ManagerVariant& fasta_manager,
+        uint_t sampling_rate = 1);
 
     bool buildIndex(FilePath output_path, bool fast_mode, uint_t thread_count);
 
@@ -73,6 +74,12 @@ public:
     bool saveToFile(const std::string& filename) const;
     bool loadFromFile(const std::string& filename);
 
+    uint_t samplingRate() const noexcept { return sampling_rate; }
+    uint_t textSize() const noexcept { return text_size; }
+    uint_t storedSuffixCount() const noexcept {
+        return stored_suffix_count;
+    }
+
     SpeciesName species_name;
     SeqPro::ManagerVariant& fasta_manager;
 
@@ -128,6 +135,9 @@ private:
 
     std::string reverse_text;
     bool coordinates_are_64_bit{false};
+    uint_t text_size{0};
+    uint_t stored_suffix_count{0};
+    uint_t sampling_rate{1};
     std::vector<uint32_t> suffix_array_32;
     std::vector<uint32_t> inverse_suffix_array_32;
     std::vector<uint32_t> lcp_32;
@@ -135,7 +145,6 @@ private:
     std::vector<uint64_t> inverse_suffix_array_64;
     std::vector<uint64_t> lcp_64;
     uint_t total_size{0};
-    uint_t suffix_count{0};
     std::vector<uint64_t> excluded_reverse_positions;
     std::vector<SAInterval> prefix_directory;
 };

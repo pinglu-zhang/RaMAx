@@ -81,71 +81,88 @@ FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVa
 	// index_dir的路径加上prefix的前缀加上fasta_manager.fasta_path_的扩展名
 	FilePath output_path = ref_index_path / (prefix + std::filesystem::path(fasta_path_str).extension().string());
 	const std::string index_source_identity = fasta_path_str +
-		"|suffix-array-v2|fast-build=" +
-		(fast_build ? "1" : "0");
+		"|suffix-array-v3|builder=hybrid-divsufsort-caps-v1|threshold-mib=1024|sampling-rate=1" +
+		std::string("|fast-build=") + (fast_build ? "1" : "0");
 
-	ref_index.emplace(prefix, ref_fasta_manager_);
+	ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
 
 	FilePath idx_file_path = ref_index_path / (prefix + "." + SAINDEX_EXTENSION);
 	const FilePath marker_path =
 		RaMAxCache::completionMarkerPath(idx_file_path);
 
-	spdlog::info("Suffix-array indexing with prefix: {}, index path: {}", prefix, ref_index_path.string());
+	spdlog::info(
+		"Suffix-array indexing with prefix: {}, index path: {}, builder: hybrid-divsufsort-caps, sampling rate: {}",
+		prefix, ref_index_path.string(), sa_sampling_rate);
 
 	const auto load_existing = [&]() -> bool {
 		try {
 			if (!ref_index->loadFromFile(idx_file_path.string())) return false;
+			if (ref_index->samplingRate() != sa_sampling_rate) {
+				throw std::runtime_error(
+					"cached sampling rate " +
+					std::to_string(ref_index->samplingRate()) +
+					" does not match requested rate " +
+					std::to_string(sa_sampling_rate));
+			}
 			++index_cache_counters->reused;
-			spdlog::info("[cache] suffix-array index reused for {}: {}",
-				prefix, idx_file_path.string());
+			spdlog::info(
+				"[cache] suffix-array index reused for {}: {} (K={}, rows={})",
+				prefix, idx_file_path.string(), ref_index->samplingRate(),
+				ref_index->storedSuffixCount());
 			return true;
 		} catch (const std::exception& error) {
-			spdlog::warn("[cache] suffix-array index load failed for {}: {}; rebuilding",
+			spdlog::warn(
+				"[cache] suffix-array index load failed for {}: {}; rebuilding",
 				prefix, error.what());
-			ref_index.emplace(prefix, ref_fasta_manager_);
+			ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
 			return false;
 		}
 	};
 
 	bool loaded = false;
 	if (RaMAxCache::markerMatches(
-			marker_path, "suffix-array-index", 2, index_source_identity, false,
+			marker_path, "suffix-array-index", 3, index_source_identity, false,
 			FilePath(fasta_path_str), idx_file_path)) {
 		loaded = load_existing();
-	} else if (trust_legacy_cache &&
-			   std::filesystem::is_regular_file(idx_file_path) &&
-			   !std::filesystem::exists(marker_path)) {
-		loaded = load_existing();
-		if (loaded) {
-			RaMAxCache::writeMarker(
-				marker_path, "suffix-array-index", 2, index_source_identity, false,
-				FilePath(fasta_path_str), idx_file_path);
-			spdlog::warn("[cache] trusted unmarked suffix-array index for {}", prefix);
-		}
 	}
 
 	if (!loaded) {
-		ref_index.emplace(prefix, ref_fasta_manager_);
+		ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
 		FilePath partial = idx_file_path;
 		partial += ".partial";
 		RaMAxCache::removeIfPresent(partial);
 		try {
 			ref_index->buildIndex(output_path, fast_build, thread_num);
 			if (!ref_index->saveToFile(partial.string())) {
-				throw std::runtime_error("Failed to save suffix-array index: " + partial.string());
+				throw std::runtime_error(
+					"Failed to save suffix-array index: " + partial.string());
+			}
+			// Release the build-time arrays and validate the exact serialized
+			// artifact before publication.  The loaded index becomes the one used
+			// by anchor search, so validation does not double resident memory.
+			ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
+			if (!ref_index->loadFromFile(partial.string()) ||
+				ref_index->samplingRate() != sa_sampling_rate) {
+				throw std::runtime_error(
+					"Failed to validate serialized suffix-array index");
 			}
 			RaMAxCache::publishFile(partial, idx_file_path);
 			RaMAxCache::writeMarker(
-				marker_path, "suffix-array-index", 2, index_source_identity, false,
+				marker_path, "suffix-array-index", 3, index_source_identity, false,
 				FilePath(fasta_path_str), idx_file_path);
 		} catch (...) {
 			RaMAxCache::removeIfPresent(partial);
 			throw;
 		}
 		++index_cache_counters->rebuilt;
-		spdlog::info("[cache] suffix-array index rebuilt for {}: {}",
-			prefix, idx_file_path.string());
+		spdlog::info(
+			"[cache] suffix-array index rebuilt for {}: {} (K={}, rows={}, "
+			"file-bytes={})",
+			prefix, idx_file_path.string(), ref_index->samplingRate(),
+			ref_index->storedSuffixCount(),
+			std::filesystem::file_size(idx_file_path));
 	}
+
 	spdlog::info("Suffix-array indexing finished, index path: {}", ref_index_path.string());
 
 	return ref_index_path;

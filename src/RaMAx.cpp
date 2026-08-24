@@ -25,7 +25,7 @@
 // ------------------------------------------------------------------
 struct CommonArgs {
 
-    uint32_t schema_version = 5;
+    uint32_t schema_version = 6;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -67,6 +67,7 @@ struct CommonArgs {
     bool allow_MEM = false;                     // 是否允许使用 MEM（Maximal Exact Match）
     bool fast_build = true;                     // 是否启用快速索引构建模式
     SeqPro::Length sampling_interval = 32;      // 索引采样间隔（影响速度与内存）
+    uint_t sa_sampling_rate = 1;                // 后缀数组文本位置采样率（1=完整 SA）
     uint_t min_span = 65;                       // 锚点或匹配的最小跨度阈值
     double near_distance = 0.01;                // 首轮 d < 此值使用 wfmash
     double far_distance = 0.02;                 // 预留的远缘物种阈值
@@ -133,6 +134,7 @@ struct CommonArgs {
             CEREAL_NVP(allow_MEM),
             CEREAL_NVP(fast_build),
             CEREAL_NVP(sampling_interval),
+            CEREAL_NVP(sa_sampling_rate),
             CEREAL_NVP(min_span),
             CEREAL_NVP(near_distance),
             CEREAL_NVP(far_distance),
@@ -155,7 +157,7 @@ struct CommonArgs {
 };
 
 namespace {
-constexpr uint32_t CONFIG_SCHEMA_VERSION = 5;
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 6;
 constexpr uint32_t OUTPUTS_SCHEMA_VERSION = 1;
 constexpr const char* OUTPUTS_FILE = "outputs.json";
 constexpr const char* INPUT_MANIFEST_FILE = "input_manifest.json";
@@ -434,6 +436,79 @@ struct LegacyCommonArgsV4 {
     }
 };
 
+
+// Exact reader for schema 5, before suffix-array text-position sampling
+// became a persistent restart parameter.
+struct LegacyCommonArgsV5 {
+    uint32_t schema_version{5};
+    FilePath input_path;
+    FilePath output_path;
+    std::vector<FilePath> output_paths;
+    FilePath work_dir_path;
+    uint_t chunk_size{10000000};
+    uint_t overlap_size{0};
+    uint_t min_anchor_length{20};
+    uint_t max_anchor_frequency{50};
+    int thread_num{static_cast<int>(std::thread::hardware_concurrency())};
+    MultipleGenomeOutputFormat output_format{MultipleGenomeOutputFormat::UNKNOWN};
+    std::string paf_mode{"connected"};
+    std::string gfa_version{"1.1"};
+    std::string gfa_profile{"exact"};
+    bool trust_legacy_cache{false};
+    bool enable_repeat_masking{false};
+    SearchMode search_mode{ACCURATE_SEARCH};
+    uint_t accurate_skip_threshold{10000};
+    bool allow_MEM{false};
+    bool fast_build{true};
+    SeqPro::Length sampling_interval{32};
+    uint_t min_span{65};
+    double near_distance{0.01};
+    double far_distance{0.02};
+    std::string log_level{"info"};
+    bool verbose{false};
+    bool quiet{false};
+    std::string root_name;
+    std::string ref_name;
+    bool one_round{false};
+    bool merge_exact_contiguous_blocks{true};
+    uint_t merge_query_gap_max{100};
+    bool realign_single_missing_species{true};
+    uint_t species_mismatch_realign_max_span{3000};
+    uint_t species_mismatch_zero_gap_max_span{200};
+    bool repair_structural_breaks{true};
+    uint_t structural_break_max_span{1000};
+    bool repair_short_blocks{true};
+
+    template<class Archive>
+    void serialize(Archive& archive) {
+        archive(
+            CEREAL_NVP(schema_version), CEREAL_NVP(input_path),
+            CEREAL_NVP(output_path), CEREAL_NVP(output_paths),
+            CEREAL_NVP(work_dir_path), CEREAL_NVP(chunk_size),
+            CEREAL_NVP(overlap_size), CEREAL_NVP(min_anchor_length),
+            CEREAL_NVP(max_anchor_frequency), CEREAL_NVP(thread_num),
+            CEREAL_NVP(output_format), CEREAL_NVP(paf_mode),
+            CEREAL_NVP(gfa_version), CEREAL_NVP(gfa_profile),
+            CEREAL_NVP(trust_legacy_cache),
+            CEREAL_NVP(enable_repeat_masking), CEREAL_NVP(search_mode),
+            CEREAL_NVP(accurate_skip_threshold), CEREAL_NVP(allow_MEM),
+            CEREAL_NVP(fast_build), CEREAL_NVP(sampling_interval),
+            CEREAL_NVP(min_span), CEREAL_NVP(near_distance),
+            CEREAL_NVP(far_distance), CEREAL_NVP(log_level),
+            CEREAL_NVP(verbose), CEREAL_NVP(quiet),
+            CEREAL_NVP(root_name), CEREAL_NVP(ref_name),
+            CEREAL_NVP(one_round),
+            CEREAL_NVP(merge_exact_contiguous_blocks),
+            CEREAL_NVP(merge_query_gap_max),
+            CEREAL_NVP(realign_single_missing_species),
+            CEREAL_NVP(species_mismatch_realign_max_span),
+            CEREAL_NVP(species_mismatch_zero_gap_max_span),
+            CEREAL_NVP(repair_structural_breaks),
+            CEREAL_NVP(structural_break_max_span),
+            CEREAL_NVP(repair_short_blocks));
+    }
+};
+
 struct InputIdentityRecord {
     std::string species;
     std::string source;
@@ -693,6 +768,53 @@ CommonArgs convertSchema4Config(const LegacyCommonArgsV4& legacy) {
     return args;
 }
 
+
+CommonArgs convertSchema5Config(const LegacyCommonArgsV5& legacy) {
+    CommonArgs args;
+    args.schema_version = CONFIG_SCHEMA_VERSION;
+    args.input_path = legacy.input_path;
+    args.output_path = legacy.output_path;
+    args.output_paths = legacy.output_paths;
+    args.work_dir_path = legacy.work_dir_path;
+    args.chunk_size = legacy.chunk_size;
+    args.overlap_size = legacy.overlap_size;
+    args.min_anchor_length = legacy.min_anchor_length;
+    args.max_anchor_frequency = legacy.max_anchor_frequency;
+    args.thread_num = legacy.thread_num;
+    args.output_format = legacy.output_format;
+    args.paf_mode = legacy.paf_mode;
+    args.gfa_version = legacy.gfa_version;
+    args.gfa_profile = legacy.gfa_profile;
+    args.trust_legacy_cache = legacy.trust_legacy_cache;
+    args.enable_repeat_masking = legacy.enable_repeat_masking;
+    args.search_mode = legacy.search_mode;
+    args.accurate_skip_threshold = legacy.accurate_skip_threshold;
+    args.allow_MEM = legacy.allow_MEM;
+    args.fast_build = legacy.fast_build;
+    args.sampling_interval = legacy.sampling_interval;
+    args.sa_sampling_rate = 1;
+    args.min_span = legacy.min_span;
+    args.near_distance = legacy.near_distance;
+    args.far_distance = legacy.far_distance;
+    args.log_level = legacy.log_level;
+    args.verbose = legacy.verbose;
+    args.quiet = legacy.quiet;
+    args.root_name = legacy.root_name;
+    args.ref_name = legacy.ref_name;
+    args.one_round = legacy.one_round;
+    args.merge_exact_contiguous_blocks = legacy.merge_exact_contiguous_blocks;
+    args.merge_query_gap_max = legacy.merge_query_gap_max;
+    args.realign_single_missing_species = legacy.realign_single_missing_species;
+    args.species_mismatch_realign_max_span =
+        legacy.species_mismatch_realign_max_span;
+    args.species_mismatch_zero_gap_max_span =
+        legacy.species_mismatch_zero_gap_max_span;
+    args.repair_structural_breaks = legacy.repair_structural_breaks;
+    args.structural_break_max_span = legacy.structural_break_max_span;
+    args.repair_short_blocks = legacy.repair_short_blocks;
+    return args;
+}
+
 void validateGfaVersion(const CommonArgs& args) {
     if (args.gfa_version != "1.0" && args.gfa_version != "1.1") {
         throw std::runtime_error(
@@ -719,18 +841,28 @@ void validateDistanceThresholds(const CommonArgs& args) {
     }
 }
 
+
+void validateSaSamplingRate(const CommonArgs& args) {
+    if (args.sa_sampling_rate != 1) {
+        throw std::runtime_error(
+            "--sa-sampling-rate must be exactly 1; the suffix-array backend "
+            "stores complete SA/ISA/LCP arrays");
+    }
+}
+
 RestartOverrides captureRestartOverrides(const CLI::App& app,
                                          const CommonArgs& values) {
     RestartOverrides overrides;
     overrides.values = values;
-    constexpr std::array<const char*, 31> names{
+    constexpr std::array<const char*, 32> names{
         "--output", "--paf-mode", "--gfa-version", "--gfa-profile", "--chunk_size", "--root", "--ref",
         "--overlap_size", "--min_anchor_length", "--max_anchor_frequency",
         "--search-mode", "--accurate-skip-threshold", "--allow-mem",
         "--one-round", "--optimize-blocks", "--merge-blocks", "--merge-gap",
         "--realign-missing", "--realign-span", "--zero-gap-span",
         "--repair-breaks", "--break-span", "--merge-short-blocks",
-        "--slow-build", "--sampling-interval", "--min-span", "--threads",
+        "--slow-build", "--sampling-interval", "--sa-sampling-rate",
+        "--min-span", "--threads",
         "--log-level", "--verbose", "--near-distance", "--far-distance"
     };
     for (const char* name : names) {
@@ -779,6 +911,8 @@ void applyRestartOverrides(CommonArgs& args,
     if (overrides.has("--slow-build")) args.fast_build = false;
     if (overrides.has("--sampling-interval"))
         args.sampling_interval = value.sampling_interval;
+    if (overrides.has("--sa-sampling-rate"))
+        args.sa_sampling_rate = value.sa_sampling_rate;
     if (overrides.has("--min-span")) args.min_span = value.min_span;
     if (overrides.has("--near-distance"))
         args.near_distance = value.near_distance;
@@ -1019,7 +1153,10 @@ inline void printRunConfiguration(const CommonArgs& args) {
     spdlog::info("  Accurate skip threshold: {}", args.accurate_skip_threshold);
     spdlog::info("  Allow MEM             : {}", args.allow_MEM ? "Enabled" : "Disabled");
     spdlog::info("  Fast build            : {}", args.fast_build ? "Enabled" : "Disabled");
-    spdlog::info("  Sampling interval     : {}", args.sampling_interval);
+    spdlog::info("  Reference coordinate sampling interval: {}",
+                 args.sampling_interval);
+    spdlog::info("  Suffix-array sampling rate            : {} (complete SA/ISA/LCP)",
+                 args.sa_sampling_rate);
     spdlog::info("  Cluster Min span      : {}", args.min_span);
     spdlog::info("  Near distance         : {}", args.near_distance);
     spdlog::info("  Far distance          : {} (recorded only)", args.far_distance);
@@ -1320,12 +1457,24 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
     // 参考序列索引采样间隔
     cmd->add_option("--sampling-interval",
         args.sampling_interval,
-        "Reference sequence sampling interval (default: 32).")
+        "Reference coordinate-cache sampling interval (default: 32).")
         ->default_val(32)
         ->capture_default_str()
         ->group("Software Parameters")
         ->check(CLI::Range(1,
             std::numeric_limits<int>::max()))
+        ->type_name("<int>")
+        ->transform(trim_whitespace);
+
+
+    cmd->add_option("--sa-sampling-rate",
+        args.sa_sampling_rate,
+        "Suffix-array sampling rate; only the complete-array value 1 is "
+        "supported by the hybrid suffix-array backend (default: 1).")
+        ->default_val(1)
+        ->capture_default_str()
+        ->group("Software Parameters")
+        ->check(CLI::Range(1, 1))
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
@@ -1564,6 +1713,21 @@ static int runRestartMode(CommonArgs& common_args,
                 "Restart configuration is incompatible with RaMAx " +
                 std::string(RAMAX_VERSION) + ": " + error.what());
         }
+    } else if (schema == 5) {
+        LegacyCommonArgsV5 legacy;
+        try {
+            std::ifstream input(config_path);
+            cereal::JSONInputArchive archive(input);
+            archive(cereal::make_nvp("common_args", legacy));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "Invalid schema-5 restart configuration: " +
+                std::string(error.what()));
+        }
+        loaded = convertSchema5Config(legacy);
+        spdlog::warn(
+            "Loaded schema-5 workdir: --sa-sampling-rate=1 was added "
+            "during migration");
     } else if (schema == 4) {
         LegacyCommonArgsV4 legacy;
         try {
@@ -1680,6 +1844,7 @@ static int runRestartMode(CommonArgs& common_args,
         throw std::runtime_error("Overlap size must be less than chunk size.");
     }
     validateDistanceThresholds(loaded);
+    validateSaSamplingRate(loaded);
     validateGfaVersion(loaded);
     validateGfaProfile(loaded);
     if (loaded.paf_mode_explicit &&
@@ -1747,6 +1912,7 @@ static int runNormalMode(CommonArgs& common_args, const CLI::App& app) {
             "--gfa-profile is only valid with .gfa output");
     }
     validateDistanceThresholds(common_args);
+    validateSaSamplingRate(common_args);
     validateGfaVersion(common_args);
     validateGfaProfile(common_args);
 
@@ -2087,6 +2253,7 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.trust_legacy_cache
     );
     mra.allow_mem = common_args.allow_MEM;
+    mra.sa_sampling_rate = common_args.sa_sampling_rate;
 
     mra.merge_exact_contiguous_blocks_enabled =
         common_args.merge_exact_contiguous_blocks;

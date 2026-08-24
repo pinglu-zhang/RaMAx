@@ -1,17 +1,19 @@
 # sufkit-derived search kernels
 
-- Source working tree: `/mnt/d/code/sufkit`
-- Base commit: `fd1abbdb4a486abcbca3be7d915f43d3638f8b16`
-- Local development branch inspected: `codex/v0.2.0-low-level-performance`
-  (working tree contained uncommitted low-level performance changes)
-- Inspected snapshot SHA-256:
-  - `src/sequence_compare.hpp`: `8240ca49f277896ba993f9ea1fb2905c5f6073a75f9c0d77f4aaef80daf1d5a1`
-  - `src/suffix_array.cpp`: `634480b98a921548ce908460ca8c2326b2358c5ef5f8fe9185c52fe150a82151`
+- Source working tree inspected: `/mnt/d/code/sufkit`
+- Full-SA integration base: `fd1abbdb4a486abcbca3be7d915f43d3638f8b16`
+- Current local sufkit main inspected: `e9a430ce6f3deba269961a3b901c5292036190c6`
 - License: MIT
 
-RaMAx does not vendor or link the complete sufkit library. The compact
-`Suffix_Array_Index` implementation adapts the SIMD byte-comparison kernel,
-Kasai SA/ISA/LCP construction logic, and generalized suffix-link interval
-derivation from sufkit while reusing RaMAx's existing libdivsufsort targets.
-This keeps the RaMAx anchor, coordinate, filtering, and downstream graph
-interfaces unchanged.
+RaMAx does not vendor or link the complete sufkit library. The native
+`Suffix_Array_Index` keeps the SIMD byte-comparison kernel and generalized
+suffix-link interval derivation adapted from sufkit so Anchor filtering,
+occurrence order, coordinate conversion, search-mode advancement, cluster, DP,
+graph, and export interfaces remain unchanged.
+
+The suffix-array backend stores complete K=1 SA/ISA/LCP arrays. References
+whose FASTA file is smaller than 1024 MiB use the bundled libdivsufsort to build
+SA followed by the complete SIMD/Kasai LCP pass; references at or above the
+threshold use the bundled CaPS-SA implementation to construct SA and LCP
+together. RaMAx builds complete ISA arrays with OpenMP in both cases. No
+sampled-SA construction or residue-recovery path is active in this version.
