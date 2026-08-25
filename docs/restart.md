@@ -2,15 +2,15 @@
 
 ## What restart means
 
-RaMAx 1.0.7 uses `--restart` to reuse expensive input preparation and
-suffix-array index caches. It is not an alignment checkpoint system.
+RaMAx 1.0.7 uses `--restart` to reuse expensive input preparation. The
+suffix-array index is memory-only and is rebuilt by every process; restart is
+not an alignment checkpoint system.
 
 Reusable state:
 
 - copied or downloaded raw FASTA;
 - normalized alignment FASTA;
 - HAL softmask sidecars;
-- native suffix-array index files and their completion markers.
 
 Anchor search, clustering, extension, DP, Block construction, graph
 optimization, and every requested export always run again from the beginning.
@@ -82,15 +82,15 @@ the effective configuration is migrated to schema 6 with a warning.
 
 ## Cache validation and lifecycle
 
-New raw, clean, softmask, and suffix-array artifacts are written through partial
-files and published only after successful completion. Their completion markers
-record cache format, source identity, file size, and mtime. A missing,
-incomplete, changed, or unloadable cache item is rebuilt independently.
+New raw, clean, and softmask artifacts are written through partial files and
+published only after successful completion. Their completion markers record
+cache format, source identity, file size, and mtime. A missing, incomplete,
+changed, or unloadable cache item is rebuilt independently.
 
-Suffix-array indexes are still created lazily at the beginning of each reference round. The persisted `--sa-sampling-rate` value must be `1`; other values are rejected before index construction. The hybrid builder provenance and 1024 MiB threshold are part of each index completion marker, so caches created by older builders are rebuilt.
-An index already completed by an earlier attempt is reused; missing later-round
-indexes are built when reached. `--slow-build` affects only indexes that need to
-be built or rebuilt.
+Suffix-array indexes are created in memory at the beginning of each reference round and are never read from or written to disk. The persisted `--sa-sampling-rate` value must be `1`; other values are rejected before index construction. Restart therefore rebuilds the suffix array while continuing to reuse eligible preprocessing artifacts. Existing `.saidx` files from older runs are ignored and are not deleted.
+Each reference round builds its suffix array when reached. `--slow-build`
+continues to control the historical text/sentinel layout; it does not enable a
+disk cache.
 
 Before restarted alignment begins, RaMAx:
 

@@ -3,16 +3,17 @@
 #include "parlay/parallel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <sys/resource.h>
 
 #include <omp.h>
 
@@ -117,60 +118,21 @@ bool isSaCanonicalBase(char base) noexcept {
     return base == 'A' || base == 'C' || base == 'G' || base == 'T';
 }
 
-constexpr std::array<char, 8> kIndexMagic{
-    'R', 'M', 'S', 'A', 'I', 'D', 'X', '1'};
-constexpr uint32_t kIndexVersion = 3;
-constexpr uint32_t kLegacyIndexVersion = 2;
-
-template<class T>
-void writePod(std::ostream& output, const T& value) {
-    output.write(reinterpret_cast<const char*>(&value), sizeof(value));
-    if (!output) throw std::runtime_error("Failed to write suffix-array index");
-}
-
-template<class T>
-void readPod(std::istream& input, T& value) {
-    input.read(reinterpret_cast<char*>(&value), sizeof(value));
-    if (!input) throw std::runtime_error("Truncated suffix-array index");
-}
-
 template<class Coordinate>
-void writeCoordinates(std::ostream& output,
-    const std::vector<Coordinate>& values) {
-    if (!values.empty()) {
-        output.write(reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(Coordinate)));
-    }
-    if (!output) throw std::runtime_error("Failed to write suffix-array coordinates");
-}
-
-template<class Coordinate>
-void readCoordinates(std::istream& input, std::vector<Coordinate>& values,
-    size_t count) {
-    values.resize(count);
-    if (!values.empty()) {
-        input.read(reinterpret_cast<char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(Coordinate)));
-    }
-    if (!input) throw std::runtime_error("Truncated suffix-array coordinates");
-}
-
-
-
-template<class Coordinate>
-std::vector<Coordinate> buildCompleteLcp(const std::string& text,
-    const std::vector<Coordinate>& suffix_array,
-    const std::vector<Coordinate>& inverse_suffix_array) {
-    std::vector<Coordinate> lcp(suffix_array.size(), 0);
+double buildCompleteLcp(const std::string& text,
+    const RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& suffix_array,
+    const RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& inverse_suffix_array,
+    RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& lcp) {
+    const auto begin = std::chrono::steady_clock::now();
     uint64_t common = 0;
     for (uint64_t suffix = 0; suffix < suffix_array.size(); ++suffix) {
         const uint64_t row = inverse_suffix_array[static_cast<size_t>(suffix)];
         if (row == 0) {
+            lcp[0] = 0;
             common = 0;
             continue;
         }
-        const uint64_t previous =
-            suffix_array[static_cast<size_t>(row - 1)];
+        const uint64_t previous = suffix_array[static_cast<size_t>(row - 1)];
         if (suffix + common < text.size() && previous + common < text.size()) {
             const size_t remaining = static_cast<size_t>(std::min<uint64_t>(
                 text.size() - suffix - common,
@@ -183,17 +145,17 @@ std::vector<Coordinate> buildCompleteLcp(const std::string& text,
         lcp[static_cast<size_t>(row)] = static_cast<Coordinate>(common);
         if (common > 0) --common;
     }
-    return lcp;
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - begin).count();
 }
 
 template<class Coordinate>
 double buildDivsufsortSa(const std::string& text,
-    std::vector<Coordinate>& suffix_array, const char* orientation) {
-    if (text.empty()) {
-        throw std::invalid_argument(
-            "divsufsort cannot index an empty reference text");
+    RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& suffix_array,
+    const char* orientation) {
+    if (text.empty() || suffix_array.size() != text.size()) {
+        throw std::invalid_argument("divsufsort requires a complete output buffer");
     }
-    suffix_array.resize(text.size());
     const auto begin = std::chrono::steady_clock::now();
     int status = 0;
     if constexpr (std::is_same_v<Coordinate, uint32_t>) {
@@ -225,42 +187,13 @@ double buildDivsufsortSa(const std::string& text,
 }
 
 template<class Coordinate>
-void validateCoordinates(const std::vector<Coordinate>& suffix_array,
-    const std::vector<Coordinate>& inverse_suffix_array,
-    const std::vector<Coordinate>& lcp, uint64_t text_size) {
-    const uint64_t size = suffix_array.size();
-    if (size != text_size || inverse_suffix_array.size() != size ||
-        lcp.size() != size) {
-        throw std::runtime_error("Complete suffix-array component sizes do not match");
-    }
-    if (size != 0 && lcp.front() != 0) {
-        throw std::runtime_error("Suffix-array LCP row zero is invalid");
-    }
-    for (uint64_t row = 0; row < size; ++row) {
-        const uint64_t suffix = suffix_array[static_cast<size_t>(row)];
-        if (suffix >= text_size ||
-            inverse_suffix_array[static_cast<size_t>(suffix)] != row) {
-            throw std::runtime_error("Suffix-array index is inconsistent");
-        }
-        uint64_t lcp_limit = text_size - suffix;
-        if (row > 0) {
-            const uint64_t previous =
-                suffix_array[static_cast<size_t>(row - 1)];
-            lcp_limit = std::min(lcp_limit, text_size - previous);
-        }
-        if (lcp[static_cast<size_t>(row)] > lcp_limit) {
-            throw std::runtime_error("Suffix-array LCP exceeds the reference text");
-        }
-    }
-}
-
-template<class Coordinate>
 double buildCaPsSaLcp(const std::string& text,
-    std::vector<Coordinate>& suffix_array,
-    std::vector<Coordinate>& lcp, uint_t thread_count,
-    const char* orientation) {
-    if (text.empty()) {
-        throw std::invalid_argument("CaPS cannot index an empty reference text");
+    RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& suffix_array,
+    RaMAxSuffixDetail::UninitializedBuffer<Coordinate>& lcp,
+    uint_t thread_count, const char* orientation) {
+    if (text.empty() || suffix_array.size() != text.size() ||
+        lcp.size() != text.size()) {
+        throw std::invalid_argument("CaPS requires complete output buffers");
     }
     if (text.size() > static_cast<uint64_t>(
             std::numeric_limits<Coordinate>::max())) {
@@ -279,8 +212,6 @@ double buildCaPsSaLcp(const std::string& text,
             std::to_string(actual_workers) + ", requested " + workers);
     }
 
-    suffix_array.resize(text.size());
-    lcp.resize(text.size());
     const auto begin = std::chrono::steady_clock::now();
     CaPS_SA::Suffix_Array<Coordinate> builder(text.data(),
         static_cast<Coordinate>(text.size()), 0, 0,
@@ -293,6 +224,140 @@ double buildCaPsSaLcp(const std::string& text,
         orientation, text.size(), actual_workers, seconds);
     return seconds;
 }
+
+struct SuffixTopTwo {
+    static constexpr uint64_t invalid = std::numeric_limits<uint64_t>::max();
+    uint64_t first{invalid};
+    uint64_t second{invalid};
+    uint64_t compared_bytes{0};
+    bool budget_exceeded{false};
+};
+
+int compareForwardSuffixes(const std::string& text, uint64_t left,
+    uint64_t right, uint64_t& compared_bytes) {
+    if (left == right) return 0;
+    const size_t left_size = text.size() - static_cast<size_t>(left);
+    const size_t right_size = text.size() - static_cast<size_t>(right);
+    const size_t common_limit = std::min(left_size, right_size);
+    const ByteComparison comparison = comparePatternBytes(
+        reinterpret_cast<const uint8_t*>(text.data()) + left, left_size,
+        reinterpret_cast<const uint8_t*>(text.data()) + right, common_limit);
+    compared_bytes += comparison.lcp +
+        static_cast<uint64_t>(comparison.lcp < common_limit);
+    if (comparison.order != 0) return comparison.order;
+    if (left_size == right_size) return left < right ? -1 : 1;
+    return left_size < right_size ? -1 : 1;
+}
+
+void considerSuffix(const std::string& text, uint64_t candidate,
+    SuffixTopTwo& top) {
+    if (top.first == SuffixTopTwo::invalid ||
+        compareForwardSuffixes(text, candidate, top.first,
+            top.compared_bytes) > 0) {
+        if (candidate != top.first) top.second = top.first;
+        top.first = candidate;
+        return;
+    }
+    if (candidate != top.first &&
+        (top.second == SuffixTopTwo::invalid ||
+         compareForwardSuffixes(text, candidate, top.second,
+             top.compared_bytes) > 0)) {
+        top.second = candidate;
+    }
+}
+
+SuffixTopTwo findLargestForwardSuffixes(const std::string& text,
+    uint_t thread_count) {
+    if (text.empty()) throw std::invalid_argument("Cannot rank empty suffix text");
+    const size_t workers = static_cast<size_t>(std::max<uint_t>(1, thread_count));
+    std::vector<std::array<uint64_t, 256>> byte_counts(workers);
+#pragma omp parallel num_threads(static_cast<int>(workers))
+    {
+        const size_t worker = static_cast<size_t>(omp_get_thread_num());
+        auto& counts = byte_counts[worker];
+        counts.fill(0);
+        const uint64_t begin = text.size() * worker / workers;
+        const uint64_t end = text.size() * (worker + 1) / workers;
+        for (uint64_t position = begin; position < end; ++position) {
+            ++counts[static_cast<uint8_t>(text[static_cast<size_t>(position)])];
+        }
+    }
+    std::array<uint64_t, 256> counts{};
+    for (const auto& local : byte_counts) {
+        for (size_t byte = 0; byte < counts.size(); ++byte) {
+            counts[byte] += local[byte];
+        }
+    }
+    int largest_byte = 255;
+    while (largest_byte >= 0 && counts[static_cast<size_t>(largest_byte)] == 0) {
+        --largest_byte;
+    }
+    int second_byte = largest_byte - 1;
+    while (second_byte >= 0 && counts[static_cast<size_t>(second_byte)] == 0) {
+        --second_byte;
+    }
+    const bool need_second_byte =
+        counts[static_cast<size_t>(largest_byte)] < 2 && second_byte >= 0;
+    const uint64_t per_worker_budget =
+        (32ULL * static_cast<uint64_t>(text.size())) / workers + text.size();
+    std::vector<SuffixTopTwo> local_top(workers);
+#pragma omp parallel num_threads(static_cast<int>(workers))
+    {
+        const size_t worker = static_cast<size_t>(omp_get_thread_num());
+        SuffixTopTwo& top = local_top[worker];
+        const uint64_t begin = text.size() * worker / workers;
+        const uint64_t end = text.size() * (worker + 1) / workers;
+        for (uint64_t position = begin; position < end; ++position) {
+            const int byte = static_cast<uint8_t>(text[static_cast<size_t>(position)]);
+            if (byte != largest_byte && !(need_second_byte && byte == second_byte)) {
+                continue;
+            }
+            considerSuffix(text, position, top);
+            if (top.compared_bytes > per_worker_budget) {
+                top.budget_exceeded = true;
+                break;
+            }
+        }
+    }
+    SuffixTopTwo result;
+    for (const SuffixTopTwo& local : local_top) {
+        result.compared_bytes += local.compared_bytes;
+        result.budget_exceeded = result.budget_exceeded || local.budget_exceeded;
+        if (result.budget_exceeded) continue;
+        if (local.first != SuffixTopTwo::invalid) {
+            considerSuffix(text, local.first, result);
+        }
+        if (local.second != SuffixTopTwo::invalid) {
+            considerSuffix(text, local.second, result);
+        }
+    }
+    return result;
+}
+
+uint64_t peakResidentBytes() noexcept {
+    rusage usage{};
+    return getrusage(RUSAGE_SELF, &usage) == 0
+        ? static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL
+        : 0;
+}
+
+constexpr bool requires64BitCoordinates(
+    uint64_t text_symbols, bool use_caps_builder) noexcept {
+    return use_caps_builder
+        ? text_symbols > static_cast<uint64_t>(
+              std::numeric_limits<uint32_t>::max())
+        : text_symbols > static_cast<uint64_t>(
+              std::numeric_limits<saidx_t>::max());
+}
+
+static_assert(!requires64BitCoordinates(
+    std::numeric_limits<uint32_t>::max(), true));
+static_assert(requires64BitCoordinates(
+    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1, true));
+static_assert(!requires64BitCoordinates(
+    std::numeric_limits<saidx_t>::max(), false));
+static_assert(requires64BitCoordinates(
+    static_cast<uint64_t>(std::numeric_limits<saidx_t>::max()) + 1, false));
 
 } // namespace
 
@@ -309,7 +374,10 @@ Suffix_Array_Index::Suffix_Array_Index(SpeciesName species_name,
 bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
     uint_t thread_count) {
     (void)output_path;
+    const auto total_begin = std::chrono::steady_clock::now();
+    const uint_t requested_threads = std::max<uint_t>(1, thread_count);
 
+    const auto concat_begin = std::chrono::steady_clock::now();
     std::string forward_text = std::visit([](auto&& manager_ptr) -> std::string {
         using PtrType = std::decay_t<decltype(manager_ptr)>;
         if (!manager_ptr) {
@@ -325,7 +393,8 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
             throw std::runtime_error("Unhandled manager type in variant");
         }
     }, fasta_manager);
-
+    const double concat_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - concat_begin).count();
     if (forward_text.empty()) return false;
     if (forward_text.size() > std::numeric_limits<uint_t>::max()) {
         throw std::runtime_error("Reference is too large for RaMAx coordinates");
@@ -344,24 +413,19 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
     }, fasta_manager);
     const bool use_caps_builder = !isFileSmallerThan(fasta_path, 1024);
     const bool legacy_caps_layout = fast_mode && use_caps_builder;
-    if (legacy_caps_layout) {
-        // FM_Index::buildIndexUsingCaPS indexes T.size()+1 symbols. Keep the
-        // same double-sentinel text so the replacement preserves every
-        // historical interval and occurrence-order boundary.
-        forward_text.push_back('\0');
-    }
+    if (legacy_caps_layout) forward_text.push_back('\0');
     if (forward_text.size() > std::numeric_limits<uint_t>::max()) {
         throw std::runtime_error("Reference is too large for RaMAx coordinates");
     }
 
     total_size = logical_size;
     text_size = static_cast<uint_t>(forward_text.size());
-    reverse_text.assign(forward_text.rbegin(), forward_text.rend());
+    const uint64_t excluded_count = text_size - (static_cast<uint64_t>(total_size) - 1);
+    if (excluded_count == 0 || excluded_count > 2) {
+        throw std::runtime_error("Unexpected FM-compatible suffix exclusion count");
+    }
 
-    const auto build_begin = std::chrono::steady_clock::now();
-    const uint_t requested_threads = std::max<uint_t>(1, thread_count);
     excluded_reverse_positions.clear();
-
     suffix_array_32.clear();
     inverse_suffix_array_32.clear();
     lcp_32.clear();
@@ -369,152 +433,192 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
     inverse_suffix_array_64.clear();
     lcp_64.clear();
 
-    double forward_builder_seconds = 0.0;
-    double reverse_builder_seconds = 0.0;
-    double lcp_seconds = 0.0;
-    double isa_seconds = 0.0;
-
-    if (reverse_text.size() <=
-        static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-        coordinates_are_64_bit = false;
-        {
-            std::vector<uint32_t> forward_suffix_array;
+    const auto largest_begin = std::chrono::steady_clock::now();
+    SuffixTopTwo largest = findLargestForwardSuffixes(
+        forward_text, requested_threads);
+    bool forward_fallback = largest.budget_exceeded ||
+        largest.first == SuffixTopTwo::invalid ||
+        (excluded_count == 2 && largest.second == SuffixTopTwo::invalid);
+    double forward_fallback_seconds = 0.0;
+    std::array<uint64_t, 2> excluded_suffixes{
+        largest.first, largest.second};
+    if (forward_fallback) {
+        const bool forward_64 = requires64BitCoordinates(
+            forward_text.size(), use_caps_builder);
+        if (forward_64) {
+            RaMAxSuffixDetail::UninitializedBuffer<uint64_t> forward_sa;
+            RaMAxSuffixDetail::UninitializedBuffer<uint64_t> forward_lcp;
+            forward_sa.allocate(forward_text.size());
             if (use_caps_builder) {
-                std::vector<uint32_t> forward_lcp;
-                forward_builder_seconds = buildCaPsSaLcp(forward_text,
-                    forward_suffix_array, forward_lcp, requested_threads,
-                    "forward-compatibility");
+                forward_lcp.allocate(forward_text.size());
+                forward_fallback_seconds = buildCaPsSaLcp(forward_text,
+                    forward_sa, forward_lcp, requested_threads,
+                    "forward-fallback");
             } else {
-                forward_builder_seconds = buildDivsufsortSa(forward_text,
-                    forward_suffix_array, "forward-compatibility");
+                forward_fallback_seconds = buildDivsufsortSa(forward_text,
+                    forward_sa, "forward-fallback");
             }
-            const uint64_t legacy_root_end = total_size - 1;
-            for (uint64_t row = legacy_root_end; row < text_size; ++row) {
-                const uint64_t suffix =
-                    forward_suffix_array[static_cast<size_t>(row)];
-                const uint64_t predecessor =
-                    (suffix + text_size - 1) % text_size;
-                excluded_reverse_positions.push_back(
-                    text_size - 1 - predecessor);
+            excluded_suffixes[0] = forward_sa[forward_sa.size() - 1];
+            if (excluded_count == 2) {
+                excluded_suffixes[1] = forward_sa[forward_sa.size() - 2];
             }
-        }
-        std::string().swap(forward_text);
-
-        if (use_caps_builder) {
-            reverse_builder_seconds = buildCaPsSaLcp(reverse_text,
-                suffix_array_32, lcp_32, requested_threads,
-                "reverse-search");
         } else {
-            reverse_builder_seconds = buildDivsufsortSa(reverse_text,
-                suffix_array_32, "reverse-search");
-        }
-        stored_suffix_count = static_cast<uint_t>(suffix_array_32.size());
-        inverse_suffix_array_32.resize(stored_suffix_count);
-        const auto local_isa_begin = std::chrono::steady_clock::now();
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(requested_threads))
-        for (long long row = 0;
-             row < static_cast<long long>(stored_suffix_count); ++row) {
-            const uint32_t suffix = suffix_array_32[static_cast<size_t>(row)];
-            inverse_suffix_array_32[suffix] = static_cast<uint32_t>(row);
-        }
-        isa_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - local_isa_begin).count();
-        if (!use_caps_builder) {
-            const auto lcp_begin = std::chrono::steady_clock::now();
-            lcp_32 = buildCompleteLcp(reverse_text, suffix_array_32,
-                inverse_suffix_array_32);
-            lcp_seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - lcp_begin).count();
-        }
-        validateCoordinates(suffix_array_32, inverse_suffix_array_32,
-            lcp_32, text_size);
-    } else {
-        coordinates_are_64_bit = true;
-        {
-            std::vector<uint64_t> forward_suffix_array;
+            RaMAxSuffixDetail::UninitializedBuffer<uint32_t> forward_sa;
+            RaMAxSuffixDetail::UninitializedBuffer<uint32_t> forward_lcp;
+            forward_sa.allocate(forward_text.size());
             if (use_caps_builder) {
-                std::vector<uint64_t> forward_lcp;
-                forward_builder_seconds = buildCaPsSaLcp(forward_text,
-                    forward_suffix_array, forward_lcp, requested_threads,
-                    "forward-compatibility");
+                forward_lcp.allocate(forward_text.size());
+                forward_fallback_seconds = buildCaPsSaLcp(forward_text,
+                    forward_sa, forward_lcp, requested_threads,
+                    "forward-fallback");
             } else {
-                forward_builder_seconds = buildDivsufsortSa(forward_text,
-                    forward_suffix_array, "forward-compatibility");
+                forward_fallback_seconds = buildDivsufsortSa(forward_text,
+                    forward_sa, "forward-fallback");
             }
-            const uint64_t legacy_root_end = total_size - 1;
-            for (uint64_t row = legacy_root_end; row < text_size; ++row) {
-                const uint64_t suffix =
-                    forward_suffix_array[static_cast<size_t>(row)];
-                const uint64_t predecessor =
-                    (suffix + text_size - 1) % text_size;
-                excluded_reverse_positions.push_back(
-                    text_size - 1 - predecessor);
+            excluded_suffixes[0] = forward_sa[forward_sa.size() - 1];
+            if (excluded_count == 2) {
+                excluded_suffixes[1] = forward_sa[forward_sa.size() - 2];
             }
         }
-        std::string().swap(forward_text);
-
-        if (use_caps_builder) {
-            reverse_builder_seconds = buildCaPsSaLcp(reverse_text,
-                suffix_array_64, lcp_64, requested_threads,
-                "reverse-search");
-        } else {
-            reverse_builder_seconds = buildDivsufsortSa(reverse_text,
-                suffix_array_64, "reverse-search");
-        }
-        stored_suffix_count = static_cast<uint_t>(suffix_array_64.size());
-        inverse_suffix_array_64.resize(stored_suffix_count);
-        const auto local_isa_begin = std::chrono::steady_clock::now();
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(requested_threads))
-        for (long long row = 0;
-             row < static_cast<long long>(stored_suffix_count); ++row) {
-            const uint64_t suffix = suffix_array_64[static_cast<size_t>(row)];
-            inverse_suffix_array_64[suffix] = static_cast<uint64_t>(row);
-        }
-        isa_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - local_isa_begin).count();
-        if (!use_caps_builder) {
-            const auto lcp_begin = std::chrono::steady_clock::now();
-            lcp_64 = buildCompleteLcp(reverse_text, suffix_array_64,
-                inverse_suffix_array_64);
-            lcp_seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - lcp_begin).count();
-        }
-        validateCoordinates(suffix_array_64, inverse_suffix_array_64,
-            lcp_64, text_size);
     }
-    if (stored_suffix_count != text_size) {
-        throw std::runtime_error("Complete suffix-array row count is invalid");
+    for (uint64_t index = 0; index < excluded_count; ++index) {
+        const uint64_t suffix = excluded_suffixes[static_cast<size_t>(index)];
+        const uint64_t predecessor = (suffix + text_size - 1) % text_size;
+        excluded_reverse_positions.push_back(text_size - 1 - predecessor);
     }
     std::sort(excluded_reverse_positions.begin(),
         excluded_reverse_positions.end());
     excluded_reverse_positions.erase(std::unique(excluded_reverse_positions.begin(),
         excluded_reverse_positions.end()), excluded_reverse_positions.end());
-    buildPrefixDirectory();
+    const double largest_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - largest_begin).count();
 
-    const double seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - build_begin).count();
+    const auto reverse_begin = std::chrono::steady_clock::now();
+    std::reverse(forward_text.begin(), forward_text.end());
+    reverse_text = std::move(forward_text);
+    const double reverse_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - reverse_begin).count();
+
+    coordinates_are_64_bit = requires64BitCoordinates(
+        reverse_text.size(), use_caps_builder);
+    const auto allocation_begin = std::chrono::steady_clock::now();
+    if (coordinates_are_64_bit) {
+        suffix_array_64.allocate(reverse_text.size());
+        inverse_suffix_array_64.allocate(reverse_text.size());
+        lcp_64.allocate(reverse_text.size());
+    } else {
+        suffix_array_32.allocate(reverse_text.size());
+        inverse_suffix_array_32.allocate(reverse_text.size());
+        lcp_32.allocate(reverse_text.size());
+    }
+    const double allocation_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - allocation_begin).count();
+
+    double builder_seconds = 0.0;
+    double lcp_seconds = 0.0;
+    double isa_seconds = 0.0;
+    std::atomic<bool> invalid_suffix{false};
+    if (coordinates_are_64_bit) {
+        if (use_caps_builder) {
+            builder_seconds = buildCaPsSaLcp(reverse_text,
+                suffix_array_64, lcp_64, requested_threads,
+                "reverse-search");
+        } else {
+            builder_seconds = buildDivsufsortSa(reverse_text,
+                suffix_array_64, "reverse-search");
+        }
+        stored_suffix_count = static_cast<uint_t>(suffix_array_64.size());
+        const auto isa_begin = std::chrono::steady_clock::now();
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(requested_threads))
+        for (long long row = 0;
+             row < static_cast<long long>(stored_suffix_count); ++row) {
+            const uint64_t suffix = suffix_array_64[static_cast<size_t>(row)];
+            if (suffix >= text_size) {
+                invalid_suffix.store(true, std::memory_order_relaxed);
+            } else {
+                inverse_suffix_array_64[static_cast<size_t>(suffix)] =
+                    static_cast<uint64_t>(row);
+            }
+        }
+        isa_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - isa_begin).count();
+        if (!use_caps_builder) {
+            lcp_seconds = buildCompleteLcp(reverse_text, suffix_array_64,
+                inverse_suffix_array_64, lcp_64);
+        }
+    } else {
+        if (use_caps_builder) {
+            builder_seconds = buildCaPsSaLcp(reverse_text,
+                suffix_array_32, lcp_32, requested_threads,
+                "reverse-search");
+        } else {
+            builder_seconds = buildDivsufsortSa(reverse_text,
+                suffix_array_32, "reverse-search");
+        }
+        stored_suffix_count = static_cast<uint_t>(suffix_array_32.size());
+        const auto isa_begin = std::chrono::steady_clock::now();
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(requested_threads))
+        for (long long row = 0;
+             row < static_cast<long long>(stored_suffix_count); ++row) {
+            const uint32_t suffix = suffix_array_32[static_cast<size_t>(row)];
+            if (static_cast<uint64_t>(suffix) >= text_size) {
+                invalid_suffix.store(true, std::memory_order_relaxed);
+            } else {
+                inverse_suffix_array_32[static_cast<size_t>(suffix)] =
+                    static_cast<uint32_t>(row);
+            }
+        }
+        isa_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - isa_begin).count();
+        if (!use_caps_builder) {
+            lcp_seconds = buildCompleteLcp(reverse_text, suffix_array_32,
+                inverse_suffix_array_32, lcp_32);
+        }
+    }
+    if (invalid_suffix.load(std::memory_order_relaxed) ||
+        stored_suffix_count != text_size ||
+        (coordinates_are_64_bit ? lcp_64[0] : lcp_32[0]) != 0) {
+        throw std::runtime_error("Suffix-array builder returned invalid dimensions");
+    }
+
+    const auto prefix_begin = std::chrono::steady_clock::now();
+    buildPrefixDirectory(requested_threads);
+    const double prefix_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prefix_begin).count();
+    const double total_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - total_begin).count();
     const uint64_t coordinate_bytes = coordinates_are_64_bit ? 8 : 4;
     const uint64_t component_bytes =
         static_cast<uint64_t>(stored_suffix_count) * coordinate_bytes;
+    const uint64_t caps_workspace_estimate = use_caps_builder
+        ? 2 * component_bytes : 0;
     spdlog::info(
-        "Suffix-array index built for {}: builder={}, threshold=1024MiB, "
-        "logical-symbols={}, text-symbols={}, stored-rows={}, sampling-rate=1, "
-        "coordinates={} bit, SA-bytes={}, ISA-bytes={}, LCP-bytes={}, "
+        "Suffix-array index built for {}: storage=memory-only, disk-cache=disabled, "
+        "disk-bytes=0, builder={}, threshold=1024MiB, logical-symbols={}, "
+        "text-symbols={}, stored-rows={}, sampling-rate=1, coordinates={} bit, "
+        "SA-bytes={}, ISA-bytes={}, LCP-bytes={}, caps-workspace-estimate={}, "
         "LCP-source={}, suffix-links=enabled, prefix-k={}, SIMD-search={}, "
-        "forward-builder-seconds={:.3f}, reverse-builder-seconds={:.3f}, "
-        "lcp-seconds={:.3f}, isa-seconds={:.3f}, total-seconds={:.3f}",
+        "text-concat-seconds={:.3f}, largest-suffix-seconds={:.3f}, "
+        "largest-suffix-compared-bytes={}, forward-fallback={}, "
+        "forward-fallback-seconds={:.3f}, text-reverse-seconds={:.3f}, "
+        "buffer-allocation-seconds={:.3f}, reverse-builder-seconds={:.3f}, "
+        "lcp-seconds={:.3f}, isa-seconds={:.3f}, prefix-directory-seconds={:.3f}, "
+        "total-index-build-seconds={:.3f}, peak-rss-bytes={}",
         species_name, use_caps_builder ? "CaPS" : "divsufsort",
         total_size, text_size, stored_suffix_count,
         coordinates_are_64_bit ? 64 : 32, component_bytes, component_bytes,
-        component_bytes, use_caps_builder ? "CaPS-joint" : "complete-Kasai",
+        component_bytes, caps_workspace_estimate,
+        use_caps_builder ? "CaPS-joint" : "complete-Kasai",
         kSaPrefixLength,
 #if defined(__SSE2__)
         "SSE2",
 #else
         "scalar",
 #endif
-        forward_builder_seconds, reverse_builder_seconds, lcp_seconds,
-        isa_seconds, seconds);
+        concat_seconds, largest_seconds, largest.compared_bytes,
+        forward_fallback ? "yes" : "no", forward_fallback_seconds,
+        reverse_seconds, allocation_seconds, builder_seconds, lcp_seconds,
+        isa_seconds, prefix_seconds, total_seconds, peakResidentBytes());
     return true;
 }
 
@@ -546,19 +650,55 @@ bool Suffix_Array_Index::isExcludedRow(uint64_t row) const noexcept {
     return isExcludedReversePosition(suffixAt(row));
 }
 
-void Suffix_Array_Index::buildPrefixDirectory() {
+void Suffix_Array_Index::buildPrefixDirectory(uint_t thread_count) {
     prefix_directory.assign(kSaPrefixCount, SAInterval{});
-    for (uint64_t row = 0; row < stored_suffix_count; ++row) {
-        const uint64_t suffix = suffixAt(row);
-        if (suffix + kSaPrefixLength > text_size) continue;
-        size_t code = 0;
-        if (!encodeSaPrefix(reverse_text.data() + suffix,
-                kSaPrefixLength, code)) {
-            continue;
+    const auto decode = [](size_t code) {
+        std::array<char, kSaPrefixLength> pattern{};
+        static constexpr std::array<char, 4> bases{'A', 'C', 'G', 'T'};
+        for (size_t index = kSaPrefixLength; index-- > 0;) {
+            pattern[index] = bases[code & 3U];
+            code >>= 2;
         }
-        SAInterval& interval = prefix_directory[code];
-        if (interval.empty()) interval.l = static_cast<uint_t>(row);
-        interval.r = static_cast<uint_t>(row + 1);
+        return pattern;
+    };
+    const auto compare = [&](uint64_t row,
+                             const std::array<char, kSaPrefixLength>& pattern) {
+        const uint64_t suffix = suffixAt(row);
+        const uint64_t available = text_size - suffix;
+        const size_t length = static_cast<size_t>(
+            std::min<uint64_t>(available, kSaPrefixLength));
+        const auto* text = reinterpret_cast<const uint8_t*>(
+            reverse_text.data() + suffix);
+        for (size_t index = 0; index < length; ++index) {
+            const uint8_t left = text[index];
+            const uint8_t right = static_cast<uint8_t>(pattern[index]);
+            if (left != right) return left < right ? -1 : 1;
+        }
+        return length < kSaPrefixLength ? -1 : 0;
+    };
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(std::max<uint_t>(1, thread_count)))
+    for (long long raw_code = 0;
+         raw_code < static_cast<long long>(kSaPrefixCount); ++raw_code) {
+        const size_t code = static_cast<size_t>(raw_code);
+        const auto pattern = decode(code);
+        uint64_t lower = 0;
+        uint64_t upper = stored_suffix_count;
+        while (lower < upper) {
+            const uint64_t middle = lower + (upper - lower) / 2;
+            if (compare(middle, pattern) < 0) lower = middle + 1;
+            else upper = middle;
+        }
+        const uint64_t begin = lower;
+        upper = stored_suffix_count;
+        while (lower < upper) {
+            const uint64_t middle = lower + (upper - lower) / 2;
+            if (compare(middle, pattern) <= 0) lower = middle + 1;
+            else upper = middle;
+        }
+        if (begin != lower) {
+            prefix_directory[code] = {
+                static_cast<uint_t>(begin), static_cast<uint_t>(lower)};
+        }
     }
 }
 
@@ -1037,143 +1177,4 @@ void Suffix_Array_Index::bisectAnchors(const std::string& query,
             max_anchor_frequency, {mid, mid_length, mid_is_mum}, right,
             out, ref_global_cache, sampling_interval);
     }
-}
-
-bool Suffix_Array_Index::saveToFile(const std::string& filename) const {
-    if (sampling_rate != 1 || stored_suffix_count != text_size) {
-        throw std::runtime_error(
-            "Refusing to save a non-complete suffix-array index");
-    }
-    std::ofstream output(filename, std::ios::binary | std::ios::trunc);
-    if (!output) return false;
-    output.write(kIndexMagic.data(), kIndexMagic.size());
-    writePod(output, kIndexVersion);
-    const uint8_t width = coordinates_are_64_bit ? 64 : 32;
-    writePod(output, width);
-    writePod(output, static_cast<uint64_t>(total_size));
-    writePod(output, static_cast<uint64_t>(text_size));
-    writePod(output, static_cast<uint64_t>(stored_suffix_count));
-    writePod(output, static_cast<uint64_t>(sampling_rate));
-    output.write(reverse_text.data(), static_cast<std::streamsize>(text_size));
-    if (!output) throw std::runtime_error("Failed to write suffix-array text");
-    if (coordinates_are_64_bit) {
-        writeCoordinates(output, suffix_array_64);
-        writeCoordinates(output, inverse_suffix_array_64);
-        writeCoordinates(output, lcp_64);
-    } else {
-        writeCoordinates(output, suffix_array_32);
-        writeCoordinates(output, inverse_suffix_array_32);
-        writeCoordinates(output, lcp_32);
-    }
-    const uint64_t excluded_count = excluded_reverse_positions.size();
-    writePod(output, excluded_count);
-    for (const uint64_t position : excluded_reverse_positions) {
-        writePod(output, position);
-    }
-    output.flush();
-    return static_cast<bool>(output);
-}
-
-
-bool Suffix_Array_Index::loadFromFile(const std::string& filename) {
-    std::ifstream input(filename, std::ios::binary);
-    if (!input) return false;
-    std::array<char, kIndexMagic.size()> magic{};
-    input.read(magic.data(), magic.size());
-    if (!input || magic != kIndexMagic) {
-        throw std::runtime_error("Invalid suffix-array index magic");
-    }
-    uint32_t version = 0;
-    uint8_t width = 0;
-    uint64_t logical_size = 0;
-    readPod(input, version);
-    readPod(input, width);
-    readPod(input, logical_size);
-    if ((version != kLegacyIndexVersion && version != kIndexVersion) ||
-        (width != 32 && width != 64) || logical_size == 0 ||
-        logical_size > std::numeric_limits<uint_t>::max()) {
-        throw std::runtime_error("Unsupported suffix-array index header");
-    }
-
-    uint64_t loaded_text_size = 0;
-    uint64_t loaded_stored_count = 0;
-    uint64_t loaded_sampling_rate = 1;
-    if (version == kLegacyIndexVersion) {
-        readPod(input, loaded_text_size);
-        loaded_stored_count = loaded_text_size;
-    } else {
-        readPod(input, loaded_text_size);
-        readPod(input, loaded_stored_count);
-        readPod(input, loaded_sampling_rate);
-    }
-    if (loaded_text_size == 0 ||
-        loaded_text_size > std::numeric_limits<uint_t>::max() ||
-        loaded_stored_count > std::numeric_limits<uint_t>::max() ||
-        loaded_sampling_rate != 1 ||
-        loaded_stored_count != loaded_text_size) {
-        throw std::runtime_error(
-            "Suffix-array index must contain complete K=1 SA/ISA/LCP arrays");
-    }
-
-    total_size = static_cast<uint_t>(logical_size);
-    text_size = static_cast<uint_t>(loaded_text_size);
-    stored_suffix_count = static_cast<uint_t>(loaded_stored_count);
-    sampling_rate = static_cast<uint_t>(loaded_sampling_rate);
-    reverse_text.resize(static_cast<size_t>(text_size));
-    input.read(reverse_text.data(), static_cast<std::streamsize>(text_size));
-    if (!input) throw std::runtime_error("Truncated suffix-array text");
-
-    coordinates_are_64_bit = width == 64;
-    suffix_array_32.clear();
-    inverse_suffix_array_32.clear();
-    lcp_32.clear();
-    suffix_array_64.clear();
-    inverse_suffix_array_64.clear();
-    lcp_64.clear();
-    if (coordinates_are_64_bit) {
-        readCoordinates(input, suffix_array_64,
-            static_cast<size_t>(stored_suffix_count));
-        readCoordinates(input, inverse_suffix_array_64,
-            static_cast<size_t>(stored_suffix_count));
-        readCoordinates(input, lcp_64,
-            static_cast<size_t>(stored_suffix_count));
-        validateCoordinates(suffix_array_64, inverse_suffix_array_64,
-            lcp_64, text_size);
-    } else {
-        readCoordinates(input, suffix_array_32,
-            static_cast<size_t>(stored_suffix_count));
-        readCoordinates(input, inverse_suffix_array_32,
-            static_cast<size_t>(stored_suffix_count));
-        readCoordinates(input, lcp_32,
-            static_cast<size_t>(stored_suffix_count));
-        validateCoordinates(suffix_array_32, inverse_suffix_array_32,
-            lcp_32, text_size);
-    }
-    uint64_t excluded_count = 0;
-    readPod(input, excluded_count);
-    if (excluded_count > text_size) {
-        throw std::runtime_error("Invalid excluded suffix count");
-    }
-    excluded_reverse_positions.resize(static_cast<size_t>(excluded_count));
-    for (uint64_t& position : excluded_reverse_positions) {
-        readPod(input, position);
-    }
-    if (!std::is_sorted(excluded_reverse_positions.begin(),
-            excluded_reverse_positions.end()) ||
-        std::adjacent_find(excluded_reverse_positions.begin(),
-            excluded_reverse_positions.end()) !=
-            excluded_reverse_positions.end() ||
-        (!excluded_reverse_positions.empty() &&
-         excluded_reverse_positions.back() >= text_size)) {
-        throw std::runtime_error("Invalid excluded suffix positions");
-    }
-    if (input.peek() != std::char_traits<char>::eof()) {
-        throw std::runtime_error("Suffix-array index has trailing data");
-    }
-    buildPrefixDirectory();
-    spdlog::info(
-        "Suffix-array index loaded: format-v{}, text-symbols={}, stored-rows={}, "
-        "sampling-rate={}", version, text_size, stored_suffix_count,
-        sampling_rate);
-    return true;
 }

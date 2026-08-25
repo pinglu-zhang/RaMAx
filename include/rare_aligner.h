@@ -20,8 +20,7 @@
 #include "wfmash_router.h"
 
 struct IndexCacheCounters {
-    std::atomic_size_t reused{0};
-    std::atomic_size_t rebuilt{0};
+    std::atomic_size_t memory_only_built{0};
 };
 
 // 多基因组比对核心调度类

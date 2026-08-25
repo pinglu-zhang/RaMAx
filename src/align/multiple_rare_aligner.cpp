@@ -440,12 +440,6 @@ MultipleRareAligner::MultipleRareAligner(
         spdlog::info("Created work directory: {}", work_dir.string());
     }
 
-    // 确保索引目录存在（默认放在 work_dir/index）
-    if (!std::filesystem::exists(index_dir)) {
-        std::filesystem::create_directories(index_dir);
-        spdlog::info("Created index directory: {}", index_dir.string());
-    }
-
     this->group_id = 0;
     this->round_id = 0;
 
@@ -961,9 +955,9 @@ starAlignment(
     }
 
     spdlog::info(
-        "[cache-summary] suffix-array index reused={} rebuilt={}",
-        index_cache_counters->reused.load(),
-        index_cache_counters->rebuilt.load());
+        "[cache-summary] suffix-array storage=memory-only built={} "
+        "disk-reused=0 disk-bytes=0",
+        index_cache_counters->memory_only_built.load());
 
     // 所有轮次完成后，flush logger
     spdlog::default_logger()->flush();
@@ -1030,9 +1024,6 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     //}
 
     /* ---------- 3. 准备参考基因组索引 ---------- */
-    FilePath ref_index_path = index_dir / ref_name;
-    std::filesystem::create_directories(ref_index_path);
-
     // PairRareAligner：用于 ref vs query 的 pairwise anchor 查找
     PairRareAligner pra(*this);
 

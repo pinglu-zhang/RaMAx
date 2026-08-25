@@ -212,8 +212,9 @@ only for HAL output.
 ## Restart compatibility
 
 RaMAx 1.0.7 treats restart as cache reuse, not alignment checkpointing. It
-reuses validated raw/clean FASTA and suffix-array artifacts, then reruns anchor
-search, clustering, graph construction, and export from the beginning:
+reuses validated raw/clean FASTA artifacts, rebuilds the memory-only suffix
+array, then reruns anchor search, clustering, graph construction, and export
+from the beginning:
 
 ```bash
 ramax --restart -w work
@@ -228,7 +229,9 @@ The seqfile cannot be replaced. Schema-1 through schema-5 work directories are
 loaded with explicit compatibility defaults and migrated to schema 6; all
 older workdirs use `--sa-sampling-rate 1`; the suffix-array backend accepts
 only this complete-array value. References below 1024 MiB use divsufsort,
-while references at or above the threshold use CaPS. Older work directories use `--gfa-profile exact`, and schemas before 4 default to
+while references at or above the threshold use CaPS. The suffix-array index is
+never written to or restored from the work directory. Older work directories
+use `--gfa-profile exact`, and schemas before 4 default to
 GFA 1.1 when no GFA version was persisted.
 
 ## License and dependencies

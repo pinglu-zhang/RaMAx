@@ -3,11 +3,66 @@
 
 #include "index.h"
 
+#include <cstdlib>
 #include <cstdint>
+#include <limits>
+#include <new>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-#define SAINDEX_EXTENSION "saidx"
+namespace RaMAxSuffixDetail {
+
+template<class T>
+class UninitializedBuffer {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+public:
+    UninitializedBuffer() = default;
+    UninitializedBuffer(const UninitializedBuffer&) = delete;
+    UninitializedBuffer& operator=(const UninitializedBuffer&) = delete;
+    UninitializedBuffer(UninitializedBuffer&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)),
+          size_(std::exchange(other.size_, 0)) {}
+    UninitializedBuffer& operator=(UninitializedBuffer&& other) noexcept {
+        if (this != &other) {
+            clear();
+            data_ = std::exchange(other.data_, nullptr);
+            size_ = std::exchange(other.size_, 0);
+        }
+        return *this;
+    }
+    ~UninitializedBuffer() { clear(); }
+
+    void allocate(size_t count) {
+        clear();
+        if (count == 0) return;
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            throw std::bad_array_new_length();
+        }
+        data_ = static_cast<T*>(std::malloc(count * sizeof(T)));
+        if (data_ == nullptr) throw std::bad_alloc();
+        size_ = count;
+    }
+    void clear() noexcept {
+        std::free(data_);
+        data_ = nullptr;
+        size_ = 0;
+    }
+    T* data() noexcept { return data_; }
+    const T* data() const noexcept { return data_; }
+    size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    T& operator[](size_t index) noexcept { return data_[index]; }
+    const T& operator[](size_t index) const noexcept { return data_[index]; }
+
+private:
+    T* data_{nullptr};
+    size_t size_{0};
+};
+
+} // namespace RaMAxSuffixDetail
 
 // Enhanced suffix-array anchor index.  Its public search contract mirrors
 // FM_Index so PairRareAligner and every downstream stage can remain unchanged.
@@ -71,9 +126,6 @@ public:
         sdsl::int_vector<0>& ref_global_cache,
         SeqPro::Length sampling_interval) const;
 
-    bool saveToFile(const std::string& filename) const;
-    bool loadFromFile(const std::string& filename);
-
     uint_t samplingRate() const noexcept { return sampling_rate; }
     uint_t textSize() const noexcept { return text_size; }
     uint_t storedSuffixCount() const noexcept {
@@ -119,7 +171,7 @@ private:
         uint_t accepted_frequency_limit) const;
     SAInterval suffixLinkInterval(SAInterval previous, uint_t depth,
         uint_t shift) const;
-    void buildPrefixDirectory();
+    void buildPrefixDirectory(uint_t thread_count);
 
     uint64_t suffixAt(uint64_t row) const noexcept;
     uint64_t inverseAt(uint64_t position) const noexcept;
@@ -138,12 +190,12 @@ private:
     uint_t text_size{0};
     uint_t stored_suffix_count{0};
     uint_t sampling_rate{1};
-    std::vector<uint32_t> suffix_array_32;
-    std::vector<uint32_t> inverse_suffix_array_32;
-    std::vector<uint32_t> lcp_32;
-    std::vector<uint64_t> suffix_array_64;
-    std::vector<uint64_t> inverse_suffix_array_64;
-    std::vector<uint64_t> lcp_64;
+    RaMAxSuffixDetail::UninitializedBuffer<uint32_t> suffix_array_32;
+    RaMAxSuffixDetail::UninitializedBuffer<uint32_t> inverse_suffix_array_32;
+    RaMAxSuffixDetail::UninitializedBuffer<uint32_t> lcp_32;
+    RaMAxSuffixDetail::UninitializedBuffer<uint64_t> suffix_array_64;
+    RaMAxSuffixDetail::UninitializedBuffer<uint64_t> inverse_suffix_array_64;
+    RaMAxSuffixDetail::UninitializedBuffer<uint64_t> lcp_64;
     uint_t total_size{0};
     std::vector<uint64_t> excluded_reverse_positions;
     std::vector<SAInterval> prefix_directory;

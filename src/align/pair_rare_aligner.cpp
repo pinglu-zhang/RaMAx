@@ -26,11 +26,6 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 	, thread_num(thread_num)
 	, trust_legacy_cache(trust_legacy_cache_)
 {
-	if (!std::filesystem::exists(index_dir)) {
-		std::filesystem::create_directories(index_dir);
-	}
-
-
 	this->group_id = 0;
 	this->round_id = 0;
 
@@ -53,119 +48,27 @@ PairRareAligner::PairRareAligner(const FilePath work_dir,
 //
 // }
 
-FilePath PairRareAligner::buildIndex(const std::string prefix, SeqPro::ManagerVariant& ref_fasta_manager_, bool fast_build) {
+FilePath PairRareAligner::buildIndex(const std::string prefix,
+    SeqPro::ManagerVariant& ref_fasta_manager_, bool fast_build) {
+    ref_name = prefix;
+    ref_seqpro_manager = &ref_fasta_manager_;
+    const FilePath logical_index_path = index_dir / prefix;
 
-	ref_name = prefix;
-	FilePath ref_index_path = index_dir / prefix;
-
-	if (!std::filesystem::exists(ref_index_path)) {
-		std::filesystem::create_directories(ref_index_path);
-	}
-
-	ref_seqpro_manager = &ref_fasta_manager_;
-	// 使用 std::visit 来获取 fasta_path
-	std::string fasta_path_str;
-	std::visit([&fasta_path_str](auto&& manager_ptr) {
-		using PtrType = std::decay_t<decltype(manager_ptr)>;
-		if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::SequenceManager>>) {
-			// 如果是 SequenceManager，直接调用 getFastaPath()
-			fasta_path_str = manager_ptr->getFastaPath();
-		} else if constexpr (std::is_same_v<PtrType, std::unique_ptr<SeqPro::MaskedSequenceManager>>) {
-			// 如果是 MaskedSequenceManager，先 getOriginalManager() 再 getFastaPath()
-			fasta_path_str = manager_ptr->getOriginalManager().getFastaPath();
-		} else {
-			throw std::runtime_error("Unhandled manager type in variant.");
-		}
-	}, ref_fasta_manager_);
-
-	// index_dir的路径加上prefix的前缀加上fasta_manager.fasta_path_的扩展名
-	FilePath output_path = ref_index_path / (prefix + std::filesystem::path(fasta_path_str).extension().string());
-	const std::string index_source_identity = fasta_path_str +
-		"|suffix-array-v3|builder=hybrid-divsufsort-caps-v1|threshold-mib=1024|sampling-rate=1" +
-		std::string("|fast-build=") + (fast_build ? "1" : "0");
-
-	ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
-
-	FilePath idx_file_path = ref_index_path / (prefix + "." + SAINDEX_EXTENSION);
-	const FilePath marker_path =
-		RaMAxCache::completionMarkerPath(idx_file_path);
-
-	spdlog::info(
-		"Suffix-array indexing with prefix: {}, index path: {}, builder: hybrid-divsufsort-caps, sampling rate: {}",
-		prefix, ref_index_path.string(), sa_sampling_rate);
-
-	const auto load_existing = [&]() -> bool {
-		try {
-			if (!ref_index->loadFromFile(idx_file_path.string())) return false;
-			if (ref_index->samplingRate() != sa_sampling_rate) {
-				throw std::runtime_error(
-					"cached sampling rate " +
-					std::to_string(ref_index->samplingRate()) +
-					" does not match requested rate " +
-					std::to_string(sa_sampling_rate));
-			}
-			++index_cache_counters->reused;
-			spdlog::info(
-				"[cache] suffix-array index reused for {}: {} (K={}, rows={})",
-				prefix, idx_file_path.string(), ref_index->samplingRate(),
-				ref_index->storedSuffixCount());
-			return true;
-		} catch (const std::exception& error) {
-			spdlog::warn(
-				"[cache] suffix-array index load failed for {}: {}; rebuilding",
-				prefix, error.what());
-			ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
-			return false;
-		}
-	};
-
-	bool loaded = false;
-	if (RaMAxCache::markerMatches(
-			marker_path, "suffix-array-index", 3, index_source_identity, false,
-			FilePath(fasta_path_str), idx_file_path)) {
-		loaded = load_existing();
-	}
-
-	if (!loaded) {
-		ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
-		FilePath partial = idx_file_path;
-		partial += ".partial";
-		RaMAxCache::removeIfPresent(partial);
-		try {
-			ref_index->buildIndex(output_path, fast_build, thread_num);
-			if (!ref_index->saveToFile(partial.string())) {
-				throw std::runtime_error(
-					"Failed to save suffix-array index: " + partial.string());
-			}
-			// Release the build-time arrays and validate the exact serialized
-			// artifact before publication.  The loaded index becomes the one used
-			// by anchor search, so validation does not double resident memory.
-			ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
-			if (!ref_index->loadFromFile(partial.string()) ||
-				ref_index->samplingRate() != sa_sampling_rate) {
-				throw std::runtime_error(
-					"Failed to validate serialized suffix-array index");
-			}
-			RaMAxCache::publishFile(partial, idx_file_path);
-			RaMAxCache::writeMarker(
-				marker_path, "suffix-array-index", 3, index_source_identity, false,
-				FilePath(fasta_path_str), idx_file_path);
-		} catch (...) {
-			RaMAxCache::removeIfPresent(partial);
-			throw;
-		}
-		++index_cache_counters->rebuilt;
-		spdlog::info(
-			"[cache] suffix-array index rebuilt for {}: {} (K={}, rows={}, "
-			"file-bytes={})",
-			prefix, idx_file_path.string(), ref_index->samplingRate(),
-			ref_index->storedSuffixCount(),
-			std::filesystem::file_size(idx_file_path));
-	}
-
-	spdlog::info("Suffix-array indexing finished, index path: {}", ref_index_path.string());
-
-	return ref_index_path;
+    ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
+    spdlog::info(
+        "Suffix-array indexing with prefix: {}, storage: memory-only, "
+        "disk-cache: disabled, sampling rate: {}",
+        prefix, sa_sampling_rate);
+    if (!ref_index->buildIndex({}, fast_build, thread_num)) {
+        throw std::runtime_error(
+            "Failed to build in-memory suffix-array index for " + prefix);
+    }
+    ++index_cache_counters->memory_only_built;
+    spdlog::info(
+        "Suffix-array indexing finished in memory for {} (K={}, rows={}, "
+        "disk-bytes=0)",
+        prefix, ref_index->samplingRate(), ref_index->storedSuffixCount());
+    return logical_index_path;
 }
 
 MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
