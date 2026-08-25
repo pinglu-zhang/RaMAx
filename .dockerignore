@@ -16,6 +16,7 @@ build
 build-*
 cmake-build-*
 _build
+tools/ramax-paf-fasta/build
 
 *.conda
 *.tar.bz2

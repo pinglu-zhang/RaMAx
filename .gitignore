@@ -443,3 +443,4 @@ recipe/run_test.sh
 recipe/conda_build_config.yaml
 recipe/meta.yaml
 recipe/build.sh
+/.codex/

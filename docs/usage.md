@@ -27,9 +27,10 @@ RaMAx requires Mash 2.3 and estimates whole-genome distances to every other
 input with `k=31` and sketch size 20,000. The normalized table is written to
 `<workdir>/similarity/mash_first_reference.tsv`. First-round queries with
 `d < --near-distance` (default `0.01`) use wfmash; only a validated final PAF
-removes a query from the first-round FM-index path. Failed wfmash queries fall
-back to RaMAx, and all later rounds use the original RaMAx algorithm. The
-reserved `--far-distance` default is `0.02` and does not yet affect routing.
+removes a query from the first-round native suffix-array path. Failed wfmash
+queries fall back to RaMAx's in-memory suffix-array aligner, and all later
+rounds use the same native backend. The reserved `--far-distance` default is
+`0.02` and does not yet affect routing.
 RaMAx requires Mash 2.3, PGGB-compatible wfmash
 `v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.23.1. All wfmash
 FAI files are produced by `samtools faidx`, including indexes for multi-FASTA
@@ -202,10 +203,10 @@ preserves the work directory after a successful export so that
 `similarity/mash_first_reference.tsv` and `wfmash/round_0/` remain available.
 Failed or interrupted runs also leave it in place for diagnosis and restart.
 
-On restart, RaMAx retains only reusable preprocessing and FM-index caches. It
-archives the previous log, removes stale `result/`, `mask_interval/`, and
-`minipoa_tmp/` directories, and starts alignment from the first reference
-round.
+On restart, RaMAx retains reusable raw, clean, and softmask preprocessing
+artifacts. It rebuilds the complete in-memory suffix-array index, archives the
+previous log, removes stale `result/`, `mask_interval/`, and `minipoa_tmp/`
+directories, and starts alignment from the first reference round.
 
 Always place the final MAF, HAL, or PAF outside the work directory:
 
