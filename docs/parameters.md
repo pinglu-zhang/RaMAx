@@ -1,6 +1,6 @@
 # Command-line parameters
 
-This page documents the public RaMAx 1.0.7 interface. Values and ranges follow
+This page documents the public RaMAx 1.0.8 interface. Values and ranges follow
 the current CLI implementation. Run `ramax --help` to inspect the installed
 binary.
 

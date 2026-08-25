@@ -2,7 +2,7 @@
 
 ## What restart means
 
-RaMAx 1.0.7 uses `--restart` to reuse expensive input preparation. The
+RaMAx 1.0.8 uses `--restart` to reuse expensive input preparation. The
 suffix-array index is memory-only and is rebuilt by every process; restart is
 not an alignment checkpoint system.
 
@@ -110,7 +110,7 @@ Before manually deleting a failed work directory, retain:
 
 - `config.json` and `input_manifest.json`;
 - `RaMAx.log` and any `RaMAx.restart.N.log` archives;
-- cache completion markers next to raw, clean, softmask, and FM-index files;
+- cache completion markers next to raw, clean, and softmask files;
 - the exact binary version and restart command.
 
 `result/`, `mask_interval/`, and `minipoa_tmp/` are diagnostic artifacts only;

@@ -1,23 +1,30 @@
 # RaMAx
 
 RaMAx aligns multiple genomes and writes whole-genome alignments in MAF, HAL,
-or PAF format. A seqfile contains one genome name and FASTA path per line. HAL
-output additionally requires a Newick species tree as the first record.
+PAF, or GFA format. A seqfile contains one genome name and FASTA path per line.
+HAL output additionally requires a Newick species tree as the first record.
 
 ## Install
 
 ### Conda
 
 ```bash
-conda install -c conda-forge -c malab ramax
+CONDA_CHANNEL_PRIORITY=flexible \
+conda install -y \
+  --override-channels \
+  -c malab \
+  -c bioconda \
+  -c conda-forge \
+  ramax=1.0.8
+
 ramax --version
 ```
 
 ### Docker
 
 ```bash
-docker pull pingluzhang/ramax:latest
-docker run --rm pingluzhang/ramax:latest --version
+docker pull pingluzhang/ramax:1.0.8
+docker run --rm pingluzhang/ramax:1.0.8 --version
 ```
 
 ### Build from source
@@ -27,7 +34,8 @@ OpenMP, HDF5, and the bundled HAL/sonLib sources. On Ubuntu or Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake libcurl4-openssl-dev zlib1g-dev \
+sudo apt install -y build-essential cmake libboost-graph-dev \
+  libcurl4-openssl-dev zlib1g-dev \
   libtbb-dev libhdf5-dev
 ```
 
@@ -211,7 +219,7 @@ only for HAL output.
 
 ## Restart compatibility
 
-RaMAx 1.0.7 treats restart as cache reuse, not alignment checkpointing. It
+RaMAx 1.0.8 treats restart as cache reuse, not alignment checkpointing. It
 reuses validated raw/clean FASTA artifacts, rebuilds the memory-only suffix
 array, then reruns anchor search, clustering, graph construction, and export
 from the beginning:

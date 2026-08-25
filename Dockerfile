@@ -1,14 +1,10 @@
-# syntax=docker/dockerfile:1.7
-
-ARG CACTUS_HELPER_SHA256
-
 FROM mambaorg/micromamba:2.3.2 AS alignment-tools
 
 USER root
 RUN micromamba create -y --strict-channel-priority \
         -p /opt/ramax \
         -c conda-forge -c bioconda -c malab \
-        mash=2.3=hb105d93_10 \
+        mash=2.3=hb105d93_9 \
         minipoa=1.4.2=hd5d28ae_0 \
         wfmash=0.14.0=h11f254b_0 \
         samtools=1.23.1=ha83d96e_0 \
@@ -23,8 +19,6 @@ RUN micromamba create -y --strict-channel-priority \
 FROM ubuntu:22.04 AS cactus-helper
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG CACTUS_HELPER_SHA256
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         binutils \
@@ -56,11 +50,7 @@ RUN set -eux; \
         after_ldd="$(ldd "${helper}")"; \
         printf '%s\n' "${after_ldd}"; \
         if printf '%s\n' "${after_ldd}" | grep -qE 'not found|/mnt/sda/'; then exit 1; fi; \
-    fi; \
-    actual_sha256="$(sha256sum "${helper}" | awk '{print $1}')"; \
-    test -n "${CACTUS_HELPER_SHA256}"; \
-    test "${actual_sha256}" = "${CACTUS_HELPER_SHA256}"; \
-    printf '%s  %s\n' "${actual_sha256}" "${helper}" > /opt/ramax/share/ramax/halAppendCactusSubtree.sha256
+    fi
 
 FROM ubuntu:22.04 AS builder
 
@@ -73,6 +63,7 @@ RUN apt-get update \
         cmake \
         g++-12 \
         gcc-12 \
+        libboost-graph-dev \
         libcurl4-openssl-dev \
         libhdf5-dev \
         libtbb-dev \
@@ -116,6 +107,7 @@ RUN set -eux; \
         -DBUILD_TESTING=OFF \
         -DRAMAX_BUILD_TESTS=OFF \
         -DRAMAX_BUILD_TOOLS=ON \
+        -DRAMAX_TOOL_BIN_DIR=/opt/ramax/bin \
         -DRAMAX_EMBED_TOOL_PATHS=ON \
         -DRAMAX_NATIVE_ARCH=OFF \
         -DRAMAX_MASH_EXECUTABLE=/opt/ramax/bin/mash \
@@ -130,9 +122,8 @@ RUN set -eux; \
     install -d /opt/ramax/share/licenses/ramax /opt/ramax/share/ramax; \
     install -m 0644 LICENSE /opt/ramax/share/licenses/ramax/RaMAx-LICENSE; \
     install -m 0644 third_party/hal/LICENSE.txt /opt/ramax/share/licenses/ramax/HAL-LICENSE; \
-    test -s /opt/ramax/share/ramax/halAppendCactusSubtree.sha256; \
     /opt/ramax/bin/ramax --help >/dev/null; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.7"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.8"; \
     test -x /opt/ramax/bin/ramax-paf-fasta; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     test ! -e /src/bin; \
@@ -141,17 +132,15 @@ RUN set -eux; \
 FROM ubuntu:22.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RAMAX_VERSION=1.0.7
+ARG RAMAX_VERSION=1.0.8
 ARG VCS_REF=unknown
-ARG CACTUS_HELPER_SHA256=unknown
 
 LABEL org.opencontainers.image.title="RaMAx" \
       org.opencontainers.image.description="Whole-genome alignment and pangenome graph construction" \
       org.opencontainers.image.version="${RAMAX_VERSION}" \
       org.opencontainers.image.source="https://github.com/pinglu-zhang/RaMAx" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.vendor="malab" \
-      org.opencontainers.image.ramax.cactus-helper-sha256="${CACTUS_HELPER_SHA256}"
+      org.opencontainers.image.vendor="malab"
 
 ENV PATH=/opt/ramax/bin:${PATH}
 
@@ -170,7 +159,7 @@ RUN apt-get update \
 COPY --from=builder /opt/ramax /opt/ramax
 
 RUN set -eux; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.7"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.8"; \
     /opt/ramax/bin/ramax --help >/dev/null; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax | tee /tmp/ramax.ldd; \

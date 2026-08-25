@@ -1,0 +1,20 @@
+--- a/src/ramax_eval/hal.py
++++ b/src/ramax_eval/hal.py
+@@ -186,9 +186,10 @@
+         output = mapped_dir / f"{genome}.to.{root}.bed"
+-        command = [
+-            hal_liftover, str(hal), genome, str(beds[genome]),
+-            root, str(output), "--outPSLWithName",
+-        ]
+-        result = run_command(command, log_dir=log_dir, label=f"liftover_{label}_{genome}", check=False)
+-        if result["returncode"] != 0:
+-            raise EvalError(f"halLiftover failed for {label}:{genome}; see {result['stderr_path']}")
++        if not output.exists():
++            partial = output.with_name(output.name + f".{os.getpid()}.partial")
++            command = [hal_liftover, str(hal), genome, str(beds[genome]),
++                       root, str(partial), "--outPSLWithName"]
++            result = run_command(command, log_dir=log_dir, label=f"liftover_{label}_{genome}", check=False)
++            if result["returncode"] != 0:
++                raise EvalError(f"halLiftover failed for {label}:{genome}; see {result['stderr_path']}")
++            os.replace(partial, output)
+         counts = _mapped_sample_counts(output)

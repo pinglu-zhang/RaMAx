@@ -108,16 +108,19 @@ cmake -S . -B build \
 
 ## Restart schema is incompatible
 
-RaMAx 1.0.7 writes `schema_version: 4`. It can read schema-1, schema-2, and
-schema-3 work directories, recover schema-1 legacy sidecars, trust legacy
-caches once, and write schema 4 after input validation. Parameters absent from
-an older schema use compatibility defaults, including GFA 1.1. Missing schema
-information or any other schema version is rejected.
+RaMAx 1.0.8 writes `schema_version: 6`. It can read schema-1 through schema-5
+work directories, recover schema-1 legacy sidecars, trust eligible legacy
+preprocessing caches once, and write schema 6 after input validation.
+Parameters absent from an older schema use compatibility defaults, including
+`--sa-sampling-rate 1`, GFA profile `exact`, and GFA 1.1 for schemas that
+predate the corresponding settings. Missing schema information or an
+unsupported schema version is rejected.
 
 Restart also rejects a changed seqfile, species mapping, or local FASTA
 size/mtime. Use a new work directory when changing input data. A damaged cache
-artifact is different: RaMAx rebuilds only that raw, clean, softmask, or
-FM-index artifact.
+artifact is different: RaMAx rebuilds only the affected raw, clean, or
+softmask artifact. The suffix-array index is memory-only and is rebuilt on
+every process start.
 
 ## MAF validation fails
 

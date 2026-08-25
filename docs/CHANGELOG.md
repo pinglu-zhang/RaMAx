@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.8 - 2026-08-26
+
+- Replaced native anchor search with a complete in-memory SA/ISA/LCP backend.
+  `--sa-sampling-rate` currently accepts only `1`; the index is rebuilt for
+  every process and is not persisted in the work directory.
+- Build suffix arrays with divsufsort below 1024 MiB and CaPS at or above that
+  threshold, while preserving the existing RaMAx anchor-search contract.
+- Upgraded restart configuration to schema 6 and retained explicit migration
+  defaults for schema-1 through schema-5 work directories.
+- Fixed missing-window realignment coverage regressions without widening
+  ordinary or hybrid merge spans.
+- Reassembled MAF runs by source block so normalization preserves the intended
+  source-block boundaries.
+- Added a shared external-tool directory for source, Conda, and Docker builds,
+  while retaining explicit per-tool overrides and runtime sibling lookup.
+- Fixed Conda builds against a glibc 2.17 sysroot by compiling the
+  `posix_spawn_file_actions_addchdir_np` path only where the interface is
+  available.
+- Updated the Linux x86-64 Conda and Docker packaging configuration for RaMAx
+  1.0.8 and fixed exact companion-tool builds. These packaging checks establish
+  build and runtime dependency compatibility, not cross-platform biological
+  equivalence or performance.
+
 ## 1.0.7 - 2026-08-17
 
 - Packaged environments use Samtools/HTSlib 1.23.1, the newest release that
