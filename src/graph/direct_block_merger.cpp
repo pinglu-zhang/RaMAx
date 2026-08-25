@@ -71,9 +71,16 @@ struct SamplingSnapshot {
 
 constexpr size_t kExactBatchMaximumChains = 4096;
 constexpr size_t kExactBatchMaximumAnchors = 262144;
+#ifdef RAMAX_REALIGNMENT_ORACLE_SINGLE_BATCH
+constexpr size_t kZeroGapBatchMaximumWindows =
+    std::numeric_limits<size_t>::max();
+constexpr size_t kMinipoaBatchMaximumWindows =
+    std::numeric_limits<size_t>::max();
+#else
 constexpr size_t kZeroGapBatchMaximumWindows = 4096;
-constexpr size_t kZeroGapBatchMaximumAnchors = 262144;
 constexpr size_t kMinipoaBatchMaximumWindows = 1024;
+#endif
+constexpr size_t kZeroGapBatchMaximumAnchors = 262144;
 constexpr size_t kMinipoaBatchMaximumAnchors = 131072;
 constexpr size_t kMaximumPreparationThreads = 32;
 
@@ -1683,11 +1690,13 @@ struct MissingWindowPlan {
     bool hybrid_empty = false;
     bool adjacent_pair = false;
     bool reference_empty = false;
+    bool extended_bridge = false;
 };
 
 MissingWindowPlan makeMissingWindowPlan(
     const MissingWindowCandidate& candidate,
-    const SpeciesName& reference_species) {
+    const SpeciesName& reference_species,
+    bool extended_bridge = false) {
     MissingWindowPlan plan;
     plan.left = candidate.left.block;
     plan.interiors.reserve(candidate.interiors.size());
@@ -1700,6 +1709,7 @@ MissingWindowPlan makeMissingWindowPlan(
     plan.boundary_species_count = candidate.boundary_species_count;
     plan.hybrid_empty = candidate.hybrid_empty;
     plan.adjacent_pair = candidate.adjacent_pair;
+    plan.extended_bridge = extended_bridge;
     const auto reference_path = std::find_if(
         candidate.paths.begin(), candidate.paths.end(),
         [&](const MissingWindowPathContext& path) {
@@ -3898,6 +3908,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
     size_t full_k_triple_committed_total = 0;
     size_t full_k_triple_fallback_total = 0;
     size_t bridge_committed_total = 0;
+    size_t bridge_extended_scanned_total = 0;
+    size_t bridge_extended_candidates_total = 0;
+    size_t bridge_extended_committed_total = 0;
+    uint64_t bridge_extended_bases_total = 0;
     size_t minipoa_invocations_total = 0;
     size_t reference_only_bypass_total = 0;
     size_t reference_empty_bypass_total = 0;
@@ -4055,15 +4069,10 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                 SegPtr right_reference;
                 bool incompatible_boundary = false;
                 bool reference_span_exceeded = false;
+                bool extended_bridge_scan = false;
                 const uint64_t left_reference_end =
                     segmentEnd(left_reference);
                 while (cursor && !cursor->isTail()) {
-                    if (static_cast<uint64_t>(cursor->start) >
-                        left_reference_end +
-                            static_cast<uint64_t>(maximum_span)) {
-                        reference_span_exceeded = true;
-                        break;
-                    }
                     BlockView cursor_view;
                     if (!getCachedRealignBlockView(
                             cursor->parent_block, reference_species,
@@ -4071,7 +4080,30 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                         incompatible_boundary = true;
                         break;
                     }
-                    if (sameAnchorKeys(left_view, cursor_view)) {
+                    const bool same_anchor_keys =
+                        sameAnchorKeys(left_view, cursor_view);
+                    const bool adjacent_same_signature =
+                        interior_blocks.empty() && same_anchor_keys;
+                    const uint64_t span_limit =
+                        adjacent_same_signature
+                            ? std::max<uint64_t>(
+                                  maximum_span,
+                                  kFullParticipantBridgeMaximumSpan)
+                            : static_cast<uint64_t>(maximum_span);
+                    if (static_cast<uint64_t>(cursor->start) >
+                        left_reference_end + span_limit) {
+                        reference_span_exceeded = true;
+                        break;
+                    }
+                    if (same_anchor_keys) {
+                        extended_bridge_scan =
+                            adjacent_same_signature &&
+                            static_cast<uint64_t>(cursor->start) >
+                                left_reference_end +
+                                    static_cast<uint64_t>(maximum_span);
+                        if (extended_bridge_scan) {
+                            ++bridge_extended_scanned_total;
+                        }
                         right_reference = cursor;
                         break;
                     }
@@ -4113,6 +4145,14 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     ++rejections[static_cast<size_t>(candidate_result)];
                     return;
                 }
+                if (extended_bridge_scan) {
+                    if (!candidate.full_participant_bridge) {
+                        ++rejections[static_cast<size_t>(
+                            MissingWindowReject::INTERVAL_INVALID)];
+                        return;
+                    }
+                    ++bridge_extended_candidates_total;
+                }
                 if (candidate.full_participant_bridge) {
                     ++bridge_this_round;
                 } else if (candidate.hybrid_empty) {
@@ -4141,7 +4181,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     }
                 }
                 candidate_slots.push_back(
-                    makeMissingWindowPlan(candidate, reference_species));
+                    makeMissingWindowPlan(
+                        candidate, reference_species,
+                        extended_bridge_scan));
             };
 
         const auto minipoa_scan_start =
@@ -4463,6 +4505,19 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     ++round_bridge_committed;
                     ++bridge_pattern_counts[
                         candidate.participant_pattern];
+                    if (candidate_slots[candidate_index]
+                            .extended_bridge) {
+                        ++bridge_extended_committed_total;
+                        const auto reference_path = std::find_if(
+                            candidate.paths.begin(), candidate.paths.end(),
+                            [&](const MissingWindowPathContext& path) {
+                                return path.key.first == reference_species;
+                            });
+                        if (reference_path != candidate.paths.end()) {
+                            bridge_extended_bases_total +=
+                                reference_path->interval_length;
+                        }
+                    }
                 } else if (candidate.hybrid_empty) {
                     ++round_hybrid_committed;
                     if (detailed_stats) {
@@ -4536,13 +4591,22 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
                     bool is_replacement = true;
                     while (start && !start->isHead()) {
                         if (!start->isTail()) {
-                            if (!minipoa_dirty_seen.insert(
-                                    start.get()).second) {
+                            const bool first_visit =
+                                minipoa_dirty_seen.insert(
+                                    start.get()).second;
+                            // A replacement may already have been visited by
+                            // a higher-priority window to its right.  It is a
+                            // full-participant barrier in that earlier walk,
+                            // but as its own dirty start the scan must cross it
+                            // once to cover the still-dirty region on its left.
+                            if (!first_visit && !is_replacement) {
                                 break;
                             }
-                            minipoa_dirty_starts.emplace_back(
-                                chain.candidate.reference_chromosome,
-                                start);
+                            if (first_visit) {
+                                minipoa_dirty_starts.emplace_back(
+                                    chain.candidate.reference_chromosome,
+                                    start);
+                            }
                         }
                         if (!is_replacement) {
                             BlockView barrier_view;
@@ -4720,7 +4784,9 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         "[species-mismatch-realign] reference={} replaced={} "
         "zero_gap={} minipoa={} calls={} bypass={} "
         "time(scan/prepare/commit)={:.3f}/{:.3f}/{:.3f}s "
-        "total_seconds={:.3f}",
+        "total_seconds={:.3f} bridge_extended_scanned={} "
+        "bridge_extended_candidates={} bridge_extended_committed={} "
+        "bridge_extended_rejected={} bridge_extended_bases={}",
         reference_species,
         zero_gap_replaced_windows + minipoa_committed_total,
         zero_gap_replaced_windows, minipoa_committed_total,
@@ -4730,7 +4796,13 @@ size_t RaMeshMultiGenomeGraph::realignSingleMissingSpeciesWindows(
         zero_gap_prepare_seconds + minipoa_prepare_seconds,
         zero_gap_commit_seconds + minipoa_commit_seconds,
         std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - realignment_started).count());
+            std::chrono::steady_clock::now() - realignment_started).count(),
+        bridge_extended_scanned_total,
+        bridge_extended_candidates_total,
+        bridge_extended_committed_total,
+        bridge_extended_scanned_total -
+            bridge_extended_committed_total,
+        bridge_extended_bases_total);
     spdlog::debug(
         "[species-mismatch-realign][adjacent-pair] reference={} "
         "minipoa_candidates={} minipoa_committed={} "
