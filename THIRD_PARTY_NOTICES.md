@@ -9,6 +9,7 @@ directories or upstream distributions.
 | HAL | Hierarchical alignment storage and export | MIT |
 | sonLib | HAL support library | MIT |
 | libdivsufsort | Suffix-array construction | MIT |
+| sufkit-derived code | SIMD comparison and suffix-link techniques adapted into RaMAx; no sufkit library is linked | MIT |
 | ParlayLib | Parallel primitives | MIT |
 | spdlog | Logging | MIT |
 | cereal | Serialization | BSD-3-Clause |

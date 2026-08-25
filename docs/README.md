@@ -1,6 +1,6 @@
 # RaMAx documentation
 
-This directory contains the detailed documentation for RaMAx 1.0.7.
+This directory contains the detailed documentation for RaMAx 1.0.8.
 
 ## Getting started
 
@@ -19,6 +19,8 @@ This directory contains the detailed documentation for RaMAx 1.0.7.
   Chr09 example.
 - [Troubleshooting](troubleshooting.md): common startup, dependency, resource,
   restart, and output problems.
+- [Packaging and release](packaging.md): Conda and Docker build, validation,
+  upload, and release-tag commands for the current version.
 
 ## Internals
 

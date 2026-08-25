@@ -9,39 +9,80 @@
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <new>
+#include <stdexcept>
 
 namespace CaPS_SA
 {
 
     template <typename T_idx_>
-    Suffix_Array<T_idx_>::Suffix_Array(const char* const T, const idx_t n, const idx_t subproblem_count, const idx_t max_context) :
+    Suffix_Array<T_idx_>::Suffix_Array(const char* const T, const idx_t n,
+        const idx_t subproblem_count, const idx_t max_context) :
         T_(T),
         n_(n),
         SA_(allocate<idx_t>(n_)),
         LCP_(allocate<idx_t>(n_)),
+        owns_output_(true),
         SA_w(nullptr),
         LCP_w(nullptr),
-        p_(std::min(subproblem_count > 0 ? subproblem_count : default_subproblem_count, n / 16)),   // TODO: fix subproblem-count for small `n`.
+        p_(n_ < 16 ? 1 : std::max<idx_t>(1,
+            std::min(subproblem_count > 0 ? subproblem_count :
+                default_subproblem_count, n_ / 16))),
         max_context(max_context ? max_context : n_),
         pivot_(nullptr),
-        pivot_per_part_(std::min(static_cast<idx_t>(std::ceil(32.0 * std::log(n_))), n_ / p_ - 1)), // (c \ln n) or (|subarray| - 1)
+        pivot_per_part_(p_ == 1 ? 0 : std::min(
+            static_cast<idx_t>(std::ceil(32.0 * std::log(n_))),
+            n_ / p_ - 1)),
         part_size_scan_(allocate<idx_t>(p_ + 1)),
-        part_ruler_(allocate<idx_t>(p_* (p_ + 1)))
+        part_ruler_(allocate<idx_t>(p_ * (p_ + 1)))
     {
-        assert(n_ >= 16);   // TODO: fix subproblem-count for small `n`.
+        if (T_ == nullptr || n_ == 0 || SA_ == nullptr || LCP_ == nullptr)
+            throw std::invalid_argument(
+                "CaPS requires non-empty input and output buffers");
+    }
 
-        if (p_ > n_)
-        {
-            std::cerr << "Incompatible subproblem-count. Aborting.\n";
-            std::exit(EXIT_FAILURE);
-        }
+
+    template <typename T_idx_>
+    Suffix_Array<T_idx_>::Suffix_Array(const char* const T, const idx_t n,
+        const idx_t subproblem_count, const idx_t max_context,
+        idx_t* const SA, idx_t* const LCP) :
+        T_(T),
+        n_(n),
+        SA_(SA),
+        LCP_(LCP),
+        owns_output_(false),
+        SA_w(nullptr),
+        LCP_w(nullptr),
+        p_(n_ < 16 ? 1 : std::max<idx_t>(1,
+            std::min(subproblem_count > 0 ? subproblem_count :
+                default_subproblem_count, n_ / 16))),
+        max_context(max_context ? max_context : n_),
+        pivot_(nullptr),
+        pivot_per_part_(p_ == 1 ? 0 : std::min(
+            static_cast<idx_t>(std::ceil(32.0 * std::log(n_))),
+            n_ / p_ - 1)),
+        part_size_scan_(allocate<idx_t>(p_ + 1)),
+        part_ruler_(allocate<idx_t>(p_ * (p_ + 1)))
+    {
+        if (T_ == nullptr || n_ == 0 || SA_ == nullptr || LCP_ == nullptr)
+            throw std::invalid_argument(
+                "CaPS requires non-empty input and output buffers");
     }
 
 
     template <typename T_idx_>
     Suffix_Array<T_idx_>::~Suffix_Array()
     {
-        deallocate(SA_), deallocate(LCP_);
+        if (owns_output_)
+        {
+            deallocate(SA_);
+            deallocate(LCP_);
+        }
+        deallocate(SA_w);
+        deallocate(LCP_w);
+        deallocate(pivot_);
+        deallocate(part_size_scan_);
+        deallocate(part_ruler_);
     }
 
 
@@ -453,10 +494,14 @@ namespace CaPS_SA
         const auto t_s = now();
 
         deallocate(SA_w), deallocate(LCP_w);
+        SA_w = nullptr, LCP_w = nullptr;
 
         deallocate(pivot_);
+        pivot_ = nullptr;
         deallocate(part_size_scan_);
+        part_size_scan_ = nullptr;
         deallocate(part_ruler_);
+        part_ruler_ = nullptr;
 
         const auto t_e = now();
         //std::cerr << "Released the temporary data structures. Time taken: " << duration(t_e - t_s) << " seconds.\n";
@@ -467,6 +512,18 @@ namespace CaPS_SA
     void Suffix_Array<T_idx_>::construct()
     {
         const auto t_start = now();
+
+        if (p_ == 1)
+        {
+            SA_w = allocate<idx_t>(n_);
+            LCP_w = allocate<idx_t>(n_);
+            if (SA_w == nullptr || LCP_w == nullptr)
+                throw std::bad_alloc();
+            permute();
+            merge_sort(SA_w, SA_, n_, LCP_, LCP_w);
+            clean_up();
+            return;
+        }
 
         initialize();
 

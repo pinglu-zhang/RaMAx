@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <chrono>
+#include <stdexcept>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -32,6 +33,7 @@ namespace CaPS_SA
         const idx_t n_; // Length of the input text.
         idx_t* const SA_;   // The suffix array.
         idx_t* const LCP_;  // The LCP array.
+        const bool owns_output_; // Whether this object owns SA_ and LCP_.
         idx_t* SA_w;    // Working space for the SA construction.
         idx_t* LCP_w;   // Working space for the LCP construction.
         const idx_t p_; // Count of subproblems used in construction.
@@ -155,6 +157,11 @@ namespace CaPS_SA
         // the maximum prefix-context length for the suffixes can be bounded by
         // `max_context`.
         Suffix_Array(const char* T, idx_t n, idx_t subproblem_count = 0, idx_t max_context = 0);
+
+        // Constructs directly into caller-owned output buffers. Both buffers
+        // must contain space for n elements and remain alive through construct().
+        Suffix_Array(const char* T, idx_t n, idx_t subproblem_count,
+            idx_t max_context, idx_t* SA, idx_t* LCP);
 
         Suffix_Array(const Suffix_Array&) = delete;
         Suffix_Array& operator=(const Suffix_Array&) = delete;

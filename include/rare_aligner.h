@@ -9,6 +9,7 @@
 
 #include "config.hpp"
 #include "index.h"
+#include "suffix_array_index.h"
 #include "SeqPro.h"
 #include "threadpool.h"
 #include "ramesh.h"
@@ -19,8 +20,7 @@
 #include "wfmash_router.h"
 
 struct IndexCacheCounters {
-    std::atomic_size_t reused{0};
-    std::atomic_size_t rebuilt{0};
+    std::atomic_size_t memory_only_built{0};
 };
 
 // 多基因组比对核心调度类
@@ -36,6 +36,7 @@ public:
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
     uint_t accurate_skip_threshold;
+    uint_t sa_sampling_rate{1};
     bool allow_mem = false;
     SpeciesClusterMap secondary_cluster_map;
     SpeciesMatchVec3DPtrMap secondary_match_map;
@@ -137,13 +138,14 @@ public:
     SpeciesName ref_name;
 
     SeqPro::ManagerVariant* ref_seqpro_manager;
-    std::optional<FM_Index> ref_index;
+    std::optional<Suffix_Array_Index> ref_index;
 
     uint_t chunk_size;
     uint_t overlap_size;
     uint_t min_anchor_length;
     uint_t max_anchor_frequency;
     uint_t accurate_skip_threshold = 0;
+    uint_t sa_sampling_rate = 1;
 
     uint_t group_id;
     uint_t round_id;
@@ -163,6 +165,7 @@ public:
         min_anchor_length(mra.min_anchor_length),
         max_anchor_frequency(mra.max_anchor_frequency),
         accurate_skip_threshold(mra.accurate_skip_threshold),
+        sa_sampling_rate(mra.sa_sampling_rate),
         thread_num(mra.thread_num),
         trust_legacy_cache(mra.trust_legacy_cache),
         index_cache_counters(mra.index_cache_counters)

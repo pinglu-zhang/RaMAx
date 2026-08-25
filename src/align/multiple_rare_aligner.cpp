@@ -440,12 +440,6 @@ MultipleRareAligner::MultipleRareAligner(
         spdlog::info("Created work directory: {}", work_dir.string());
     }
 
-    // 确保索引目录存在（默认放在 work_dir/index）
-    if (!std::filesystem::exists(index_dir)) {
-        std::filesystem::create_directories(index_dir);
-        spdlog::info("Created index directory: {}", index_dir.string());
-    }
-
     this->group_id = 0;
     this->round_id = 0;
 
@@ -683,7 +677,7 @@ starAlignment(
     }
 
     // Estimate whole-genome Mash distance once for the first selected
-    // reference. The legacy FM-index aligner remains the only alignment
+    // reference. The native suffix-array aligner remains the only legacy
     // backend in this phase; these records are retained for the future router.
     MashDistanceEstimator mash_estimator(
         locateMashExecutable(), work_dir / "similarity", thread_num);
@@ -692,7 +686,7 @@ starAlignment(
 
     // Route only first-round near genomes through wfmash. Tool/version
     // validation and the public-reference FAI are intentionally completed
-    // before any legacy FM-index can be built.
+    // before any native suffix-array index can be built.
     FirstRoundWfmashRouter wfmash_router(
         locateSamtoolsExecutable(), locateWfmashExecutable(),
         work_dir / "wfmash" / "round_0", thread_num);
@@ -807,11 +801,11 @@ starAlignment(
         } else {
             if (i == 0) {
                 spdlog::info(
-                    "[wfmash-router] all first-round queries succeeded; skipping FM-index, cluster, and DP for {}",
+                    "[wfmash-router] all first-round queries succeeded; skipping suffix-array index, cluster, and DP for {}",
                     current_ref_name);
             } else {
                 spdlog::info(
-                    "No remaining legacy queries for {}; skipping FM-index, cluster, and DP",
+                    "No remaining legacy queries for {}; skipping suffix-array index, cluster, and DP",
                     current_ref_name);
             }
         }
@@ -961,9 +955,9 @@ starAlignment(
     }
 
     spdlog::info(
-        "[cache-summary] FM-index reused={} rebuilt={}",
-        index_cache_counters->reused.load(),
-        index_cache_counters->rebuilt.load());
+        "[cache-summary] suffix-array storage=memory-only built={} "
+        "disk-reused=0 disk-bytes=0",
+        index_cache_counters->memory_only_built.load());
 
     // 所有轮次完成后，flush logger
     spdlog::default_logger()->flush();
@@ -1030,9 +1024,6 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     //}
 
     /* ---------- 3. 准备参考基因组索引 ---------- */
-    FilePath ref_index_path = index_dir / ref_name;
-    std::filesystem::create_directories(ref_index_path);
-
     // PairRareAligner：用于 ref vs query 的 pairwise anchor 查找
     PairRareAligner pra(*this);
 

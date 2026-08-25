@@ -1,6 +1,6 @@
 # Command-line parameters
 
-This page documents the public RaMAx 1.0.7 interface. Values and ranges follow
+This page documents the public RaMAx 1.0.8 interface. Values and ranges follow
 the current CLI implementation. Run `ramax --help` to inspect the installed
 binary.
 
@@ -41,7 +41,8 @@ binary.
 | `--allow-mem` | flag; off | Allow MEM anchors instead of restricting discovery to MUM anchors. |
 | `--one-round` | flag; off | Stop after one reference-guided alignment round. |
 | `--slow-build` | flag; off | Use the slower index-building implementation. |
-| `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference index. |
+| `--sampling-interval` | integer; `32`; `1..INT_MAX` bp | Sampling interval for the reference global-coordinate cache; it does not sample suffix-array rows. |
+| `--sa-sampling-rate` | integer; `1`; only `1` | Suffix-array sampling rate. RaMAx stores complete in-memory SA/ISA/LCP arrays and rejects every value other than `1`; references below 1024 MiB use divsufsort and larger references use CaPS. The suffix-array index is never written to disk. |
 | `--min-span` | integer; `65`; `1..INT_MAX` bp | Minimum span used during graph construction. |
 | `--near-distance` | float; `0.01`; `0..1` | In the first round, route a query to wfmash only when its Mash distance is strictly smaller than this value. Equality stays on the RaMAx backend. |
 | `--far-distance` | float; `0.02`; `0..1` | Reserved distant-species threshold. It is persisted and logged but does not route queries in this release. |
@@ -51,8 +52,7 @@ The thresholds must satisfy
 uses PGGB-compatible wfmash `v0.14.0-0-g517e1bc` with
 `-s 5000 -l 25000 -p 95 -n 1 -k 19 -H 0.001 -Y '#'
 --hg-filter-ani-diff 30 --approx-map`; precise alignment reuses the mapping
-PAF with `--invert-filtering`. Later reference rounds always use the RaMAx
-FM-index backend. Unlike PGGB, RaMAx launches independent reference/query
+PAF with `--invert-filtering`. Later reference rounds always use the native RaMAx suffix-array backend. Unlike PGGB, RaMAx launches independent reference/query
 pairs and therefore does not use `--lower-triangular`.
 
 Parameter names containing underscores are retained in the current public CLI
@@ -93,10 +93,10 @@ modules are enabled by default, the normal numeric-only overrides are valid.
 | Option | Type/default/range | Description |
 |---|---|---|
 | `-t`, `--threads` | integer; hardware concurrency; `1..INT_MAX` | Worker-thread count. It may also be supplied by `RAMAx_THREADS`. |
-| `--restart` | flag; off | Reuse validated raw/clean FASTA and FM-index caches, then rerun alignment from the beginning. |
+| `--restart` | flag; off | Reuse validated raw/clean FASTA artifacts, rebuild the memory-only suffix array, then rerun alignment from the beginning. |
 
 In restart mode, `-w` identifies the interrupted run and `-i` is forbidden.
-Explicit output, algorithm, optimization, thread, root, PAF-mode, GFA-version, GFA-profile, and logging
+Explicit output, algorithm (including `--sa-sampling-rate`), optimization, thread, root, PAF-mode, GFA-version, GFA-profile, and logging
 options override the latest saved configuration. If any `-o` is supplied, the
 complete repeated `-o` list replaces the saved output list. Existing boolean
 flags retain their current one-way behavior; no new negative forms are added.

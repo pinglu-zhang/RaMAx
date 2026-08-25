@@ -685,13 +685,12 @@ bool ExternalMsaRunner::align(
                                 "Cannot initialize MSA spawn actions");
     }
     int action_error = 0;
-#if defined(__linux__)
+#if defined(__linux__) && defined(__GLIBC__) && defined(__GLIBC_PREREQ) && \
+    __GLIBC_PREREQ(2, 29)
     if (!invocation_scratch.empty()) {
         action_error = posix_spawn_file_actions_addchdir_np(
             &actions, invocation_scratch.c_str());
     }
-#else
-    if (!invocation_scratch.empty()) action_error = ENOTSUP;
 #endif
     if (action_error == 0 && input_fd) {
         action_error = posix_spawn_file_actions_adddup2(
