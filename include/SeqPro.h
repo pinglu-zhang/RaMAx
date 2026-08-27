@@ -11,6 +11,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -224,6 +225,17 @@ public:
   std::string getSubSequence(const std::string &seq_name, Position start, Length length) const;
   std::string getSubSequence(SequenceId seq_id, Position start, Length length) const;
 
+  // Returns a non-owning view only when the requested range is physically
+  // contiguous in the mapped FASTA. The view remains valid for this manager's
+  // lifetime. Wrapped FASTA ranges that cross a physical line return false.
+  bool tryGetContiguousSubSequence(SequenceId seq_id, Position start,
+                                   Length length, std::string_view &view) const;
+
+  // Owning fallback that reuses caller-managed storage. Existing string-return
+  // APIs keep their original behavior.
+  void getSubSequenceInto(SequenceId seq_id, Position start, Length length,
+                          std::string &output) const;
+
   // 全局坐标获取（原始坐标）
   std::string getSubSequenceGlobal(Position global_start, Length length) const;
 
@@ -306,6 +318,8 @@ private:
   // 内部方法
   void buildIndex();
   std::string extractSequence(const SequenceInfo &info, Position start, Length length) const;
+  void extractSequenceInto(const SequenceInfo &info, Position start, Length length,
+                           std::string &output) const;
 };
 
 // === 遮蔽序列管理器 ===

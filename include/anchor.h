@@ -262,7 +262,7 @@ struct Anchor {
         strand(strand),
         alignment_length(align_len),
         aligned_base(aligned_base),
-        cigar(cigar_str) {
+        cigar(std::move(cigar_str)) {
     }
 
 

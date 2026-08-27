@@ -130,7 +130,8 @@ namespace {
         size_t work_items,
         uint_t requested_threads,
         OpenMPStageActivity& activity,
-        Function&& function) {
+        Function&& function,
+        int dynamic_chunk = 1) {
         std::mutex failure_mutex;
         std::exception_ptr first_failure;
         size_t first_failure_index = work_items;
@@ -161,7 +162,7 @@ namespace {
                 execute(index);
             }
         } else {
-#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#pragma omp parallel for schedule(dynamic, dynamic_chunk) num_threads(workers)
             for (long long index = 0;
                  index <
                      static_cast<long long>(
@@ -1561,12 +1562,18 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
     }
 
     struct ExtensionWorkItem {
-        size_t species_index = 0;
-        size_t group_index = 0;
+        uint32_t species_index = 0;
+        uint32_t group_index = 0;
         MatchClusterVec* group = nullptr;
-        uint32_t cost = 0;
+        uint64_t cost = 0;
         bool secondary = false;
+        bool heavy = false;
     };
+    std::vector<SeqPro::ManagerVariant*> species_managers;
+    species_managers.reserve(species_list.size());
+    for (const auto& species : species_list) {
+        species_managers.push_back(seqpro_managers.at(species).get());
+    }
     std::vector<std::vector<AnchorPtrVec>>
         primary_extensions(
             species_list.size());
@@ -1575,6 +1582,67 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             species_list.size());
     std::vector<ExtensionWorkItem>
         extension_work;
+
+    const auto saturatingAdd = [](uint64_t left, uint64_t right) {
+        return right > std::numeric_limits<uint64_t>::max() - left
+            ? std::numeric_limits<uint64_t>::max()
+            : left + right;
+    };
+    const auto estimateExtensionCost = [&](const MatchClusterVec& group) {
+        uint64_t cost = 0;
+        bool heavy = false;
+        uint64_t total_matches = 0;
+        for (const auto& cluster : group) {
+            total_matches = saturatingAdd(
+                total_matches, cluster.size());
+        }
+        cost = saturatingAdd(cost, total_matches);
+        if (!is_first) {
+            return std::pair<uint64_t, bool>{cost, false};
+        }
+        const uint64_t candidate_width =
+            std::min<size_t>(group.size(), 2000);
+        const uint64_t candidate_cost = candidate_width != 0 &&
+                group.size() >
+                    std::numeric_limits<uint64_t>::max() / candidate_width
+            ? std::numeric_limits<uint64_t>::max()
+            : static_cast<uint64_t>(group.size()) * candidate_width;
+        cost = saturatingAdd(cost, candidate_cost);
+        heavy = group.size() > 1;
+        for (const auto& cluster : group) {
+            for (size_t index = 1; index < cluster.size(); ++index) {
+                const Match& previous = cluster[index - 1];
+                const Match& current = cluster[index];
+                const int64_t ref_gap = static_cast<int64_t>(current.ref_start) -
+                    static_cast<int64_t>(previous.ref_start + previous.match_len());
+                int64_t query_gap = 0;
+                if (previous.strand() == FORWARD) {
+                    query_gap = static_cast<int64_t>(current.qry_start) -
+                        static_cast<int64_t>(previous.qry_start + previous.match_len());
+                } else {
+                    query_gap = static_cast<int64_t>(previous.qry_start) -
+                        static_cast<int64_t>(current.qry_start + current.match_len());
+                }
+                if (ref_gap < 0 || query_gap < 0 ||
+                    ref_gap > 10000 || query_gap > 10000) {
+                    continue;
+                }
+                heavy = true;
+                const uint64_t maximum_gap = static_cast<uint64_t>(
+                    std::max(ref_gap, query_gap));
+                const uint64_t band = static_cast<uint64_t>(auto_band(
+                    static_cast<int>(ref_gap),
+                    static_cast<int>(query_gap)));
+                const uint64_t width = saturatingAdd(band, band) + 1;
+                const uint64_t alignment_cost = maximum_gap != 0 &&
+                        width > std::numeric_limits<uint64_t>::max() / maximum_gap
+                    ? std::numeric_limits<uint64_t>::max()
+                    : maximum_gap * width;
+                cost = saturatingAdd(cost, alignment_cost);
+            }
+        }
+        return std::pair<uint64_t, bool>{cost, heavy};
+    };
 
     for (size_t species_index = 0;
          species_index <
@@ -1591,20 +1659,13 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         for (const auto& [key, group] :
              primary_map) {
             (void)key;
-            uint64_t cost = 0;
-            if (group) {
-                for (const auto& cluster : *group) {
-                    cost += cluster.size();
-                }
-            }
-            extension_work.push_back(
-                {species_index,
-                 primary_index++,
-                 group.get(),
-                 static_cast<uint32_t>(std::min<uint64_t>(
-                     cost,
-                     std::numeric_limits<uint32_t>::max())),
-                 false});
+            const size_t output_index = primary_index++;
+            if (!group || group->empty()) continue;
+            const auto [cost, heavy] = estimateExtensionCost(*group);
+            extension_work.push_back({
+                static_cast<uint32_t>(species_index),
+                static_cast<uint32_t>(output_index),
+                group.get(), cost, false, heavy});
         }
 
         if (allow_mem) {
@@ -1622,20 +1683,13 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 for (const auto& [key, group] :
                       *secondary_it->second) {
                     (void)key;
-                    uint64_t cost = 0;
-                    if (group) {
-                        for (const auto& cluster : *group) {
-                            cost += cluster.size();
-                        }
-                    }
-                    extension_work.push_back(
-                        {species_index,
-                         secondary_index++,
-                         group.get(),
-                         static_cast<uint32_t>(std::min<uint64_t>(
-                             cost,
-                             std::numeric_limits<uint32_t>::max())),
-                         true});
+                    const size_t output_index = secondary_index++;
+                    if (!group || group->empty()) continue;
+                    const auto [cost, heavy] = estimateExtensionCost(*group);
+                    extension_work.push_back({
+                        static_cast<uint32_t>(species_index),
+                        static_cast<uint32_t>(output_index),
+                        group.get(), cost, true, heavy});
                 }
             }
         }
@@ -1646,6 +1700,9 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         extension_work.end(),
         [](const ExtensionWorkItem& left,
            const ExtensionWorkItem& right) {
+            if (left.heavy != right.heavy) {
+                return left.heavy > right.heavy;
+            }
             if (left.cost != right.cost) {
                 return left.cost > right.cost;
             }
@@ -1657,6 +1714,9 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             }
             return left.group_index < right.group_index;
         });
+    const size_t heavy_work_items = static_cast<size_t>(
+        std::count_if(extension_work.begin(), extension_work.end(),
+            [](const ExtensionWorkItem& item) { return item.heavy; }));
 
     OpenMPStageActivity
         extension_activity;
@@ -1664,21 +1724,17 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         "cluster-extension", "start", extension_work.size());
     const auto extension_start =
         std::chrono::steady_clock::now();
-    executeParallelStage(
-        extension_work.size(),
+    const auto runExtensionRange = [&](size_t begin, size_t end,
+                                       int dynamic_chunk) {
+        executeParallelStage(
+        end - begin,
         thread_num,
         extension_activity,
-        [&](size_t work_index) {
+        [&](size_t relative_index) {
+            const size_t work_index = begin + relative_index;
             const auto& item =
                 extension_work[work_index];
-            auto& manager =
-                *seqpro_managers.at(
-                    species_list[
-                        item.species_index]);
-            if (item.group == nullptr ||
-                item.group->empty()) {
-                return;
-            }
+            auto& manager = *species_managers[item.species_index];
             if (item.secondary) {
                 secondary_extensions[
                     item.species_index]
@@ -1696,7 +1752,10 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                         *item.group,
                         is_first);
             }
-        });
+        }, dynamic_chunk);
+    };
+    runExtensionRange(0, heavy_work_items, 1);
+    runExtensionRange(heavy_work_items, extension_work.size(), 64);
     const double extension_ms =
         std::chrono::duration<
             double,
@@ -1706,9 +1765,11 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             .count();
     spdlog::info(
         "[parallel-stage] cluster-extension: "
-        "tasks={}, threads={}, max_active={}, "
+        "tasks={}, heavy={}, light={}, threads={}, max_active={}, "
         "elapsed_ms={:.3f}",
         extension_work.size(),
+        heavy_work_items,
+        extension_work.size() - heavy_work_items,
         stageWorkerCount(
             thread_num,
             extension_work.size()),
@@ -1826,6 +1887,7 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 size_t begin = 0;
                 size_t end = 0;
                 size_t anchor_count = 0;
+                size_t original_task_index = 0;
             };
             size_t possible_chromosomes = 0;
             size_t total_groups = 0;
@@ -1894,7 +1956,8 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                         ref.chromosome_id,
                         index,
                         index,
-                        0});
+                        0,
+                        work_items.size()});
                 }
                 auto& item = work_items.back();
                 item.end = index + 1;
@@ -1903,12 +1966,22 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                         [ref.group_index]
                             .size();
             }
+            std::stable_sort(
+                work_items.begin(), work_items.end(),
+                [](const DPWorkItem& left, const DPWorkItem& right) {
+                    if (left.anchor_count != right.anchor_count) {
+                        return left.anchor_count > right.anchor_count;
+                    }
+                    return left.original_task_index < right.original_task_index;
+                });
 
             OpenMPStageActivity activity;
             logStageMemory(
                 stage_name, "start", work_items.size(), group_refs.size());
             const auto stage_start =
                 std::chrono::steady_clock::now();
+            const uint64_t fallback_before =
+                PairRareAligner::dpTreapFallbackCount();
             executeParallelStage(
                 work_items.size(),
                 thread_num,
@@ -1935,6 +2008,8 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                         std::move(anchors),
                         filter_reference);
                 });
+            const uint64_t fallback_count =
+                PairRareAligner::dpTreapFallbackCount() - fallback_before;
             const double elapsed_ms =
                 std::chrono::duration<
                     double,
@@ -1946,6 +2021,7 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 "[parallel-stage] {}: tasks={}, "
                 "threads={}, max_active={}, groups={}, "
                 "possible_chromosomes={}, skipped_empty={}, "
+                "treap_fallbacks={}, "
                 "elapsed_ms={:.3f}",
                 stage_name,
                 work_items.size(),
@@ -1959,6 +2035,7 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 possible_chromosomes >= work_items.size()
                     ? possible_chromosomes - work_items.size()
                     : 0,
+                fallback_count,
                 elapsed_ms);
             logStageMemory(
                 stage_name, "complete", work_items.size(), group_refs.size());

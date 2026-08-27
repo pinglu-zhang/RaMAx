@@ -12,9 +12,44 @@
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace RaMesh {
+namespace {
+
+void stableRadixSortSegmentsByStart(
+    std::vector<SegPtr>& segments,
+    std::vector<SegPtr>& scratch,
+    std::vector<size_t>& counts) {
+  if (segments.size() < 2) return;
+  constexpr size_t kRadix = 1u << 16;
+  counts.resize(kRadix);
+  scratch.resize(segments.size());
+  const auto pass = [&](const std::vector<SegPtr>& source,
+                        std::vector<SegPtr>& destination,
+                        unsigned shift) {
+    std::fill(counts.begin(), counts.end(), 0);
+    for (const auto& segment : source) {
+      ++counts[(static_cast<uint32_t>(segment->start) >> shift) & 0xffffu];
+    }
+    size_t offset = 0;
+    for (size_t& count : counts) {
+      const size_t frequency = count;
+      count = offset;
+      offset += frequency;
+    }
+    for (const auto& segment : source) {
+      const size_t key =
+          (static_cast<uint32_t>(segment->start) >> shift) & 0xffffu;
+      destination[counts[key]++] = segment;
+    }
+  };
+  pass(segments, scratch, 0);
+  pass(scratch, segments, 16);
+}
+
+}  // namespace
 /* =============================================================
  * 1.  RaMeshGenomeGraph
  * ===========================================================*/
@@ -69,7 +104,8 @@ RaMeshMultiGenomeGraph::RaMeshMultiGenomeGraph(
 
 void RaMeshMultiGenomeGraph::insertAnchorIntoGraph(
     SeqPro::ManagerVariant &ref_mgr, SeqPro::ManagerVariant &qry_mgr,
-    SpeciesName ref_name, SpeciesName qry_name, const Anchor &anchor,
+    const SpeciesName &ref_name, const SpeciesName &qry_name,
+    const Anchor &anchor,
     bool isMultiple) {
 
   auto fetchName = [](const SeqPro::ManagerVariant &mv, const ChrIndex &chr) {
@@ -112,6 +148,82 @@ void RaMeshMultiGenomeGraph::insertAnchorIntoGraph(
 
   ref_end.insertSegment(r_seg);
   qry_end.insertSegment(q_seg);
+}
+
+void RaMeshMultiGenomeGraph::insertAnchorsIntoGraphBatch(
+    SeqPro::ManagerVariant& ref_mgr,
+    SeqPro::ManagerVariant& qry_mgr,
+    const SpeciesName& ref_name,
+    const SpeciesName& qry_name,
+    const std::vector<Anchor*>& anchors) {
+  if (anchors.empty()) return;
+  const auto sequenceNames = [](SeqPro::ManagerVariant& manager) {
+    return std::visit([](auto& pointer) {
+      using Pointer = std::decay_t<decltype(pointer)>;
+      if constexpr (std::is_same_v<
+                        Pointer,
+                        std::unique_ptr<SeqPro::SequenceManager>>) {
+        return pointer->getSequenceNames();
+      } else {
+        return pointer->getOriginalManager().getSequenceNames();
+      }
+    }, manager);
+  };
+  const std::vector<ChrName> ref_chromosomes = sequenceNames(ref_mgr);
+  const std::vector<ChrName> qry_chromosomes = sequenceNames(qry_mgr);
+
+  struct PendingGenomeEnd {
+    GenomeEnd* end = nullptr;
+    std::vector<SegPtr> segments;
+  };
+  std::vector<PendingGenomeEnd> pending;
+  std::unordered_map<GenomeEnd*, size_t> pending_index;
+  pending_index.reserve(ref_chromosomes.size() + qry_chromosomes.size());
+  const auto enqueue = [&](GenomeEnd& end, SegPtr segment) {
+    const auto [iterator, inserted] = pending_index.emplace(
+        &end, pending.size());
+    if (inserted) pending.push_back({&end, {}});
+    pending[iterator->second].segments.push_back(std::move(segment));
+  };
+
+  auto& ref_graph = species_graphs.at(ref_name);
+  auto& qry_graph = species_graphs.at(qry_name);
+  {
+    std::unique_lock pool_lock(rw);
+    blocks.reserve(blocks.size() + anchors.size());
+    for (Anchor* anchor : anchors) {
+      if (!anchor) continue;
+      try {
+        const ChrName& ref_chromosome =
+            ref_chromosomes.at(anchor->ref_chr_index);
+        const ChrName& qry_chromosome =
+            qry_chromosomes.at(anchor->qry_chr_index);
+        GenomeEnd& ref_end = ref_graph.chr2end.at(ref_chromosome);
+        GenomeEnd& qry_end = qry_graph.chr2end.at(qry_chromosome);
+        BlockPtr block = Block::create(2);
+        block->ref_chr = ref_chromosome;
+        block->ref_species = ref_name;
+        auto [ref_segment, qry_segment] = Block::createSegmentPair(
+            *anchor, ref_name, qry_name,
+            ref_chromosome, qry_chromosome, block);
+        blocks.emplace_back(WeakBlock(block));
+        enqueue(ref_end, std::move(ref_segment));
+        enqueue(qry_end, std::move(qry_segment));
+      } catch (const std::exception& error) {
+        spdlog::error("Error materializing anchor for batch insertion: {}",
+                      error.what());
+      }
+    }
+  }
+
+  std::vector<SegPtr> radix_scratch;
+  std::vector<size_t> radix_counts;
+  for (auto& item : pending) {
+    stableRadixSortSegmentsByStart(
+        item.segments, radix_scratch, radix_counts);
+    item.end->insertSegmentsSorted(item.segments);
+    std::vector<SegPtr>().swap(item.segments);
+  }
 }
 
 namespace {

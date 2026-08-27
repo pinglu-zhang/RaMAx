@@ -9,7 +9,7 @@ HAL output additionally requires a Newick species tree as the first record.
 ### Conda
 
 ```bash
-conda install -y -c malab ramax=1.0.8
+conda install -c malab -c conda-forge -c bioconda ramax=1.0.8 -y
 
 ramax --version
 ```

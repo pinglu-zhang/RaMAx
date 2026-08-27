@@ -19,7 +19,7 @@ namespace RaMesh {
         Cigar_t cg, AlignRole rl, SegmentRole sl,
         const BlockPtr& bp)
     {
-        auto* s = new Segment();
+        auto s = std::make_shared<Segment>();
         s->start = start;
         s->length = len;
         s->strand = sd;
@@ -32,7 +32,7 @@ namespace RaMesh {
         s->primary_path.next.store(nullptr, std::memory_order_relaxed);
         s->primary_path.prev.store(nullptr, std::memory_order_relaxed);
 
-        return std::shared_ptr<Segment>(s);
+        return s;
     }
 
     SegPtr Segment::createFromRegion(Region& region, Strand sd,
@@ -282,6 +282,44 @@ namespace RaMesh {
         next->primary_path.prev.store(seg);
        
         setToSampling(seg);
+    }
+
+    void GenomeEnd::insertSegmentsSorted(
+        const std::vector<SegPtr>& segments)
+    {
+        if (segments.empty()) return;
+        SegPtr previous;
+        uint_t previous_start = 0;
+        bool first = true;
+        for (const SegPtr& segment : segments) {
+            if (!segment) continue;
+            if (first || segment->start - previous_start > 2 * kSampleStep) {
+                previous = findSurrounding(segment->start);
+            } else {
+                SegPtr current = previous->primary_path.next.load(
+                    std::memory_order_acquire);
+                while (current && !current->isTail() &&
+                       current->start <= segment->start) {
+                    previous = current;
+                    current = current->primary_path.next.load(
+                        std::memory_order_acquire);
+                }
+            }
+            SegPtr next = previous->primary_path.next.load(
+                std::memory_order_acquire);
+            segment->primary_path.prev.store(
+                previous, std::memory_order_release);
+            segment->primary_path.next.store(
+                next, std::memory_order_release);
+            previous->primary_path.next.store(
+                segment, std::memory_order_release);
+            next->primary_path.prev.store(
+                segment, std::memory_order_release);
+            setToSampling(segment);
+            previous = segment;
+            previous_start = segment->start;
+            first = false;
+        }
     }
 
 
@@ -979,13 +1017,10 @@ namespace RaMesh {
             match.strand(), Cigar_t{ cigarToInt('M', match_len) }, AlignRole::PRIMARY,
             SegmentRole::SEGMENT, blk);
 
-        // Register anchors
-        {
-            std::unique_lock lk(blk->rw);
-            blk->ref_species = ref_name;
-            blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
-            blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
-        }
+        // The block is not published yet; no lock is required here.
+        blk->ref_species = ref_name;
+        blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
+        blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
         return { ref_seg, qry_seg };
     }
 
@@ -1006,14 +1041,30 @@ namespace RaMesh {
             anchor.strand, anchor.cigar, AlignRole::PRIMARY,
             SegmentRole::SEGMENT, blk);
 
-        // Register anchors
-        {
-            std::unique_lock lk(blk->rw);
-            blk->ref_species = ref_name;
-            blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
-            blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
-        }
+        // The block is not published yet; no lock is required here.
+        blk->ref_species = ref_name;
+        blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
+        blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
         return { ref_seg, qry_seg };
+    }
+
+    std::pair<SegPtr, SegPtr> Block::createSegmentPair(Anchor& anchor,
+        const SpeciesName& ref_name,
+        const SpeciesName& qry_name,
+        const ChrName& ref_chr,
+        const ChrName& qry_chr,
+        const BlockPtr& blk)
+    {
+        SegPtr ref_seg = Segment::create(anchor.ref_start, anchor.ref_len,
+            Strand::FORWARD, Cigar_t{}, AlignRole::PRIMARY,
+            SegmentRole::SEGMENT, blk);
+        SegPtr qry_seg = Segment::create(anchor.qry_start, anchor.qry_len,
+            anchor.strand, std::move(anchor.cigar), AlignRole::PRIMARY,
+            SegmentRole::SEGMENT, blk);
+        blk->ref_species = ref_name;
+        blk->anchors.emplace(SpeciesChrPair{ref_name, ref_chr}, ref_seg);
+        blk->anchors.emplace(SpeciesChrPair{qry_name, qry_chr}, qry_seg);
+        return {ref_seg, qry_seg};
     }
     
     //void Block::removeAllSegments() {

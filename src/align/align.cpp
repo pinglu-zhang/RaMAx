@@ -25,6 +25,72 @@ constexpr uint32_t kCrossAnchorFlankLength = 16;
 constexpr double kCrossAnchorMinimumCoverage = 0.70;
 constexpr double kCrossAnchorMinimumIdentity = 0.60;
 constexpr size_t kCrossAnchorCacheLimit = 1024;
+constexpr size_t kMaximumRetainedKswEncoding = 64 * 1024;
+
+struct KswEncodingScratch {
+    std::vector<uint8_t> reference;
+    std::vector<uint8_t> query;
+};
+
+thread_local KswEncodingScratch ksw_encoding_scratch;
+
+char orientedBase(const KswSequenceView sequence, size_t index) {
+    if (!sequence.reverse_complement) {
+        return sequence.bases[index];
+    }
+    const size_t reversed_index = sequence.bases.size() - index - 1;
+    return BASE_COMPLEMENT[static_cast<uint8_t>(
+        sequence.bases[reversed_index])];
+}
+
+void encodeSequence(const KswSequenceView sequence,
+                    std::vector<uint8_t>& encoded) {
+    encoded.resize(sequence.bases.size());
+    for (size_t index = 0; index < sequence.bases.size(); ++index) {
+        encoded[index] = ScoreChar2Idx[static_cast<uint8_t>(
+            orientedBase(sequence, index))];
+    }
+}
+
+bool isCanonicalExactMatch(const KswSequenceView reference,
+                           const KswSequenceView query) {
+    if (reference.bases.empty() ||
+        reference.bases.size() != query.bases.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < reference.bases.size(); ++index) {
+        const char ref_base = orientedBase(reference, index);
+        const char query_base = orientedBase(query, index);
+        if (ref_base != query_base ||
+            (ref_base != 'A' && ref_base != 'C' &&
+             ref_base != 'G' && ref_base != 'T')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<uint8_t>& selectEncodingBuffer(
+    size_t size, std::vector<uint8_t>& retained,
+    std::vector<uint8_t>& temporary) {
+    return size <= kMaximumRetainedKswEncoding ? retained : temporary;
+}
+
+AlignmentResult copyKswResultAndSummarize(const ksw_extz_t& result) {
+    AlignmentResult output;
+    output.cigar.reserve(result.n_cigar);
+    for (int index = 0; index < result.n_cigar; ++index) {
+        const CigarUnit unit = result.cigar[index];
+        output.cigar.push_back(unit);
+        const uint32_t length = unit >> 4;
+        const uint32_t operation = unit & 0xf;
+        output.summary.alignment_length += length;
+        if (operation != 1) output.summary.reference_length += length;
+        if (operation != 2) output.summary.query_length += length;
+        if (operation == 0) output.summary.match_length += length;
+    }
+    return output;
+}
 
 using RaMesh::Alignment::CrossAnchorRepairConfiguration;
 
@@ -45,6 +111,7 @@ uint64_t elapsedNanoseconds(
 
 struct GlobalKswRun {
     Cigar_t cigar;
+    CigarSummary summary;
     int score = std::numeric_limits<int>::min();
 };
 
@@ -82,15 +149,15 @@ void appendSimpleGlobalCigar(
 // bound for every path with another gap run. Strict comparison plus a unique
 // one-gap placement preserves KSW2's tie-breaking contract.
 bool tryProvablyOptimalSimpleGlobalAlignment(
-    const std::string& reference,
-    const std::string& query,
+    KswSequenceView reference,
+    KswSequenceView query,
     const int8_t* matrix,
     int maximum_substitution_score,
     int gap_open,
     int gap_extend,
     Cigar_t& cigar) {
-    const size_t reference_length = reference.size();
-    const size_t query_length = query.size();
+    const size_t reference_length = reference.bases.size();
+    const size_t query_length = query.bases.size();
     const size_t shorter_length =
         std::min(reference_length, query_length);
     const size_t length_difference =
@@ -121,23 +188,27 @@ bool tryProvablyOptimalSimpleGlobalAlignment(
     bool best_gap_position_is_unique = true;
     if (reference_length == query_length) {
         for (size_t index = 0; index < shorter_length; ++index) {
-            best_score += score_pair(reference[index], query[index]);
+            best_score += score_pair(
+                orientedBase(reference, index),
+                orientedBase(query, index));
         }
     } else if (reference_length > query_length) {
         int64_t current_score = 0;
         for (size_t index = 0; index < shorter_length; ++index) {
             current_score += score_pair(
-                reference[index + length_difference], query[index]);
+                orientedBase(reference, index + length_difference),
+                orientedBase(query, index));
         }
         best_score = current_score;
         for (size_t gap_position = 0;
              gap_position < shorter_length;
              ++gap_position) {
             current_score -= score_pair(
-                reference[gap_position + length_difference],
-                query[gap_position]);
+                orientedBase(reference, gap_position + length_difference),
+                orientedBase(query, gap_position));
             current_score +=
-                score_pair(reference[gap_position], query[gap_position]);
+                score_pair(orientedBase(reference, gap_position),
+                           orientedBase(query, gap_position));
             if (current_score > best_score) {
                 best_score = current_score;
                 best_gap_position = gap_position + 1;
@@ -150,17 +221,19 @@ bool tryProvablyOptimalSimpleGlobalAlignment(
         int64_t current_score = 0;
         for (size_t index = 0; index < shorter_length; ++index) {
             current_score += score_pair(
-                reference[index], query[index + length_difference]);
+                orientedBase(reference, index),
+                orientedBase(query, index + length_difference));
         }
         best_score = current_score;
         for (size_t gap_position = 0;
              gap_position < shorter_length;
              ++gap_position) {
             current_score -= score_pair(
-                reference[gap_position],
-                query[gap_position + length_difference]);
+                orientedBase(reference, gap_position),
+                orientedBase(query, gap_position + length_difference));
             current_score +=
-                score_pair(reference[gap_position], query[gap_position]);
+                score_pair(orientedBase(reference, gap_position),
+                           orientedBase(query, gap_position));
             if (current_score > best_score) {
                 best_score = current_score;
                 best_gap_position = gap_position + 1;
@@ -226,7 +299,14 @@ GlobalKswRun runGlobalKsw(
     run.score = result.score;
     run.cigar.reserve(result.n_cigar);
     for (int index = 0; index < result.n_cigar; ++index) {
-        run.cigar.push_back(result.cigar[index]);
+        const CigarUnit unit = result.cigar[index];
+        run.cigar.push_back(unit);
+        const uint32_t length = unit >> 4;
+        const uint32_t operation = unit & 0xf;
+        run.summary.alignment_length += length;
+        if (operation != 1) run.summary.reference_length += length;
+        if (operation != 2) run.summary.query_length += length;
+        if (operation == 0) run.summary.match_length += length;
     }
     free(result.cigar);
     return run;
@@ -301,10 +381,16 @@ int bandRequiredToCertifyScore(
 
 }  // namespace
 
-
 Cigar_t globalAlignKSW2(
     const std::string& reference,
     const std::string& query) {
+    return globalAlignKSW2Result(
+        {reference, false}, {query, false}).cigar;
+}
+
+AlignmentResult globalAlignKSW2Result(
+    KswSequenceView reference,
+    KswSequenceView query) {
     init_simd_mat();
 
     KSW2AlignConfig config;
@@ -326,76 +412,82 @@ Cigar_t globalAlignKSW2(
             maximum_substitution_score,
             config.gap_open, config.gap_extend,
             simple_cigar)) {
-        return simple_cigar;
+        AlignmentResult result;
+        result.cigar = std::move(simple_cigar);
+        result.summary = summarizeCigar(result.cigar);
+        return result;
     }
 
-    std::vector<uint8_t> encoded_reference(reference.size());
-    std::vector<uint8_t> encoded_query(query.size());
-    for (size_t index = 0; index < reference.size(); ++index) {
-        encoded_reference[index] =
-            ScoreChar2Idx[static_cast<uint8_t>(reference[index])];
-    }
-    for (size_t index = 0; index < query.size(); ++index) {
-        encoded_query[index] =
-            ScoreChar2Idx[static_cast<uint8_t>(query[index])];
-    }
+    std::vector<uint8_t> temporary_reference;
+    std::vector<uint8_t> temporary_query;
+    auto& encoded_reference = selectEncodingBuffer(
+        reference.bases.size(), ksw_encoding_scratch.reference,
+        temporary_reference);
+    auto& encoded_query = selectEncodingBuffer(
+        query.bases.size(), ksw_encoding_scratch.query,
+        temporary_query);
+    encodeSequence(reference, encoded_reference);
+    encodeSequence(query, encoded_query);
 
     const size_t maximum_length =
-        std::max(reference.size(), query.size());
+        std::max(reference.bases.size(), query.bases.size());
     const int64_t length_difference = std::abs(
-        static_cast<int64_t>(query.size()) -
-        static_cast<int64_t>(reference.size()));
+        static_cast<int64_t>(query.bases.size()) -
+        static_cast<int64_t>(reference.bases.size()));
     const bool can_certify_band =
         maximum_substitution_score >= 0 &&
         config.gap_open >= 0 &&
         config.gap_extend >= 0 &&
         maximum_substitution_score + 2 * config.gap_extend > 0;
     if (!can_certify_band || maximum_length <= 64) {
-        return runGlobalKsw(
-            encoded_reference, encoded_query, config, -1).cigar;
+        GlobalKswRun run = runGlobalKsw(
+            encoded_reference, encoded_query, config, -1);
+        return {std::move(run.cigar), run.summary};
     }
 
     int band_width = static_cast<int>(
         std::max<int64_t>(64, length_difference));
     if (static_cast<size_t>(band_width) >= maximum_length) {
-        return runGlobalKsw(
-            encoded_reference, encoded_query, config, -1).cigar;
+        GlobalKswRun run = runGlobalKsw(
+            encoded_reference, encoded_query, config, -1);
+        return {std::move(run.cigar), run.summary};
     }
 
     GlobalKswRun banded = runGlobalKsw(
         encoded_reference, encoded_query, config, band_width);
     const auto consumes_complete_input = [&reference, &query](
-                                             const Cigar_t& cigar) {
-        return countRefLength(cigar) == reference.size() &&
-               countQryLength(cigar) == query.size();
+                                             const GlobalKswRun& run) {
+        return run.summary.reference_length == reference.bases.size() &&
+               run.summary.query_length == query.bases.size();
     };
-    if (consumes_complete_input(banded.cigar) &&
+    if (consumes_complete_input(banded) &&
         bandExcludesEveryGlobalOptimum(
-            reference.size(), query.size(), band_width,
+            reference.bases.size(), query.bases.size(), band_width,
             banded.score, maximum_substitution_score,
             config.gap_open, config.gap_extend)) {
-        return std::move(banded.cigar);
+        return {std::move(banded.cigar), banded.summary};
     }
 
     const int required_band = bandRequiredToCertifyScore(
-        reference.size(), query.size(), banded.score,
+        reference.bases.size(), query.bases.size(), banded.score,
         maximum_substitution_score,
         config.gap_open, config.gap_extend);
     if (required_band > band_width &&
         static_cast<size_t>(required_band) < maximum_length) {
         banded = runGlobalKsw(
             encoded_reference, encoded_query, config, required_band);
-        if (consumes_complete_input(banded.cigar) &&
+        if (consumes_complete_input(banded) &&
             bandExcludesEveryGlobalOptimum(
-                reference.size(), query.size(), required_band,
+                reference.bases.size(), query.bases.size(), required_band,
                 banded.score, maximum_substitution_score,
                 config.gap_open, config.gap_extend)) {
-            return std::move(banded.cigar);
+            return {std::move(banded.cigar), banded.summary};
         }
     }
 
-    return runGlobalKsw(
-        encoded_reference, encoded_query, config, -1).cigar;
+    GlobalKswRun run = runGlobalKsw(
+        encoded_reference, encoded_query, config, -1);
+    return {std::move(run.cigar), run.summary};
 }
 
 Cigar_t globalAlignKSW2_2(const std::string& ref,
@@ -449,11 +541,49 @@ Cigar_t extendAlignKSW2(const std::string& ref,
     const std::string& query,
     int zdrop)
 {
+    return extendAlignKSW2Result(
+        {ref, false}, {query, false}, zdrop).cigar;
+}
+
+CigarSummary summarizeCigar(const Cigar_t& cigar) {
+    CigarSummary summary;
+    for (const CigarUnit unit : cigar) {
+        const uint32_t length = unit >> 4;
+        const uint32_t operation = unit & 0xf;
+        summary.alignment_length += length;
+        if (operation != 1) summary.reference_length += length;
+        if (operation != 2) summary.query_length += length;
+        if (operation == 0) summary.match_length += length;
+    }
+    return summary;
+}
+
+static AlignmentResult extendAlignKSW2Impl(
+    KswSequenceView ref, KswSequenceView query, int zdrop,
+    bool allow_shortcuts)
+{
+    if (allow_shortcuts && ref.bases.empty() && query.bases.empty()) {
+        return {};
+    }
+    if (allow_shortcuts && isCanonicalExactMatch(ref, query)) {
+        AlignmentResult result;
+        const auto length = static_cast<uint32_t>(ref.bases.size());
+        result.cigar.push_back(cigarToInt('M', length));
+        result.summary = {length, length, length, length};
+        return result;
+    }
+
     /* ---------- 1. 序列编码 ---------- */
-    std::vector<uint8_t> ref_enc(ref.size());
-    std::vector<uint8_t> qry_enc(query.size());
-    for (size_t i = 0; i < ref.size(); ++i) ref_enc[i] = ScoreChar2Idx[(uint8_t)ref[i]];
-    for (size_t i = 0; i < query.size(); ++i) qry_enc[i] = ScoreChar2Idx[(uint8_t)query[i]];
+    std::vector<uint8_t> temporary_reference;
+    std::vector<uint8_t> temporary_query;
+    auto& ref_enc = selectEncodingBuffer(
+        ref.bases.size(), ksw_encoding_scratch.reference,
+        temporary_reference);
+    auto& qry_enc = selectEncodingBuffer(
+        query.bases.size(), ksw_encoding_scratch.query,
+        temporary_query);
+    encodeSequence(ref, ref_enc);
+    encodeSequence(query, qry_enc);
 
     ///* ---------- 2. 配置 ---------- */
     //KSW2AlignConfig cfg = makeTurboKSW2Config(query.size(), ref.size());
@@ -476,7 +606,7 @@ Cigar_t extendAlignKSW2(const std::string& ref,
     cfg.alphabet_size = 5;
     cfg.gap_open = ksw2GapOpenPenalty();
     cfg.gap_extend = ksw2GapExtendPenalty();
-    cfg.band_width = auto_band(ref.size(), query.size());
+    cfg.band_width = auto_band(ref.bases.size(), query.bases.size());
 
 
     /* ---------- 3. 调用 KSW2 ---------- */
@@ -491,13 +621,19 @@ Cigar_t extendAlignKSW2(const std::string& ref,
 
     // 赋值bool& if_zdrop,int& ref_end,int& qry_end
     /* ---------- 4. 拷贝 & 释放 ---------- */
-    Cigar_t cigar;
-    cigar.reserve(ez.n_cigar);
-    for (int i = 0; i < ez.n_cigar; ++i)
-        cigar.push_back(ez.cigar[i]);
-
+    AlignmentResult result = copyKswResultAndSummarize(ez);
     free(ez.cigar);                    // ksw2 使用 malloc
-    return cigar;                      // 返回的 CIGAR 即延伸片段
+    return result;
+}
+
+AlignmentResult extendAlignKSW2Result(
+    KswSequenceView ref, KswSequenceView query, int zdrop) {
+    return extendAlignKSW2Impl(ref, query, zdrop, true);
+}
+
+AlignmentResult ramaxExtendAlignKSW2RawForTesting(
+    KswSequenceView ref, KswSequenceView query, int zdrop) {
+    return extendAlignKSW2Impl(ref, query, zdrop, false);
 }
 
 namespace {

@@ -226,11 +226,22 @@ public:
         AnchorPtrVec anchors,
         bool filter_ref);
 
+    static uint64_t dpTreapFallbackCount();
 
-    void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
+
+    void constructGraphByDP(const SpeciesName& query_name,
+                            SeqPro::ManagerVariant& query_seqpro_manager,
+                            AnchorBySQR_SparsePtr anchor_ptr,
+                            RaMesh::RaMeshMultiGenomeGraph& graph);
     void registerSecondaryAnchors(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, bool initial_round);
 
 };
 
+#ifdef RAMAX_PERFORMANCE_TEST_HOOKS
+void ramaxFilterAnchorsByDpOptimizedForTesting(
+    AnchorPtrVec anchors, bool filter_ref);
+void ramaxFilterAnchorsByDpLegacyForTesting(
+    AnchorPtrVec anchors, bool filter_ref);
+#endif
 
 #endif

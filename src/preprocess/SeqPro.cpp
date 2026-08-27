@@ -644,10 +644,67 @@ std::string SequenceManager::getSubSequence(SequenceId seq_id, Position start, L
   return extractSequence(*info, start, length);
 }
 
-std::string SequenceManager::extractSequence(const SequenceInfo &info, Position start, Length length) const {
-  if (length == 0) return "";
+bool SequenceManager::tryGetContiguousSubSequence(
+    SequenceId seq_id, Position start, Length length,
+    std::string_view &view) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto *info = sequence_index_.getSequenceInfo(seq_id);
+  if (!info) {
+    throw SequenceException("Invalid sequence ID: " + std::to_string(seq_id));
+  }
+  if (start >= info->length) {
+    throw SequenceException("Start position out of bounds");
+  }
 
+  length = std::min(length, info->length - start);
+  if (length == 0) {
+    view = {};
+    return true;
+  }
+  if (info->line_width == 0 || info->line_bytes < info->line_width) {
+    view = {};
+    return false;
+  }
+
+  const Position offset_in_line = start % info->line_width;
+  if (length > info->line_width - offset_in_line) {
+    view = {};
+    return false;
+  }
+  const Position line_number = start / info->line_width;
+  const Position file_position = info->file_offset +
+      line_number * info->line_bytes + offset_in_line;
+  const auto data = memory_mapper_->getData(file_position, length);
+  view = std::string_view(data.data(), data.size());
+  return true;
+}
+
+void SequenceManager::getSubSequenceInto(
+    SequenceId seq_id, Position start, Length length,
+    std::string &output) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto *info = sequence_index_.getSequenceInfo(seq_id);
+  if (!info) {
+    throw SequenceException("Invalid sequence ID: " + std::to_string(seq_id));
+  }
+  if (start >= info->length) {
+    throw SequenceException("Start position out of bounds");
+  }
+  length = std::min(length, info->length - start);
+  extractSequenceInto(*info, start, length, output);
+}
+
+std::string SequenceManager::extractSequence(const SequenceInfo &info, Position start, Length length) const {
   std::string result;
+  extractSequenceInto(info, start, length, result);
+  return result;
+}
+
+void SequenceManager::extractSequenceInto(
+    const SequenceInfo &info, Position start, Length length,
+    std::string &result) const {
+  result.clear();
+  if (length == 0) return;
   result.reserve(length);
 
   Position seq_pos = start;
@@ -671,7 +728,6 @@ std::string SequenceManager::extractSequence(const SequenceInfo &info, Position 
     remaining -= chars_to_read;
   }
 
-  return result;
 }
 
 std::string SequenceManager::getSubSequenceGlobal(Position global_start, Length length) const {
