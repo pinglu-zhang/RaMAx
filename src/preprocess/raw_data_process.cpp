@@ -1,6 +1,44 @@
 #include "SeqPro.h"
 #include "data_process.h"
 
+#include <algorithm>
+#include <exception>
+#include <mutex>
+#include <vector>
+
+#include <omp.h>
+
+namespace {
+
+template<class Function>
+void parallelForIndexed(size_t count, int requested_threads, Function&& function) {
+    if (count == 0) return;
+    const int workers = omp_in_parallel()
+        ? 1
+        : std::max(1, std::min<int>(requested_threads,
+              static_cast<int>(count)));
+    std::mutex failure_mutex;
+    std::exception_ptr first_failure;
+    size_t first_failure_index = count;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers) if(workers > 1)
+    for (long long raw_index = 0;
+         raw_index < static_cast<long long>(count); ++raw_index) {
+        const size_t index = static_cast<size_t>(raw_index);
+        try {
+            function(index);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            if (index < first_failure_index) {
+                first_failure_index = index;
+                first_failure = std::current_exception();
+            }
+        }
+    }
+    if (first_failure) std::rethrow_exception(first_failure);
+}
+
+} // namespace
+
 // -----------------------------
 // 查找 windowmasker 可执行文件路径
 // -----------------------------
@@ -196,68 +234,73 @@ bool copyRawData(const FilePath workdir_path, SpeciesPathMap& species_path_map,
             bool reused{false};
         };
 
-        // 使用线程池并发执行下载或复制。工作线程不修改共享 map。
-        ThreadPool pool(thread_num);
-        std::vector<std::future<RawResult>> futures;
-        futures.reserve(species_path_map.size());
+        struct RawInput {
+            SpeciesName species;
+            FilePath path;
+        };
+        std::vector<RawInput> inputs;
+        inputs.reserve(species_path_map.size());
         for (const auto& [key, path] : species_path_map) {
+            inputs.push_back({key, path});
+        }
+        std::vector<RawResult> results(inputs.size());
+        parallelForIndexed(inputs.size(), thread_num, [&](size_t index) {
+            const auto& key = inputs[index].species;
+            const auto& path = inputs[index].path;
             std::string extension = getFileExtension(path);
             std::string final_name = key + extension;
             FilePath final_dest = raw_data_dir / final_name;
-            futures.emplace_back(pool.enqueue(
-                [key, path, final_dest, trust_legacy_cache]() -> RawResult {
-                    const bool source_is_url = isUrl(path.string());
-                    const FilePath marker =
-                        RaMAxCache::completionMarkerPath(final_dest);
-                    if (RaMAxCache::markerMatches(
-                            marker, "raw-fasta", 1, path.string(),
-                            source_is_url, path, final_dest)) {
-                        spdlog::info("[cache] raw FASTA reused for {}: {}",
-                                     key, final_dest.string());
-                        return {key, final_dest, true};
-                    }
-                    if (trust_legacy_cache &&
-                        std::filesystem::is_regular_file(final_dest) &&
-                        !std::filesystem::exists(marker)) {
-                        RaMAxCache::writeMarker(
-                            marker, "raw-fasta", 1, path.string(),
-                            source_is_url, path, final_dest);
-                        spdlog::warn(
-                            "[cache] trusting legacy raw FASTA for {}: {}",
-                            key, final_dest.string());
-                        return {key, final_dest, true};
-                    }
+            const bool source_is_url = isUrl(path.string());
+            const FilePath marker =
+                RaMAxCache::completionMarkerPath(final_dest);
+            if (RaMAxCache::markerMatches(
+                    marker, "raw-fasta", 1, path.string(),
+                    source_is_url, path, final_dest)) {
+                spdlog::info("[cache] raw FASTA reused for {}: {}",
+                             key, final_dest.string());
+                results[index] = {key, final_dest, true};
+                return;
+            }
+            if (trust_legacy_cache &&
+                std::filesystem::is_regular_file(final_dest) &&
+                !std::filesystem::exists(marker)) {
+                RaMAxCache::writeMarker(
+                    marker, "raw-fasta", 1, path.string(),
+                    source_is_url, path, final_dest);
+                spdlog::warn(
+                    "[cache] trusting legacy raw FASTA for {}: {}",
+                    key, final_dest.string());
+                results[index] = {key, final_dest, true};
+                return;
+            }
 
-                    FilePath partial = final_dest;
-                    partial += ".partial";
-                    RaMAxCache::removeIfPresent(partial);
-                    try {
-                        if (source_is_url) {
-                            downloadFile(path.string(), partial);
-                        } else {
-                            copyLocalFile(path, partial);
-                        }
-                        RaMAxCache::publishFile(partial, final_dest);
-                        RaMAxCache::writeMarker(
-                            marker, "raw-fasta", 1, path.string(),
-                            source_is_url, path, final_dest);
-                    } catch (...) {
-                        RaMAxCache::removeIfPresent(partial);
-                        throw;
-                    }
-                    spdlog::info("Successfully processed species {} -> {}",
-                                 key, final_dest.string());
-                    return {key, final_dest, false};
-                }));
-        }
+            FilePath partial = final_dest;
+            partial += ".partial";
+            RaMAxCache::removeIfPresent(partial);
+            try {
+                if (source_is_url) {
+                    downloadFile(path.string(), partial);
+                } else {
+                    copyLocalFile(path, partial);
+                }
+                RaMAxCache::publishFile(partial, final_dest);
+                RaMAxCache::writeMarker(
+                    marker, "raw-fasta", 1, path.string(),
+                    source_is_url, path, final_dest);
+            } catch (...) {
+                RaMAxCache::removeIfPresent(partial);
+                throw;
+            }
+            spdlog::info("Successfully processed species {} -> {}",
+                         key, final_dest.string());
+            results[index] = {key, final_dest, false};
+        });
 
         RaMAxCache::StageStats local_stats;
-        for (auto& future : futures) {
-            RawResult result = future.get();
+        for (const auto& result : results) {
             species_path_map[result.species] = result.path;
             result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
         }
-        pool.waitAllTasksDone();
         if (cache_stats) *cache_stats = local_stats;
         spdlog::info("All raw sequence data copy to work directory successfully.");
         return true;
@@ -290,64 +333,69 @@ bool cleanRawDataset(const FilePath workdir_path,
             FilePath path;
             bool reused{false};
         };
-        ThreadPool pool(thread_num);
-        std::vector<std::future<CleanResult>> futures;
-        futures.reserve(species_path_map.size());
+        struct CleanInput {
+            SpeciesName species;
+            FilePath path;
+        };
+        std::vector<CleanInput> inputs;
+        inputs.reserve(species_path_map.size());
         for (const auto& [species, raw_path] : species_path_map) {
-            futures.emplace_back(pool.enqueue(
-                [species, raw_path, &workdir_path,
-                 trust_legacy_cache]() -> CleanResult {
-                FilePath out_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
-                FilePath out_fasta = out_dir / (species + ".fasta");
-                const FilePath marker =
-                    RaMAxCache::completionMarkerPath(out_fasta);
-
-                if (RaMAxCache::markerMatches(
-                        marker, "clean-fasta", 1, raw_path.string(), false,
-                        raw_path, out_fasta)) {
-                    spdlog::info("[cache] cleaned FASTA reused for {}: {}",
-                                 species, out_fasta.string());
-                    return {species, out_fasta, true};
-                }
-                if (trust_legacy_cache &&
-                    std::filesystem::is_regular_file(out_fasta) &&
-                    !std::filesystem::exists(marker)) {
-                    RaMAxCache::writeMarker(
-                        marker, "clean-fasta", 1, raw_path.string(), false,
-                        raw_path, out_fasta);
-                    spdlog::warn(
-                        "[cache] trusting legacy cleaned FASTA for {}: {}",
-                        species, out_fasta.string());
-                    return {species, out_fasta, true};
-                }
-
-                FilePath partial = out_fasta;
-                partial += ".partial";
-                RaMAxCache::removeIfPresent(partial);
-                try {
-                    SeqPro::utils::cleanFastaFile(raw_path, partial, 60);
-                    RaMAxCache::publishFile(partial, out_fasta);
-                    RaMAxCache::writeMarker(
-                        marker, "clean-fasta", 1, raw_path.string(), false,
-                        raw_path, out_fasta);
-                } catch (...) {
-                    RaMAxCache::removeIfPresent(partial);
-                    throw;
-                }
-
-                spdlog::info("Species {} cleaned file path updated to: {}", species,
-                    out_fasta.string());
-                return {species, out_fasta, false};
-                }));
+            inputs.push_back({species, raw_path});
         }
+        std::vector<CleanResult> results(inputs.size());
+        parallelForIndexed(inputs.size(), thread_num, [&](size_t index) {
+            const auto& species = inputs[index].species;
+            const auto& raw_path = inputs[index].path;
+            FilePath out_dir = workdir_path / DATA_DIR / CLEAN_DATA_DIR;
+            FilePath out_fasta = out_dir / (species + ".fasta");
+            const FilePath marker =
+                RaMAxCache::completionMarkerPath(out_fasta);
+
+            if (RaMAxCache::markerMatches(
+                marker, "clean-fasta", 1, raw_path.string(), false,
+                raw_path, out_fasta)) {
+                spdlog::info("[cache] cleaned FASTA reused for {}: {}",
+                             species, out_fasta.string());
+                results[index] = {species, out_fasta, true};
+                return;
+            }
+            if (trust_legacy_cache &&
+                std::filesystem::is_regular_file(out_fasta) &&
+                !std::filesystem::exists(marker)) {
+                RaMAxCache::writeMarker(
+                    marker, "clean-fasta", 1, raw_path.string(), false,
+                    raw_path, out_fasta);
+                spdlog::warn(
+                    "[cache] trusting legacy cleaned FASTA for {}: {}",
+                    species, out_fasta.string());
+                results[index] = {species, out_fasta, true};
+                return;
+            }
+
+            FilePath partial = out_fasta;
+            partial += ".partial";
+            RaMAxCache::removeIfPresent(partial);
+            try {
+                SeqPro::utils::cleanFastaFile(raw_path, partial, 60);
+                RaMAxCache::publishFile(partial, out_fasta);
+                RaMAxCache::writeMarker(
+                    marker, "clean-fasta", 1, raw_path.string(), false,
+                    raw_path, out_fasta);
+            } catch (...) {
+                RaMAxCache::removeIfPresent(partial);
+                throw;
+            }
+
+            spdlog::info("Species {} cleaned file path updated to: {}", species,
+                out_fasta.string());
+            results[index] = {species, out_fasta, false};
+        });
 
         RaMAxCache::StageStats local_stats;
-        for (auto& future : futures) {
-            CleanResult result = future.get();
+        for (const auto& result : results) {
             species_path_map[result.species] = result.path;
             result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
         }
-        pool.waitAllTasksDone();
         if (cache_stats) *cache_stats = local_stats;
         spdlog::info("All raw sequence data cleaned successfully.");
         return true;
@@ -380,38 +428,43 @@ bool cleanRawDatasetWithSoftMaskIndex(const FilePath workdir_path,
             bool reused{false};
         };
 
-        ThreadPool pool(std::max(1, thread_num));
-        std::vector<std::future<CleanResult>> futures;
-        futures.reserve(species_path_map.size());
-
+        struct CleanInput {
+            SpeciesName species;
+            FilePath path;
+        };
+        std::vector<CleanInput> inputs;
+        inputs.reserve(species_path_map.size());
         for (const auto& [species, raw_path] : species_path_map) {
-            futures.emplace_back(pool.enqueue(
-                [species, raw_path, clean_data_dir,
-                 trust_legacy_cache]() -> CleanResult {
-                const FilePath out_fasta = clean_data_dir / (species + ".align-v2.fasta");
-                const FilePath out_index = clean_data_dir / (species + ".softmask-v1.bin");
-                const FilePath marker = clean_data_dir / (species + ".softmask-v1.complete.json");
-
-                const bool reused = SoftMask::ensureUppercaseFastaAndIndex(
-                    raw_path, out_fasta, out_index, marker,
-                    trust_legacy_cache);
-                return {species, out_fasta, out_index, reused};
-            }));
+            inputs.push_back({species, raw_path});
         }
+        std::vector<CleanResult> results(inputs.size());
+        parallelForIndexed(inputs.size(), thread_num, [&](size_t index) {
+            const auto& species = inputs[index].species;
+            const auto& raw_path = inputs[index].path;
+            const FilePath out_fasta =
+                clean_data_dir / (species + ".align-v2.fasta");
+            const FilePath out_index =
+                clean_data_dir / (species + ".softmask-v1.bin");
+            const FilePath marker =
+                clean_data_dir / (species + ".softmask-v1.complete.json");
+
+            const bool reused = SoftMask::ensureUppercaseFastaAndIndex(
+                raw_path, out_fasta, out_index, marker,
+                trust_legacy_cache);
+            results[index] = {species, out_fasta, out_index, reused};
+        });
 
         // Publish maps only after each task has completed successfully. This
         // avoids concurrent writes to unordered_map/map and propagates worker
         // exceptions instead of silently swallowing them.
         RaMAxCache::StageStats local_stats;
-        for (auto& future : futures) {
-            CleanResult result = future.get();
+        for (const auto& result : results) {
             species_path_map[result.species] = result.fasta;
             softmask_path_map[result.species] = result.index;
             result.reused ? ++local_stats.reused : ++local_stats.rebuilt;
             spdlog::info("Species {} alignment FASTA: {}; HAL soft-mask index: {}",
                 result.species, result.fasta.string(), result.index.string());
         }
-        pool.waitAllTasksDone();
         if (cache_stats) *cache_stats = local_stats;
 
         if (softmask_path_map.size() != species_path_map.size()) {
@@ -462,25 +515,35 @@ repeatSeqMasking(const FilePath workdir_path,
             throw std::runtime_error("Cannot proceed with repeat masking: " + std::string(e.what()));
         }
 
-        ThreadPool pool(thread_num);
-
-        for (auto it = species_path_map.begin(); it != species_path_map.end();
-            ++it) {
-            std::string species_key = it->first;
-            FilePath input_fasta_path = it->second; // 待处理的FASTA文件
-
-            pool.enqueue([species_key, input_fasta_path, masked_data_dir,
-                &species_path_map, &interval_files_map, windowmasker_path]() {
+        struct MaskInput {
+            SpeciesName species;
+            FilePath fasta;
+        };
+        struct MaskResult {
+            SpeciesName species;
+            FilePath interval;
+            bool success{false};
+        };
+        std::vector<MaskInput> inputs;
+        inputs.reserve(species_path_map.size());
+        for (const auto& [species, fasta] : species_path_map) {
+            inputs.push_back({species, fasta});
+        }
+        std::vector<MaskResult> results(inputs.size());
+        parallelForIndexed(inputs.size(), thread_num, [&](size_t index) {
+                    const auto& species_key = inputs[index].species;
+                    const auto& input_fasta_path = inputs[index].fasta;
                     FilePath counts_file = masked_data_dir / (species_key + ".counts");
                     FilePath interval_file = masked_data_dir / (species_key + ".interval");
+                    results[index].species = species_key;
+                    results[index].interval = interval_file;
 
                     // 检查最终的interval文件是否已存在
                     if (std::filesystem::exists(interval_file)) {
                         spdlog::warn("[{}] WindowMasker output interval file already exists, "
                             "skipping: {}",
                             species_key, interval_file.string());
-                        interval_files_map[species_key] =
-                            interval_file; // Store in the new map
+                        results[index].success = true;
                         return;
                     }
 
@@ -522,13 +585,16 @@ repeatSeqMasking(const FilePath workdir_path,
                     spdlog::info("[{}] windowmasker -ustat successful. Output: {}",
                         species_key, interval_file.string());
 
-                    interval_files_map[species_key] = interval_file;
                     spdlog::info("[{}] Interval file generated at: {}", species_key,
                         interval_file.string());
-                });
-        }
+                    results[index].success = true;
+        });
 
-        pool.waitAllTasksDone();
+        for (const auto& result : results) {
+            if (result.success) {
+                interval_files_map[result.species] = result.interval;
+            }
+        }
 
         spdlog::info("All windowmasker tasks submitted and processing attempted. "
             "Check logs for individual species status.");

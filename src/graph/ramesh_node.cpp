@@ -399,11 +399,11 @@ namespace RaMesh {
         }
     }
 
-    void RaMesh::GenomeEnd::alignInterval(const SpeciesName ref_name,
-        const SpeciesName query_name,
-        const ChrName query_chr_name,
+    void RaMesh::GenomeEnd::alignInterval(const SpeciesName& ref_name,
+        const SpeciesName& query_name,
+        const ChrName& query_chr_name,
         SegPtr cur_node,
-        std::map<SpeciesName, SeqPro::SharedManagerVariant> managers,
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
         bool is_left_extend, int_t zdrop) {
         if (cur_node == head || cur_node == tail || cur_node == NULL) return;
 		//if (cur_node->right_extend) return; // 已经扩展过了
@@ -448,7 +448,7 @@ namespace RaMesh {
                 if (!query_right_node->isTail())
                     query_len = (int_t)query_right_node->start - (int_t)query_start;
                 else
-                    query_len = (int_t)getChrLen(*managers[query_name], query_chr_name) - (int_t)query_start;
+                    query_len = (int_t)getChrLen(*managers.at(query_name), query_chr_name) - (int_t)query_start;
             }
 
             BlockPtr cur_block = cur_node->parent_block;
@@ -492,8 +492,8 @@ namespace RaMesh {
                     // std::cout << "Left extend too long: " << query_len << ", " << ref_len << "\n";
                 }
 
-                std::string query_seq = fetchSeq(*managers[query_name], query_chr_name, query_start, query_len);
-                std::string ref_seq = fetchSeq(*managers[ref_name], cur_block->ref_chr, ref_start, ref_len);
+                std::string query_seq = fetchSeq(*managers.at(query_name), query_chr_name, query_start, query_len);
+                std::string ref_seq = fetchSeq(*managers.at(ref_name), cur_block->ref_chr, ref_start, ref_len);
 
                 // 把“左扩”转换成“向右比对”
                 // 1) 反转 query（统一向右延伸）
@@ -554,7 +554,7 @@ namespace RaMesh {
                     query_len = (int_t)query_right_node->start - (int_t)query_start;
                 }
                 else {
-                    query_len = (int_t)getChrLen(*managers[query_name], query_chr_name) - (int_t)query_start;
+                    query_len = (int_t)getChrLen(*managers.at(query_name), query_chr_name) - (int_t)query_start;
                 }
             }
             else {
@@ -596,7 +596,7 @@ namespace RaMesh {
             }
 
             int_t ref_start = ref_cur_node->start + ref_cur_node->length;
-            int_t ref_len = (!ref_right_node->isTail()) ? (int_t)ref_right_node->start - (int_t)ref_start : (int_t)getChrLen(*managers[ref_name], cur_block->ref_chr) - (int_t)ref_start;
+            int_t ref_len = (!ref_right_node->isTail()) ? (int_t)ref_right_node->start - (int_t)ref_start : (int_t)getChrLen(*managers.at(ref_name), cur_block->ref_chr) - (int_t)ref_start;
 
             // cur_node->right_extend = true;
             // ref_cur_node->right_extend = true;
@@ -607,8 +607,8 @@ namespace RaMesh {
                     return;
 					//std::cout << "Right extend too long: " << query_len << ", " << ref_len << "\n";
 				}
-                std::string query_seq = fetchSeq(*managers[query_name], query_chr_name, query_start, query_len);
-                std::string ref_seq = fetchSeq(*managers[ref_name], cur_block->ref_chr, ref_start, ref_len);
+                std::string query_seq = fetchSeq(*managers.at(query_name), query_chr_name, query_start, query_len);
+                std::string ref_seq = fetchSeq(*managers.at(ref_name), cur_block->ref_chr, ref_start, ref_len);
 
                 // TODO: 在这里执行右扩展比对
                 if (strand == FORWARD) {

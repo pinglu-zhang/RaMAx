@@ -205,25 +205,8 @@ void groupMatchByQueryRefSparse(
     SeqPro::ManagerVariant& ref_fasta_manager,
     SeqPro::ManagerVariant& query_fasta_manager);
 
-MatchClusterVecPtr
-groupClustersToVec(const ClusterVecPtrByStrandByQueryRefPtr& src,
-    ThreadPool& pool, uint_t thread_num);
-
-ClusterVecPtrByRefPtr groupClustersToRefVec(
-    const ClusterVecPtrByStrandByQueryRefPtr& src,
-    ThreadPool& pool, uint_t thread_num);
-
-
 ClusterVecPtrByRefPtr
 groupClustersByRef(const ClusterVecPtrByStrandByQueryRefPtr& src);
-// void sortMatchByRefStart(MatchByQueryRefPtr& anchors, ThreadPool& pool);
-
-ClusterVecPtrByRefQueryPtr
-groupClustersByRefQuery(const ClusterVecPtrByRefPtr& by_ref,
-    SeqPro::ManagerVariant& query_fasta_manager,
-    ThreadPool& pool);
-
-void sortMatchByQueryStart(MatchByStrandByQueryRefPtr& anchors, ThreadPool& pool);
 
 MatchClusterVecPtr clusterChrMatch(MatchVec& unique_match, uint_t min_cluster_length, int_t max_gap = 90, int_t diagdiff = 5, double diagfactor = 0.12);
 

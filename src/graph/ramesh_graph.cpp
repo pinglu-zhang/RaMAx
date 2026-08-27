@@ -1004,9 +1004,8 @@ size_t RaMeshMultiGenomeGraph::materializeSecondaryAlignments() {
 
 void RaMeshMultiGenomeGraph::extendRefNodes(
     const SpeciesName &ref_name,
-    std::map<SpeciesName, SeqPro::SharedManagerVariant> managers,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
     int_t zdrop) {
-  //ThreadPool pool(thread_num);
   for (auto &[sp, g] : species_graphs) {
     if (sp == ref_name) {
       continue;
@@ -1015,13 +1014,12 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
       SegPtr cur_node = end.head;
 
       while (cur_node != NULL) {
-        // pool.enqueue([this, &ref_name, &sp, &chr_name, &end, &cur_node,
-        // &managers]() {
-        //
-        //     end.alignInterval(ref_name, sp, chr_name, cur_node, managers,
-        //     false, true);
-        //
-        // });
+        if (cur_node == end.head || cur_node == end.tail ||
+            (cur_node->right_extend && cur_node->left_extend)) {
+          cur_node = cur_node->primary_path.next.load(
+              std::memory_order_acquire);
+          continue;
+        }
         end.alignInterval(ref_name, sp, chr_name, cur_node, managers, false,
                           zdrop);
         cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
@@ -1032,20 +1030,18 @@ void RaMeshMultiGenomeGraph::extendRefNodes(
         SegPtr cur_node = end.head;
 
         while (cur_node != NULL) {
-            // pool.enqueue([this, &ref_name, &sp, &chr_name, &end, &cur_node,
-            // &managers]() {
-            //
-            //     end.alignInterval(ref_name, sp, chr_name, cur_node, managers,
-            //     false, true);
-            //
-            // });
+            if (cur_node == end.head || cur_node == end.tail ||
+                (cur_node->right_extend && cur_node->left_extend)) {
+                cur_node = cur_node->primary_path.next.load(
+                    std::memory_order_acquire);
+                continue;
+            }
             end.alignInterval(ref_name, sp, chr_name, cur_node, managers, true,
                 zdrop);
             cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
         }
     }
   }
-  //pool.waitAllTasksDone();
 
   //for (auto& [sp, g] : species_graphs) {
   //    if (sp == ref_name) {

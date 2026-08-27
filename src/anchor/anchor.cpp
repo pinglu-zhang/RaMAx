@@ -2,6 +2,20 @@
 #include <SeqPro.h>
 #include "data_process.h"
 
+namespace {
+constexpr Coord_t kMaximumLinkedGapAlignmentLength = 10000;
+
+constexpr bool linkedGapCanBeAligned(Coord_t ref_gap, Coord_t query_gap) {
+    return ref_gap <= kMaximumLinkedGapAlignmentLength &&
+           query_gap <= kMaximumLinkedGapAlignmentLength;
+}
+
+static_assert(linkedGapCanBeAligned(9999, 9999));
+static_assert(linkedGapCanBeAligned(10000, 10000));
+static_assert(!linkedGapCanBeAligned(10001, 10000));
+static_assert(!linkedGapCanBeAligned(10000, 10001));
+}  // namespace
+
 // 稀疏版：不再 resize 出 [strand][qry][ref] 的满矩阵
 void groupMatchByQueryRefSparse(
     MatchVec3DPtr& anchors,
@@ -53,280 +67,6 @@ void groupMatchByQueryRefSparse(
     anchors->clear();
     anchors->shrink_to_fit();
 }
-
-void sortMatchByQueryStart(MatchByStrandByQueryRefPtr& anchors, ThreadPool& pool)
-{
-    constexpr size_t MIN_SIZE_FOR_PARALLEL = 100;  // 阈值：小于100个元素直接串行排序
-    constexpr size_t BATCH_SIZE = 50;              // 批处理大小
-    
-    std::vector<std::future<void>> futures;
-    std::vector<std::vector<MatchVec*>> batches;
-    std::vector<MatchVec*> current_batch;
-    
-    // 收集所有需要排序的向量，并按大小分类
-    for (auto& strand_layer : *anchors) {
-        for (auto& query_row : strand_layer) {
-            for (auto& vec : query_row) {
-                if (vec.empty()) continue;
-                
-                if (vec.size() >= MIN_SIZE_FOR_PARALLEL) {
-                    // 大向量：单独提交任务
-                    futures.emplace_back(pool.enqueue([v = &vec]() {
-                        std::sort(v->begin(), v->end(),
-                            [](const Match& a, const Match& b) {
-                                return a.qry_start < b.qry_start;
-                            });
-                    }));
-                } else {
-                    // 小向量：加入批处理
-                    current_batch.push_back(&vec);
-                    if (current_batch.size() >= BATCH_SIZE) {
-                        batches.push_back(std::move(current_batch));
-                        current_batch.clear();
-                    }
-                }
-            }
-        }
-    }
-    
-    // 处理剩余的小向量
-    if (!current_batch.empty()) {
-        batches.push_back(std::move(current_batch));
-    }
-    
-    // 批处理小向量
-    for (auto& batch : batches) {
-        futures.emplace_back(pool.enqueue([batch = std::move(batch)]() {
-            for (auto* vec : batch) {
-                std::sort(vec->begin(), vec->end(),
-                    [](const Match& a, const Match& b) {
-                        return a.qry_start < b.qry_start;
-                    });
-            }
-        }));
-    }
-    
-    // 等待所有任务完成
-    for (auto& future : futures) {
-        future.get();
-    }
-}
-
-MatchClusterVecPtr
-groupClustersToVec(const ClusterVecPtrByStrandByQueryRefPtr& src,
-    ThreadPool& pool, uint_t thread_num)
-{
-    auto result = std::make_shared<MatchClusterVec>();
-    
-    if (!src || src->empty()) {
-        return result;
-    }
-    
-    // 预计算总的簇数量，用于预分配空间
-    size_t total_clusters = 0;
-    for (const auto& strand_layer : *src) {
-        for (const auto& query_row : strand_layer) {
-            for (const auto& cluster_vec_ptr : query_row) {
-                if (cluster_vec_ptr && !cluster_vec_ptr->empty()) {
-                    total_clusters += cluster_vec_ptr->size();
-                }
-            }
-        }
-    }
-    
-    result->reserve(total_clusters);
-    
-    // 使用线程安全的方式收集所有簇
-    std::mutex result_mutex;
-    std::vector<std::future<std::vector<MatchCluster>>> futures;
-    
-    // 将收集任务分配给多个线程
-    size_t tasks_per_thread = std::max(size_t(1), total_clusters / thread_num);
-    size_t current_task_count = 0;
-    std::vector<MatchCluster> current_batch;
-    
-    for (const auto& strand_layer : *src) {
-        for (const auto& query_row : strand_layer) {
-            for (const auto& cluster_vec_ptr : query_row) {
-                if (!cluster_vec_ptr || cluster_vec_ptr->empty()) continue;
-                
-                for (const auto& cluster : *cluster_vec_ptr) {
-                    if (!cluster.empty()) {
-                        current_batch.push_back(cluster);
-                        current_task_count++;
-                        
-                        // 当批次足够大时，提交到线程池
-                        if (current_task_count >= tasks_per_thread) {
-                            auto batch_copy = current_batch;  // 复制用于线程安全
-                            futures.emplace_back(pool.enqueue([batch_copy]() -> std::vector<MatchCluster> {
-                                return batch_copy;
-                            }));
-                            
-                            current_batch.clear();
-                            current_task_count = 0;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // 处理剩余的批次
-    if (!current_batch.empty()) {
-        futures.emplace_back(pool.enqueue([current_batch]() -> std::vector<MatchCluster> {
-            return current_batch;
-        }));
-    }
-    
-    // 收集所有结果
-    for (auto& future : futures) {
-        auto batch_result = future.get();
-        for (auto& cluster : batch_result) {
-            result->emplace_back(std::move(cluster));
-        }
-    }
-    
-    return result;
-}
-
-// ------------------------------------------------------------------
-// 把 3D: [strand][queryRef][ref] 的聚簇重新组织成 1D: [ref]
-// ------------------------------------------------------------------
-ClusterVecPtrByRefPtr groupClustersToRefVec(
-    const ClusterVecPtrByStrandByQueryRefPtr& src,
-    ThreadPool& pool, uint_t thread_num)
-{
-    // ---------- 1. 空输入 ----------
-    if (!src || src->empty())
-        return std::make_shared<ClusterVecPtrByRef>();
-
-    // ---------- 2. 探测 ref 数 ----------
-    size_t n_ref = 0;
-    for (const auto& strandVec : *src) {
-        for (const auto& queryVec : strandVec) {
-            if (!queryVec.empty()) {
-                n_ref = queryVec.size();
-                break;
-            }
-        }
-        if (n_ref) break;
-    }
-    if (n_ref == 0)
-        return std::make_shared<ClusterVecPtrByRef>();
-
-    // ---------- 3. 目标 ----------
-    auto dst = std::make_shared<ClusterVecPtrByRef>(n_ref, nullptr);
-
-    /* ******************************************************************
-     * 4. 决定是否并行
-     *    只能使用 pool 已有的信息，不能改 ThreadPool 接口。
-     *    - 大部分线程池都会暴露  thread_count()/size()/parallelism() 之类的读接口；
-     *      如果你的实现没有，可以在 ThreadPool 里加一个 const 方法，
-     *      但这属于“实现细节”而不是“函数接口”变更，外部签名不动。
-     ******************************************************************/
-    const bool can_parallel =
-        n_ref > 1 &&   // 工作量足够大才值得并行
-        thread_num > 1;   // 剩余线程数至少 1 条
-
-    /* =================== 顺序分支 =================== */
-    if (!can_parallel) {
-        for (size_t ref_id = 0; ref_id < n_ref; ++ref_id) {
-            auto combined = std::make_shared<MatchClusterVec>();
-            for (const auto& strandVec : *src)
-                for (const auto& queryVec : strandVec)
-                    if (ref_id < queryVec.size() && queryVec[ref_id])
-                        combined->insert(combined->end(),
-                            queryVec[ref_id]->begin(),
-                            queryVec[ref_id]->end());
-            (*dst)[ref_id] = std::move(combined);
-        }
-        return dst;
-    }
-
-    /* =================== 并行分支（原逻辑） =================== */
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_ref);
-
-    for (size_t ref_id = 0; ref_id < n_ref; ++ref_id) {
-        futures.emplace_back(
-            pool.enqueue([&, ref_id] {
-                auto combined = std::make_shared<MatchClusterVec>();
-                for (const auto& strandVec : *src)
-                    for (const auto& queryVec : strandVec)
-                        if (ref_id < queryVec.size() && queryVec[ref_id])
-                            combined->insert(combined->end(),
-                                queryVec[ref_id]->begin(),
-                                queryVec[ref_id]->end());
-                (*dst)[ref_id] = std::move(combined);
-                }));
-    }
-    for (auto& fut : futures) fut.get();
-    return dst;
-}
-
-// ------------------------------------------------------------------
-// 把 3D: [strand][queryRef][ref] 的聚簇重新组织成 1D: [ref]
-// ------------------------------------------------------------------
-ClusterVecPtrByRefPtr
-groupClustersToRefVec(const ClusterVecPtrByStrandByQueryRefPtr& src,
-    ThreadPool& pool)
-{
-    // ---------- 1. 空输入快速返回 ----------
-    if (!src || src->empty()) {
-        return std::make_shared<ClusterVecPtrByRef>();
-    }
-
-    // ---------- 2. 探测参考染色体 (Ref) 数 ----------
-    size_t n_ref = 0;
-    for (const auto& strandVec : *src) {
-        for (const auto& queryVec : strandVec) {
-            if (!queryVec.empty()) {
-                n_ref = queryVec.size();   // 第一次遇到非空即足够
-                break;
-            }
-        }
-        if (n_ref) break;
-    }
-    if (n_ref == 0) {
-        return std::make_shared<ClusterVecPtrByRef>();   // 没有 Ref
-    }
-
-    // ---------- 3. 准备目标结构 ----------
-    auto dst = std::make_shared<ClusterVecPtrByRef>(n_ref, nullptr);
-
-    // ---------- 4. 为 “每个 Ref ⇨ 一条任务” ----------
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_ref);
-
-    for (size_t ref_id = 0; ref_id < n_ref; ++ref_id) {
-        futures.emplace_back(
-            pool.enqueue([&, ref_id] {
-                auto combined = std::make_shared<MatchClusterVec>();
-
-                // 聚合：遍历所有 [strand][query]，把 ref_id 处的聚簇并入
-                for (const auto& strandVec : *src) {
-                    for (const auto& queryVec : strandVec) {
-                        if (ref_id < queryVec.size() && queryVec[ref_id]) {
-                            combined->insert(combined->end(),
-                                queryVec[ref_id]->begin(),
-                                queryVec[ref_id]->end());
-                        }
-                    }
-                }
-                // 无竞态：独占写入各自槽位
-                (*dst)[ref_id] = std::move(combined);
-                })
-        );
-    }
-
-    // ---------- 5. 等待全部任务完成 ----------
-    for (auto& fut : futures) fut.get();
-
-    return dst;
-}
-
-
-
 
 //--------------------------------------------------------------------
 // Anchor 验证功能实现
@@ -1005,6 +745,9 @@ void linkClusters(AnchorPtrVec& anchors,
        //         continue;
        //     }
 
+            if (!linkedGapCanBeAligned(ref_gap_len, qry_gap_len)) {
+                reach = false;
+            } else {
             std::string ref_gap_seq = std::visit([&](auto& p) {
                 using T = std::decay_t<decltype(p)>;
                 if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::SequenceManager>>) {
@@ -1032,14 +775,9 @@ void linkClusters(AnchorPtrVec& anchors,
             uint_t ref_len = 0;
             uint_t qry_len = 0;
             Cigar_t gap_cigar;
-            if (qry_gap_len > 10000 || ref_gap_len > 10000) {
-                reach = false;
-            }
-            else {
-                gap_cigar = extendAlignKSW2(ref_gap_seq, qry_gap_seq, 2 * break_len);
-                ref_len = countRefLength(gap_cigar);
-                qry_len = countQryLength(gap_cigar);
-            }
+            gap_cigar = extendAlignKSW2(ref_gap_seq, qry_gap_seq, 2 * break_len);
+            ref_len = countRefLength(gap_cigar);
+            qry_len = countQryLength(gap_cigar);
             if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
 			    reach = true;
                 // ---- 更新 curr 坐标 ----
@@ -1072,6 +810,7 @@ void linkClusters(AnchorPtrVec& anchors,
 		    else {
 			    reach = false;
 		    }
+            }
         }
 
 
@@ -1291,7 +1030,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
             cl.front().strand()      != prev_strand) {
 
             // 整簇接入
-            MatchCluster kept = cl;
+            MatchCluster kept = std::move(cl);
             // 更新 prev 指标
             prev_ref_chr = kept.front().ref_chr_index;
             prev_qry_chr = kept.front().qry_chr_index;
@@ -1310,7 +1049,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
         MatchCluster pruned;
         pruned.reserve(cl.size());
 
-        for (const auto& m : cl) {
+        for (auto& m : cl) {
             // ref 不重叠：要求当前 match 起点 >= 上一簇的 ref_end（闭开）
             bool ref_ok = (m.ref_start >= prev_ref_end);
 
@@ -1322,7 +1061,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
             bool qry_ok = !intervalOverlap(qlo, qhi, prev_q_lo, prev_q_hi);
 
             if (ref_ok && qry_ok) {
-                pruned.push_back(m);
+                pruned.push_back(std::move(m));
             }
         }
 
@@ -1348,6 +1087,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
     }
 
     clusters.swap(cleaned);
+    MatchClusterVec().swap(cleaned);
 
 
 
@@ -1357,7 +1097,9 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
         auto ap = std::make_shared<Anchor>(std::move(a));
         ap->is_linked = false;                                    // 确保初始未链接
         anchors.push_back(std::move(ap));
+        MatchCluster().swap(c);
     }
+    MatchClusterVec().swap(clusters);
 
     // 2) 没有可用 anchor 直接返回空
     AnchorPtrVec linked;
@@ -1450,7 +1192,10 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
        //         continue;
        //     }
 
-            std::string ref_gap_seq = std::visit([&](auto& p) {
+            if (!linkedGapCanBeAligned(ref_gap_len, qry_gap_len)) {
+                reach = false;
+            } else {
+                std::string ref_gap_seq = std::visit([&](auto& p) {
                 using T = std::decay_t<decltype(p)>;
                 if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::SequenceManager>>) {
                     return p->getSubSequence((*curr)->ref_chr_index, ref_gap_beg, ref_gap_len);
@@ -1460,7 +1205,7 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                 }
                 }, ref_mgr);
 
-            std::string qry_gap_seq = std::visit([&](auto& p) {
+                std::string qry_gap_seq = std::visit([&](auto& p) {
                 using T = std::decay_t<decltype(p)>;
                 if constexpr (std::is_same_v<T, std::unique_ptr<SeqPro::SequenceManager>>) {
                     return p->getSubSequence((*curr)->qry_chr_index, qry_gap_beg, qry_gap_len);
@@ -1470,22 +1215,17 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
                 }
                 }, qry_mgr);
 
-            if ((*curr)->strand == REVERSE) {
-                reverseComplement(qry_gap_seq); // 保证方向一致
-            }
+                if ((*curr)->strand == REVERSE) {
+                    reverseComplement(qry_gap_seq); // 保证方向一致
+                }
 
-            uint_t ref_len = 0;
-            uint_t qry_len = 0;
-            Cigar_t gap_cigar;
-            if (qry_gap_len > 10000 || ref_gap_len > 10000) {
-                reach = false;
-            }
-            else {
+                uint_t ref_len = 0;
+                uint_t qry_len = 0;
+                Cigar_t gap_cigar;
                 gap_cigar = extendAlignKSW2(ref_gap_seq, qry_gap_seq, 2 * break_len);
                 ref_len = countRefLength(gap_cigar);
                 qry_len = countQryLength(gap_cigar);
-            }
-            if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
+                if (ref_len == ref_gap_len && qry_len == qry_gap_len) {
 			    reach = true;
                 // ---- 更新 curr 坐标 ----
                 (*curr)->ref_len = ((*best)->ref_start + (*best)->ref_len) - (*curr)->ref_start;
@@ -1514,9 +1254,10 @@ AnchorPtrVec linkClusters(MatchClusterVec& clusters,
 
                 (*best)->is_linked = true;
 		    }
-		    else {
-			    reach = false;
-		    }
+		        else {
+			        reach = false;
+		        }
+            }
         }
 
 

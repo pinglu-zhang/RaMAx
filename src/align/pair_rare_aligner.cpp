@@ -656,16 +656,15 @@ AnchorPtrVec PairRareAligner::
 extendClusterGroupToAnchors(
     SeqPro::ManagerVariant&
         query_seqpro_manager,
-    MatchClusterVecPtr cluster_group,
+    MatchClusterVec& cluster_group,
     bool is_first) {
     AnchorPtrVec anchors;
-    if (!cluster_group ||
-        cluster_group->empty()) {
+    if (cluster_group.empty()) {
         return anchors;
     }
     if (!is_first) {
         for (auto& cluster :
-             *cluster_group) {
+             cluster_group) {
             for (auto& match : cluster) {
                 MatchVec single_match{
                     match};
@@ -678,13 +677,15 @@ extendClusterGroupToAnchors(
                     std::make_shared<Anchor>(
                         std::move(anchor)));
             }
+            MatchCluster().swap(cluster);
         }
     } else {
         anchors = linkClusters(
-            *cluster_group,
+            cluster_group,
             *ref_seqpro_manager,
             query_seqpro_manager);
     }
+    MatchClusterVec().swap(cluster_group);
     return anchors;
 }
 
@@ -715,7 +716,7 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
         AnchorPtrVec anchors =
             extendClusterGroupToAnchors(
                 query_seqpro_manager,
-                tmp_p,
+                *tmp_p,
                 is_first);
 
         if (!anchors.empty()) {
@@ -764,37 +765,8 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
 
 
 
-static void filterChrByDP(
-	AnchorBySQR_SparsePtr anchor_map,
-	uint_t id,
-	bool filter_ref)
+static void filterAnchorsByDP(AnchorPtrVec result, bool filter_ref)
 {
-	AnchorPtrVec result;
-
-	if (!anchor_map) return;
-
-	for (auto & a_vec : *anchor_map)
-	{
-		if (a_vec.size() > 0)
-		{
-			uint_t ref_idx = a_vec[0]->ref_chr_index;
-			uint_t qry_idx = a_vec[0]->qry_chr_index;
-			if (filter_ref)
-			{
-				if (ref_idx == id)
-				{
-					result.insert(result.end(), a_vec.begin(), a_vec.end());
-				}
-			}else
-			{
-				if (qry_idx == id)
-				{
-					result.insert(result.end(), a_vec.begin(), a_vec.end());
-				}
-			}
-		}
-	}
-
 	if (result.empty()) return;
 
 	// ====== DP 部分 ======
@@ -944,6 +916,25 @@ static void filterChrByDP(
 #endif
 }
 
+static void filterChrByDP(
+	AnchorBySQR_SparsePtr anchor_map,
+	uint_t id,
+	bool filter_ref)
+{
+	AnchorPtrVec result;
+	if (!anchor_map) return;
+	for (auto& a_vec : *anchor_map) {
+		if (a_vec.empty()) continue;
+		const uint_t chromosome_id = filter_ref
+			? a_vec.front()->ref_chr_index
+			: a_vec.front()->qry_chr_index;
+		if (chromosome_id == id) {
+			result.insert(result.end(), a_vec.begin(), a_vec.end());
+		}
+	}
+	filterAnchorsByDP(std::move(result), filter_ref);
+}
+
 void PairRareAligner::
 filterAnchorByDPDimension(
     AnchorBySQR_SparsePtr anchor_map,
@@ -953,6 +944,11 @@ filterAnchorByDPDimension(
         std::move(anchor_map),
         chromosome_id,
         filter_ref);
+}
+
+void PairRareAligner::filterAnchorVectorByDP(
+    AnchorPtrVec anchors, bool filter_ref) {
+    filterAnchorsByDP(std::move(anchors), filter_ref);
 }
 
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
@@ -995,6 +991,7 @@ void PairRareAligner::constructGraphByDP(
                     error.what());
             }
         }
+        AnchorPtrVec().swap(anchor_group);
     }
 }
 

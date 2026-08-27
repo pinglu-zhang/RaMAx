@@ -179,7 +179,13 @@ namespace RaMesh {
 
         void resortSegments();
 
-        void alignInterval(const SpeciesName ref_name, const SpeciesName query_name, const ChrName query_chr_name, SegPtr cur_node, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, bool is_left_extend, int_t zdrop);
+        void alignInterval(const SpeciesName& ref_name,
+                           const SpeciesName& query_name,
+                           const ChrName& query_chr_name,
+                           SegPtr cur_node,
+                           const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+                           bool is_left_extend,
+                           int_t zdrop);
 
         void removeOverlap(bool if_ref);
 
@@ -270,7 +276,10 @@ namespace RaMesh {
         };
 
 
-		void extendRefNodes(const SpeciesName& ref_name, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, int_t zdrop);
+		void extendRefNodes(
+            const SpeciesName& ref_name,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+            int_t zdrop);
         
         // 图正确性验证函数
         bool verifyGraphCorrectness(bool verbose = false, bool show_detailed_segments = false) const;

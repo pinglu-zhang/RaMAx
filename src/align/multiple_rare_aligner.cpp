@@ -2,9 +2,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <string_view>
+
+#include <omp.h>
 
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
@@ -15,6 +22,68 @@
 namespace {
 
     constexpr size_t kMaxReferenceSequenceCount = 100000;
+
+    struct ProcessMemorySnapshot {
+        uint64_t rss_kib = 0;
+        uint64_t peak_rss_kib = 0;
+        uint64_t virtual_kib = 0;
+        uint64_t cgroup_limit_bytes = 0;
+        bool available = false;
+    };
+
+    ProcessMemorySnapshot readProcessMemorySnapshot() noexcept {
+        ProcessMemorySnapshot result;
+#if defined(__linux__)
+        try {
+            std::ifstream status("/proc/self/status");
+            std::string line;
+            while (std::getline(status, line)) {
+                std::istringstream fields(line);
+                std::string key;
+                uint64_t value = 0;
+                std::string unit;
+                if (!(fields >> key >> value >> unit)) continue;
+                if (key == "VmRSS:") result.rss_kib = value;
+                else if (key == "VmHWM:") result.peak_rss_kib = value;
+                else if (key == "VmSize:") result.virtual_kib = value;
+            }
+            for (const char* path : {
+                     "/sys/fs/cgroup/memory.max",
+                     "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+                std::ifstream limit_file(path);
+                std::string limit;
+                if (limit_file >> limit && limit != "max") {
+                    result.cgroup_limit_bytes = std::stoull(limit);
+                    if (result.cgroup_limit_bytes >= (1ULL << 60U)) {
+                        result.cgroup_limit_bytes = 0;
+                    }
+                    break;
+                }
+            }
+            result.available = status.good() || result.rss_kib != 0;
+        } catch (...) {
+        }
+#endif
+        return result;
+    }
+
+    void logStageMemory(std::string_view stage,
+                        std::string_view event,
+                        size_t items = 0,
+                        size_t auxiliary = 0) {
+        const ProcessMemorySnapshot memory = readProcessMemorySnapshot();
+        if (!memory.available) {
+            spdlog::info(
+                "[stage-memory] stage={} event={} available=false items={} auxiliary={}",
+                stage, event, items, auxiliary);
+            return;
+        }
+        spdlog::info(
+            "[stage-memory] stage={} event={} rss_kib={} peak_rss_kib={} "
+            "virtual_kib={} cgroup_limit_bytes={} items={} auxiliary={}",
+            stage, event, memory.rss_kib, memory.peak_rss_kib,
+            memory.virtual_kib, memory.cgroup_limit_bytes, items, auxiliary);
+    }
     struct OpenMPStageActivity {
         std::atomic<size_t> active{0};
         std::atomic<size_t> maximum{0};
@@ -62,8 +131,9 @@ namespace {
         uint_t requested_threads,
         OpenMPStageActivity& activity,
         Function&& function) {
-        std::vector<std::exception_ptr>
-            errors(work_items);
+        std::mutex failure_mutex;
+        std::exception_ptr first_failure;
+        size_t first_failure_index = work_items;
         const size_t workers =
             stageWorkerCount(
                 requested_threads,
@@ -74,12 +144,17 @@ namespace {
                 try {
                     function(index);
                 } catch (...) {
-                    errors[index] =
-                        std::current_exception();
+                    std::lock_guard<std::mutex> lock(
+                        failure_mutex);
+                    if (index < first_failure_index) {
+                        first_failure_index = index;
+                        first_failure =
+                            std::current_exception();
+                    }
                 }
                 activity.leave();
             };
-        if (workers == 1) {
+        if (workers == 1 || omp_in_parallel()) {
             for (size_t index = 0;
                  index < work_items;
                  ++index) {
@@ -97,11 +172,8 @@ namespace {
                         index));
             }
         }
-        for (const auto& error : errors) {
-            if (error) {
-                std::rethrow_exception(
-                    error);
-            }
+        if (first_failure) {
+            std::rethrow_exception(first_failure);
         }
     }
 
@@ -760,6 +832,8 @@ starAlignment(
             species_fasta_manager_map.size() -
             (species_fasta_manager_map.contains(current_ref_name) ? 1 : 0);
         if (legacy_query_count > 0) {
+            logStageMemory(
+                "anchor-search", "start", legacy_query_count);
             SpeciesMatchVec3DPtrMapPtr match_ptr = alignMultipleGenome(
                 current_ref_name,
                 species_fasta_manager_map,
@@ -770,6 +844,8 @@ starAlignment(
                 ref_global_cache,
                 sampling_interval
             );
+            logStageMemory(
+                "anchor-search", "complete", match_ptr ? match_ptr->size() : 0);
 
             spdlog::info("align multiple genome for {} done", current_ref_name);
 
@@ -830,7 +906,9 @@ starAlignment(
         // 7-6) 扩展/优化/验证图结构
         // --------------------------------------------------------
         spdlog::info("begin to extend nodes for {}", current_ref_name);
+        logStageMemory("extend-ref-nodes", "start");
         multi_graph->extendRefNodes(current_ref_name, seqpro_managers, 200);
+        logStageMemory("extend-ref-nodes", "complete");
 
         multi_graph->optimizeGraphStructure();
 
@@ -1229,6 +1307,8 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
     if (!species_match_map || species_match_map->empty()) {
         return std::make_shared<SpeciesClusterMap>();
     }
+    logStageMemory(
+        "sparse-clustering", "start", species_match_map->size());
 
     // unique_map / repeat_map：每个物种分别存 unique/repeat anchors（稀疏 key→MatchVec）
     std::unordered_map<SpeciesName, MatchBySQR_SparsePtr> unique_map;
@@ -1431,6 +1511,8 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
     }
     auto cluster_map_ptr = std::make_shared<SpeciesClusterMap>(std::move(cluster_map));
     spdlog::info("Cluster All Chr Match (Sparse) Done, species num: {}", cluster_map_ptr->size());
+    logStageMemory(
+        "sparse-clustering", "complete", cluster_map_ptr->size());
 
     return cluster_map_ptr;
 }
@@ -1481,16 +1563,10 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
     struct ExtensionWorkItem {
         size_t species_index = 0;
         size_t group_index = 0;
+        MatchClusterVec* group = nullptr;
+        uint32_t cost = 0;
         bool secondary = false;
     };
-    std::vector<std::vector<
-        MatchClusterVecPtr>>
-        primary_groups(
-            species_list.size());
-    std::vector<std::vector<
-        MatchClusterVecPtr>>
-        secondary_groups(
-            species_list.size());
     std::vector<std::vector<AnchorPtrVec>>
         primary_extensions(
             species_list.size());
@@ -1509,24 +1585,25 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         const auto& primary_map =
             *species_cluster_map.at(
                 species);
+        primary_extensions[species_index]
+            .resize(primary_map.size());
+        size_t primary_index = 0;
         for (const auto& [key, group] :
              primary_map) {
             (void)key;
-            primary_groups[species_index]
-                .push_back(group);
-        }
-        primary_extensions[species_index]
-            .resize(
-                primary_groups[species_index]
-                    .size());
-        for (size_t group_index = 0;
-             group_index <
-                 primary_groups[species_index]
-                     .size();
-             ++group_index) {
+            uint64_t cost = 0;
+            if (group) {
+                for (const auto& cluster : *group) {
+                    cost += cluster.size();
+                }
+            }
             extension_work.push_back(
                 {species_index,
-                 group_index,
+                 primary_index++,
+                 group.get(),
+                 static_cast<uint32_t>(std::min<uint64_t>(
+                     cost,
+                     std::numeric_limits<uint32_t>::max())),
                  false});
         }
 
@@ -1537,36 +1614,54 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             if (secondary_it !=
                     secondary_cluster_map.end() &&
                 secondary_it->second) {
-                for (const auto& [key, group] :
-                     *secondary_it->second) {
-                    (void)key;
-                    secondary_groups[
-                        species_index]
-                        .push_back(group);
-                }
                 secondary_extensions[
                     species_index]
                     .resize(
-                        secondary_groups[
-                            species_index]
-                            .size());
-                for (size_t group_index = 0;
-                     group_index <
-                         secondary_groups[
-                             species_index]
-                             .size();
-                     ++group_index) {
+                        secondary_it->second->size());
+                size_t secondary_index = 0;
+                for (const auto& [key, group] :
+                      *secondary_it->second) {
+                    (void)key;
+                    uint64_t cost = 0;
+                    if (group) {
+                        for (const auto& cluster : *group) {
+                            cost += cluster.size();
+                        }
+                    }
                     extension_work.push_back(
                         {species_index,
-                         group_index,
+                         secondary_index++,
+                         group.get(),
+                         static_cast<uint32_t>(std::min<uint64_t>(
+                             cost,
+                             std::numeric_limits<uint32_t>::max())),
                          true});
                 }
             }
         }
     }
 
+    std::sort(
+        extension_work.begin(),
+        extension_work.end(),
+        [](const ExtensionWorkItem& left,
+           const ExtensionWorkItem& right) {
+            if (left.cost != right.cost) {
+                return left.cost > right.cost;
+            }
+            if (left.species_index != right.species_index) {
+                return left.species_index < right.species_index;
+            }
+            if (left.secondary != right.secondary) {
+                return left.secondary < right.secondary;
+            }
+            return left.group_index < right.group_index;
+        });
+
     OpenMPStageActivity
         extension_activity;
+    logStageMemory(
+        "cluster-extension", "start", extension_work.size());
     const auto extension_start =
         std::chrono::steady_clock::now();
     executeParallelStage(
@@ -1580,15 +1675,17 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 *seqpro_managers.at(
                     species_list[
                         item.species_index]);
+            if (item.group == nullptr ||
+                item.group->empty()) {
+                return;
+            }
             if (item.secondary) {
                 secondary_extensions[
                     item.species_index]
                     [item.group_index] =
                     pra.extendClusterGroupToAnchors(
                         manager,
-                        secondary_groups[
-                            item.species_index]
-                            [item.group_index],
+                        *item.group,
                         is_first);
             } else {
                 primary_extensions[
@@ -1596,9 +1693,7 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     [item.group_index] =
                     pra.extendClusterGroupToAnchors(
                         manager,
-                        primary_groups[
-                            item.species_index]
-                            [item.group_index],
+                        *item.group,
                         is_first);
             }
         });
@@ -1620,6 +1715,9 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         extension_activity.maximum.load(
             std::memory_order_relaxed),
         extension_ms);
+    logStageMemory(
+        "cluster-extension", "complete", extension_work.size());
+    std::vector<ExtensionWorkItem>().swap(extension_work);
 
     std::vector<AnchorBySQR_SparsePtr>
         anchor_results(
@@ -1669,6 +1767,10 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             species_index] =
             std::move(secondary_anchors);
     }
+    std::vector<std::vector<AnchorPtrVec>>().swap(primary_extensions);
+    std::vector<std::vector<AnchorPtrVec>>().swap(secondary_extensions);
+    logStageMemory(
+        "cluster-extension", "released", species_list.size());
 
     if (allow_mem) {
         size_t secondary_anchor_count = 0;
@@ -1692,16 +1794,16 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                 secondary_anchors,
                 graph,
                 is_first);
+            for (auto& group : *secondary_anchors) {
+                AnchorPtrVec().swap(group);
+            }
+            secondary_anchor_results[species_index].reset();
         }
         spdlog::info(
             "[secondary-mem] extended_anchors={}",
             secondary_anchor_count);
     }
 
-    struct DPWorkItem {
-        size_t species_index = 0;
-        uint_t chromosome_id = 0;
-    };
     const uint_t reference_count =
         std::visit(
             [](auto& manager) {
@@ -1710,51 +1812,101 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             },
             *seqpro_managers.at(
                 ref_name));
-    std::vector<DPWorkItem>
-        reference_work;
-    std::vector<DPWorkItem>
-        query_work;
-    for (size_t species_index = 0;
-         species_index <
-             species_list.size();
-         ++species_index) {
-        if (!anchor_results[
-                species_index]) {
-            continue;
-        }
-        for (uint_t chromosome_id = 0;
-             chromosome_id <
-                 reference_count;
-             ++chromosome_id) {
-            reference_work.push_back(
-                {species_index,
-                 chromosome_id});
-        }
-        const uint_t query_count =
-            std::visit(
-                [](auto& manager) {
-                    return manager
-                        ->getSequenceCount();
-                },
-                *seqpro_managers.at(
-                    species_list[
-                        species_index]));
-        for (uint_t chromosome_id = 0;
-             chromosome_id <
-                 query_count;
-             ++chromosome_id) {
-            query_work.push_back(
-                {species_index,
-                 chromosome_id});
-        }
-    }
-
     const auto run_dp_stage =
-        [&](const std::vector<DPWorkItem>&
-                work_items,
-            bool filter_reference,
+        [&](bool filter_reference,
             std::string_view stage_name) {
+            struct DPGroupRef {
+                size_t species_index = 0;
+                size_t group_index = 0;
+                uint_t chromosome_id = 0;
+            };
+            struct DPWorkItem {
+                size_t species_index = 0;
+                uint_t chromosome_id = 0;
+                size_t begin = 0;
+                size_t end = 0;
+                size_t anchor_count = 0;
+            };
+            size_t possible_chromosomes = 0;
+            size_t total_groups = 0;
+            for (size_t species_index = 0;
+                 species_index < species_list.size();
+                 ++species_index) {
+                const auto& anchors = anchor_results[species_index];
+                if (!anchors) continue;
+                total_groups += anchors->size();
+                if (filter_reference) {
+                    possible_chromosomes += reference_count;
+                } else {
+                    possible_chromosomes += std::visit(
+                        [](auto& manager) {
+                            return static_cast<size_t>(
+                                manager->getSequenceCount());
+                        },
+                        *seqpro_managers.at(
+                            species_list[species_index]));
+                }
+            }
+
+            std::vector<DPGroupRef> group_refs;
+            group_refs.reserve(total_groups);
+            for (size_t species_index = 0;
+                 species_index < species_list.size();
+                 ++species_index) {
+                const auto& anchors = anchor_results[species_index];
+                if (!anchors) continue;
+                for (size_t group_index = 0;
+                     group_index < anchors->size();
+                     ++group_index) {
+                    const auto& group = (*anchors)[group_index];
+                    if (group.empty()) continue;
+                    group_refs.push_back({
+                        species_index,
+                        group_index,
+                        filter_reference
+                            ? group.front()->ref_chr_index
+                            : group.front()->qry_chr_index});
+                }
+            }
+            std::sort(
+                group_refs.begin(),
+                group_refs.end(),
+                [](const DPGroupRef& left,
+                   const DPGroupRef& right) {
+                    if (left.species_index != right.species_index) {
+                        return left.species_index < right.species_index;
+                    }
+                    if (left.chromosome_id != right.chromosome_id) {
+                        return left.chromosome_id < right.chromosome_id;
+                    }
+                    return left.group_index < right.group_index;
+                });
+
+            std::vector<DPWorkItem> work_items;
+            work_items.reserve(group_refs.size());
+            for (size_t index = 0; index < group_refs.size(); ++index) {
+                const auto& ref = group_refs[index];
+                if (work_items.empty() ||
+                    work_items.back().species_index != ref.species_index ||
+                    work_items.back().chromosome_id != ref.chromosome_id) {
+                    work_items.push_back({
+                        ref.species_index,
+                        ref.chromosome_id,
+                        index,
+                        index,
+                        0});
+                }
+                auto& item = work_items.back();
+                item.end = index + 1;
+                item.anchor_count +=
+                    (*anchor_results[ref.species_index])
+                        [ref.group_index]
+                            .size();
+            }
+
             OpenMPStageActivity activity;
+            logStageMemory(
+                stage_name, "start", work_items.size(), group_refs.size());
             const auto stage_start =
                 std::chrono::steady_clock::now();
             executeParallelStage(
@@ -1765,10 +1917,22 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     const auto& item =
                         work_items[
                             work_index];
-                    pra.filterAnchorByDPDimension(
-                        anchor_results[
-                            item.species_index],
-                        item.chromosome_id,
+                    AnchorPtrVec anchors;
+                    anchors.reserve(item.anchor_count);
+                    for (size_t index = item.begin;
+                         index < item.end;
+                         ++index) {
+                        const auto& ref = group_refs[index];
+                        const auto& group =
+                            (*anchor_results[ref.species_index])
+                                [ref.group_index];
+                        anchors.insert(
+                            anchors.end(),
+                            group.begin(),
+                            group.end());
+                    }
+                    pra.filterAnchorVectorByDP(
+                        std::move(anchors),
                         filter_reference);
                 });
             const double elapsed_ms =
@@ -1780,7 +1944,8 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     .count();
             spdlog::info(
                 "[parallel-stage] {}: tasks={}, "
-                "threads={}, max_active={}, "
+                "threads={}, max_active={}, groups={}, "
+                "possible_chromosomes={}, skipped_empty={}, "
                 "elapsed_ms={:.3f}",
                 stage_name,
                 work_items.size(),
@@ -1789,17 +1954,24 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     work_items.size()),
                 activity.maximum.load(
                     std::memory_order_relaxed),
+                group_refs.size(),
+                possible_chromosomes,
+                possible_chromosomes >= work_items.size()
+                    ? possible_chromosomes - work_items.size()
+                    : 0,
                 elapsed_ms);
+            logStageMemory(
+                stage_name, "complete", work_items.size(), group_refs.size());
         };
     run_dp_stage(
-        reference_work,
         true,
         "anchor-dp-reference");
     run_dp_stage(
-        query_work,
         false,
         "anchor-dp-query");
 
+    logStageMemory(
+        "serial-graph-insertion", "start", species_list.size());
     for (size_t species_index = 0;
          species_index <
              species_list.size();
@@ -1820,7 +1992,10 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             *seqpro_managers.at(species),
             anchors,
             graph);
+        anchor_results[species_index].reset();
     }
+    logStageMemory(
+        "serial-graph-insertion", "complete", species_list.size());
 
     spdlog::info("[constructMultipleGraphsByDP] Completed all species.");
 }
