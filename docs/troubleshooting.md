@@ -122,6 +122,22 @@ artifact is different: RaMAx rebuilds only the affected raw, clean, or
 softmask artifact. The suffix-array index is memory-only and is rebuilt on
 every process start.
 
+## A wfmash pair times out
+
+First-round wfmash routing has a fixed 60-minute budget for each query. The
+budget covers mapping, mapping validation, alignment, waiting for the guarded
+alignment retry, and the retry itself. A timeout is a routing fallback rather
+than a fatal RaMAx error: the complete wfmash process group is terminated and
+the query continues through the native suffix-array alignment path in the same
+reference round.
+
+Inspect `<workdir>/wfmash/round_0/routing.tsv` for `timeout_fallback`, then use
+the species directory below `round_0` to identify the timed-out stage from the
+stderr and `.part` files. These diagnostic files are intentionally retained;
+they are not accepted as completed PAF output. The main log reports the worker
+index, assigned wfmash threads, elapsed pair time, remaining budget, exit code,
+and terminating signal for each external stage.
+
 ## MAF validation fails
 
 For each Block, verify:

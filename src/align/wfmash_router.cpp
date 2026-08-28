@@ -43,7 +43,7 @@ constexpr std::string_view kWfmashParameterSummary =
 // Some wfmash builds intermittently fail to reopen a freshly produced mapping
 // PAF when several alignment processes start together. Keep the normal
 // OpenMP-parallel fast path, but serialize one retry for failed alignments.
-std::mutex wfmash_alignment_retry_mutex;
+std::timed_mutex wfmash_alignment_retry_mutex;
 
 uint64_t parseUnsigned(std::string_view value, const char* field) {
     if (value.empty()) {
@@ -285,6 +285,7 @@ void ensureFai(const std::filesystem::path& samtools,
 struct PreparedQuery {
     SpeciesName species;
     double distance{0.0};
+    uint64_t total_bases{0};
     SeqPro::SharedManagerVariant manager;
     std::filesystem::path fasta;
     std::vector<SequenceRecord> records;
@@ -518,26 +519,112 @@ struct PairExecutionResult {
     bool success{false};
     AnchorVec anchors;
     std::string error;
+    bool timed_out{false};
 };
+
+class WfmashPairTimeout : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+using SteadyClock = std::chrono::steady_clock;
+
+std::chrono::milliseconds remainingPairBudget(
+    SteadyClock::time_point deadline) {
+    const auto now = SteadyClock::now();
+    if (now >= deadline) return std::chrono::milliseconds::zero();
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+}
+
+std::string timeoutDetail(
+    const PreparedQuery& query, std::string_view stage,
+    SteadyClock::time_point pair_started,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        SteadyClock::now() - pair_started);
+    return "wfmash " + std::string(stage) + " timeout for " + query.species +
+           " after " + std::to_string(elapsed.count()) +
+           " ms (pair budget " + std::to_string(policy.pair_timeout.count()) +
+           " ms)";
+}
+
+RaMAxExternalTool::CommandResult runWfmashStage(
+    const std::filesystem::path& wfmash,
+    const std::vector<std::string>& arguments,
+    const std::filesystem::path& stdout_path,
+    const std::filesystem::path& stderr_path,
+    const PreparedQuery& query,
+    std::string_view stage,
+    size_t worker_index,
+    uint_t pair_threads,
+    SteadyClock::time_point pair_started,
+    SteadyClock::time_point deadline,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    const auto remaining = remainingPairBudget(deadline);
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw WfmashPairTimeout(
+            timeoutDetail(query, stage, pair_started, policy));
+    }
+    const auto pair_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            SteadyClock::now() - pair_started);
+    spdlog::info(
+        "[wfmash-router] {} stage={} start worker={} threads={} "
+        "pair_elapsed_ms={} remaining_ms={}",
+        query.species, stage, worker_index, pair_threads,
+        pair_elapsed.count(), remaining.count());
+
+    RaMAxExternalTool::RunOptions run_options;
+    run_options.timeout = remaining;
+    run_options.termination_grace = policy.termination_grace;
+    run_options.poll_interval = policy.poll_interval;
+    run_options.create_process_group = true;
+    const auto result = RaMAxExternalTool::run(
+        wfmash, arguments, stdout_path, stderr_path, run_options);
+    spdlog::info(
+        "[wfmash-router] {} stage={} complete worker={} threads={} "
+        "elapsed_ms={} exit_code={} timed_out={} signal={}",
+        query.species, stage, worker_index, pair_threads,
+        result.elapsed.count(), result.exit_code,
+        result.timed_out ? "true" : "false", result.termination_signal);
+    if (result.timed_out) {
+        throw WfmashPairTimeout(
+            timeoutDetail(query, stage, pair_started, policy));
+    }
+    return result;
+}
 
 PairExecutionResult executePair(
     const std::filesystem::path& wfmash,
     uint_t pair_threads,
+    size_t worker_index,
     const std::filesystem::path& reference_fasta,
     const std::vector<SequenceRecord>& reference_records,
     const SeqPro::SharedManagerVariant& reference_manager,
-    const PreparedQuery& query) {
+    const PreparedQuery& query,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    const auto pair_started = SteadyClock::now();
+    const auto deadline = pair_started + policy.pair_timeout;
     try {
-        std::filesystem::create_directories(query.directory / "tmp");
+        const auto tmp_root = query.directory / "tmp";
+        const auto mapping_tmp = tmp_root / "mapping.attempt1";
+        const auto alignment_attempt1_tmp = tmp_root / "alignment.attempt1";
+        const auto alignment_retry_tmp = tmp_root / "alignment.attempt2";
+        std::filesystem::create_directories(mapping_tmp);
+        std::filesystem::create_directories(alignment_attempt1_tmp);
+        std::filesystem::create_directories(alignment_retry_tmp);
         const auto mappings = query.directory / "mappings.paf";
         auto mappings_partial = mappings;
         mappings_partial += ".part";
         const auto mapping_stderr = query.directory / "mapping.stderr.log";
-        const auto mapping_result = RaMAxExternalTool::run(
+        const auto mapping_result = runWfmashStage(
             wfmash,
-            buildMappingArguments(pair_threads, query.directory / "tmp",
+            buildMappingArguments(pair_threads, mapping_tmp,
                                   reference_fasta, query.fasta),
-            mappings_partial, mapping_stderr);
+            mappings_partial, mapping_stderr, query, "mapping",
+            worker_index, pair_threads, pair_started, deadline, policy);
         if (mapping_result.exit_code != 0) {
             throw std::runtime_error("wfmash mapping exited " +
                                      std::to_string(mapping_result.exit_code));
@@ -551,20 +638,26 @@ PairExecutionResult executePair(
         const auto alignment_stderr = query.directory / "alignment.stderr.log";
         const auto first_alignment_stderr =
             query.directory / "alignment.attempt1.stderr.log";
-        auto alignment_result = RaMAxExternalTool::run(
+        auto alignment_result = runWfmashStage(
             wfmash,
-            buildAlignmentArguments(pair_threads, query.directory / "tmp",
+            buildAlignmentArguments(pair_threads, alignment_attempt1_tmp,
                                     mappings_partial,
                                     reference_fasta, query.fasta),
-            alignment_partial, first_alignment_stderr);
+            alignment_partial, first_alignment_stderr, query,
+            "alignment-attempt1", worker_index, pair_threads,
+            pair_started, deadline, policy);
         if (alignment_result.exit_code != 0) {
             const int first_exit_code = alignment_result.exit_code;
             spdlog::warn(
                 "[wfmash-router] {} parallel alignment exited {}; "
                 "retrying once under the process-wide serial guard",
                 query.species, first_exit_code);
-            std::lock_guard<std::mutex> retry_guard(
-                wfmash_alignment_retry_mutex);
+            std::unique_lock<std::timed_mutex> retry_guard(
+                wfmash_alignment_retry_mutex, std::defer_lock);
+            if (!retry_guard.try_lock_until(deadline)) {
+                throw WfmashPairTimeout(
+                    timeoutDetail(query, "retry-lock", pair_started, policy));
+            }
             std::ifstream mapping_check(mappings_partial, std::ios::binary);
             if (!mapping_check || mapping_check.peek() == std::ifstream::traits_type::eof()) {
                 throw std::runtime_error(
@@ -572,12 +665,14 @@ PairExecutionResult executePair(
                     "initial exit " + std::to_string(first_exit_code));
             }
             mapping_check.close();
-            alignment_result = RaMAxExternalTool::run(
+            alignment_result = runWfmashStage(
                 wfmash,
-                buildAlignmentArguments(pair_threads, query.directory / "tmp",
+                buildAlignmentArguments(pair_threads, alignment_retry_tmp,
                                         mappings_partial,
                                         reference_fasta, query.fasta),
-                alignment_partial, alignment_stderr);
+                alignment_partial, alignment_stderr, query,
+                "alignment-retry", worker_index, pair_threads,
+                pair_started, deadline, policy);
             if (alignment_result.exit_code != 0) {
                 throw std::runtime_error(
                     "wfmash alignment exited " +
@@ -610,9 +705,14 @@ PairExecutionResult executePair(
         // path and only publishes the stable user-facing name afterward.
         atomicPublish(mappings_partial, mappings);
         atomicPublish(alignment_partial, alignment);
-        return {true, std::move(anchors), {}};
+        return {true, std::move(anchors), {}, false};
+    } catch (const WfmashPairTimeout& error) {
+        spdlog::warn(
+            "[wfmash-router] {} timed out; returning to native fallback: {}",
+            query.species, error.what());
+        return {false, {}, error.what(), true};
     } catch (const std::exception& error) {
-        return {false, {}, error.what()};
+        return {false, {}, error.what(), false};
     }
 }
 
@@ -938,17 +1038,49 @@ uint_t threadsPerTask(size_t tasks, uint_t total_threads) {
     return std::max<uint_t>(1, total_threads / static_cast<uint_t>(tasks));
 }
 
+PairThreadSchedule pairThreadSchedule(
+    size_t tasks, uint_t total_threads,
+    uint_t minimum_threads_per_process) {
+    PairThreadSchedule schedule;
+    if (tasks == 0) return schedule;
+
+    const uint_t normalized_threads = std::max<uint_t>(1, total_threads);
+    const uint_t normalized_minimum =
+        std::max<uint_t>(1, minimum_threads_per_process);
+    const size_t workers = normalized_threads < normalized_minimum
+        ? 1
+        : std::max<size_t>(
+              1, std::min<size_t>(
+                     tasks, normalized_threads / normalized_minimum));
+    schedule.threads_per_worker.resize(workers);
+    const uint_t base = normalized_threads / static_cast<uint_t>(workers);
+    const uint_t remainder = normalized_threads % static_cast<uint_t>(workers);
+    for (size_t worker = 0; worker < workers; ++worker) {
+        schedule.threads_per_worker[worker] =
+            base + (worker < remainder ? 1U : 0U);
+    }
+    return schedule;
+}
+
 }  // namespace WfmashRouterDetail
 
 FirstRoundWfmashRouter::FirstRoundWfmashRouter(
     std::filesystem::path samtools_executable,
     std::filesystem::path wfmash_executable,
     std::filesystem::path output_directory,
-    uint_t threads)
+    uint_t threads,
+    WfmashRouterDetail::ExecutionPolicy execution_policy)
     : samtools_executable_(std::move(samtools_executable)),
       wfmash_executable_(std::move(wfmash_executable)),
       output_directory_(std::move(output_directory)),
-      threads_(std::max<uint_t>(1, threads)) {
+      threads_(std::max<uint_t>(1, threads)),
+      execution_policy_(execution_policy) {
+    if (execution_policy_.minimum_threads_per_process == 0 ||
+        execution_policy_.pair_timeout <= std::chrono::milliseconds::zero() ||
+        execution_policy_.termination_grace < std::chrono::milliseconds::zero() ||
+        execution_policy_.poll_interval <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error("Invalid wfmash execution policy");
+    }
     if (!RaMAxExternalTool::isExecutable(samtools_executable_)) {
         throw std::runtime_error("samtools is required but was not found");
     }
@@ -1013,6 +1145,14 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         query.directory = output_directory_ / safeName(query.species);
         std::filesystem::create_directories(query.directory);
         createAliasedView(query, reference_names, output_directory_ / "views");
+        for (const auto& record : query.records) {
+            if (record.length >
+                std::numeric_limits<uint64_t>::max() - query.total_bases) {
+                query.total_bases = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            query.total_bases += record.length;
+        }
         queries.push_back(std::move(query));
     }
     std::sort(queries.begin(), queries.end(), [](const auto& left, const auto& right) {
@@ -1063,25 +1203,53 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         else spdlog::warn("[wfmash-router] {} falls back to legacy: {}",
                           queries[i].species, queries[i].error);
     }
-    const uint_t pair_threads = WfmashRouterDetail::threadsPerTask(
-        std::max<size_t>(1, queries.size()), threads_);
-    const size_t workers = WfmashRouterDetail::workerCount(runnable.size(), threads_);
+
+    std::sort(runnable.begin(), runnable.end(), [&](size_t left, size_t right) {
+        const auto& lhs = queries[left];
+        const auto& rhs = queries[right];
+        if (lhs.total_bases != rhs.total_bases) {
+            return lhs.total_bases > rhs.total_bases;
+        }
+        if (lhs.records.size() != rhs.records.size()) {
+            return lhs.records.size() > rhs.records.size();
+        }
+        if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
+        return lhs.species < rhs.species;
+    });
+
+    const auto pair_schedule = WfmashRouterDetail::pairThreadSchedule(
+        runnable.size(), threads_,
+        execution_policy_.minimum_threads_per_process);
+    std::ostringstream thread_budgets;
+    for (size_t worker = 0;
+         worker < pair_schedule.threads_per_worker.size(); ++worker) {
+        if (worker != 0) thread_budgets << ',';
+        thread_budgets << pair_schedule.threads_per_worker[worker];
+    }
     spdlog::info(
-        "[wfmash-router] reference={} near={} far={} candidates={} workers={} threads_per_pair={} params={}",
-        reference, near_distance, far_distance, queries.size(), workers,
-        pair_threads, kWfmashParameterSummary);
+        "[wfmash-router] reference={} near={} far={} candidates={} "
+        "runnable={} workers={} thread_budgets=[{}] pair_timeout_ms={} params={}",
+        reference, near_distance, far_distance, queries.size(), runnable.size(),
+        pair_schedule.workers(), thread_budgets.str(),
+        execution_policy_.pair_timeout.count(), kWfmashParameterSummary);
 
     std::vector<PairExecutionResult> pair_results(queries.size());
 
     if (!runnable.empty()) {
-        const int omp_workers = static_cast<int>(
-            WfmashRouterDetail::workerCount(runnable.size(), threads_));
-#pragma omp parallel for schedule(dynamic) num_threads(omp_workers)
+        const int omp_workers = static_cast<int>(pair_schedule.workers());
+#pragma omp parallel for schedule(dynamic, 1) num_threads(omp_workers)
         for (size_t position = 0; position < runnable.size(); ++position) {
             const size_t index = runnable[position];
+            size_t worker_index = 0;
+#ifdef _OPENMP
+            worker_index = static_cast<size_t>(omp_get_thread_num());
+#endif
+            const uint_t pair_threads =
+                pair_schedule.threads_per_worker.at(worker_index);
             pair_results[index] = executePair(
-                wfmash_executable_, pair_threads, reference_fasta,
-                reference_records, reference_it->second, queries[index]);
+                wfmash_executable_, pair_threads, worker_index,
+                reference_fasta, reference_records, reference_it->second,
+                queries[index], execution_policy_);
         }
     }
 
@@ -1102,7 +1270,9 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
             const std::string detail = !queries[i].error.empty()
                 ? queries[i].error : pair_results[i].error;
             routing << queries[i].species << '\t' << std::setprecision(17)
-                    << queries[i].distance << "\tlegacy\tfallback\t"
+                    << queries[i].distance << "\tlegacy\t"
+                    << (pair_results[i].timed_out
+                        ? "timeout_fallback" : "fallback") << '\t'
                     << detail << '\n';
             spdlog::warn("[wfmash-router] {} falls back to legacy: {}",
                          queries[i].species, detail);
@@ -1123,7 +1293,14 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
              << samtools_version_ << '\n'
              << "wfmash\t" << wfmash_executable_.string() << '\t'
              << wfmash_version_ << '\n'
-             << "parameters\t" << kWfmashParameterSummary << '\n';
+             << "parameters\t" << kWfmashParameterSummary << '\n'
+             << "execution_policy\tminimum_threads_per_process="
+             << execution_policy_.minimum_threads_per_process
+             << ";pair_timeout_ms=" << execution_policy_.pair_timeout.count()
+             << ";termination_grace_ms="
+             << execution_policy_.termination_grace.count()
+             << ";poll_interval_ms="
+             << execution_policy_.poll_interval.count() << '\n';
     writeAtomicText(output_directory_ / "tools.tsv", versions.str());
     return result;
 }
