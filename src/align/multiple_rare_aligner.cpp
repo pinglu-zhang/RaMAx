@@ -16,6 +16,7 @@
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
 #include "SeqPro.h"  // 包含 SeqPro 相关定义
+#include "process_memory.h"
 #include "ramesh.h"  // 包含 RaMesh 图结构定义
 
 // 辅助函数：根据CIGAR字符串计算query区间对应关系
@@ -23,55 +24,11 @@ namespace {
 
     constexpr size_t kMaxReferenceSequenceCount = 100000;
 
-    struct ProcessMemorySnapshot {
-        uint64_t rss_kib = 0;
-        uint64_t peak_rss_kib = 0;
-        uint64_t virtual_kib = 0;
-        uint64_t cgroup_limit_bytes = 0;
-        bool available = false;
-    };
-
-    ProcessMemorySnapshot readProcessMemorySnapshot() noexcept {
-        ProcessMemorySnapshot result;
-#if defined(__linux__)
-        try {
-            std::ifstream status("/proc/self/status");
-            std::string line;
-            while (std::getline(status, line)) {
-                std::istringstream fields(line);
-                std::string key;
-                uint64_t value = 0;
-                std::string unit;
-                if (!(fields >> key >> value >> unit)) continue;
-                if (key == "VmRSS:") result.rss_kib = value;
-                else if (key == "VmHWM:") result.peak_rss_kib = value;
-                else if (key == "VmSize:") result.virtual_kib = value;
-            }
-            for (const char* path : {
-                     "/sys/fs/cgroup/memory.max",
-                     "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
-                std::ifstream limit_file(path);
-                std::string limit;
-                if (limit_file >> limit && limit != "max") {
-                    result.cgroup_limit_bytes = std::stoull(limit);
-                    if (result.cgroup_limit_bytes >= (1ULL << 60U)) {
-                        result.cgroup_limit_bytes = 0;
-                    }
-                    break;
-                }
-            }
-            result.available = status.good() || result.rss_kib != 0;
-        } catch (...) {
-        }
-#endif
-        return result;
-    }
-
     void logStageMemory(std::string_view stage,
                         std::string_view event,
                         size_t items = 0,
                         size_t auxiliary = 0) {
-        const ProcessMemorySnapshot memory = readProcessMemorySnapshot();
+        const auto memory = RaMAxMemory::readProcessMemorySnapshot();
         if (!memory.available) {
             spdlog::info(
                 "[stage-memory] stage={} event={} available=false items={} auxiliary={}",
@@ -923,7 +880,11 @@ starAlignment(
         // 7-7) 合并本轮生成的多个子图到 multi_graph
         // --------------------------------------------------------
         spdlog::info("merge multiple genome graphs for {}", current_ref_name);
+        logStageMemory(
+            "graph-merge", "start", multi_graph->blocks.size());
         multi_graph->mergeMultipleGraphs(current_ref_name, thread_num);
+        logStageMemory(
+            "graph-merge", "complete", multi_graph->blocks.size());
         spdlog::info("merge multiple genome graphs for {} done", current_ref_name);
 
 #ifdef _DEBUG_

@@ -2,6 +2,7 @@
 //  File: ramesh_graph.cpp –  High‑level graph ops (v0.6‑alpha)
 // =============================================================
 #include "align.h"
+#include "process_memory.h"
 #include "ramesh.h"
 #include <algorithm>
 #include <chrono>
@@ -549,6 +550,22 @@ bool secondaryRunLess(
     return false;
   }
   return lhs.common_start < rhs.common_start;
+}
+
+size_t eraseExpiredWeakBlocksUnlocked(std::vector<WeakBlock>& block_pool) {
+  size_t removed = 0;
+  block_pool.erase(
+      std::remove_if(
+          block_pool.begin(), block_pool.end(),
+          [&removed](const WeakBlock& weak_block) {
+            if (!weak_block.expired()) {
+              return false;
+            }
+            ++removed;
+            return true;
+          }),
+      block_pool.end());
+  return removed;
 }
 
 }  // namespace
@@ -1704,7 +1721,7 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
         continue; // 已在指针有效性检查中报告
       }
 
-      // 添加与debug_all_species_segments相同的锁保护
+      // Hold the chromosome read lock for the complete verification pass.
       std::shared_lock end_lock(genome_end.rw);
 
       SegPtr current = genome_end.head;
@@ -1713,14 +1730,40 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
       size_t ordering_violations = 0;
       size_t large_gaps = 0;
 
-      // 调试：收集所有segments用于对比
-      std::vector<std::pair<size_t, uint_t>> debug_segments; // <index, start>
+      // Detailed diagnostics only need the first/last ten entries and two
+      // historical checkpoints.  Keep this bounded instead of copying every
+      // Segment coordinate on a large chromosome.
+      const bool collect_debug_segments =
+          options.verbose && options.show_detailed_segments;
+      std::vector<std::pair<size_t, uint_t>> first_debug_segments;
+      std::vector<std::pair<size_t, uint_t>> last_debug_segments;
+      if (collect_debug_segments) {
+        first_debug_segments.reserve(10);
+        last_debug_segments.reserve(10);
+      }
+      std::optional<uint_t> debug_segment_5000;
+      std::optional<uint_t> debug_segment_5500;
 
-      // 遍历整个链表，与debug_all_species_segments保持一致的条件
+      // Traverse the complete chromosome list for correctness checks.
       while (current && current != genome_end.tail) {
         if (current->isSegment()) {
           segment_count++;
-          debug_segments.emplace_back(segment_count, current->start);
+          if (collect_debug_segments) {
+            const auto debug_entry =
+                std::pair<size_t, uint_t>{segment_count, current->start};
+            if (first_debug_segments.size() < 10) {
+              first_debug_segments.push_back(debug_entry);
+            }
+            if (last_debug_segments.size() == 10) {
+              last_debug_segments.erase(last_debug_segments.begin());
+            }
+            last_debug_segments.push_back(debug_entry);
+            if (segment_count == 5000) {
+              debug_segment_5000 = current->start;
+            } else if (segment_count == 5500) {
+              debug_segment_5500 = current->start;
+            }
+          }
 
           // 检查segment链表的顺序（start是否递增）
           if (prev_segment) {
@@ -1787,27 +1830,24 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
                       chr_name, segment_count, ordering_violations, large_gaps);
 
         // 输出前10个和后10个segments的start值用于调试（仅在启用详细段信息时）
-        if (options.show_detailed_segments && debug_segments.size() > 20) {
+        if (segment_count > 20) {
           spdlog::debug("    First 10 segments start values:");
-          for (size_t i = 0; i < std::min(size_t(10), debug_segments.size());
-               ++i) {
-            spdlog::debug("      Segment#{}: start={}", debug_segments[i].first,
-                          debug_segments[i].second);
+          for (const auto& [index, start] : first_debug_segments) {
+            spdlog::debug("      Segment#{}: start={}", index, start);
           }
           spdlog::debug("    Last 10 segments start values:");
-          for (size_t i = std::max(size_t(0), debug_segments.size() - 10);
-               i < debug_segments.size(); ++i) {
-            spdlog::debug("      Segment#{}: start={}", debug_segments[i].first,
-                          debug_segments[i].second);
+          for (const auto& [index, start] : last_debug_segments) {
+            spdlog::debug("      Segment#{}: start={}", index, start);
           }
 
           // 特别检查第5000和第5500个segment
-          if (debug_segments.size() > 5500) {
+          if (segment_count > 5500 && debug_segment_5000 &&
+              debug_segment_5500) {
             spdlog::debug("    Special check - Segment#5000: start={}",
-                          debug_segments[4999].second);
+                          *debug_segment_5000);
             spdlog::debug("    Special check - Segment#5500: start={}",
-                          debug_segments[5499].second);
-            if (debug_segments[4999].second > debug_segments[5499].second) {
+                          *debug_segment_5500);
+            if (*debug_segment_5000 > *debug_segment_5500) {
               spdlog::error("    MANUAL CHECK CONFIRMED: Segment#5000 start > "
                             "Segment#5500 start!");
               spdlog::error("      This should have been detected as an "
@@ -2307,6 +2347,7 @@ void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
  * ===========================================================*/
 void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                                                  uint_t thread_num) {
+  (void)thread_num;
   // ═══════════════════════════════════════════════════════════
   // 性能分析：函数开始计时
   // ═══════════════════════════════════════════════════════════
@@ -2428,13 +2469,14 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
   TimePoint step_start_time = HighResClock::now();
 
-  // ═══════════════════════════════════════════════════════════
-  // 批量删除优化：收集要删除的Block，避免逐个删除的O(n²)问题
-  // ═══════════════════════════════════════════════════════════
-  std::unordered_set<BlockPtr> blocks_to_delete;
-  blocks_to_delete.reserve(100000); // 预分配空间，根据统计数据估算
+  constexpr size_t kRetiredBlockCheckpoint = 131072;
+  std::unordered_set<uint64_t> retired_block_ids;
+  retired_block_ids.reserve(kRetiredBlockCheckpoint);
+  std::unordered_set<GenomeEnd*> touched_genome_ends;
 
-  std::shared_lock graph_lock(rw);
+  // merge mutates both the global Block pool and every affected chromosome
+  // path.  Keep the public graph lock exclusive for the complete serial stage.
+  std::unique_lock graph_lock(rw);
 
   // ═══════════════════════════════════════════════════════════
   // 进度跟踪结构体定义 - 基于基因组坐标而非segment数量
@@ -2453,14 +2495,51 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
     std::string current_chromosome; // 当前处理的染色体
     uint64_t current_position = 0;  // 当前处理位置
 
+    const std::vector<WeakBlock>* block_pool = nullptr;
+    size_t blocks_created = 0;
+    size_t blocks_retired = 0;
+    size_t blocks_released = 0;
+    size_t segments_released = 0;
+    size_t cigar_operations_released = 0;
+    size_t expired_weak_entries_removed = 0;
+    size_t pending_retired_ids = 0;
+    size_t touched_genome_ends = 0;
+
+    mutable RaMAxMemory::ProcessMemorySnapshot current_memory;
+    mutable uint64_t merge_sampled_peak_rss_kib = 0;
+    std::chrono::steady_clock::time_point merge_start_time;
+    mutable std::chrono::steady_clock::time_point last_memory_sample_time;
+    mutable std::chrono::steady_clock::time_point last_memory_log_time;
+
     // 上次日志输出时间（避免过于频繁的日志输出）
     mutable std::chrono::steady_clock::time_point last_log_time;
     mutable double last_logged_percentage = -1.0;
 
-    MergeProgress() { last_log_time = std::chrono::steady_clock::now(); }
+    explicit MergeProgress(const std::vector<WeakBlock>* pool)
+        : block_pool(pool) {
+      const auto now = std::chrono::steady_clock::now();
+      merge_start_time = now;
+      last_log_time = now;
+      last_memory_log_time = now;
+      last_memory_sample_time = now - std::chrono::seconds(60);
+      maybeSampleMemory(true);
+    }
+
+    void maybeSampleMemory(bool force = false) const {
+      const auto now = std::chrono::steady_clock::now();
+      if (!force && now - last_memory_sample_time < std::chrono::seconds(60)) {
+        return;
+      }
+      last_memory_sample_time = now;
+      current_memory = RaMAxMemory::readProcessMemorySnapshot();
+      if (current_memory.available) {
+        merge_sampled_peak_rss_kib =
+            std::max(merge_sampled_peak_rss_kib, current_memory.rss_kib);
+      }
+    }
 
     // 显示进度（使用spdlog，控制输出频率）
-    void displayProgress() const {
+    void displayProgress(bool force = false) const {
       if (total_genomic_length == 0)
         return;
 
@@ -2476,7 +2555,8 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                          current_chr_length * 100.0;
       }
 
-      // 控制日志输出频率：每1%或每5秒输出一次
+      // Keep long-stage logs coarse: at most once every five minutes unless
+      // genomic progress advances by at least five percentage points.
       auto now = std::chrono::steady_clock::now();
       auto time_diff =
           std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time)
@@ -2484,14 +2564,39 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       double percentage_diff =
           std::abs(overall_percentage - last_logged_percentage);
 
-      if (percentage_diff >= 5.0 || time_diff >= 5) {
-        spdlog::info(
-            "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) Chromosomes: {}/{} "
-            "Current: {}.{} ({:.1f}%) Position: {} Merges: {}",
-            overall_percentage, processed_genomic_length / 1000000.0,
-            total_genomic_length / 1000000.0, completed_chromosomes,
-            total_chromosomes, current_species, current_chromosome,
-            chr_percentage, current_position, completed_merges);
+      if (force || percentage_diff >= 5.0 || time_diff >= 300) {
+        const bool include_memory_summary =
+            force || now - last_memory_log_time >= std::chrono::seconds(300);
+        if (include_memory_summary) {
+          maybeSampleMemory(true);
+          spdlog::info(
+              "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) Chromosomes: "
+              "{}/{} Current: {}.{} ({:.1f}%) Position: {} Merges: {} "
+              "current-rss-kib={} merge-sampled-peak-rss-kib={} "
+              "memory-available={} block-pool-size={} blocks-created={} "
+              "blocks-retired={} blocks-released={} segments-released={} "
+              "cigar-operations-released={} expired-weak-entries-removed={} "
+              "pending-retired-ids={} touched-genome-ends={}",
+              overall_percentage, processed_genomic_length / 1000000.0,
+              total_genomic_length / 1000000.0, completed_chromosomes,
+              total_chromosomes, current_species, current_chromosome,
+              chr_percentage, current_position, completed_merges,
+              current_memory.rss_kib, merge_sampled_peak_rss_kib,
+              current_memory.available,
+              block_pool ? block_pool->size() : 0, blocks_created,
+              blocks_retired, blocks_released, segments_released,
+              cigar_operations_released, expired_weak_entries_removed,
+              pending_retired_ids, touched_genome_ends);
+          last_memory_log_time = now;
+        } else {
+          spdlog::info(
+              "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) Chromosomes: "
+              "{}/{} Current: {}.{} ({:.1f}%) Position: {} Merges: {}",
+              overall_percentage, processed_genomic_length / 1000000.0,
+              total_genomic_length / 1000000.0, completed_chromosomes,
+              total_chromosomes, current_species, current_chromosome,
+              chr_percentage, current_position, completed_merges);
+        }
 
         last_log_time = now;
         last_logged_percentage = overall_percentage;
@@ -2518,6 +2623,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
     // 更新当前处理位置
     void updatePosition(uint64_t position) {
+      maybeSampleMemory();
       if (position > current_position) {
         uint64_t advance = position - current_position;
         current_chr_processed += advance;
@@ -2537,6 +2643,7 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       }
 
       completed_chromosomes++;
+      maybeSampleMemory(true);
       // spdlog::info("Completed chromosome: {}.{} ({}/{})",
       //              current_species,
       //              current_chromosome,
@@ -2547,11 +2654,19 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
     }
 
     // 记录合并操作
-    void recordMerge() { completed_merges++; }
+    void recordMerge() {
+      completed_merges++;
+      maybeSampleMemory();
+    }
     void recordParticipantConflict() { participant_conflict_rejections++; }
 
     // 完成所有处理
     void finish() {
+      maybeSampleMemory(true);
+      const double merge_wall_seconds =
+          std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - merge_start_time)
+              .count();
       spdlog::info(
           "Merge completed! Processed a total of {} chromosomes, {:.1f} MB of "
           "genomic data, with {} merge operations executed.",
@@ -2560,69 +2675,30 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       spdlog::info("Merge retained {} overlapping Block pairs because their "
                    "non-reference participant species conflict.",
                    participant_conflict_rejections);
+      spdlog::info(
+          "[merge-memory] current-rss-kib={} process-peak-rss-kib={} "
+          "merge-sampled-peak-rss-kib={} virtual-kib={} "
+          "cgroup-limit-bytes={} merge-wall-seconds={:.3f} "
+          "memory-available={} block-pool-size={} "
+          "blocks-created={} blocks-retired={} blocks-released={} "
+          "segments-released={} cigar-operations-released={} "
+          "expired-weak-entries-removed={} pending-retired-ids={} "
+          "touched-genome-ends={}",
+          current_memory.rss_kib, current_memory.peak_rss_kib,
+          merge_sampled_peak_rss_kib, current_memory.virtual_kib,
+          current_memory.cgroup_limit_bytes, merge_wall_seconds,
+          current_memory.available,
+          block_pool ? block_pool->size() : 0, blocks_created,
+          blocks_retired, blocks_released, segments_released,
+          cigar_operations_released, expired_weak_entries_removed,
+          pending_retired_ids, touched_genome_ends);
     }
-  };
-
-  // 调试用：收集所有物种的segment详细信息，方便在调试器中查看
-  struct SegmentDebugInfo {
-    uint_t start;
-    uint_t length;
-    std::string strand_str;
-    std::string seg_role_str;
-    std::string align_role_str;
-    size_t cigar_size;
-    std::string parent_block_ref_chr;
-    std::vector<std::string> parent_block_chromosomes;
-
-    SegmentDebugInfo(const SegPtr &seg) {
-      if (!seg)
-        return;
-      start = seg->start;
-      length = seg->length;
-      strand_str = (seg->strand == Strand::FORWARD) ? "FORWARD" : "REVERSE";
-      seg_role_str = (seg->seg_role == SegmentRole::SEGMENT) ? "SEGMENT"
-                     : (seg->seg_role == SegmentRole::HEAD)  ? "HEAD"
-                                                             : "TAIL";
-      align_role_str =
-          (seg->align_role == AlignRole::PRIMARY) ? "PRIMARY" : "SECONDARY";
-      cigar_size = seg->cigar.size();
-
-      if (seg->parent_block) {
-        parent_block_ref_chr = seg->parent_block->ref_chr;
-        std::shared_lock block_lock(seg->parent_block->rw);
-        parent_block_chromosomes.reserve(seg->parent_block->anchors.size());
-        for (const auto &anchor_entry : seg->parent_block->anchors) {
-          const auto &species = anchor_entry.first.first;
-          const auto &chr = anchor_entry.first.second;
-          parent_block_chromosomes.emplace_back(species + "." + chr);
-        }
-        std::sort(parent_block_chromosomes.begin(),
-                  parent_block_chromosomes.end());
-      } else {
-        parent_block_ref_chr = "null";
-        parent_block_chromosomes.clear();
-      }
-    }
-  };
-
-  struct ChromosomeDebugInfo {
-    std::string chr_name;
-    std::vector<SegmentDebugInfo> segments;
-
-    ChromosomeDebugInfo(const std::string &name) : chr_name(name) {}
-  };
-
-  struct SpeciesDebugInfo {
-    std::string species_name;
-    std::vector<ChromosomeDebugInfo> chromosomes;
-
-    SpeciesDebugInfo(const std::string &name) : species_name(name) {}
   };
 
   // ═══════════════════════════════════════════════════════════
   // 初始化进度跟踪
   // ═══════════════════════════════════════════════════════════
-  MergeProgress progress;
+  MergeProgress progress(&blocks);
 
   // 统计总的染色体数量和基因组长度
   for (const auto &[species_name, genome_graph] : species_graphs) {
@@ -2668,36 +2744,144 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
       duration_cast<Duration>(init_end_time - step_start_time);
   step_start_time = init_end_time;
 
-  std::vector<SpeciesDebugInfo> debug_all_species_segments;
-  debug_all_species_segments.reserve(species_graphs.size());
-
-  // 收集所有物种的segment详细信息
-  for (const auto &[species_name, genome_graph] : species_graphs) {
-    SpeciesDebugInfo species_info(species_name);
-    std::shared_lock genome_lock(genome_graph.rw);
-
-    for (const auto &[chr_name, genome_end] : genome_graph.chr2end) {
-      ChromosomeDebugInfo chr_info(chr_name);
-      std::shared_lock end_lock(genome_end.rw);
-
-      // 遍历该染色体的所有segments
-      SegPtr current = genome_end.head;
-      while (current && current != genome_end.tail) {
-        if (current->isSegment()) {
-          chr_info.segments.emplace_back(current);
-        }
-        current = current->primary_path.next.load(std::memory_order_acquire);
-      }
-
-      species_info.chromosomes.push_back(std::move(chr_info));
-    }
-
-    debug_all_species_segments.push_back(std::move(species_info));
-  }
-
   auto ref_it = species_graphs.find(ref_name);
   if (ref_it == species_graphs.end())
     return;
+
+  const auto compactRetiredBlockPool = [&]() {
+    if (retired_block_ids.empty()) {
+      return;
+    }
+
+    size_t removed = 0;
+    blocks.erase(
+        std::remove_if(
+            blocks.begin(), blocks.end(),
+            [&](const WeakBlock& weak_block) {
+              if (weak_block.expired()) {
+                ++removed;
+                return true;
+              }
+              const auto block = weak_block.lock();
+              if (block && retired_block_ids.find(block->block_id) !=
+                               retired_block_ids.end()) {
+                ++removed;
+                return true;
+              }
+              return false;
+            }),
+        blocks.end());
+    progress.expired_weak_entries_removed += removed;
+    perf_stats.batch_deletion_operations++;
+    retired_block_ids.clear();
+    progress.pending_retired_ids = 0;
+  };
+
+  const auto resolveGenomeEnd = [&](const SpeciesChrPair& species_chr) {
+    auto species_it = species_graphs.find(species_chr.first);
+    if (species_it == species_graphs.end()) {
+      throw std::logic_error(
+          "merge retirement cannot find species " + species_chr.first);
+    }
+    auto chromosome_it = species_it->second.chr2end.find(species_chr.second);
+    if (chromosome_it == species_it->second.chr2end.end()) {
+      throw std::logic_error(
+          "merge retirement cannot find chromosome " + species_chr.first +
+          "." + species_chr.second);
+    }
+    return &chromosome_it->second;
+  };
+
+  const auto markGenomeEndTouched = [&](const SpeciesChrPair& species_chr) {
+    GenomeEnd* genome_end = resolveGenomeEnd(species_chr);
+    if (touched_genome_ends.emplace(genome_end).second) {
+      std::unique_lock end_lock(genome_end->rw);
+      genome_end->sample_vec.clear();
+      progress.touched_genome_ends = touched_genome_ends.size();
+    }
+  };
+
+  const auto retireMergedBlock = [&](BlockPtr& block) {
+    if (!block) {
+      return;
+    }
+
+    const uint64_t block_id = block->block_id;
+    if (retired_block_ids.find(block_id) != retired_block_ids.end() ||
+        block->anchors.empty()) {
+      block.reset();
+      return;
+    }
+
+    std::vector<SegPtr> retired_segments;
+    {
+      std::unique_lock block_lock(block->rw);
+      retired_segments.reserve(block->anchors.size());
+      for (const auto& [species_chr, segment] : block->anchors) {
+        markGenomeEndTouched(species_chr);
+        if (segment) {
+          retired_segments.push_back(segment);
+        }
+      }
+      block->anchors.clear();
+    }
+
+    size_t released_cigar_operations = 0;
+    for (auto& segment : retired_segments) {
+      released_cigar_operations += segment->cigar.size();
+      Segment::unlinkSegment(segment);
+      Cigar_t{}.swap(segment->cigar);
+      segment->parent_block.reset();
+    }
+
+    retired_block_ids.emplace(block_id);
+    progress.blocks_retired++;
+    progress.blocks_released++;
+    progress.segments_released += retired_segments.size();
+    progress.cigar_operations_released += released_cigar_operations;
+    progress.pending_retired_ids = retired_block_ids.size();
+    perf_stats.total_blocks_marked_for_deletion++;
+    block.reset();
+
+    if (retired_block_ids.size() >= kRetiredBlockCheckpoint) {
+      compactRetiredBlockPool();
+    }
+  };
+
+  const auto rebuildTouchedSampling = [&]() {
+    for (auto& [species, genome_graph] : species_graphs) {
+      for (auto& [chromosome, genome_end] : genome_graph.chr2end) {
+        if (touched_genome_ends.find(&genome_end) ==
+            touched_genome_ends.end()) {
+          continue;
+        }
+
+        std::unique_lock end_lock(genome_end.rw);
+        genome_end.sample_vec.clear();
+        if (!genome_end.head || !genome_end.tail) {
+          continue;
+        }
+
+        std::unordered_set<const Segment*> visited;
+        SegPtr segment = genome_end.head->primary_path.next.load(
+            std::memory_order_acquire);
+        while (segment && !segment->isTail()) {
+          if (!visited.emplace(segment.get()).second) {
+            throw std::runtime_error(
+                "merge sampling rebuild detected a cycle for " + species +
+                "." + chromosome);
+          }
+          genome_end.setToSampling(segment);
+          segment = segment->primary_path.next.load(std::memory_order_acquire);
+        }
+        if (segment != genome_end.tail) {
+          throw std::runtime_error(
+              "merge sampling rebuild did not reach the tail for " + species +
+              "." + chromosome);
+        }
+      }
+    }
+  };
 
   // ═══════════════════════════════════════════════════════════
   // 性能分析：开始主循环 - 染色体遍历
@@ -2890,6 +3074,9 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                 perf_stats.total_blocks_created++;
                 perf_stats.total_segments_created++;
               }
+              progress.blocks_created +=
+                  1 + static_cast<size_t>(prefix_block != nullptr) +
+                  static_cast<size_t>(suffix_block != nullptr);
 
               // ═══════════════════════════════════════════════════════════
               // 性能分析：Block创建完成
@@ -3707,17 +3894,11 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 
               TimePoint cleanup_start = HighResClock::now();
 
-              // ═══════════════════════════════════════════════════════════
-              // 批量删除优化：标记要删除的Block，而不是立即删除
-              // ═══════════════════════════════════════════════════════════
-              if (prev_block) {
-                blocks_to_delete.insert(prev_block);
-                perf_stats.total_blocks_marked_for_deletion++;
-              }
-              if (current_block) {
-                blocks_to_delete.insert(current_block);
-                perf_stats.total_blocks_marked_for_deletion++;
-              }
+              // All replacement paths are now linked.  Retire the two source
+              // Blocks immediately so their Segment/CIGAR payload cannot
+              // accumulate until the end of the whole-genome merge.
+              retireMergedBlock(prev_block);
+              retireMergedBlock(current_block);
               // 替换current和prev
               prev = overlap_ref_seg->primary_path.prev.load(
                   std::memory_order_acquire);
@@ -3735,82 +3916,6 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
                   duration_cast<Duration>(cleanup_end - cleanup_start);
 
               // 继续处理，不要跳到最后，因为新创建的blocks之间可能还有重叠
-
-              //                                 //
-              //                                 收集所有物种的segment详细信息
-              //                                 debug_all_species_segments.clear();
-              //                                 for (const auto& [species_name,
-              //                                 genome_graph] : species_graphs)
-              //                                 {
-              //                                     SpeciesDebugInfo
-              //                                     species_info(species_name);
-              //                                     std::shared_lock
-              //                                     genome_lock(genome_graph.rw);
-              //
-              //                                     for (const auto& [chr_name,
-              //                                     genome_end] :
-              //                                     genome_graph.chr2end) {
-              //                                         ChromosomeDebugInfo
-              //                                         chr_info(chr_name);
-              //                                         std::shared_lock
-              //                                         end_lock(genome_end.rw);
-              //
-              //                                         //
-              //                                         遍历该染色体的所有segments
-              //                                         SegPtr current =
-              //                                         genome_end.head;
-              //                                         current =
-              //                                         current->primary_path.next.load(std::memory_order_acquire);
-              //                                         while (current &&
-              //                                         current !=
-              //                                         genome_end.tail) {
-              //                                             if
-              //                                             (current->isSegment())
-              //                                             {
-              //                                                 chr_info.segments.emplace_back(current);
-              //                                             }
-              //                                             //
-              //                                             检查链表结构是否正确
-              //                                             if
-              //                                             (current->isHead())
-              //                                             {
-              //                                                 current =
-              //                                                 current->primary_path.next.load(std::memory_order_acquire);
-              //                                                 continue;
-              //                                             }
-              //                                             SegPtr prev =
-              //                                             current->primary_path.prev.load(std::memory_order_acquire);
-              //                                             if(prev &&
-              //                                             prev->isHead())
-              //                                             {
-              //                                                 current =
-              //                                                 current->primary_path.next.load(std::memory_order_acquire);
-              //                                                 continue;
-              //                                             }
-              //                                             if (prev &&
-              //                                             prev->primary_path.next.load(std::memory_order_acquire)
-              //                                             != current) {
-              //                                                 std::cerr <<
-              //                                                 "[链表错误]
-              //                                                 prev->next !=
-              //                                                 current,
-              //                                                 current start:
-              //                                                 " <<
-              //                                                 current->start
-              //                                                 << std::endl;
-              //                                             }
-              //                                             current =
-              //                                             current->primary_path.next.load(std::memory_order_acquire);
-              //                                         }
-              //
-              //                                         species_info.chromosomes.push_back(std::move(chr_info));
-              //                                     }
-              //
-              //                                     debug_all_species_segments.push_back(std::move(species_info));
-              //                                 }
-              //
-              // count++;
-              // std::cout<<count<<std::endl;
               continue;
             }
           }
@@ -3836,54 +3941,22 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
   perf_stats.chromosome_iteration_time =
       duration_cast<Duration>(main_loop_end - main_loop_start);
 
-  // ═══════════════════════════════════════════════════════════
-  // 批量删除优化：一次性删除所有标记的Block
-  // ═══════════════════════════════════════════════════════════
+  // Release the bounded weak-reference retirement batch and restore sampling
+  // only after every replacement path is final.
   TimePoint batch_deletion_start = HighResClock::now();
+  compactRetiredBlockPool();
+  progress.expired_weak_entries_removed +=
+      eraseExpiredWeakBlocksUnlocked(blocks);
+  rebuildTouchedSampling();
 
-  if (!blocks_to_delete.empty()) {
-    spdlog::info("Starting batch deletion of {} blocks...", blocks_to_delete.size());
-
-
-    // 升级为写锁以进行删除操作
-    graph_lock.unlock();
-    std::unique_lock<std::shared_mutex> write_lock(rw);
-
-    // 使用高效的批量删除：标记-清除策略
-    size_t original_size = blocks.size();
-
-    // 1. Block查找阶段计时
-    TimePoint lookup_start = HighResClock::now();
-
-    // 方法1：使用remove_if + erase idiom（推荐）
-    auto new_end = std::remove_if(
-        blocks.begin(), blocks.end(), [&blocks_to_delete](const WeakBlock &wb) {
-          auto locked = wb.lock();
-          return locked &&
-                 blocks_to_delete.find(locked) != blocks_to_delete.end();
-        });
-
-    TimePoint lookup_end = HighResClock::now();
-    perf_stats.block_lookup_time +=
-        duration_cast<Duration>(lookup_end - lookup_start);
-
-    // 2. 实际删除阶段计时
-    TimePoint deletion_start = HighResClock::now();
-
-    blocks.erase(new_end, blocks.end());
-
-    TimePoint deletion_end = HighResClock::now();
-    perf_stats.actual_deletion_time +=
-        duration_cast<Duration>(deletion_end - deletion_start);
-
-    size_t deleted_count = original_size - blocks.size();
-    perf_stats.batch_deletion_operations = 1;
-
-    spdlog::info("Delete {} Block", deleted_count);
-
-    // 释放写锁，重新获取读锁
-    write_lock.unlock();
-    graph_lock = std::shared_lock<std::shared_mutex>(rw);
+  if (blocks.capacity() - blocks.size() >= kRetiredBlockCheckpoint &&
+      blocks.size() < blocks.capacity() / 2) {
+    std::vector<WeakBlock> compacted;
+    compacted.reserve(blocks.size());
+    for (auto& weak_block : blocks) {
+      compacted.emplace_back(std::move(weak_block));
+    }
+    blocks.swap(compacted);
   }
 
   TimePoint batch_deletion_end = HighResClock::now();
@@ -3907,52 +3980,6 @@ void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
 #ifdef _DEBUG_
   perf_stats.logFinalReport(total_function_time);
 #endif
-  // // 收集所有物种的segment详细信息
-  // debug_all_species_segments.clear();
-  // for (const auto &[species_name, genome_graph]: species_graphs) {
-  //     SpeciesDebugInfo species_info(species_name);
-  //     std::shared_lock genome_lock(genome_graph.rw);
-  //
-  //     for (const auto &[chr_name, genome_end]: genome_graph.chr2end) {
-  //         ChromosomeDebugInfo chr_info(chr_name);
-  //         std::shared_lock end_lock(genome_end.rw);
-  //
-  //         // 遍历该染色体的所有segments
-  //         SegPtr current = genome_end.head;
-  //         current =
-  //         current->primary_path.next.load(std::memory_order_acquire); while
-  //         (current && current != genome_end.tail) {
-  //             if (current->isSegment()) {
-  //                 chr_info.segments.emplace_back(current);
-  //             }
-  //             // 检查链表结构是否正确
-  //             if (current->isHead()) {
-  //                 current =
-  //                 current->primary_path.next.load(std::memory_order_acquire);
-  //                 continue;
-  //             }
-  //             SegPtr prev =
-  //             current->primary_path.prev.load(std::memory_order_acquire); if
-  //             (prev && prev->isHead()) {
-  //                 current =
-  //                 current->primary_path.next.load(std::memory_order_acquire);
-  //                 continue;
-  //             }
-  //             if (prev &&
-  //             prev->primary_path.next.load(std::memory_order_acquire) !=
-  //             current) {
-  //                 std::cerr << "[链表错误] prev->next != current, current
-  //                 start: " << current->start << std::endl;
-  //             }
-  //             current =
-  //             current->primary_path.next.load(std::memory_order_acquire);
-  //         }
-  //
-  //         species_info.chromosomes.push_back(std::move(chr_info));
-  //     }
-  //
-  //     debug_all_species_segments.push_back(std::move(species_info));
-  // }
 }
 
 /* ==============================================================
@@ -4077,21 +4104,7 @@ void RaMeshMultiGenomeGraph::removeBlocksBatch(
 
 size_t RaMeshMultiGenomeGraph::removeExpiredBlocks() {
   std::unique_lock graph_lock(rw);
-
-  size_t removed_count = 0;
-
-  // 移除所有过期的weak_ptr
-  blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-                              [&removed_count](const WeakBlock &wb) {
-                                if (wb.expired()) {
-                                  ++removed_count;
-                                  return true;
-                                }
-                                return false;
-                              }),
-               blocks.end());
-
-  return removed_count;
+  return eraseExpiredWeakBlocksUnlocked(blocks);
 }
 
 void RaMeshMultiGenomeGraph::removeSpecies(const SpeciesName &species) {
@@ -4179,16 +4192,9 @@ void RaMeshMultiGenomeGraph::removeChromosome(const SpeciesName &species,
 void RaMeshMultiGenomeGraph::clearAllGraphs() {
   std::unique_lock graph_lock(rw);
 
-  // 1. 清空所有species的图
-  for (auto &[species, genome_graph] : species_graphs) {
-    std::unique_lock species_lock(genome_graph.rw);
-    for (auto &[chr, genome_end] : genome_graph.chr2end) {
-      genome_end.clearAllSegments();
-    }
-    genome_graph.chr2end.clear();
-  }
-
-  // 2. 清空所有blocks
+  // 1. Break Block <-> Segment ownership while every GenomeEnd is still alive.
+  // This lets unlinkSegment() see the real neighbours instead of a list that
+  // has already been reset to head <-> tail.
   for (const auto &weak_block : blocks) {
     auto block = weak_block.lock();
     if (block) {
@@ -4197,14 +4203,36 @@ void RaMeshMultiGenomeGraph::clearAllGraphs() {
   }
   blocks.clear();
 
-  // 3. 清空species_graphs
+  // 2. Clear sampling and explicitly break the final head <-> tail shared_ptr
+  // cycle before destroying each GenomeEnd. clearAllSegments() intentionally
+  // leaves an empty, reusable list; clearAllGraphs() is the terminal teardown.
+  for (auto &[species, genome_graph] : species_graphs) {
+    std::unique_lock species_lock(genome_graph.rw);
+    for (auto &[chr, genome_end] : genome_graph.chr2end) {
+      genome_end.clearAllSegments();
+      genome_end.sample_vec.clear();
+      if (genome_end.head) {
+        genome_end.head->primary_path.next.store(nullptr,
+                                                 std::memory_order_release);
+      }
+      if (genome_end.tail) {
+        genome_end.tail->primary_path.prev.store(nullptr,
+                                                 std::memory_order_release);
+      }
+      genome_end.head.reset();
+      genome_end.tail.reset();
+    }
+    genome_graph.chr2end.clear();
+  }
+
+  // 3. Clear the outer species map after all per-chromosome ownership has
+  // been dismantled.
   species_graphs.clear();
 }
 
 size_t RaMeshMultiGenomeGraph::compactBlockPool() {
   std::unique_lock graph_lock(rw);
-
-  size_t compacted = removeExpiredBlocks();
+  const size_t compacted = eraseExpiredWeakBlocksUnlocked(blocks);
 
   // 可以在这里添加更多的内存优化逻辑
   blocks.shrink_to_fit();
