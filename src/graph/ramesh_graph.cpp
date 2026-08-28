@@ -2232,14 +2232,40 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
       size_t ordering_violations = 0;
       size_t large_gaps = 0;
 
-      // 调试：收集所有segments用于对比
-      std::vector<std::pair<size_t, uint_t>> debug_segments; // <index, start>
+      // Detailed diagnostics only need the first/last ten entries and two
+      // historical checkpoints. Keep this bounded instead of copying every
+      // Segment coordinate on a large chromosome.
+      const bool collect_debug_segments =
+          options.verbose && options.show_detailed_segments;
+      std::vector<std::pair<size_t, uint_t>> first_debug_segments;
+      std::vector<std::pair<size_t, uint_t>> last_debug_segments;
+      if (collect_debug_segments) {
+        first_debug_segments.reserve(10);
+        last_debug_segments.reserve(10);
+      }
+      std::optional<uint_t> debug_segment_5000;
+      std::optional<uint_t> debug_segment_5500;
 
-      // Traverse the complete chromosome list.
+      // Traverse the complete chromosome list for correctness checks.
       while (current && current != genome_end.tail) {
         if (current->isSegment()) {
           segment_count++;
-          debug_segments.emplace_back(segment_count, current->start);
+          if (collect_debug_segments) {
+            const auto debug_entry =
+                std::pair<size_t, uint_t>{segment_count, current->start};
+            if (first_debug_segments.size() < 10) {
+              first_debug_segments.push_back(debug_entry);
+            }
+            if (last_debug_segments.size() == 10) {
+              last_debug_segments.erase(last_debug_segments.begin());
+            }
+            last_debug_segments.push_back(debug_entry);
+            if (segment_count == 5000) {
+              debug_segment_5000 = current->start;
+            } else if (segment_count == 5500) {
+              debug_segment_5500 = current->start;
+            }
+          }
 
           // 检查segment链表的顺序（start是否递增）
           if (prev_segment) {
@@ -2306,27 +2332,24 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
                       chr_name, segment_count, ordering_violations, large_gaps);
 
         // 输出前10个和后10个segments的start值用于调试（仅在启用详细段信息时）
-        if (options.show_detailed_segments && debug_segments.size() > 20) {
+        if (segment_count > 20) {
           spdlog::debug("    First 10 segments start values:");
-          for (size_t i = 0; i < std::min(size_t(10), debug_segments.size());
-               ++i) {
-            spdlog::debug("      Segment#{}: start={}", debug_segments[i].first,
-                          debug_segments[i].second);
+          for (const auto& [index, start] : first_debug_segments) {
+            spdlog::debug("      Segment#{}: start={}", index, start);
           }
           spdlog::debug("    Last 10 segments start values:");
-          for (size_t i = std::max(size_t(0), debug_segments.size() - 10);
-               i < debug_segments.size(); ++i) {
-            spdlog::debug("      Segment#{}: start={}", debug_segments[i].first,
-                          debug_segments[i].second);
+          for (const auto& [index, start] : last_debug_segments) {
+            spdlog::debug("      Segment#{}: start={}", index, start);
           }
 
           // 特别检查第5000和第5500个segment
-          if (debug_segments.size() > 5500) {
+          if (segment_count > 5500 && debug_segment_5000 &&
+              debug_segment_5500) {
             spdlog::debug("    Special check - Segment#5000: start={}",
-                          debug_segments[4999].second);
+                          *debug_segment_5000);
             spdlog::debug("    Special check - Segment#5500: start={}",
-                          debug_segments[5499].second);
-            if (debug_segments[4999].second > debug_segments[5499].second) {
+                          *debug_segment_5500);
+            if (*debug_segment_5000 > *debug_segment_5500) {
               spdlog::error("    MANUAL CHECK CONFIRMED: Segment#5000 start > "
                             "Segment#5500 start!");
               spdlog::error("      This should have been detected as an "
@@ -3983,16 +4006,9 @@ void RaMeshMultiGenomeGraph::removeChromosome(const SpeciesName &species,
 void RaMeshMultiGenomeGraph::clearAllGraphs() {
   std::unique_lock graph_lock(rw);
 
-  // 1. 清空所有species的图
-  for (auto &[species, genome_graph] : species_graphs) {
-    std::unique_lock species_lock(genome_graph.rw);
-    for (auto &[chr, genome_end] : genome_graph.chr2end) {
-      genome_end.clearAllSegments();
-    }
-    genome_graph.chr2end.clear();
-  }
-
-  // 2. 清空所有blocks
+  // 1. Break Block <-> Segment ownership while every GenomeEnd is still alive.
+  // This lets unlinkSegment() see the real neighbours instead of a list that
+  // has already been reset to head <-> tail.
   for (const auto &weak_block : blocks) {
     auto block = weak_block.lock();
     if (block) {
@@ -4001,7 +4017,30 @@ void RaMeshMultiGenomeGraph::clearAllGraphs() {
   }
   blocks.clear();
 
-  // 3. 清空species_graphs
+  // 2. Clear sampling and explicitly break the final head <-> tail shared_ptr
+  // cycle before destroying each GenomeEnd. clearAllSegments() intentionally
+  // leaves an empty, reusable list; clearAllGraphs() is terminal teardown.
+  for (auto &[species, genome_graph] : species_graphs) {
+    std::unique_lock species_lock(genome_graph.rw);
+    for (auto &[chr, genome_end] : genome_graph.chr2end) {
+      genome_end.clearAllSegments();
+      genome_end.sample_vec.clear();
+      if (genome_end.head) {
+        genome_end.head->primary_path.next.store(
+            nullptr, std::memory_order_release);
+      }
+      if (genome_end.tail) {
+        genome_end.tail->primary_path.prev.store(
+            nullptr, std::memory_order_release);
+      }
+      genome_end.head.reset();
+      genome_end.tail.reset();
+    }
+    genome_graph.chr2end.clear();
+  }
+
+  // 3. Clear the outer species map after all per-chromosome ownership has
+  // been dismantled.
   species_graphs.clear();
 }
 
