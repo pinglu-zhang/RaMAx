@@ -3,6 +3,8 @@
 // =============================================================
 #include "align.h"
 #include "extension_internal.h"
+#include "merge_internal.h"
+#include "process_memory.h"
 #include "ramesh.h"
 #include <algorithm>
 #include <chrono>
@@ -220,6 +222,118 @@ void logExtensionStageStats(std::string_view scope,
 }
 
 }  // namespace
+
+namespace detail {
+
+MergeCigarSplit splitCigarForOverlapMerge(
+    const Cigar_t& source,
+    bool has_prefix,
+    uint32_t prefix_reference_length,
+    uint32_t overlap_reference_length,
+    bool has_suffix,
+    uint32_t suffix_reference_length) {
+  MergeCigarSplit result;
+  result.has_prefix = has_prefix;
+  result.has_suffix = has_suffix;
+  result.source_units_scanned = source.size();
+
+  size_t source_index = 0;
+  uint32_t source_offset = 0;
+
+  const auto append_unit = [](MergeCigarPiece& piece, char operation,
+                              uint32_t length) {
+    piece.cigar.push_back(cigarToInt(operation, length));
+    if (operation != 'I') {
+      piece.reference_length += length;
+    }
+    if (operation != 'D') {
+      piece.query_length += length;
+    }
+  };
+
+  const auto consume_piece = [&](MergeCigarPiece& piece,
+                                 uint32_t target_reference_length) {
+    while (piece.reference_length < target_reference_length) {
+      if (source_index >= source.size()) {
+        throw std::logic_error(
+            "overlap merge CIGAR ends before the requested reference span");
+      }
+
+      char operation = '\0';
+      uint32_t source_length = 0;
+      intToCigar(source[source_index], operation, source_length);
+      if (source_offset > source_length) {
+        throw std::logic_error("overlap merge CIGAR cursor is invalid");
+      }
+
+      const uint32_t remaining = source_length - source_offset;
+      if (remaining == 0) {
+        append_unit(piece, operation, 0);
+        ++source_index;
+        source_offset = 0;
+        continue;
+      }
+
+      if (operation == 'I') {
+        append_unit(piece, operation, remaining);
+        ++source_index;
+        source_offset = 0;
+        continue;
+      }
+
+      const uint32_t required =
+          target_reference_length - piece.reference_length;
+      const uint32_t consumed = std::min(remaining, required);
+      append_unit(piece, operation, consumed);
+      if (consumed == remaining) {
+        ++source_index;
+        source_offset = 0;
+      } else {
+        source_offset += consumed;
+      }
+    }
+  };
+
+  if (has_prefix) {
+    consume_piece(result.prefix, prefix_reference_length);
+  }
+  consume_piece(result.overlap, overlap_reference_length);
+  if (has_suffix) {
+    consume_piece(result.suffix, suffix_reference_length);
+  }
+
+  Cigar_t terminal_query_only;
+  uint32_t terminal_query_length = 0;
+  while (source_index < source.size()) {
+    char operation = '\0';
+    uint32_t source_length = 0;
+    intToCigar(source[source_index], operation, source_length);
+    if (source_offset > source_length) {
+      throw std::logic_error("overlap merge CIGAR cursor is invalid");
+    }
+    const uint32_t remaining = source_length - source_offset;
+    if (operation != 'I' && remaining != 0) {
+      throw std::logic_error(
+          "overlap merge left reference-consuming CIGAR operations "
+          "unassigned");
+    }
+    terminal_query_only.push_back(cigarToInt(operation, remaining));
+    if (operation != 'D') {
+      terminal_query_length += remaining;
+    }
+    ++source_index;
+    source_offset = 0;
+  }
+
+  MergeCigarPiece& terminal_piece =
+      has_suffix ? result.suffix : result.overlap;
+  terminal_piece.query_length += terminal_query_length;
+  appendCigar(terminal_piece.cigar, terminal_query_only);
+  return result;
+}
+
+}  // namespace detail
+
 /* =============================================================
  * 1.  RaMeshGenomeGraph
  * ===========================================================*/
@@ -441,6 +555,22 @@ bool blocksShareNonReferenceSpecies(const BlockPtr &left, const BlockPtr &right,
     }
   }
   return false;
+}
+
+size_t eraseExpiredWeakBlocksUnlocked(std::vector<WeakBlock>& block_pool) {
+  size_t removed = 0;
+  block_pool.erase(
+      std::remove_if(
+          block_pool.begin(), block_pool.end(),
+          [&removed](const WeakBlock& weak_block) {
+            if (!weak_block.expired()) {
+              return false;
+            }
+            ++removed;
+            return true;
+          }),
+      block_pool.end());
+  return removed;
 }
 
 using PrimarySegmentIndex =
@@ -2093,7 +2223,7 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
         continue; // 已在指针有效性检查中报告
       }
 
-      // 添加与debug_all_species_segments相同的锁保护
+      // Hold the chromosome read lock for the complete verification pass.
       std::shared_lock end_lock(genome_end.rw);
 
       SegPtr current = genome_end.head;
@@ -2105,7 +2235,7 @@ void RaMeshMultiGenomeGraph::verifyCoordinateOrdering(
       // 调试：收集所有segments用于对比
       std::vector<std::pair<size_t, uint_t>> debug_segments; // <index, start>
 
-      // 遍历整个链表，与debug_all_species_segments保持一致的条件
+      // Traverse the complete chromosome list.
       while (current && current != genome_end.tail) {
         if (current->isSegment()) {
           segment_count++;
@@ -2694,1656 +2824,955 @@ void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
 /* =============================================================
  * 6.  Merge multiple graphs (public API)
  * ===========================================================*/
-void RaMeshMultiGenomeGraph::mergeMultipleGraphs(const SpeciesName &ref_name,
-                                                 uint_t thread_num) {
-  // ═══════════════════════════════════════════════════════════
-  // 性能分析：函数开始计时
-  // ═══════════════════════════════════════════════════════════
-  using namespace std::chrono;
-  using HighResClock = high_resolution_clock;
-  using TimePoint = HighResClock::time_point;
-  using Duration = nanoseconds;
+void RaMeshMultiGenomeGraph::mergeMultipleGraphs(
+    const SpeciesName& ref_name, uint_t thread_num) {
+  (void)thread_num;
+  using Clock = std::chrono::steady_clock;
 
-  const TimePoint function_start_time = HighResClock::now();
+  constexpr size_t kRetiredBlockCheckpoint = 131072;
+  constexpr uint64_t kProgressBoundaryInterval = 65536;
 
-  // 性能统计结构
-  struct PerformanceStats {
-    Duration initialization_time{0};
-    Duration chromosome_iteration_time{0};
-    Duration overlap_detection_time{0};
-    Duration block_creation_time{0};
-    Duration cigar_processing_time{0};
-    Duration segment_creation_time{0};
-    Duration link_replacement_time{0};
-    Duration cleanup_time{0};
+  const auto function_start = Clock::now();
+  const RaMAxMemory::ProcessMemorySnapshot start_memory =
+      RaMAxMemory::readProcessMemorySnapshot();
+  uint64_t sampled_peak_rss_kib =
+      start_memory.available ? start_memory.rss_kib : 0;
 
-    size_t total_overlaps_found = 0;
-    size_t total_blocks_created = 0;
-    size_t total_segments_created = 0;
-    size_t total_cigar_operations = 0;
+  // The stage is deliberately serial, but it mutates the global weak Block
+  // pool and every affected chromosome path. Hold the graph lock exclusively
+  // for the complete operation.
+  std::unique_lock graph_lock(rw);
+  const size_t blocks_before = blocks.size();
 
-    // 批量删除相关统计
-    size_t total_blocks_marked_for_deletion = 0;
-    size_t batch_deletion_operations = 0;
-
-    // 细粒度清理工作计时
-    Duration block_lookup_time{0};
-    Duration actual_deletion_time{0};
-    Duration container_reorganization_time{0};
-
-    void logStepTime(const std::string &step_name, Duration step_time,
-                     Duration total_time) const {
-      double step_ms = duration_cast<microseconds>(step_time).count() / 1000.0;
-      double total_ms =
-          duration_cast<microseconds>(total_time).count() / 1000.0;
-      double percentage = total_ms > 0 ? (step_ms / total_ms) * 100.0 : 0.0;
-
-      spdlog::info("性能分析 - {}: {:.3f}ms ({:.2f}%)", step_name, step_ms,
-                   percentage);
-    }
-
-    void logFinalReport(Duration total_time) const {
-      double total_ms =
-          duration_cast<microseconds>(total_time).count() / 1000.0;
-
-      spdlog::info(
-          "═══════════════════════════════════════════════════════════");
-      spdlog::info("性能分析报告 - mergeMultipleGraphs 函数");
-      spdlog::info(
-          "═══════════════════════════════════════════════════════════");
-      spdlog::info("总执行时间: {:.3f}ms", total_ms);
-      spdlog::info(
-          "───────────────────────────────────────────────────────────");
-
-      logStepTime("初始化阶段", initialization_time, total_time);
-      logStepTime("染色体遍历", chromosome_iteration_time, total_time);
-      logStepTime("重叠检测", overlap_detection_time, total_time);
-      logStepTime("Block创建", block_creation_time, total_time);
-      logStepTime("CIGAR处理", cigar_processing_time, total_time);
-      logStepTime("Segment创建", segment_creation_time, total_time);
-      logStepTime("链表重连", link_replacement_time, total_time);
-      logStepTime("清理工作", cleanup_time, total_time);
-
-      spdlog::info(
-          "───────────────────────────────────────────────────────────");
-      spdlog::info("清理工作详细分析:");
-      logStepTime("  Block查找", block_lookup_time, total_time);
-      logStepTime("  实际删除", actual_deletion_time, total_time);
-      logStepTime("  容器重组", container_reorganization_time, total_time);
-
-      spdlog::info(
-          "───────────────────────────────────────────────────────────");
-      spdlog::info("操作统计:");
-      spdlog::info("  发现重叠: {} 次", total_overlaps_found);
-      spdlog::info("  创建Block: {} 个", total_blocks_created);
-      spdlog::info("  创建Segment: {} 个", total_segments_created);
-      spdlog::info("  CIGAR操作: {} 次", total_cigar_operations);
-      spdlog::info("  标记删除Block: {} 个", total_blocks_marked_for_deletion);
-      spdlog::info("  批量删除操作: {} 次", batch_deletion_operations);
-
-      if (total_overlaps_found > 0) {
-        double avg_overlap_time =
-            duration_cast<microseconds>(overlap_detection_time).count() /
-            1000.0 / total_overlaps_found;
-        spdlog::info("  平均重叠处理时间: {:.3f}ms", avg_overlap_time);
-      }
-
-      if (total_blocks_marked_for_deletion > 0 &&
-          batch_deletion_operations > 0) {
-        double avg_deletion_efficiency =
-            static_cast<double>(total_blocks_marked_for_deletion) /
-            batch_deletion_operations;
-        spdlog::info("  批量删除效率: {:.1f} 个Block/次",
-                     avg_deletion_efficiency);
-      }
-
-      spdlog::info(
-          "═══════════════════════════════════════════════════════════");
-    }
-  } perf_stats;
-
-  // 辅助函数：带性能监控的Segment创建
-  auto createSegmentWithTiming = [&](uint_t start, uint_t len, Strand sd,
-                                     Cigar_t cg, AlignRole rl, SegmentRole sl,
-                                     const BlockPtr &bp) -> SegPtr {
-    TimePoint seg_create_start = HighResClock::now();
-    SegPtr result = Segment::create(start, len, sd, std::move(cg), rl, sl, bp);
-    TimePoint seg_create_end = HighResClock::now();
-    perf_stats.segment_creation_time +=
-        duration_cast<Duration>(seg_create_end - seg_create_start);
-    perf_stats.total_segments_created++;
-    return result;
-  };
-
-  TimePoint step_start_time = HighResClock::now();
-
-  // ═══════════════════════════════════════════════════════════
-  // 批量删除优化：收集要删除的Block，避免逐个删除的O(n²)问题
-  // ═══════════════════════════════════════════════════════════
-  std::unordered_set<BlockPtr> blocks_to_delete;
-  blocks_to_delete.reserve(100000); // 预分配空间，根据统计数据估算
-
-  std::shared_lock graph_lock(rw);
-
-  // ═══════════════════════════════════════════════════════════
-  // 进度跟踪结构体定义 - 基于基因组坐标而非segment数量
-  // ═══════════════════════════════════════════════════════════
-  struct MergeProgress {
-    size_t total_chromosomes = 0;          // 总染色体数量
-    size_t completed_chromosomes = 0;      // 已完成染色体数量
-    uint64_t total_genomic_length = 0;     // 总基因组长度（所有染色体）
-    uint64_t processed_genomic_length = 0; // 已处理基因组长度
-    uint64_t current_chr_length = 0;       // 当前染色体长度
-    uint64_t current_chr_processed = 0;    // 当前染色体已处理长度
-    size_t total_merges = 0;               // 总合并操作数量
-    size_t completed_merges = 0;           // 已完成合并操作数量
-    size_t participant_conflict_rejections = 0;
-    std::string current_species;    // 当前处理的物种
-    std::string current_chromosome; // 当前处理的染色体
-    uint64_t current_position = 0;  // 当前处理位置
-
-    // 上次日志输出时间（避免过于频繁的日志输出）
-    mutable std::chrono::steady_clock::time_point last_log_time;
-    mutable double last_logged_percentage = -1.0;
-
-    MergeProgress() { last_log_time = std::chrono::steady_clock::now(); }
-
-    // 显示进度（使用spdlog，控制输出频率）
-    void displayProgress() const {
-      if (total_genomic_length == 0)
-        return;
-
-      // 计算总体进度
-      double overall_percentage =
-          static_cast<double>(processed_genomic_length) / total_genomic_length *
-          100.0;
-
-      // 计算当前染色体进度
-      double chr_percentage = 0.0;
-      if (current_chr_length > 0) {
-        chr_percentage = static_cast<double>(current_chr_processed) /
-                         current_chr_length * 100.0;
-      }
-
-      // 控制日志输出频率：每1%或每5秒输出一次
-      auto now = std::chrono::steady_clock::now();
-      auto time_diff =
-          std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time)
-              .count();
-      double percentage_diff =
-          std::abs(overall_percentage - last_logged_percentage);
-
-      if (percentage_diff >= 5.0 || time_diff >= 5) {
-        spdlog::info(
-            "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) Chromosomes: {}/{} "
-            "Current: {}.{} ({:.1f}%) Position: {} Merges: {}",
-            overall_percentage, processed_genomic_length / 1000000.0,
-            total_genomic_length / 1000000.0, completed_chromosomes,
-            total_chromosomes, current_species, current_chromosome,
-            chr_percentage, current_position, completed_merges);
-
-        last_log_time = now;
-        last_logged_percentage = overall_percentage;
-      }
-    }
-
-    // 开始处理新染色体
-    void startChromosome(const std::string &species,
-                         const std::string &chromosome, uint64_t chr_length) {
-      current_species = species;
-      current_chromosome = chromosome;
-      current_chr_length = chr_length;
-      current_chr_processed = 0;
-      current_position = 0;
-
-      // spdlog::info("Starting to process chromosome: {}.{} (Length: {:.1f}
-      // MB)",
-      //              species,
-      //              chromosome,
-      //              chr_length / 1000000.0);
-
-      displayProgress();
-    }
-
-    // 更新当前处理位置
-    void updatePosition(uint64_t position) {
-      if (position > current_position) {
-        uint64_t advance = position - current_position;
-        current_chr_processed += advance;
-        processed_genomic_length += advance;
-        current_position = position;
-        displayProgress();
-      }
-    }
-
-    // 完成一个染色体的处理
-    void completeChromosome() {
-      // 确保当前染色体完全处理完成
-      if (current_chr_processed < current_chr_length) {
-        uint64_t remaining = current_chr_length - current_chr_processed;
-        current_chr_processed = current_chr_length;
-        processed_genomic_length += remaining;
-      }
-
-      completed_chromosomes++;
-      // spdlog::info("Completed chromosome: {}.{} ({}/{})",
-      //              current_species,
-      //              current_chromosome,
-      //              completed_chromosomes,
-      //              total_chromosomes);
-
-      displayProgress();
-    }
-
-    // 记录合并操作
-    void recordMerge() { completed_merges++; }
-    void recordParticipantConflict() { participant_conflict_rejections++; }
-
-    // 完成所有处理
-    void finish() {
-      spdlog::info(
-          "Merge completed! Processed a total of {} chromosomes, {:.1f} MB of "
-          "genomic data, with {} merge operations executed.",
-          total_chromosomes, total_genomic_length / 1000000.0,
-          completed_merges);
-      spdlog::info("Merge retained {} overlapping Block pairs because their "
-                   "non-reference participant species conflict.",
-                   participant_conflict_rejections);
-    }
-  };
-
-  // 调试用：收集所有物种的segment详细信息，方便在调试器中查看
-  struct SegmentDebugInfo {
-    uint_t start;
-    uint_t length;
-    std::string strand_str;
-    std::string seg_role_str;
-    std::string align_role_str;
-    size_t cigar_size;
-    std::string parent_block_ref_chr;
-    std::vector<std::string> parent_block_chromosomes;
-
-    SegmentDebugInfo(const SegPtr &seg) {
-      if (!seg)
-        return;
-      start = seg->start;
-      length = seg->length;
-      strand_str = (seg->strand == Strand::FORWARD) ? "FORWARD" : "REVERSE";
-      seg_role_str = (seg->seg_role == SegmentRole::SEGMENT) ? "SEGMENT"
-                     : (seg->seg_role == SegmentRole::HEAD)  ? "HEAD"
-                                                             : "TAIL";
-      align_role_str =
-          (seg->align_role == AlignRole::PRIMARY) ? "PRIMARY" : "SECONDARY";
-      cigar_size = seg->cigar.size();
-
-      if (seg->parent_block) {
-        parent_block_ref_chr = seg->parent_block->ref_chr;
-        std::shared_lock block_lock(seg->parent_block->rw);
-        parent_block_chromosomes.reserve(seg->parent_block->anchors.size());
-        for (const auto &anchor_entry : seg->parent_block->anchors) {
-          const auto &species = anchor_entry.first.first;
-          const auto &chr = anchor_entry.first.second;
-          parent_block_chromosomes.emplace_back(species + "." + chr);
-        }
-        std::sort(parent_block_chromosomes.begin(),
-                  parent_block_chromosomes.end());
-      } else {
-        parent_block_ref_chr = "null";
-        parent_block_chromosomes.clear();
-      }
-    }
-  };
-
-  struct ChromosomeDebugInfo {
-    std::string chr_name;
-    std::vector<SegmentDebugInfo> segments;
-
-    ChromosomeDebugInfo(const std::string &name) : chr_name(name) {}
-  };
-
-  struct SpeciesDebugInfo {
-    std::string species_name;
-    std::vector<ChromosomeDebugInfo> chromosomes;
-
-    SpeciesDebugInfo(const std::string &name) : species_name(name) {}
-  };
-
-  // ═══════════════════════════════════════════════════════════
-  // 初始化进度跟踪
-  // ═══════════════════════════════════════════════════════════
-  MergeProgress progress;
-
-  // 统计总的染色体数量和基因组长度
-  for (const auto &[species_name, genome_graph] : species_graphs) {
-    if (species_name == ref_name) {
-      progress.total_chromosomes += genome_graph.chr2end.size();
-
-      // 统计总基因组长度
-      std::shared_lock genome_lock(genome_graph.rw);
-      for (const auto &[chr_name, genome_end] : genome_graph.chr2end) {
-        std::shared_lock end_lock(genome_end.rw);
-
-        // 找到染色体的最后一个segment来确定长度
-        uint64_t chr_length = 0;
-        SegPtr current = genome_end.head;
-        if (current) {
-          current = current->primary_path.next.load(std::memory_order_acquire);
-        }
-        while (current && !current->isTail()) {
-          if (current->isSegment()) {
-            uint64_t segment_end = current->start + current->length;
-            chr_length = std::max(chr_length, segment_end);
-          }
-          current = current->primary_path.next.load(std::memory_order_acquire);
-        }
-        progress.total_genomic_length += chr_length;
-      }
-      break;
-    }
-  }
-
-  spdlog::info("Starting to merge multi-genome graph, reference species: {}", ref_name);
-  spdlog::info("A total of {} chromosomes ({:.1f} MB of genomic data) will be processed",
-               progress.total_chromosomes,
-               progress.total_genomic_length / 1000000.0);
-
-  progress.displayProgress();
-
-  // ═══════════════════════════════════════════════════════════
-  // 性能分析：初始化阶段完成
-  // ═══════════════════════════════════════════════════════════
-  TimePoint init_end_time = HighResClock::now();
-  perf_stats.initialization_time =
-      duration_cast<Duration>(init_end_time - step_start_time);
-  step_start_time = init_end_time;
-
-  std::vector<SpeciesDebugInfo> debug_all_species_segments;
-  debug_all_species_segments.reserve(species_graphs.size());
-
-  // 收集所有物种的segment详细信息
-  for (const auto &[species_name, genome_graph] : species_graphs) {
-    SpeciesDebugInfo species_info(species_name);
-    std::shared_lock genome_lock(genome_graph.rw);
-
-    for (const auto &[chr_name, genome_end] : genome_graph.chr2end) {
-      ChromosomeDebugInfo chr_info(chr_name);
-      std::shared_lock end_lock(genome_end.rw);
-
-      // 遍历该染色体的所有segments
-      SegPtr current = genome_end.head;
-      while (current && current != genome_end.tail) {
-        if (current->isSegment()) {
-          chr_info.segments.emplace_back(current);
-        }
-        current = current->primary_path.next.load(std::memory_order_acquire);
-      }
-
-      species_info.chromosomes.push_back(std::move(chr_info));
-    }
-
-    debug_all_species_segments.push_back(std::move(species_info));
-  }
-
-  auto ref_it = species_graphs.find(ref_name);
-  if (ref_it == species_graphs.end())
+  auto reference_it = species_graphs.find(ref_name);
+  if (reference_it == species_graphs.end()) {
+    spdlog::warn(
+        "[graph-merge] reference={} status=skipped reason=missing-reference",
+        ref_name);
     return;
+  }
 
-  // ═══════════════════════════════════════════════════════════
-  // 性能分析：开始主循环 - 染色体遍历
-  // ═══════════════════════════════════════════════════════════
-  TimePoint main_loop_start = HighResClock::now();
+  struct ReferenceChromosomeContext {
+    GenomeEnd* end = nullptr;
+    ChrName chromosome;
+    uint64_t maximum_end = 0;
+    uint64_t initial_segments = 0;
+  };
 
-  // 改为遍历species_graphs来查找Ref
-  for (const auto &[current_species, ref_genome] : species_graphs) {
-    if (current_species != ref_name) {
-      continue;
+  size_t total_genome_ends = 0;
+  for (const auto& [species, graph] : species_graphs) {
+    (void)species;
+    total_genome_ends += graph.chr2end.size();
+  }
+
+  std::vector<ReferenceChromosomeContext> reference_contexts;
+  reference_contexts.reserve(reference_it->second.chr2end.size());
+  uint64_t total_reference_length = 0;
+  uint64_t initial_reference_segments = 0;
+  for (auto& [chromosome, genome_end] : reference_it->second.chr2end) {
+    ReferenceChromosomeContext context;
+    context.end = &genome_end;
+    context.chromosome = chromosome;
+    for (SegPtr segment =
+             genome_end.head
+                 ? genome_end.head->primary_path.next.load(
+                       std::memory_order_acquire)
+                 : nullptr;
+         segment && !segment->isTail();
+         segment =
+             segment->primary_path.next.load(std::memory_order_acquire)) {
+      if (!segment->isSegment()) {
+        continue;
+      }
+      ++context.initial_segments;
+      context.maximum_end =
+          std::max(context.maximum_end,
+                   static_cast<uint64_t>(segment->start) + segment->length);
     }
-    std::shared_lock genome_lock(ref_genome.rw);
-    // 主循环，遍历所有Ref序列
-    for (const auto &[chr_name, genome_end] : ref_genome.chr2end) {
-      // ═══════════════════════════════════════════════════════════
-      // 计算当前染色体长度并开始处理
-      // ═══════════════════════════════════════════════════════════
-      uint64_t chr_length = 0;
-      std::shared_lock end_lock(genome_end.rw);
-      SegPtr count_current = genome_end.head;
-      if (count_current) {
-        count_current =
-            count_current->primary_path.next.load(std::memory_order_acquire);
-      }
-      while (count_current && !count_current->isTail()) {
-        if (count_current->isSegment()) {
-          uint64_t segment_end = count_current->start + count_current->length;
-          chr_length = std::max(chr_length, segment_end);
+    total_reference_length += context.maximum_end;
+    initial_reference_segments += context.initial_segments;
+    reference_contexts.push_back(std::move(context));
+  }
+
+  std::unordered_map<SpeciesName, uint32_t> species_ids;
+  species_ids.reserve(species_graphs.size());
+  uint32_t next_species_id = 0;
+  for (const auto& [species, graph] : species_graphs) {
+    (void)graph;
+    if (next_species_id == std::numeric_limits<uint32_t>::max()) {
+      throw std::length_error(
+          "graph merge has too many species for participant stamps");
+    }
+    species_ids.emplace(species, next_species_id++);
+  }
+  std::vector<uint32_t> participant_stamps(species_ids.size(), 0);
+  uint32_t participant_epoch = 0;
+
+  const auto blocks_share_non_reference_species =
+      [&](const BlockPtr& left, const BlockPtr& right) {
+        if (!left || !right) {
+          return true;
         }
-        count_current =
-            count_current->primary_path.next.load(std::memory_order_acquire);
+        ++participant_epoch;
+        if (participant_epoch == 0) {
+          std::fill(participant_stamps.begin(), participant_stamps.end(), 0);
+          participant_epoch = 1;
+        }
+
+        for (const auto& [key, segment] : left->anchors) {
+          (void)segment;
+          if (key.first == ref_name) {
+            continue;
+          }
+          const auto species_it = species_ids.find(key.first);
+          if (species_it == species_ids.end()) {
+            return blocksShareNonReferenceSpecies(left, right, ref_name);
+          }
+          participant_stamps[species_it->second] = participant_epoch;
+        }
+        for (const auto& [key, segment] : right->anchors) {
+          (void)segment;
+          if (key.first == ref_name) {
+            continue;
+          }
+          const auto species_it = species_ids.find(key.first);
+          if (species_it == species_ids.end()) {
+            return blocksShareNonReferenceSpecies(left, right, ref_name);
+          }
+          if (participant_stamps[species_it->second] == participant_epoch) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+  struct MergeTelemetry {
+    uint64_t boundaries_scanned = 0;
+    uint64_t overlaps_found = 0;
+    uint64_t participant_conflicts = 0;
+    uint64_t merges_committed = 0;
+    uint64_t cigar_units_scanned = 0;
+    uint64_t suffix_forward_scan_steps = 0;
+    uint64_t blocks_created = 0;
+    uint64_t blocks_retired = 0;
+    uint64_t blocks_released = 0;
+    uint64_t segments_created = 0;
+    uint64_t segments_released = 0;
+    uint64_t cigar_units_released = 0;
+    uint64_t expired_weak_entries_removed = 0;
+    size_t maximum_retirement_batch = 0;
+  } telemetry;
+
+  std::unordered_map<SpeciesChrPair, GenomeEnd*, SpeciesChrPairHash>
+      genome_end_cache;
+  genome_end_cache.reserve(total_genome_ends);
+  std::unordered_set<GenomeEnd*> touched_genome_ends;
+  touched_genome_ends.reserve(total_genome_ends);
+  std::vector<GenomeEnd*> touched_genome_end_order;
+  touched_genome_end_order.reserve(total_genome_ends);
+
+  const auto resolve_genome_end =
+      [&](const SpeciesChrPair& key) -> GenomeEnd* {
+        const auto cached = genome_end_cache.find(key);
+        if (cached != genome_end_cache.end()) {
+          return cached->second;
+        }
+        const auto species_it = species_graphs.find(key.first);
+        if (species_it == species_graphs.end()) {
+          throw std::logic_error(
+              "graph merge cannot resolve species " + key.first);
+        }
+        const auto chromosome_it =
+            species_it->second.chr2end.find(key.second);
+        if (chromosome_it == species_it->second.chr2end.end()) {
+          throw std::logic_error(
+              "graph merge cannot resolve chromosome " + key.first + "." +
+              key.second);
+        }
+        GenomeEnd* result = &chromosome_it->second;
+        genome_end_cache.emplace(key, result);
+        return result;
+      };
+
+  std::vector<GenomeEnd*> source_genome_end_scratch;
+  std::vector<GenomeEnd*> newly_touched_scratch;
+  const auto mark_genome_ends_touched =
+      [&](const std::vector<GenomeEnd*>& source_ends) {
+        newly_touched_scratch.clear();
+        if (newly_touched_scratch.capacity() < source_ends.size()) {
+          newly_touched_scratch.reserve(source_ends.size());
+        }
+        for (GenomeEnd* end : source_ends) {
+          if (end && touched_genome_ends.emplace(end).second) {
+            newly_touched_scratch.push_back(end);
+          }
+        }
+        for (GenomeEnd* end : newly_touched_scratch) {
+          touched_genome_end_order.push_back(end);
+          std::unique_lock end_lock(end->rw);
+          end->sample_vec.clear();
+        }
+      };
+
+  std::vector<uint64_t> retired_block_ids;
+  retired_block_ids.reserve(kRetiredBlockCheckpoint);
+  std::vector<SegPtr> retired_segment_scratch;
+  double retirement_seconds = 0.0;
+
+  const auto sample_memory = [&]() {
+    const RaMAxMemory::ProcessMemorySnapshot memory =
+        RaMAxMemory::readProcessMemorySnapshot();
+    if (memory.available) {
+      sampled_peak_rss_kib =
+          std::max(sampled_peak_rss_kib, memory.rss_kib);
+    }
+    return memory;
+  };
+
+  const auto compact_retired_block_pool = [&]() {
+    if (retired_block_ids.empty()) {
+      return;
+    }
+    const auto retirement_start = Clock::now();
+    std::sort(retired_block_ids.begin(), retired_block_ids.end());
+    retired_block_ids.erase(
+        std::unique(retired_block_ids.begin(), retired_block_ids.end()),
+        retired_block_ids.end());
+
+    size_t removed = 0;
+    blocks.erase(
+        std::remove_if(
+            blocks.begin(), blocks.end(),
+            [&](const WeakBlock& weak_block) {
+              if (weak_block.expired()) {
+                ++removed;
+                return true;
+              }
+              const BlockPtr block = weak_block.lock();
+              if (block &&
+                  std::binary_search(retired_block_ids.begin(),
+                                     retired_block_ids.end(),
+                                     block->block_id)) {
+                ++removed;
+                return true;
+              }
+              return false;
+            }),
+        blocks.end());
+    telemetry.expired_weak_entries_removed += removed;
+    retired_block_ids.clear();
+    retirement_seconds +=
+        std::chrono::duration<double>(Clock::now() - retirement_start)
+            .count();
+    (void)sample_memory();
+  };
+
+  const auto retire_block = [&](BlockPtr& block) {
+    if (!block) {
+      return;
+    }
+    if (block->anchors.empty()) {
+      block.reset();
+      return;
+    }
+
+    retired_segment_scratch.clear();
+    for (const auto& [key, segment] : block->anchors) {
+      (void)key;
+      if (segment) {
+        retired_segment_scratch.push_back(segment);
       }
-      end_lock.unlock();
+    }
 
-      progress.startChromosome(current_species, chr_name, chr_length);
+    // Capacity for IDs and Segment pointers is guaranteed before publication;
+    // retirement itself therefore performs no unbounded task-level allocation.
+    retired_block_ids.push_back(block->block_id);
+    telemetry.maximum_retirement_batch =
+        std::max(telemetry.maximum_retirement_batch,
+                 retired_block_ids.size());
 
-      // 从头节点开始遍历链表
-      SegPtr prev =
-          genome_end.head->primary_path.next.load(std::memory_order_acquire);
-      SegPtr current = prev->primary_path.next.load(std::memory_order_acquire);
-      BlockPtr prev_block = prev->parent_block;
-      BlockPtr current_block = nullptr;
+    const WeakBlock source_block = block;
+    block->anchors.clear();
+    const size_t released_segment_count = retired_segment_scratch.size();
+    uint64_t released_cigar_units = 0;
+    for (SegPtr& segment : retired_segment_scratch) {
+      released_cigar_units += segment->cigar.size();
+      Segment::unlinkSegment(segment);
+      Cigar_t{}.swap(segment->cigar);
+      segment->parent_block.reset();
+    }
+    retired_segment_scratch.clear();
 
-      while (current && !current->isTail()) {
-        // if (current->start >= 2310000 && chr_name == "simGorilla.chrD") {
-        //     std::cout<<"test";
-        // }
-        // 只处理真正的segment（跳过头尾哨兵）
-        if (current->isSegment() && current->parent_block) {
-          // ═══════════════════════════════════════════════════════════
-          // 更新基因组位置进度
-          // ═══════════════════════════════════════════════════════════
-          progress.updatePosition(current->start + current->length);
+    ++telemetry.blocks_retired;
+    telemetry.segments_released += released_segment_count;
+    telemetry.cigar_units_released += released_cigar_units;
+    block.reset();
+    if (source_block.expired()) {
+      ++telemetry.blocks_released;
+    }
 
-          current_block = current->parent_block;
+    if (retired_block_ids.size() >= kRetiredBlockCheckpoint) {
+      compact_retired_block_pool();
+    }
+  };
 
-          // ═══════════════════════════════════════════════════════════
-          // 性能分析：重叠检测开始
-          // ═══════════════════════════════════════════════════════════
-          TimePoint overlap_detection_start = HighResClock::now();
+  struct ReplacementRecord {
+    SpeciesChrPair key;
+    SegPtr source;
+    SegPtr source_previous;
+    SegPtr source_next;
+    SegPtr prefix;
+    SegPtr overlap;
+    SegPtr suffix;
+  };
 
-          // 构造查找键并直接find
-          SpeciesChrPair ref_key{ref_name, chr_name};
+  std::vector<ReplacementRecord> previous_replacements;
+  std::vector<ReplacementRecord> current_replacements;
 
-          // 直接查找，避免遍历整个anchors
-          auto prev_anchor_it = prev_block->anchors.find(ref_key);
-          auto curr_anchor_it = current_block->anchors.find(ref_key);
+  const auto prepare_replacements =
+      [&](const BlockPtr& source_block, bool source_has_prefix,
+          bool source_has_suffix, uint32_t prefix_length,
+          uint32_t overlap_length, uint32_t suffix_length,
+          const BlockPtr& prefix_block, const BlockPtr& overlap_block,
+          const BlockPtr& suffix_block,
+          std::vector<ReplacementRecord>& replacements) {
+        replacements.clear();
+        if (replacements.capacity() < source_block->anchors.size()) {
+          replacements.reserve(source_block->anchors.size());
+        }
 
-          // 快速存在性检查
-          if (prev_anchor_it != prev_block->anchors.end() &&
-              curr_anchor_it != current_block->anchors.end()) {
-            const SegPtr prev_seg = prev_anchor_it->second;
-            const SegPtr curr_seg = curr_anchor_it->second;
-
-            // 快速重叠判断（内联计算，避免函数调用）
-            const uint_t prev_end = prev_seg->start + prev_seg->length;
-            const uint_t curr_start = curr_seg->start;
-
-            // 发现重叠
-            if (prev_end > curr_start &&
-                blocksShareNonReferenceSpecies(prev_block, current_block,
-                                               ref_name)) {
-              progress.recordParticipantConflict();
-            } else if (prev_end > curr_start) {
-              // ═══════════════════════════════════════════════════════════
-              // 性能分析：重叠检测完成，开始处理
-              // ═══════════════════════════════════════════════════════════
-              TimePoint overlap_detection_end = HighResClock::now();
-              perf_stats.overlap_detection_time += duration_cast<Duration>(
-                  overlap_detection_end - overlap_detection_start);
-              perf_stats.total_overlaps_found++;
-
-              TimePoint block_creation_start = HighResClock::now();
-              // ═══════════════════════════════════════════════════════════
-              // 记录合并操作
-              // ═══════════════════════════════════════════════════════════
-              progress.recordMerge();
-
-              // 处理合并并确定重叠区间。
-              uint_t overlap_start = std::max(prev_seg->start, curr_seg->start);
-              uint_t overlap_end = std::min(prev_seg->start + prev_seg->length,
-                                            curr_seg->start + curr_seg->length);
-
-              // 计算出区间：前缀区间，重叠区间，后缀区间（前缀或后缀不一定存在，但重叠区间一定存在）
-              uint_t full_start = std::min(prev_seg->start, curr_seg->start);
-              uint_t full_end = std::max(prev_seg->start + prev_seg->length,
-                                         curr_seg->start + curr_seg->length);
-
-              // 前缀区间：从合并范围开始到重叠开始
-              uint_t prefix_start = full_start;
-              uint_t prefix_end = overlap_start;
-              uint32_t prefix_len = prefix_end - prefix_start;
-              bool prev_has_prefix = prev_seg->start < overlap_start;
-              bool curr_has_prefix = curr_seg->start < overlap_start;
-
-              // 后缀区间：从重叠结束到合并范围结束
-              uint_t suffix_start = overlap_end;
-              uint_t suffix_end = full_end;
-              uint32_t suffix_len = suffix_end - suffix_start;
-              bool prev_has_suffix =
-                  prev_seg->start + prev_seg->length > overlap_end;
-              bool curr_has_suffix =
-                  curr_seg->start + curr_seg->length > overlap_end;
-
-              // 计算创建新block和新seg的参数，然后创建2-3个新的Block和Segment
-
-              // 声明新blocks（作用域扩大到整个处理过程）
-              BlockPtr prefix_block = nullptr;
-              BlockPtr overlap_block = nullptr;
-              BlockPtr suffix_block = nullptr;
-              SegPtr prefix_ref_seg = nullptr;
-              SegPtr overlap_ref_seg = nullptr;
-              SegPtr suffix_ref_seg = nullptr;
-
-              // 1. 创建前缀block和segment（如果存在）
-              if (prev_has_prefix || curr_has_prefix) {
-                prefix_block = Block::create(2);
-                prefix_block->ref_species = ref_name;
-                prefix_block->ref_chr = prev_block->ref_chr;
-                prefix_block->ref_species = prev_block->ref_species;
-                prefix_ref_seg = Segment::create(
-                    prefix_start, prefix_len,
-                    Strand::FORWARD, // ref总是正向
-                    prev_seg->cigar, // ref没有cigar，所以直接使用prev的cigar
-                    prev_seg->align_role, // 使用prev的align_role,
-                                          // 以防以后有secondary alignment
-                    SegmentRole::SEGMENT, // 前缀是segment，所以是segment
-                    prefix_block);
-                // 将ref segment注册到block
-                prefix_block->anchors.emplace(ref_key, prefix_ref_seg);
-                perf_stats.total_blocks_created++;
-                perf_stats.total_segments_created++;
-              }
-
-              // 2. 创建重叠block和segment（必定存在）
-              overlap_block = Block::create(2);
-              overlap_block->ref_species = ref_name;
-              overlap_block->ref_chr = prev_block->ref_chr;
-              overlap_block->ref_species = prev_block->ref_species;
-              uint32_t overlap_len = overlap_end - overlap_start;
-              overlap_ref_seg = Segment::create(
-                  overlap_start, overlap_len,
-                  Strand::FORWARD,      // ref总是正向
-                  prev_seg->cigar,      // ref没有cigar，所以直接使用prev的cigar
-                  prev_seg->align_role, // 使用prev的align_role,
-                                        // 以防以后有secondary alignment
-                  SegmentRole::SEGMENT, // 重叠是segment，所以是segment
-                  overlap_block);
-              // 将ref segment注册到block
-              overlap_block->anchors.emplace(ref_key, overlap_ref_seg);
-              perf_stats.total_blocks_created++;
-              perf_stats.total_segments_created++;
-
-              // 3. 创建后缀block和segment（如果存在）
-              if (prev_has_suffix || curr_has_suffix) {
-                suffix_block = Block::create(2);
-                suffix_block->ref_species = ref_name;
-                suffix_block->ref_chr = prev_block->ref_chr;
-                suffix_block->ref_species = prev_block->ref_species;
-                suffix_ref_seg = Segment::create(
-                    suffix_start, suffix_len,
-                    Strand::FORWARD, // ref总是正向
-                    prev_seg->cigar, // ref没有cigar，所以直接使用prev的cigar
-                    prev_seg->align_role, // 使用prev的align_role,
-                                          // 以防以后有secondary alignment
-                    SegmentRole::SEGMENT, // 后缀是segment，所以是segment
-                    suffix_block);
-                // 将ref segment注册到block
-                suffix_block->anchors.emplace(ref_key, suffix_ref_seg);
-                perf_stats.total_blocks_created++;
-                perf_stats.total_segments_created++;
-              }
-
-              // ═══════════════════════════════════════════════════════════
-              // 性能分析：Block创建完成
-              // ═══════════════════════════════════════════════════════════
-              TimePoint block_creation_end = HighResClock::now();
-              perf_stats.block_creation_time += duration_cast<Duration>(
-                  block_creation_end - block_creation_start);
-
-              TimePoint cigar_processing_start = HighResClock::now();
-              // 准备开始处理对应的query，首先处理prev_block，然后处理current_block
-              // 1. 处理prev_block
-              // 遍历prev_block非ref的anchors
-              for (const auto &[species_chr, segment] : prev_block->anchors) {
-                // 找到非ref的anchor
-                if (species_chr.first != ref_name) {
-                  if (segment->strand == Strand::FORWARD) {
-                    // if (segment->start == 2174791 && species_chr.second ==
-                    // "simChimp.chrD") {
-                    //     std::cout<<"test";
-                    // }
-                    std::string cigar_str;
-                    uint32_t sum = 0;
-                    bool prefix_done = prev_has_prefix ? false : true;
-                    bool overlap_done = false;
-                    bool suffix_done = prev_has_suffix ? false : true;
-                    SegPtr prefix_qry_seg = nullptr;
-                    SegPtr overlap_qry_seg = nullptr;
-                    SegPtr suffix_qry_seg = nullptr;
-                    uint32_t prefix_length = prev_has_prefix ? prefix_len : 0;
-                    uint32_t overlap_length = prefix_length + overlap_len;
-                    uint32_t suffix_length =
-                        prev_has_suffix ? overlap_length + suffix_len : 0;
-                    for (CigarUnit cu : segment->cigar) {
-                      perf_stats.total_cigar_operations++;
-                      uint32_t cigar_len;
-                      char op;
-                      intToCigar(cu, op, cigar_len);
-                      cigar_str += std::to_string(cigar_len) + op;
-                      if (op != 'I') {
-                        sum += cigar_len;
-                        // 修正累计长度判断
-                        if (!prefix_done && sum >= prefix_length) {
-                          prefix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, prefix_len);
-                          cigar_str = remain_cigar;
-                          prefix_qry_seg = createSegmentWithTiming(
-                              segment->start,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT,
-                              prefix_block // 使用新创建的prefix_block
-                          );
-                          // 将query segment注册到prefix_block
-                          if (prefix_block) {
-                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
-                          }
-                        }
-                        if (prefix_done && !overlap_done &&
-                            sum >= overlap_length) {
-                          // 累计长度
-                          overlap_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, overlap_len);
-                          cigar_str = remain_cigar;
-                          overlap_qry_seg = createSegmentWithTiming(
-                              prefix_qry_seg ? prefix_qry_seg->start +
-                                                   prefix_qry_seg->length
-                                             : segment->start,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT,
-                              overlap_block // 使用新创建的overlap_block
-                          );
-                          // 将query segment注册到overlap_block
-                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
-                        }
-                        if (overlap_done && !suffix_done &&
-                            sum >= suffix_length) {
-                          // 累计长度
-                          suffix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, suffix_len);
-                          cigar_str = remain_cigar;
-                          suffix_qry_seg = createSegmentWithTiming(
-                              overlap_qry_seg->start + overlap_qry_seg->length,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT,
-                              suffix_block // 使用新创建的suffix_block
-                          );
-                          // 将query segment注册到suffix_block
-                          if (suffix_block) {
-                            suffix_block->anchors.emplace(species_chr,
-                                                          suffix_qry_seg);
-                          }
-                        }
-                      }
-                    }
-                    appendTerminalQueryOnlyRemainder(
-                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
-                        cigar_str);
-                  } else {
-                    // segment->strand == Strand::REVERSE
-                    std::string cigar_str;
-                    uint32_t sum = 0;
-                    bool prefix_done = prev_has_prefix ? false : true;
-                    bool overlap_done = false;
-                    bool suffix_done = prev_has_suffix ? false : true;
-                    SegPtr prefix_qry_seg = nullptr;
-                    SegPtr overlap_qry_seg = nullptr;
-                    SegPtr suffix_qry_seg = nullptr;
-                    uint32_t prefix_length = prev_has_prefix ? prefix_len : 0;
-                    uint32_t overlap_length = prefix_length + overlap_len;
-                    uint32_t suffix_length =
-                        prev_has_suffix ? overlap_length + suffix_len : 0;
-
-                    // CIGAR分割逻辑与正向链相同
-                    for (CigarUnit cu : segment->cigar) {
-                      uint32_t cigar_len;
-                      char op;
-                      intToCigar(cu, op, cigar_len);
-                      cigar_str += std::to_string(cigar_len) + op;
-                      if (op != 'I') {
-                        sum += cigar_len;
-                        // 分割判断逻辑相同
-                        if (!prefix_done && sum >= prefix_length) {
-                          prefix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, prefix_len);
-                          cigar_str = remain_cigar;
-                          prefix_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, prefix_block);
-                          // 将query segment注册到prefix_block
-                          if (prefix_block) {
-                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
-                          }
-                        }
-                        if (prefix_done && !overlap_done &&
-                            sum >= overlap_length) {
-                          overlap_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, overlap_len);
-                          cigar_str = remain_cigar;
-                          overlap_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, overlap_block);
-                          // 将query segment注册到overlap_block
-                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
-                        }
-                        if (overlap_done && !suffix_done &&
-                            sum >= suffix_length) {
-                          suffix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, suffix_len);
-                          cigar_str = remain_cigar;
-                          suffix_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, suffix_block);
-                          // 将query segment注册到suffix_block
-                          if (suffix_block) {
-                            suffix_block->anchors.emplace(species_chr,
-                                                          suffix_qry_seg);
-                          }
-                        }
-                      }
-                    }
-                    appendTerminalQueryOnlyRemainder(
-                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
-                        cigar_str);
-
-                    // 反向链坐标修正：从segment末端开始，向前计算
-                    uint_t segment_end = segment->start + segment->length;
-
-                    // 使用一个临时变量来追踪当前段的末尾
-                    auto current_segment_end = segment_end;
-
-                    // 1. 首先处理前缀 (prefix)，如果它存在
-                    if (prefix_qry_seg) {
-                      prefix_qry_seg->start =
-                          current_segment_end - prefix_qry_seg->length;
-                      // 更新末尾位置，为下一个块做准备
-                      current_segment_end = prefix_qry_seg->start;
-                    }
-
-                    // 2. 接着处理重叠 (overlap)
-                    overlap_qry_seg->start =
-                        current_segment_end - overlap_qry_seg->length;
-                    // 再次更新末尾位置
-                    current_segment_end = overlap_qry_seg->start;
-
-                    // 3. 最后处理后缀 (suffix)，如果它存在
-                    if (suffix_qry_seg) {
-                      suffix_qry_seg->start =
-                          current_segment_end - suffix_qry_seg->length;
-                    }
-                  }
-                }
-              }
-
-              // 2. 处理current_block的非ref anchors
-              for (const auto &[species_chr, segment] :
-                   current_block->anchors) {
-                // 找到非ref的anchor
-                if (species_chr.first != ref_name) {
-                  if (segment->strand == Strand::FORWARD) {
-                    // if (segment->start == 2174791 && species_chr.second ==
-                    // "simChimp.chrD") {
-                    //     std::cout<<"test";
-                    // }
-                    std::string cigar_str;
-                    uint32_t sum = 0;
-                    bool prefix_done = curr_has_prefix ? false : true;
-                    bool overlap_done = false;
-                    bool suffix_done = curr_has_suffix ? false : true;
-                    SegPtr prefix_qry_seg = nullptr;
-                    SegPtr overlap_qry_seg = nullptr;
-                    SegPtr suffix_qry_seg = nullptr;
-                    uint32_t prefix_length = curr_has_prefix ? prefix_len : 0;
-                    uint32_t overlap_length = prefix_length + overlap_len;
-                    uint32_t suffix_length =
-                        curr_has_suffix ? overlap_length + suffix_len : 0;
-
-                    for (CigarUnit cu : segment->cigar) {
-                      uint32_t cigar_len;
-                      char op;
-                      intToCigar(cu, op, cigar_len);
-                      cigar_str += std::to_string(cigar_len) + op;
-                      if (op != 'I') {
-                        sum += cigar_len;
-                        // 修正累计长度判断
-                        if (!prefix_done && sum >= prefix_length) {
-                          prefix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, prefix_len);
-                          cigar_str = remain_cigar;
-                          prefix_qry_seg = Segment::create(
-                              segment->start,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, prefix_block);
-                          // 将query segment注册到prefix_block
-                          if (prefix_block) {
-                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
-                          }
-                        }
-                        if (prefix_done && !overlap_done &&
-                            sum >= overlap_length) {
-                          overlap_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, overlap_len);
-                          cigar_str = remain_cigar;
-                          overlap_qry_seg = Segment::create(
-                              prefix_qry_seg ? prefix_qry_seg->start +
-                                                   prefix_qry_seg->length
-                                             : segment->start,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, overlap_block);
-                          // 将query segment注册到overlap_block
-                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
-                        }
-                        if (overlap_done && !suffix_done &&
-                            sum >= suffix_length) {
-                          suffix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, suffix_len);
-                          cigar_str = remain_cigar;
-                          uint_t suffix_start_pos =
-                              overlap_qry_seg
-                                  ? overlap_qry_seg->start +
-                                        overlap_qry_seg->length
-                                  : (prefix_qry_seg ? prefix_qry_seg->start +
-                                                          prefix_qry_seg->length
-                                                    : segment->start);
-                          suffix_qry_seg = Segment::create(
-                              suffix_start_pos,
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, suffix_block);
-                          // 将query segment注册到suffix_block
-                          if (suffix_block) {
-                            suffix_block->anchors.emplace(species_chr,
-                                                          suffix_qry_seg);
-                          }
-                        }
-                      }
-                    }
-                    appendTerminalQueryOnlyRemainder(
-                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
-                        cigar_str);
-                  } else {
-                    // segment->strand == Strand::REVERSE
-                    std::string cigar_str;
-                    uint32_t sum = 0;
-                    bool prefix_done = curr_has_prefix ? false : true;
-                    bool overlap_done = false;
-                    bool suffix_done = curr_has_suffix ? false : true;
-                    SegPtr prefix_qry_seg = nullptr;
-                    SegPtr overlap_qry_seg = nullptr;
-                    SegPtr suffix_qry_seg = nullptr;
-                    uint32_t prefix_length = curr_has_prefix ? prefix_len : 0;
-                    uint32_t overlap_length = prefix_length + overlap_len;
-                    uint32_t suffix_length =
-                        curr_has_suffix ? overlap_length + suffix_len : 0;
-
-                    // CIGAR分割逻辑与正向链相同
-                    for (CigarUnit cu : segment->cigar) {
-                      uint32_t cigar_len;
-                      char op;
-                      intToCigar(cu, op, cigar_len);
-                      cigar_str += std::to_string(cigar_len) + op;
-                      if (op != 'I') {
-                        sum += cigar_len;
-                        // 分割判断逻辑相同
-                        if (!prefix_done && sum >= prefix_length) {
-                          prefix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, prefix_len);
-                          cigar_str = remain_cigar;
-                          prefix_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, prefix_block);
-                          // 将query segment注册到prefix_block
-                          if (prefix_block) {
-                            prefix_block->anchors.emplace(species_chr, prefix_qry_seg);
-                          }
-                        }
-                        if (prefix_done && !overlap_done &&
-                            sum >= overlap_length) {
-                          overlap_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, overlap_len);
-                          cigar_str = remain_cigar;
-                          overlap_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, overlap_block);
-                          // 将query segment注册到overlap_block
-                          overlap_block->anchors.emplace(species_chr, overlap_qry_seg);
-                        }
-                        if (overlap_done && !suffix_done &&
-                            sum >= suffix_length) {
-                          suffix_done = true;
-                          auto [split_cigar, remain_cigar] =
-                              splitCigarMixed(cigar_str, suffix_len);
-                          cigar_str = remain_cigar;
-                          suffix_qry_seg = Segment::create(
-                              0, // 临时坐标，稍后修正
-                              countNonDeletionOperations(split_cigar),
-                              segment->strand, // 保持REVERSE
-                              split_cigar, segment->align_role,
-                              SegmentRole::SEGMENT, suffix_block);
-                          // 将query segment注册到suffix_block
-                          if (suffix_block) {
-                            suffix_block->anchors.emplace(species_chr,
-                                                          suffix_qry_seg);
-                          }
-                        }
-                      }
-                    }
-                    appendTerminalQueryOnlyRemainder(
-                        suffix_qry_seg ? suffix_qry_seg : overlap_qry_seg,
-                        cigar_str);
-
-                    // 反向链坐标修正：从segment末端开始，向前计算
-                    uint_t segment_end = segment->start + segment->length;
-
-                    // 使用一个临时变量来追踪当前段的末尾
-                    auto current_segment_end = segment_end;
-
-                    // 1. 首先处理前缀 (prefix)，如果它存在
-                    if (prefix_qry_seg) {
-                      prefix_qry_seg->start =
-                          current_segment_end - prefix_qry_seg->length;
-                      // 更新末尾位置，为下一个块做准备
-                      current_segment_end = prefix_qry_seg->start;
-                    }
-
-                    // 2. 接着处理重叠 (overlap)
-                    overlap_qry_seg->start =
-                        current_segment_end - overlap_qry_seg->length;
-                    // 再次更新末尾位置
-                    current_segment_end = overlap_qry_seg->start;
-
-                    // 3. 最后处理后缀 (suffix)，如果它存在
-                    if (suffix_qry_seg) {
-                      suffix_qry_seg->start =
-                          current_segment_end - suffix_qry_seg->length;
-                    }
-                  }
-                }
-              }
-
-              // ═══════════════════════════════════════════════════════════
-              // 性能分析：CIGAR处理完成，开始链表重连
-              // ═══════════════════════════════════════════════════════════
-              TimePoint cigar_processing_end = HighResClock::now();
-              perf_stats.cigar_processing_time += duration_cast<Duration>(
-                  cigar_processing_end - cigar_processing_start);
-
-              TimePoint link_replacement_start = HighResClock::now();
-
-              // 开始替换prev和current，先替换Ref
-              // 获取prev的前驱和current的后继
-              SegPtr prev_prev =
-                  prev->primary_path.prev.load(std::memory_order_acquire);
-              SegPtr current_next =
-                  current->primary_path.next.load(std::memory_order_acquire);
-              // 移除prev和current的前驱和后继
-              prev->primary_path.prev.store(nullptr, std::memory_order_release);
-              prev->primary_path.next.store(nullptr, std::memory_order_release);
-              current->primary_path.next.store(nullptr,
-                                               std::memory_order_release);
-              current->primary_path.prev.store(nullptr,
-                                               std::memory_order_release);
-
-              // 将新blocks添加到全局池
-              if (prefix_block) {
-                blocks.emplace_back(WeakBlock(prefix_block));
-                // 将prefix的Seg插入
-
-                prefix_ref_seg->primary_path.next.store(
-                    overlap_ref_seg, std::memory_order_release);
-                overlap_ref_seg->primary_path.prev.store(
-                    prefix_ref_seg, std::memory_order_release);
-
-                prefix_ref_seg->primary_path.prev.store(
-                    prev_prev, std::memory_order_release);
-                prev_prev->primary_path.next.store(prefix_ref_seg,
-                                                   std::memory_order_release);
-              } else {
-                overlap_ref_seg->primary_path.prev.store(
-                    prev_prev, std::memory_order_release);
-                prev_prev->primary_path.next.store(overlap_ref_seg,
-                                                   std::memory_order_release);
-              }
-              blocks.emplace_back(WeakBlock(overlap_block));
-
-              if (suffix_block) {
-                blocks.emplace_back(WeakBlock(suffix_block));
-                SegPtr suffix_next = current_next;
-                if (current_next->isTail()) {
-                  suffix_ref_seg->primary_path.next.store(
-                      current_next, std::memory_order_release);
-                  current_next->primary_path.prev.store(
-                      suffix_ref_seg, std::memory_order_release);
-
-                  overlap_ref_seg->primary_path.next.store(
-                      suffix_ref_seg, std::memory_order_release);
-                  suffix_ref_seg->primary_path.prev.store(
-                      overlap_ref_seg, std::memory_order_release);
-                } else if (suffix_ref_seg->start > suffix_next->start) {
-                  while (suffix_ref_seg->start > suffix_next->start) {
-                    if (suffix_next->isTail()) {
-                      break;
-                    }
-                    suffix_next = suffix_next->primary_path.next.load(
-                        std::memory_order_release);
-                  }
-                  overlap_ref_seg->primary_path.next.store(
-                      current_next, std::memory_order_release);
-                  current_next->primary_path.prev.store(
-                      overlap_ref_seg, std::memory_order_release);
-
-                  suffix_ref_seg->primary_path.prev.store(
-                      suffix_next->primary_path.prev.load(
-                          std::memory_order_release),
-                      std::memory_order_release);
-                  suffix_next->primary_path.prev
-                      .load(std::memory_order_release)
-                      ->primary_path.next.store(suffix_ref_seg,
-                                                std::memory_order_release);
-
-                  suffix_ref_seg->primary_path.next.store(
-                      suffix_next, std::memory_order_release);
-                  suffix_next->primary_path.prev.store(
-                      suffix_ref_seg, std::memory_order_release);
-                } else {
-                  suffix_ref_seg->primary_path.next.store(
-                      current_next, std::memory_order_release);
-                  current_next->primary_path.prev.store(
-                      suffix_ref_seg, std::memory_order_release);
-
-                  overlap_ref_seg->primary_path.next.store(
-                      suffix_ref_seg, std::memory_order_release);
-                  suffix_ref_seg->primary_path.prev.store(
-                      overlap_ref_seg, std::memory_order_release);
-                }
-              } else {
-                overlap_ref_seg->primary_path.next.store(
-                    current_next, std::memory_order_release);
-                current_next->primary_path.prev.store(
-                    overlap_ref_seg, std::memory_order_release);
-              }
-
-              // 开始替换query的seg和block
-              for (const auto &[species_chr, segment] : prev_block->anchors) {
-                if (species_chr.first != ref_name) {
-                  SegPtr qry_prev = segment->primary_path.prev.load(
-                      std::memory_order_acquire);
-                  SegPtr qry_next = segment->primary_path.next.load(
-                      std::memory_order_acquire);
-                  // 先找到一定存在的overlap_block
-                  bool matched = false;
-                  for (const auto &[species_chr_overlap, segment_overlap] :
-                       overlap_block->anchors) {
-                    if (species_chr_overlap == species_chr) {
-                      matched = true;
-                      Segment::unlinkSegment(segment);
-                      if (segment->strand == Strand::FORWARD) {
-                        bool query_has_prefix = false;
-                        bool query_has_suffix = false;
-                        if (prev_has_prefix) {
-                          for (const auto &[species_chr_prefix,
-                                            segment_prefix] :
-                               prefix_block->anchors) {
-                            if (species_chr_prefix == species_chr) {
-                              query_has_prefix = true;
-                              qry_prev->primary_path.next.store(
-                                  segment_prefix, std::memory_order_release);
-                              segment_prefix->primary_path.prev.store(
-                                  qry_prev, std::memory_order_release);
-                              segment_prefix->primary_path.next.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_overlap->primary_path.prev.store(
-                                  segment_prefix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_prefix) {
-                            qry_prev->primary_path.next.store(
-                                segment_overlap, std::memory_order_release);
-                            segment_overlap->primary_path.prev.store(
-                                qry_prev, std::memory_order_release);
-                          }
-                        } else {
-                          qry_prev->primary_path.next.store(
-                              segment_overlap, std::memory_order_release);
-                          segment_overlap->primary_path.prev.store(
-                              qry_prev, std::memory_order_release);
-                        }
-                        if (prev_has_suffix) {
-                          for (const auto &[species_chr_suffix,
-                                            segment_suffix] :
-                               suffix_block->anchors) {
-                            if (species_chr_suffix == species_chr) {
-                              query_has_suffix = true;
-                              segment_overlap->primary_path.next.store(
-                                  segment_suffix, std::memory_order_release);
-                              segment_suffix->primary_path.prev.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_suffix->primary_path.next.store(
-                                  qry_next, std::memory_order_release);
-                              qry_next->primary_path.prev.store(
-                                  segment_suffix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_suffix) {
-                            segment_overlap->primary_path.next.store(
-                                qry_next, std::memory_order_release);
-                            qry_next->primary_path.prev.store(
-                                segment_overlap, std::memory_order_release);
-                          }
-                        } else {
-                          segment_overlap->primary_path.next.store(
-                              qry_next, std::memory_order_release);
-                          qry_next->primary_path.prev.store(
-                              segment_overlap, std::memory_order_release);
-                        }
-                      }
-                      // 如果是反向链就反着连
-                      else {
-                        bool query_has_prefix = false;
-                        bool query_has_suffix = false;
-                        if (prev_has_suffix) {
-                          for (const auto &[species_chr_suffix,
-                                            segment_suffix] :
-                               suffix_block->anchors) {
-                            if (species_chr_suffix == species_chr) {
-                              query_has_suffix = true;
-                              qry_prev->primary_path.next.store(
-                                  segment_suffix, std::memory_order_release);
-                              segment_suffix->primary_path.prev.store(
-                                  qry_prev, std::memory_order_release);
-                              segment_suffix->primary_path.next.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_overlap->primary_path.prev.store(
-                                  segment_suffix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_suffix) {
-                            qry_prev->primary_path.next.store(
-                                segment_overlap, std::memory_order_release);
-                            segment_overlap->primary_path.prev.store(
-                                qry_prev, std::memory_order_release);
-                          }
-                        } else {
-                          qry_prev->primary_path.next.store(
-                              segment_overlap, std::memory_order_release);
-                          segment_overlap->primary_path.prev.store(
-                              qry_prev, std::memory_order_release);
-                        }
-                        if (prev_has_prefix) {
-                          for (const auto &[species_chr_prefix,
-                                            segment_prefix] :
-                               prefix_block->anchors) {
-                            if (species_chr_prefix == species_chr) {
-                              query_has_prefix = true;
-                              segment_prefix->primary_path.prev.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_prefix->primary_path.next.store(
-                                  qry_next, std::memory_order_release);
-                              qry_next->primary_path.prev.store(
-                                  segment_prefix, std::memory_order_release);
-                              segment_overlap->primary_path.next.store(
-                                  segment_prefix, std::memory_order_release);
-
-                              break;
-                            }
-                          }
-                          if (!query_has_prefix) {
-                            segment_overlap->primary_path.next.store(
-                                qry_next, std::memory_order_release);
-                            qry_next->primary_path.prev.store(
-                                segment_overlap, std::memory_order_release);
-                          }
-                        } else {
-                          segment_overlap->primary_path.next.store(
-                              qry_next, std::memory_order_release);
-                          qry_next->primary_path.prev.store(
-                              segment_overlap, std::memory_order_release);
-                        }
-                      }
-                      break;
-                    }
-                  }
-                  if (!matched) {
-                    continue;
-                  }
-                }
-              }
-              for (const auto &[species_chr, segment] :
-                   current_block->anchors) {
-                if (species_chr.first != ref_name) {
-                  SegPtr qry_prev = segment->primary_path.prev.load(
-                      std::memory_order_acquire);
-                  SegPtr qry_next = segment->primary_path.next.load(
-                      std::memory_order_acquire);
-                  // 先找到一定存在的overlap_block
-                  bool matched = false;
-                  for (const auto &[species_chr_overlap, segment_overlap] :
-                       overlap_block->anchors) {
-                    if (species_chr_overlap == species_chr) {
-                      matched = true;
-                      Segment::unlinkSegment(segment);
-                      if (segment->strand == Strand::FORWARD) {
-                        bool query_has_prefix = false;
-                        bool query_has_suffix = false;
-                        if (curr_has_prefix) {
-                          for (const auto &[species_chr_prefix,
-                                            segment_prefix] :
-                               prefix_block->anchors) {
-                            if (species_chr_prefix == species_chr) {
-                              query_has_prefix = true;
-                              qry_prev->primary_path.next.store(
-                                  segment_prefix, std::memory_order_release);
-                              segment_prefix->primary_path.prev.store(
-                                  qry_prev, std::memory_order_release);
-                              segment_prefix->primary_path.next.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_overlap->primary_path.prev.store(
-                                  segment_prefix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_prefix) {
-                            qry_prev->primary_path.next.store(
-                                segment_overlap, std::memory_order_release);
-                            segment_overlap->primary_path.prev.store(
-                                qry_prev, std::memory_order_release);
-                          }
-                        } else {
-                          qry_prev->primary_path.next.store(
-                              segment_overlap, std::memory_order_release);
-                          segment_overlap->primary_path.prev.store(
-                              qry_prev, std::memory_order_release);
-                        }
-                        if (curr_has_suffix) {
-                          for (const auto &[species_chr_suffix,
-                                            segment_suffix] :
-                               suffix_block->anchors) {
-                            if (species_chr_suffix == species_chr) {
-                              query_has_suffix = true;
-                              segment_overlap->primary_path.next.store(
-                                  segment_suffix, std::memory_order_release);
-                              segment_suffix->primary_path.prev.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_suffix->primary_path.next.store(
-                                  qry_next, std::memory_order_release);
-                              qry_next->primary_path.prev.store(
-                                  segment_suffix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_suffix) {
-                            segment_overlap->primary_path.next.store(
-                                qry_next, std::memory_order_release);
-                            qry_next->primary_path.prev.store(
-                                segment_overlap, std::memory_order_release);
-                          }
-                        } else {
-                          segment_overlap->primary_path.next.store(
-                              qry_next, std::memory_order_release);
-                          qry_next->primary_path.prev.store(
-                              segment_overlap, std::memory_order_release);
-                        }
-                      }
-                      // 如果是反向链就反着连
-                      else {
-                        bool query_has_prefix = false;
-                        bool query_has_suffix = false;
-                        if (curr_has_suffix) {
-                          for (const auto &[species_chr_suffix,
-                                            segment_suffix] :
-                               suffix_block->anchors) {
-                            if (species_chr_suffix == species_chr) {
-                              query_has_suffix = true;
-                              qry_prev->primary_path.next.store(
-                                  segment_suffix, std::memory_order_release);
-                              segment_suffix->primary_path.prev.store(
-                                  qry_prev, std::memory_order_release);
-                              segment_suffix->primary_path.next.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_overlap->primary_path.prev.store(
-                                  segment_suffix, std::memory_order_release);
-                              break;
-                            }
-                          }
-                          if (!query_has_suffix) {
-                            qry_prev->primary_path.next.store(
-                                segment_overlap, std::memory_order_release);
-                            segment_overlap->primary_path.prev.store(
-                                qry_prev, std::memory_order_release);
-                          }
-                        } else {
-                          qry_prev->primary_path.next.store(
-                              segment_overlap, std::memory_order_release);
-                          segment_overlap->primary_path.prev.store(
-                              qry_prev, std::memory_order_release);
-                        }
-                        if (curr_has_prefix) {
-                          for (const auto &[species_chr_prefix,
-                                            segment_prefix] :
-                               prefix_block->anchors) {
-                            if (species_chr_prefix == species_chr) {
-                              query_has_prefix = true;
-                              segment_prefix->primary_path.prev.store(
-                                  segment_overlap, std::memory_order_release);
-                              segment_prefix->primary_path.next.store(
-                                  qry_next, std::memory_order_release);
-                              qry_next->primary_path.prev.store(
-                                  segment_prefix, std::memory_order_release);
-                              segment_overlap->primary_path.next.store(
-                                  segment_prefix, std::memory_order_release);
-
-                              break;
-                            }
-                          }
-                          if (!query_has_prefix) {
-                            segment_overlap->primary_path.next.store(
-                                qry_next, std::memory_order_release);
-                            qry_next->primary_path.prev.store(
-                                segment_overlap, std::memory_order_release);
-                          }
-                        } else {
-                          segment_overlap->primary_path.next.store(
-                              qry_next, std::memory_order_release);
-                          qry_next->primary_path.prev.store(
-                              segment_overlap, std::memory_order_release);
-                        }
-                      }
-                      break;
-                    }
-                  }
-                  if (!matched) {
-                    continue;
-                  }
-                }
-              }
-
-              // ═══════════════════════════════════════════════════════════
-              // 性能分析：链表重连完成，开始清理工作
-              // ═══════════════════════════════════════════════════════════
-              TimePoint link_replacement_end = HighResClock::now();
-              perf_stats.link_replacement_time += duration_cast<Duration>(
-                  link_replacement_end - link_replacement_start);
-
-              TimePoint cleanup_start = HighResClock::now();
-
-              // ═══════════════════════════════════════════════════════════
-              // 批量删除优化：标记要删除的Block，而不是立即删除
-              // ═══════════════════════════════════════════════════════════
-              if (prev_block) {
-                blocks_to_delete.insert(prev_block);
-                perf_stats.total_blocks_marked_for_deletion++;
-              }
-              if (current_block) {
-                blocks_to_delete.insert(current_block);
-                perf_stats.total_blocks_marked_for_deletion++;
-              }
-              // 替换current和prev
-              prev = overlap_ref_seg->primary_path.prev.load(
+        for (const auto& [key, source_segment] : source_block->anchors) {
+          if (key.first == ref_name) {
+            continue;
+          }
+          if (!source_segment) {
+            throw std::logic_error(
+                "graph merge encountered a null query Segment");
+          }
+          const SegPtr source_previous =
+              source_segment->primary_path.prev.load(
                   std::memory_order_acquire);
-              if (prev->isHead()) {
-                prev = overlap_ref_seg;
-              }
-              prev_block = prev->parent_block;
-              current = prev->primary_path.next.load(std::memory_order_acquire);
-              current_block = current->parent_block;
-              // ═══════════════════════════════════════════════════════════
-              // 性能分析：清理工作完成
-              // ═══════════════════════════════════════════════════════════
-              TimePoint cleanup_end = HighResClock::now();
-              perf_stats.cleanup_time +=
-                  duration_cast<Duration>(cleanup_end - cleanup_start);
+          const SegPtr source_next =
+              source_segment->primary_path.next.load(
+                  std::memory_order_acquire);
+          if (!source_previous || !source_next) {
+            throw std::logic_error(
+                "graph merge encountered a detached query Segment");
+          }
 
-              // 继续处理，不要跳到最后，因为新创建的blocks之间可能还有重叠
+          detail::MergeCigarSplit split =
+              detail::splitCigarForOverlapMerge(
+                  source_segment->cigar, source_has_prefix, prefix_length,
+                  overlap_length, source_has_suffix, suffix_length);
+          telemetry.cigar_units_scanned += split.source_units_scanned;
 
-              //                                 //
-              //                                 收集所有物种的segment详细信息
-              //                                 debug_all_species_segments.clear();
-              //                                 for (const auto& [species_name,
-              //                                 genome_graph] : species_graphs)
-              //                                 {
-              //                                     SpeciesDebugInfo
-              //                                     species_info(species_name);
-              //                                     std::shared_lock
-              //                                     genome_lock(genome_graph.rw);
-              //
-              //                                     for (const auto& [chr_name,
-              //                                     genome_end] :
-              //                                     genome_graph.chr2end) {
-              //                                         ChromosomeDebugInfo
-              //                                         chr_info(chr_name);
-              //                                         std::shared_lock
-              //                                         end_lock(genome_end.rw);
-              //
-              //                                         //
-              //                                         遍历该染色体的所有segments
-              //                                         SegPtr current =
-              //                                         genome_end.head;
-              //                                         current =
-              //                                         current->primary_path.next.load(std::memory_order_acquire);
-              //                                         while (current &&
-              //                                         current !=
-              //                                         genome_end.tail) {
-              //                                             if
-              //                                             (current->isSegment())
-              //                                             {
-              //                                                 chr_info.segments.emplace_back(current);
-              //                                             }
-              //                                             //
-              //                                             检查链表结构是否正确
-              //                                             if
-              //                                             (current->isHead())
-              //                                             {
-              //                                                 current =
-              //                                                 current->primary_path.next.load(std::memory_order_acquire);
-              //                                                 continue;
-              //                                             }
-              //                                             SegPtr prev =
-              //                                             current->primary_path.prev.load(std::memory_order_acquire);
-              //                                             if(prev &&
-              //                                             prev->isHead())
-              //                                             {
-              //                                                 current =
-              //                                                 current->primary_path.next.load(std::memory_order_acquire);
-              //                                                 continue;
-              //                                             }
-              //                                             if (prev &&
-              //                                             prev->primary_path.next.load(std::memory_order_acquire)
-              //                                             != current) {
-              //                                                 std::cerr <<
-              //                                                 "[链表错误]
-              //                                                 prev->next !=
-              //                                                 current,
-              //                                                 current start:
-              //                                                 " <<
-              //                                                 current->start
-              //                                                 << std::endl;
-              //                                             }
-              //                                             current =
-              //                                             current->primary_path.next.load(std::memory_order_acquire);
-              //                                         }
-              //
-              //                                         species_info.chromosomes.push_back(std::move(chr_info));
-              //                                     }
-              //
-              //                                     debug_all_species_segments.push_back(std::move(species_info));
-              //                                 }
-              //
-              // count++;
-              // std::cout<<count<<std::endl;
-              continue;
+          SegPtr prefix_segment;
+          SegPtr overlap_segment;
+          SegPtr suffix_segment;
+
+          const auto create_query_segment =
+              [&](uint_t start, detail::MergeCigarPiece& piece,
+                  const BlockPtr& destination_block) {
+                ++telemetry.segments_created;
+                return Segment::create(
+                    start, static_cast<uint_t>(piece.query_length),
+                    source_segment->strand, std::move(piece.cigar),
+                    source_segment->align_role, SegmentRole::SEGMENT,
+                    destination_block);
+              };
+
+          if (source_segment->strand == Strand::FORWARD) {
+            uint_t next_start = source_segment->start;
+            if (source_has_prefix) {
+              prefix_segment = create_query_segment(
+                  next_start, split.prefix, prefix_block);
+              prefix_block->anchors.emplace(key, prefix_segment);
+              next_start += prefix_segment->length;
+            }
+            overlap_segment = create_query_segment(
+                next_start, split.overlap, overlap_block);
+            overlap_block->anchors.emplace(key, overlap_segment);
+            next_start += overlap_segment->length;
+            if (source_has_suffix) {
+              suffix_segment = create_query_segment(
+                  next_start, split.suffix, suffix_block);
+              suffix_block->anchors.emplace(key, suffix_segment);
+            }
+          } else {
+            uint_t next_end =
+                source_segment->start + source_segment->length;
+            if (source_has_prefix) {
+              const uint_t start =
+                  next_end - static_cast<uint_t>(split.prefix.query_length);
+              prefix_segment = create_query_segment(
+                  start, split.prefix, prefix_block);
+              prefix_block->anchors.emplace(key, prefix_segment);
+              next_end = start;
+            }
+            const uint_t overlap_start =
+                next_end - static_cast<uint_t>(split.overlap.query_length);
+            overlap_segment = create_query_segment(
+                overlap_start, split.overlap, overlap_block);
+            overlap_block->anchors.emplace(key, overlap_segment);
+            next_end = overlap_start;
+            if (source_has_suffix) {
+              const uint_t start =
+                  next_end - static_cast<uint_t>(split.suffix.query_length);
+              suffix_segment = create_query_segment(
+                  start, split.suffix, suffix_block);
+              suffix_block->anchors.emplace(key, suffix_segment);
             }
           }
-        }
 
-        prev_block = current_block;
-        prev = current;
-        // 移动到下一个segment - 使用原子操作保证线程安全
-        current = current->primary_path.next.load(std::memory_order_acquire);
+          replacements.push_back(ReplacementRecord{
+              key, source_segment, source_previous, source_next,
+              prefix_segment, overlap_segment, suffix_segment});
+        }
+      };
+
+  const auto publish_replacement = [](ReplacementRecord& replacement) {
+    std::array<SegPtr, 3> chain;
+    size_t chain_size = 0;
+    if (replacement.source->strand == Strand::FORWARD) {
+      if (replacement.prefix) {
+        chain[chain_size++] = replacement.prefix;
+      }
+      chain[chain_size++] = replacement.overlap;
+      if (replacement.suffix) {
+        chain[chain_size++] = replacement.suffix;
+      }
+    } else {
+      if (replacement.suffix) {
+        chain[chain_size++] = replacement.suffix;
+      }
+      chain[chain_size++] = replacement.overlap;
+      if (replacement.prefix) {
+        chain[chain_size++] = replacement.prefix;
+      }
+    }
+
+    Segment::unlinkSegment(replacement.source);
+    replacement.source_previous->primary_path.next.store(
+        chain[0], std::memory_order_release);
+    chain[0]->primary_path.prev.store(
+        replacement.source_previous, std::memory_order_release);
+    for (size_t index = 1; index < chain_size; ++index) {
+      chain[index - 1]->primary_path.next.store(
+          chain[index], std::memory_order_release);
+      chain[index]->primary_path.prev.store(
+          chain[index - 1], std::memory_order_release);
+    }
+    chain[chain_size - 1]->primary_path.next.store(
+        replacement.source_next, std::memory_order_release);
+    replacement.source_next->primary_path.prev.store(
+        chain[chain_size - 1], std::memory_order_release);
+  };
+
+  const auto initialization_complete = Clock::now();
+  const double initialization_seconds =
+      std::chrono::duration<double>(
+          initialization_complete - function_start)
+          .count();
+
+  spdlog::info(
+      "Starting to merge multi-genome graph, reference species: {}", ref_name);
+  spdlog::info(
+      "A total of {} chromosomes ({:.1f} MB of genomic data) will be "
+      "processed",
+      reference_contexts.size(), total_reference_length / 1000000.0);
+
+  uint64_t completed_reference_length = 0;
+  double last_logged_percentage = 0.0;
+  auto last_progress_log = Clock::now();
+
+  const auto maybe_log_progress =
+      [&](const ReferenceChromosomeContext& context,
+          uint64_t chromosome_position, size_t completed_chromosomes) {
+        if (telemetry.boundaries_scanned % kProgressBoundaryInterval != 0) {
+          return;
+        }
+        const auto now = Clock::now();
+        const uint64_t bounded_position =
+            std::min(chromosome_position, context.maximum_end);
+        const uint64_t processed =
+            completed_reference_length + bounded_position;
+        const double percentage =
+            total_reference_length == 0
+                ? 100.0
+                : static_cast<double>(processed) /
+                      static_cast<double>(total_reference_length) *
+                      100.0;
+        const bool percentage_due =
+            percentage - last_logged_percentage >= 5.0;
+        const bool time_due =
+            now - last_progress_log >= std::chrono::seconds(300);
+        if (!percentage_due && !time_due) {
+          return;
+        }
+        const RaMAxMemory::ProcessMemorySnapshot memory = sample_memory();
+        spdlog::info(
+            "Merge progress: {:.1f}% ({:.1f} MB/{:.1f} MB) "
+            "Chromosomes: {}/{} Current: {}.{} Position: {} "
+            "Merges: {} current-rss-kib={} sampled-peak-rss-kib={}",
+            percentage, processed / 1000000.0,
+            total_reference_length / 1000000.0, completed_chromosomes,
+            reference_contexts.size(), ref_name, context.chromosome,
+            chromosome_position, telemetry.merges_committed,
+            memory.rss_kib, sampled_peak_rss_kib);
+        last_logged_percentage = percentage;
+        last_progress_log = now;
+      };
+
+  const auto traversal_start = Clock::now();
+  size_t completed_chromosomes = 0;
+  for (const ReferenceChromosomeContext& context : reference_contexts) {
+    GenomeEnd& genome_end = *context.end;
+    const SpeciesChrPair reference_key{ref_name, context.chromosome};
+
+    SegPtr previous =
+        genome_end.head
+            ? genome_end.head->primary_path.next.load(
+                  std::memory_order_acquire)
+            : nullptr;
+    if (!previous || previous->isTail()) {
+      completed_reference_length += context.maximum_end;
+      ++completed_chromosomes;
+      continue;
+    }
+    SegPtr current =
+        previous->primary_path.next.load(std::memory_order_acquire);
+    BlockPtr previous_block = previous->parent_block;
+    uint64_t chromosome_position = 0;
+
+    while (current && !current->isTail()) {
+      ++telemetry.boundaries_scanned;
+      chromosome_position =
+          std::max(chromosome_position,
+                   static_cast<uint64_t>(current->start) + current->length);
+      maybe_log_progress(
+          context, chromosome_position, completed_chromosomes);
+
+      BlockPtr current_block = current->parent_block;
+      if (!previous->isSegment() || !current->isSegment() ||
+          !previous_block || !current_block) {
+        previous = current;
+        previous_block = current_block;
+        current =
+            current->primary_path.next.load(std::memory_order_acquire);
+        continue;
       }
 
-      // ═══════════════════════════════════════════════════════════
-      // 标记当前染色体处理完成
-      // ═══════════════════════════════════════════════════════════
-      progress.completeChromosome();
+      const auto previous_anchor =
+          previous_block->anchors.find(reference_key);
+      const auto current_anchor =
+          current_block->anchors.find(reference_key);
+      if (previous_anchor == previous_block->anchors.end() ||
+          current_anchor == current_block->anchors.end()) {
+        previous = current;
+        previous_block = current_block;
+        current =
+            current->primary_path.next.load(std::memory_order_acquire);
+        continue;
+      }
+
+      const SegPtr previous_reference_segment = previous_anchor->second;
+      const SegPtr current_reference_segment = current_anchor->second;
+      const uint_t previous_end =
+          previous_reference_segment->start +
+          previous_reference_segment->length;
+      if (previous_end <= current_reference_segment->start) {
+        previous = current;
+        previous_block = current_block;
+        current =
+            current->primary_path.next.load(std::memory_order_acquire);
+        continue;
+      }
+
+      ++telemetry.overlaps_found;
+      if (blocks_share_non_reference_species(
+              previous_block, current_block)) {
+        ++telemetry.participant_conflicts;
+        previous = current;
+        previous_block = current_block;
+        current =
+            current->primary_path.next.load(std::memory_order_acquire);
+        continue;
+      }
+
+      const uint_t overlap_start =
+          std::max(previous_reference_segment->start,
+                   current_reference_segment->start);
+      const uint_t overlap_end =
+          std::min(previous_reference_segment->start +
+                       previous_reference_segment->length,
+                   current_reference_segment->start +
+                       current_reference_segment->length);
+      const uint_t full_start =
+          std::min(previous_reference_segment->start,
+                   current_reference_segment->start);
+      const uint_t full_end =
+          std::max(previous_reference_segment->start +
+                       previous_reference_segment->length,
+                   current_reference_segment->start +
+                       current_reference_segment->length);
+
+      const uint_t prefix_start = full_start;
+      const uint_t prefix_end = overlap_start;
+      const uint32_t prefix_length =
+          static_cast<uint32_t>(prefix_end - prefix_start);
+      const bool previous_has_prefix =
+          previous_reference_segment->start < overlap_start;
+      const bool current_has_prefix =
+          current_reference_segment->start < overlap_start;
+
+      const uint_t suffix_start = overlap_end;
+      const uint_t suffix_end = full_end;
+      const uint32_t suffix_length =
+          static_cast<uint32_t>(suffix_end - suffix_start);
+      const bool previous_has_suffix =
+          previous_reference_segment->start +
+                  previous_reference_segment->length >
+              overlap_end;
+      const bool current_has_suffix =
+          current_reference_segment->start +
+                  current_reference_segment->length >
+              overlap_end;
+      const uint32_t overlap_length =
+          static_cast<uint32_t>(overlap_end - overlap_start);
+
+      BlockPtr prefix_block;
+      BlockPtr overlap_block;
+      BlockPtr suffix_block;
+      SegPtr prefix_reference_replacement;
+      SegPtr overlap_reference_replacement;
+      SegPtr suffix_reference_replacement;
+
+      const auto initialize_block = [&](BlockPtr& block) {
+        block = Block::create(2);
+        block->ref_chr = previous_block->ref_chr;
+        block->ref_species = previous_block->ref_species;
+        ++telemetry.blocks_created;
+      };
+
+      if (previous_has_prefix || current_has_prefix) {
+        initialize_block(prefix_block);
+        prefix_reference_replacement = Segment::create(
+            prefix_start, static_cast<uint_t>(prefix_length),
+            Strand::FORWARD, previous_reference_segment->cigar,
+            previous_reference_segment->align_role,
+            SegmentRole::SEGMENT, prefix_block);
+        prefix_block->anchors.emplace(
+            reference_key, prefix_reference_replacement);
+        ++telemetry.segments_created;
+      }
+
+      initialize_block(overlap_block);
+      overlap_reference_replacement = Segment::create(
+          overlap_start, static_cast<uint_t>(overlap_length),
+          Strand::FORWARD, previous_reference_segment->cigar,
+          previous_reference_segment->align_role,
+          SegmentRole::SEGMENT, overlap_block);
+      overlap_block->anchors.emplace(
+          reference_key, overlap_reference_replacement);
+      ++telemetry.segments_created;
+
+      if (previous_has_suffix || current_has_suffix) {
+        initialize_block(suffix_block);
+        suffix_reference_replacement = Segment::create(
+            suffix_start, static_cast<uint_t>(suffix_length),
+            Strand::FORWARD, previous_reference_segment->cigar,
+            previous_reference_segment->align_role,
+            SegmentRole::SEGMENT, suffix_block);
+        suffix_block->anchors.emplace(
+            reference_key, suffix_reference_replacement);
+        ++telemetry.segments_created;
+      }
+
+      prepare_replacements(
+          previous_block, previous_has_prefix, previous_has_suffix,
+          prefix_length, overlap_length, suffix_length, prefix_block,
+          overlap_block, suffix_block, previous_replacements);
+      prepare_replacements(
+          current_block, current_has_prefix, current_has_suffix,
+          prefix_length, overlap_length, suffix_length, prefix_block,
+          overlap_block, suffix_block, current_replacements);
+
+      const SegPtr reference_previous =
+          previous->primary_path.prev.load(std::memory_order_acquire);
+      const SegPtr reference_next =
+          current->primary_path.next.load(std::memory_order_acquire);
+      if (!reference_previous || !reference_next) {
+        throw std::logic_error(
+            "graph merge encountered a detached reference Segment");
+      }
+
+      const size_t source_anchor_count =
+          previous_block->anchors.size() +
+          current_block->anchors.size();
+      if (source_genome_end_scratch.capacity() < source_anchor_count) {
+        source_genome_end_scratch.reserve(source_anchor_count);
+      }
+      source_genome_end_scratch.clear();
+      for (const auto& [key, segment] : previous_block->anchors) {
+        (void)segment;
+        source_genome_end_scratch.push_back(resolve_genome_end(key));
+      }
+      for (const auto& [key, segment] : current_block->anchors) {
+        (void)segment;
+        source_genome_end_scratch.push_back(resolve_genome_end(key));
+      }
+      if (retired_segment_scratch.capacity() <
+          std::max(previous_block->anchors.size(),
+                   current_block->anchors.size())) {
+        retired_segment_scratch.reserve(
+            std::max(previous_block->anchors.size(),
+                     current_block->anchors.size()));
+      }
+
+      const size_t new_block_count =
+          1 + static_cast<size_t>(prefix_block != nullptr) +
+          static_cast<size_t>(suffix_block != nullptr);
+      if (blocks.capacity() - blocks.size() < new_block_count) {
+        const size_t minimum_capacity = blocks.size() + new_block_count;
+        const size_t growth =
+            std::max<size_t>(blocks.capacity() / 2, 1024);
+        blocks.reserve(
+            std::max(minimum_capacity, blocks.capacity() + growth));
+      }
+
+      // All allocations and graph lookups required for the commit are now
+      // complete. Clear sampling only after every touched GenomeEnd resolves.
+      mark_genome_ends_touched(source_genome_end_scratch);
+
+      previous->primary_path.prev.store(
+          nullptr, std::memory_order_release);
+      previous->primary_path.next.store(
+          nullptr, std::memory_order_release);
+      current->primary_path.prev.store(
+          nullptr, std::memory_order_release);
+      current->primary_path.next.store(
+          nullptr, std::memory_order_release);
+
+      if (prefix_block) {
+        blocks.emplace_back(WeakBlock(prefix_block));
+        reference_previous->primary_path.next.store(
+            prefix_reference_replacement, std::memory_order_release);
+        prefix_reference_replacement->primary_path.prev.store(
+            reference_previous, std::memory_order_release);
+        prefix_reference_replacement->primary_path.next.store(
+            overlap_reference_replacement, std::memory_order_release);
+        overlap_reference_replacement->primary_path.prev.store(
+            prefix_reference_replacement, std::memory_order_release);
+      } else {
+        reference_previous->primary_path.next.store(
+            overlap_reference_replacement, std::memory_order_release);
+        overlap_reference_replacement->primary_path.prev.store(
+            reference_previous, std::memory_order_release);
+      }
+      blocks.emplace_back(WeakBlock(overlap_block));
+
+      if (suffix_block) {
+        blocks.emplace_back(WeakBlock(suffix_block));
+        if (reference_next->isTail()) {
+          overlap_reference_replacement->primary_path.next.store(
+              suffix_reference_replacement, std::memory_order_release);
+          suffix_reference_replacement->primary_path.prev.store(
+              overlap_reference_replacement, std::memory_order_release);
+          suffix_reference_replacement->primary_path.next.store(
+              reference_next, std::memory_order_release);
+          reference_next->primary_path.prev.store(
+              suffix_reference_replacement, std::memory_order_release);
+        } else if (suffix_reference_replacement->start >
+                   reference_next->start) {
+          SegPtr suffix_next = reference_next;
+          while (!suffix_next->isTail() &&
+                 suffix_reference_replacement->start >
+                     suffix_next->start) {
+            suffix_next = suffix_next->primary_path.next.load(
+                std::memory_order_acquire);
+            ++telemetry.suffix_forward_scan_steps;
+          }
+
+          overlap_reference_replacement->primary_path.next.store(
+              reference_next, std::memory_order_release);
+          reference_next->primary_path.prev.store(
+              overlap_reference_replacement, std::memory_order_release);
+
+          const SegPtr suffix_previous =
+              suffix_next->primary_path.prev.load(
+                  std::memory_order_acquire);
+          suffix_previous->primary_path.next.store(
+              suffix_reference_replacement, std::memory_order_release);
+          suffix_reference_replacement->primary_path.prev.store(
+              suffix_previous, std::memory_order_release);
+          suffix_reference_replacement->primary_path.next.store(
+              suffix_next, std::memory_order_release);
+          suffix_next->primary_path.prev.store(
+              suffix_reference_replacement, std::memory_order_release);
+        } else {
+          overlap_reference_replacement->primary_path.next.store(
+              suffix_reference_replacement, std::memory_order_release);
+          suffix_reference_replacement->primary_path.prev.store(
+              overlap_reference_replacement, std::memory_order_release);
+          suffix_reference_replacement->primary_path.next.store(
+              reference_next, std::memory_order_release);
+          reference_next->primary_path.prev.store(
+              suffix_reference_replacement, std::memory_order_release);
+        }
+      } else {
+        overlap_reference_replacement->primary_path.next.store(
+            reference_next, std::memory_order_release);
+        reference_next->primary_path.prev.store(
+            overlap_reference_replacement, std::memory_order_release);
+      }
+
+      for (ReplacementRecord& replacement : previous_replacements) {
+        publish_replacement(replacement);
+      }
+      for (ReplacementRecord& replacement : current_replacements) {
+        publish_replacement(replacement);
+      }
+
+      ++telemetry.merges_committed;
+      retire_block(previous_block);
+      retire_block(current_block);
+
+      previous_replacements.clear();
+      current_replacements.clear();
+      source_genome_end_scratch.clear();
+
+      previous =
+          overlap_reference_replacement->primary_path.prev.load(
+              std::memory_order_acquire);
+      if (previous->isHead()) {
+        previous = overlap_reference_replacement;
+      }
+      previous_block = previous->parent_block;
+      current =
+          previous->primary_path.next.load(std::memory_order_acquire);
+    }
+
+    completed_reference_length += context.maximum_end;
+    ++completed_chromosomes;
+  }
+  const auto traversal_complete = Clock::now();
+  const double traversal_seconds =
+      std::chrono::duration<double>(
+          traversal_complete - traversal_start)
+          .count();
+
+  compact_retired_block_pool();
+
+  const auto sampling_start = Clock::now();
+  for (GenomeEnd* genome_end : touched_genome_end_order) {
+    std::unique_lock end_lock(genome_end->rw);
+    genome_end->sample_vec.clear();
+    if (!genome_end->head || !genome_end->tail) {
+      continue;
+    }
+    genome_end->sample_vec.resize(1, genome_end->head);
+
+    // Validate cycles in constant auxiliary space before rebuilding sampling.
+    SegPtr slow = genome_end->head;
+    SegPtr fast = genome_end->head;
+    for (;;) {
+      slow = slow
+                 ? slow->primary_path.next.load(std::memory_order_acquire)
+                 : nullptr;
+      fast = fast
+                 ? fast->primary_path.next.load(std::memory_order_acquire)
+                 : nullptr;
+      if (fast && !fast->isTail()) {
+        fast =
+            fast->primary_path.next.load(std::memory_order_acquire);
+      }
+      if (!slow || !fast) {
+        throw std::runtime_error(
+            "graph merge sampling rebuild found a detached chromosome path");
+      }
+      if (slow == fast && !slow->isTail()) {
+        throw std::runtime_error(
+            "graph merge sampling rebuild detected a chromosome cycle");
+      }
+      if (fast->isTail()) {
+        break;
+      }
+    }
+
+    SegPtr segment =
+        genome_end->head->primary_path.next.load(
+            std::memory_order_acquire);
+    while (segment && !segment->isTail()) {
+      genome_end->setToSampling(segment);
+      segment =
+          segment->primary_path.next.load(std::memory_order_acquire);
+    }
+    if (segment != genome_end->tail) {
+      throw std::runtime_error(
+          "graph merge sampling rebuild did not reach the tail");
     }
   }
+  const double sampling_rebuild_seconds =
+      std::chrono::duration<double>(
+          Clock::now() - sampling_start)
+          .count();
 
-  // ═══════════════════════════════════════════════════════════
-  // 性能分析：染色体遍历完成
-  // ═══════════════════════════════════════════════════════════
-  TimePoint main_loop_end = HighResClock::now();
-  perf_stats.chromosome_iteration_time =
-      duration_cast<Duration>(main_loop_end - main_loop_start);
-
-  // ═══════════════════════════════════════════════════════════
-  // 批量删除优化：一次性删除所有标记的Block
-  // ═══════════════════════════════════════════════════════════
-  TimePoint batch_deletion_start = HighResClock::now();
-
-  if (!blocks_to_delete.empty()) {
-    spdlog::info("Starting batch deletion of {} blocks...", blocks_to_delete.size());
-
-
-    // 升级为写锁以进行删除操作
-    graph_lock.unlock();
-    std::unique_lock<std::shared_mutex> write_lock(rw);
-
-    // 使用高效的批量删除：标记-清除策略
-    size_t original_size = blocks.size();
-
-    // 1. Block查找阶段计时
-    TimePoint lookup_start = HighResClock::now();
-
-    // 方法1：使用remove_if + erase idiom（推荐）
-    auto new_end = std::remove_if(
-        blocks.begin(), blocks.end(), [&blocks_to_delete](const WeakBlock &wb) {
-          auto locked = wb.lock();
-          return locked &&
-                 blocks_to_delete.find(locked) != blocks_to_delete.end();
-        });
-
-    TimePoint lookup_end = HighResClock::now();
-    perf_stats.block_lookup_time +=
-        duration_cast<Duration>(lookup_end - lookup_start);
-
-    // 2. 实际删除阶段计时
-    TimePoint deletion_start = HighResClock::now();
-
-    blocks.erase(new_end, blocks.end());
-
-    TimePoint deletion_end = HighResClock::now();
-    perf_stats.actual_deletion_time +=
-        duration_cast<Duration>(deletion_end - deletion_start);
-
-    size_t deleted_count = original_size - blocks.size();
-    perf_stats.batch_deletion_operations = 1;
-
-    spdlog::info("Delete {} Block", deleted_count);
-
-    // 释放写锁，重新获取读锁
-    write_lock.unlock();
-    graph_lock = std::shared_lock<std::shared_mutex>(rw);
+  if (blocks.capacity() >= blocks.size() + kRetiredBlockCheckpoint &&
+      blocks.size() < blocks.capacity() / 2) {
+    std::vector<WeakBlock> compacted;
+    compacted.reserve(blocks.size());
+    for (WeakBlock& weak_block : blocks) {
+      compacted.push_back(std::move(weak_block));
+    }
+    blocks.swap(compacted);
   }
 
-  TimePoint batch_deletion_end = HighResClock::now();
-  Duration batch_deletion_time =
-      duration_cast<Duration>(batch_deletion_end - batch_deletion_start);
+  const RaMAxMemory::ProcessMemorySnapshot end_memory = sample_memory();
+  const double wall_seconds =
+      std::chrono::duration<double>(Clock::now() - function_start)
+          .count();
 
-  // 将批量删除时间加入清理工作统计
-  perf_stats.cleanup_time += batch_deletion_time;
-
-  // ═══════════════════════════════════════════════════════════
-  // 完成所有处理
-  // ═══════════════════════════════════════════════════════════
-  progress.finish();
-
-  // ═══════════════════════════════════════════════════════════
-  // 性能分析：函数执行完成，生成最终报告
-  // ═══════════════════════════════════════════════════════════
-  TimePoint function_end_time = HighResClock::now();
-  Duration total_function_time =
-      duration_cast<Duration>(function_end_time - function_start_time);
-#ifdef _DEBUG_
-  perf_stats.logFinalReport(total_function_time);
-#endif
-  // // 收集所有物种的segment详细信息
-  // debug_all_species_segments.clear();
-  // for (const auto &[species_name, genome_graph]: species_graphs) {
-  //     SpeciesDebugInfo species_info(species_name);
-  //     std::shared_lock genome_lock(genome_graph.rw);
-  //
-  //     for (const auto &[chr_name, genome_end]: genome_graph.chr2end) {
-  //         ChromosomeDebugInfo chr_info(chr_name);
-  //         std::shared_lock end_lock(genome_end.rw);
-  //
-  //         // 遍历该染色体的所有segments
-  //         SegPtr current = genome_end.head;
-  //         current =
-  //         current->primary_path.next.load(std::memory_order_acquire); while
-  //         (current && current != genome_end.tail) {
-  //             if (current->isSegment()) {
-  //                 chr_info.segments.emplace_back(current);
-  //             }
-  //             // 检查链表结构是否正确
-  //             if (current->isHead()) {
-  //                 current =
-  //                 current->primary_path.next.load(std::memory_order_acquire);
-  //                 continue;
-  //             }
-  //             SegPtr prev =
-  //             current->primary_path.prev.load(std::memory_order_acquire); if
-  //             (prev && prev->isHead()) {
-  //                 current =
-  //                 current->primary_path.next.load(std::memory_order_acquire);
-  //                 continue;
-  //             }
-  //             if (prev &&
-  //             prev->primary_path.next.load(std::memory_order_acquire) !=
-  //             current) {
-  //                 std::cerr << "[链表错误] prev->next != current, current
-  //                 start: " << current->start << std::endl;
-  //             }
-  //             current =
-  //             current->primary_path.next.load(std::memory_order_acquire);
-  //         }
-  //
-  //         species_info.chromosomes.push_back(std::move(chr_info));
-  //     }
-  //
-  //     debug_all_species_segments.push_back(std::move(species_info));
-  // }
+  spdlog::info(
+      "Merge completed! Processed a total of {} chromosomes, {:.1f} MB of "
+      "genomic data, with {} merge operations executed.",
+      reference_contexts.size(), total_reference_length / 1000000.0,
+      telemetry.merges_committed);
+  spdlog::info(
+      "Merge retained {} overlapping Block pairs because their "
+      "non-reference participant species conflict.",
+      telemetry.participant_conflicts);
+  spdlog::info(
+      "[graph-merge] reference={} wall_seconds={:.3f} "
+      "initialization_seconds={:.3f} traversal_seconds={:.3f} "
+      "retirement_seconds={:.3f} sampling_rebuild_seconds={:.3f} "
+      "reference_chromosomes={} initial_reference_segments={} "
+      "boundaries_scanned={} overlaps_found={} participant_conflicts={} "
+      "merges_committed={} cigar_units_scanned={} "
+      "suffix_forward_scan_steps={} blocks_before={} blocks_after={} "
+      "blocks_created={} blocks_retired={} blocks_released={} "
+      "segments_created={} segments_released={} "
+      "cigar_units_released={} expired_weak_entries_removed={} "
+      "maximum_retirement_batch={} touched_genome_ends={} "
+      "start_rss_kib={} end_rss_kib={} sampled_peak_rss_kib={} "
+      "process_peak_rss_kib={} virtual_kib={} cgroup_limit_bytes={} "
+      "memory_available={}",
+      ref_name, wall_seconds, initialization_seconds, traversal_seconds,
+      retirement_seconds, sampling_rebuild_seconds,
+      reference_contexts.size(), initial_reference_segments,
+      telemetry.boundaries_scanned, telemetry.overlaps_found,
+      telemetry.participant_conflicts, telemetry.merges_committed,
+      telemetry.cigar_units_scanned,
+      telemetry.suffix_forward_scan_steps, blocks_before, blocks.size(),
+      telemetry.blocks_created, telemetry.blocks_retired,
+      telemetry.blocks_released, telemetry.segments_created,
+      telemetry.segments_released, telemetry.cigar_units_released,
+      telemetry.expired_weak_entries_removed,
+      telemetry.maximum_retirement_batch,
+      touched_genome_end_order.size(), start_memory.rss_kib,
+      end_memory.rss_kib, sampled_peak_rss_kib,
+      end_memory.peak_rss_kib, end_memory.virtual_kib,
+      end_memory.cgroup_limit_bytes, end_memory.available);
 }
-
 /* ==============================================================
  * 7. 高性能删除方法 (public API)
  * ==============================================================*/
@@ -4466,21 +3895,7 @@ void RaMeshMultiGenomeGraph::removeBlocksBatch(
 
 size_t RaMeshMultiGenomeGraph::removeExpiredBlocks() {
   std::unique_lock graph_lock(rw);
-
-  size_t removed_count = 0;
-
-  // 移除所有过期的weak_ptr
-  blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-                              [&removed_count](const WeakBlock &wb) {
-                                if (wb.expired()) {
-                                  ++removed_count;
-                                  return true;
-                                }
-                                return false;
-                              }),
-               blocks.end());
-
-  return removed_count;
+  return eraseExpiredWeakBlocksUnlocked(blocks);
 }
 
 void RaMeshMultiGenomeGraph::removeSpecies(const SpeciesName &species) {
@@ -4593,7 +4008,7 @@ void RaMeshMultiGenomeGraph::clearAllGraphs() {
 size_t RaMeshMultiGenomeGraph::compactBlockPool() {
   std::unique_lock graph_lock(rw);
 
-  size_t compacted = removeExpiredBlocks();
+  const size_t compacted = eraseExpiredWeakBlocksUnlocked(blocks);
 
   // 可以在这里添加更多的内存优化逻辑
   blocks.shrink_to_fit();
