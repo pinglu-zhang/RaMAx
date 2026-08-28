@@ -2,18 +2,22 @@
 //  File: ramesh_graph.cpp –  High‑level graph ops (v0.6‑alpha)
 // =============================================================
 #include "align.h"
+#include "extension_internal.h"
 #include "ramesh.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <curl/curl.h>
+#include <limits>
 #include <optional>
 #include <shared_mutex>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace RaMesh {
 namespace {
@@ -47,6 +51,172 @@ void stableRadixSortSegmentsByStart(
   };
   pass(segments, scratch, 0);
   pass(scratch, segments, 16);
+}
+
+constexpr uint32_t kNoExtensionWorkIndex =
+    std::numeric_limits<uint32_t>::max();
+
+struct ExtensionWorkItem {
+  Segment* query_segment{nullptr};
+  Segment* reference_segment{nullptr};
+  Segment* left_reference_candidate{nullptr};
+  Segment* right_reference_candidate{nullptr};
+  uint32_t query_context_index{0};
+  uint32_t reference_context_index{0};
+  uint32_t same_reference_next{kNoExtensionWorkIndex};
+};
+
+struct QueryExtensionContext {
+  GenomeEnd* end{nullptr};
+  ChrName chromosome;
+  detail::ExtensionSequenceContext sequence;
+};
+
+struct ReferenceExtensionContext {
+  GenomeEnd* end{nullptr};
+  ChrName chromosome;
+  detail::ExtensionSequenceContext sequence;
+  std::vector<uint32_t> work_indices;
+};
+
+struct ReferenceExtensionNode {
+  Segment* segment{nullptr};
+  bool barrier{false};
+  bool contains_query_species{false};
+};
+
+struct ExtensionStageStats {
+  uint64_t query_segments{0};
+  uint64_t eligible_segments{0};
+  uint64_t touched_reference_chromosomes{0};
+  uint64_t reference_segments_scanned{0};
+  uint64_t barriers{0};
+  uint64_t left_candidate_hits{0};
+  uint64_t left_candidate_misses{0};
+  uint64_t right_candidate_hits{0};
+  uint64_t right_candidate_misses{0};
+  uint64_t right_alignment_calls{0};
+  uint64_t right_alignment_accepted{0};
+  uint64_t left_alignment_calls{0};
+  uint64_t left_alignment_accepted{0};
+  uint64_t gap_too_long{0};
+  uint64_t empty_or_nonpositive_gap{0};
+  uint64_t maximum_work_items{0};
+  uint64_t maximum_temporary_reference_nodes{0};
+  double collect_seconds{0.0};
+  double index_seconds{0.0};
+  double right_seconds{0.0};
+  double left_seconds{0.0};
+  double resort_seconds{0.0};
+
+  void merge(const ExtensionStageStats& other) {
+    query_segments += other.query_segments;
+    eligible_segments += other.eligible_segments;
+    touched_reference_chromosomes +=
+        other.touched_reference_chromosomes;
+    reference_segments_scanned += other.reference_segments_scanned;
+    barriers += other.barriers;
+    left_candidate_hits += other.left_candidate_hits;
+    left_candidate_misses += other.left_candidate_misses;
+    right_candidate_hits += other.right_candidate_hits;
+    right_candidate_misses += other.right_candidate_misses;
+    right_alignment_calls += other.right_alignment_calls;
+    right_alignment_accepted += other.right_alignment_accepted;
+    left_alignment_calls += other.left_alignment_calls;
+    left_alignment_accepted += other.left_alignment_accepted;
+    gap_too_long += other.gap_too_long;
+    empty_or_nonpositive_gap += other.empty_or_nonpositive_gap;
+    maximum_work_items =
+        std::max(maximum_work_items, other.maximum_work_items);
+    maximum_temporary_reference_nodes = std::max(
+        maximum_temporary_reference_nodes,
+        other.maximum_temporary_reference_nodes);
+    collect_seconds += other.collect_seconds;
+    index_seconds += other.index_seconds;
+    right_seconds += other.right_seconds;
+    left_seconds += other.left_seconds;
+    resort_seconds += other.resort_seconds;
+  }
+};
+
+double extensionElapsedSeconds(
+    std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start).count();
+}
+
+bool blockContainsSpecies(const Segment* segment,
+                          const SpeciesName& species) {
+  if (!segment) return false;
+  const Block* block = segment->parent_block.get();
+  if (!block) return false;
+  for (const auto& [key, occurrence] : block->anchors) {
+    (void)occurrence;
+    if (key.first == species) return true;
+  }
+  return false;
+}
+
+void recordPreparedExtensionResult(
+    const detail::PreparedExtensionResult& result,
+    bool is_left_extend,
+    ExtensionStageStats& stats) {
+  switch (result.status) {
+    case detail::PreparedExtensionStatus::NONPOSITIVE_GAP:
+      ++stats.empty_or_nonpositive_gap;
+      break;
+    case detail::PreparedExtensionStatus::GAP_TOO_LONG:
+      ++stats.gap_too_long;
+      break;
+    case detail::PreparedExtensionStatus::ALIGNMENT_REJECTED:
+      if (is_left_extend) {
+        ++stats.left_alignment_calls;
+      } else {
+        ++stats.right_alignment_calls;
+      }
+      break;
+    case detail::PreparedExtensionStatus::ALIGNMENT_ACCEPTED:
+      if (is_left_extend) {
+        ++stats.left_alignment_calls;
+        ++stats.left_alignment_accepted;
+      } else {
+        ++stats.right_alignment_calls;
+        ++stats.right_alignment_accepted;
+      }
+      break;
+    case detail::PreparedExtensionStatus::SKIPPED:
+    case detail::PreparedExtensionStatus::NO_CANDIDATE:
+      break;
+  }
+}
+
+void logExtensionStageStats(std::string_view scope,
+                            std::string_view query_name,
+                            const ExtensionStageStats& stats) {
+  spdlog::info(
+      "[extend-ref-nodes] scope={} query={} query_segments={} "
+      "eligible_segments={} touched_reference_chromosomes={} "
+      "reference_segments_scanned={} barriers={} "
+      "left_candidate_hits={} left_candidate_misses={} "
+      "right_candidate_hits={} right_candidate_misses={} "
+      "right_alignment_calls={} right_alignment_accepted={} "
+      "left_alignment_calls={} left_alignment_accepted={} "
+      "gap_too_long={} empty_or_nonpositive_gap={} "
+      "collect_seconds={:.3f} index_seconds={:.3f} "
+      "right_seconds={:.3f} left_seconds={:.3f} "
+      "resort_seconds={:.3f} maximum_work_items={} "
+      "maximum_temporary_reference_nodes={}",
+      scope, query_name, stats.query_segments, stats.eligible_segments,
+      stats.touched_reference_chromosomes,
+      stats.reference_segments_scanned, stats.barriers,
+      stats.left_candidate_hits, stats.left_candidate_misses,
+      stats.right_candidate_hits, stats.right_candidate_misses,
+      stats.right_alignment_calls, stats.right_alignment_accepted,
+      stats.left_alignment_calls, stats.left_alignment_accepted,
+      stats.gap_too_long, stats.empty_or_nonpositive_gap,
+      stats.collect_seconds, stats.index_seconds, stats.right_seconds,
+      stats.left_seconds, stats.resort_seconds, stats.maximum_work_items,
+      stats.maximum_temporary_reference_nodes);
 }
 
 }  // namespace
@@ -1115,84 +1285,303 @@ size_t RaMeshMultiGenomeGraph::materializeSecondaryAlignments() {
 }
 
 void RaMeshMultiGenomeGraph::extendRefNodes(
-    const SpeciesName &ref_name,
+    const SpeciesName& ref_name,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
     int_t zdrop) {
-  for (auto &[sp, g] : species_graphs) {
-    if (sp == ref_name) {
-      continue;
-    }
-    for (auto &[chr_name, end] : g.chr2end) {
-      SegPtr cur_node = end.head;
+  auto reference_graph_it = species_graphs.find(ref_name);
+  if (reference_graph_it == species_graphs.end()) {
+    throw std::invalid_argument(
+        "Reference species is missing from the graph: " + ref_name);
+  }
+  RaMeshGenomeGraph& reference_graph = reference_graph_it->second;
+  ExtensionStageStats total_stats;
 
-      while (cur_node != NULL) {
-        if (cur_node == end.head || cur_node == end.tail ||
-            (cur_node->right_extend && cur_node->left_extend)) {
-          cur_node = cur_node->primary_path.next.load(
-              std::memory_order_acquire);
-          continue;
+  for (auto& [query_name, query_graph] : species_graphs) {
+    if (query_name == ref_name) continue;
+
+    ExtensionStageStats stats;
+    const auto collect_start = std::chrono::steady_clock::now();
+    std::size_t eligible_count = 0;
+    for (auto& [query_chromosome, query_end] : query_graph.chr2end) {
+      (void)query_chromosome;
+      SegPtr current = query_end.head->primary_path.next.load(
+          std::memory_order_acquire);
+      while (current && !current->isTail()) {
+        ++stats.query_segments;
+        if (!(current->left_extend && current->right_extend)) {
+          ++eligible_count;
         }
-        end.alignInterval(ref_name, sp, chr_name, cur_node, managers, false,
-                          zdrop);
-        cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
+        current = current->primary_path.next.load(
+            std::memory_order_acquire);
       }
     }
+    stats.eligible_segments = eligible_count;
+    stats.maximum_work_items = eligible_count;
 
-    for (auto& [chr_name, end] : g.chr2end) {
-        SegPtr cur_node = end.head;
+    if (eligible_count >
+        static_cast<std::size_t>(kNoExtensionWorkIndex)) {
+      throw std::length_error(
+          "extendRefNodes work list exceeds the compact index range");
+    }
 
-        while (cur_node != NULL) {
-            if (cur_node == end.head || cur_node == end.tail ||
-                (cur_node->right_extend && cur_node->left_extend)) {
-                cur_node = cur_node->primary_path.next.load(
-                    std::memory_order_acquire);
-                continue;
+    if (eligible_count != 0) {
+      const auto& query_manager = detail::originalSequenceManager(
+          managers.at(query_name));
+      const auto& reference_manager = detail::originalSequenceManager(
+          managers.at(ref_name));
+
+      std::vector<ExtensionWorkItem> work_items;
+      std::vector<QueryExtensionContext> query_contexts;
+      std::vector<ReferenceExtensionContext> reference_contexts;
+      std::unordered_map<ChrName, uint32_t>
+          reference_context_by_chromosome;
+
+      work_items.reserve(eligible_count);
+      query_contexts.reserve(
+          std::min(eligible_count, query_graph.chr2end.size()));
+      reference_contexts.reserve(
+          std::min(eligible_count, reference_graph.chr2end.size()));
+      reference_context_by_chromosome.reserve(
+          std::min(eligible_count, reference_graph.chr2end.size()));
+
+      for (auto& [query_chromosome, query_end] :
+           query_graph.chr2end) {
+        uint32_t query_context_index = kNoExtensionWorkIndex;
+        SegPtr current = query_end.head->primary_path.next.load(
+            std::memory_order_acquire);
+        while (current && !current->isTail()) {
+          if (current->left_extend && current->right_extend) {
+            current = current->primary_path.next.load(
+                std::memory_order_acquire);
+            continue;
+          }
+
+          if (query_context_index == kNoExtensionWorkIndex) {
+            if (query_contexts.size() >=
+                static_cast<std::size_t>(kNoExtensionWorkIndex)) {
+              throw std::length_error(
+                  "Too many query chromosome extension contexts");
             }
-            end.alignInterval(ref_name, sp, chr_name, cur_node, managers, true,
-                zdrop);
-            cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
+            const SeqPro::SequenceId sequence_id =
+                query_manager.getSequenceId(query_chromosome);
+            query_context_index =
+                static_cast<uint32_t>(query_contexts.size());
+            query_contexts.push_back(QueryExtensionContext{
+                &query_end,
+                query_chromosome,
+                detail::ExtensionSequenceContext{
+                    &query_manager,
+                    sequence_id,
+                    query_manager.getSequenceLength(sequence_id)}});
+          }
+
+          Block* block = current->parent_block.get();
+          if (!block) {
+            throw std::runtime_error(
+                "Query segment is missing its parent block");
+          }
+          const auto reference_occurrence = block->anchors.find(
+              {ref_name, block->ref_chr});
+          if (reference_occurrence == block->anchors.end() ||
+              !reference_occurrence->second) {
+            throw std::runtime_error(
+                "Reference occurrence is missing from the current block");
+          }
+
+          auto reference_end_it =
+              reference_graph.chr2end.find(block->ref_chr);
+          if (reference_end_it == reference_graph.chr2end.end()) {
+            throw std::runtime_error(
+                "Reference chromosome is missing from the graph: " +
+                block->ref_chr);
+          }
+
+          auto [context_it, inserted] =
+              reference_context_by_chromosome.try_emplace(
+                  block->ref_chr,
+                  static_cast<uint32_t>(reference_contexts.size()));
+          if (inserted) {
+            if (reference_contexts.size() >=
+                static_cast<std::size_t>(kNoExtensionWorkIndex)) {
+              throw std::length_error(
+                  "Too many reference chromosome extension contexts");
+            }
+            const SeqPro::SequenceId sequence_id =
+                reference_manager.getSequenceId(block->ref_chr);
+            reference_contexts.push_back(ReferenceExtensionContext{
+                &reference_end_it->second,
+                block->ref_chr,
+                detail::ExtensionSequenceContext{
+                    &reference_manager,
+                    sequence_id,
+                    reference_manager.getSequenceLength(sequence_id)},
+                {}});
+            context_it->second =
+                static_cast<uint32_t>(reference_contexts.size() - 1);
+          }
+
+          const uint32_t reference_context_index = context_it->second;
+          const uint32_t work_index =
+              static_cast<uint32_t>(work_items.size());
+          work_items.push_back(ExtensionWorkItem{
+              current.get(),
+              reference_occurrence->second.get(),
+              nullptr,
+              nullptr,
+              query_context_index,
+              reference_context_index,
+              kNoExtensionWorkIndex});
+          reference_contexts[reference_context_index]
+              .work_indices.push_back(work_index);
+
+          current = current->primary_path.next.load(
+              std::memory_order_acquire);
         }
+      }
+      stats.collect_seconds = extensionElapsedSeconds(collect_start);
+      stats.touched_reference_chromosomes =
+          reference_contexts.size();
+
+      const auto index_start = std::chrono::steady_clock::now();
+      for (ReferenceExtensionContext& reference_context :
+           reference_contexts) {
+        std::unordered_map<Segment*, uint32_t> target_heads;
+        target_heads.reserve(reference_context.work_indices.size());
+        for (const uint32_t work_index :
+             reference_context.work_indices) {
+          ExtensionWorkItem& work = work_items[work_index];
+          auto [target_it, inserted] = target_heads.try_emplace(
+              work.reference_segment, kNoExtensionWorkIndex);
+          work.same_reference_next = target_it->second;
+          target_it->second = work_index;
+          (void)inserted;
+        }
+
+        std::vector<ReferenceExtensionNode> reference_nodes;
+        reference_nodes.reserve(reference_context.work_indices.size());
+        SegPtr current =
+            reference_context.end->head->primary_path.next.load(
+                std::memory_order_acquire);
+        while (current && !current->isTail()) {
+          const bool barrier =
+              current->left_extend && current->right_extend;
+          reference_nodes.push_back(ReferenceExtensionNode{
+              current.get(),
+              barrier,
+              !barrier &&
+                  blockContainsSpecies(current.get(), query_name)});
+          if (barrier) ++stats.barriers;
+          current = current->primary_path.next.load(
+              std::memory_order_acquire);
+        }
+
+        stats.maximum_temporary_reference_nodes = std::max<uint64_t>(
+            stats.maximum_temporary_reference_nodes,
+            reference_nodes.size());
+        stats.reference_segments_scanned +=
+            static_cast<uint64_t>(reference_nodes.size()) * 2;
+
+        Segment* nearest = nullptr;
+        for (const ReferenceExtensionNode& node : reference_nodes) {
+          const auto target_it = target_heads.find(node.segment);
+          if (target_it != target_heads.end()) {
+            for (uint32_t work_index = target_it->second;
+                 work_index != kNoExtensionWorkIndex;
+                 work_index =
+                     work_items[work_index].same_reference_next) {
+              work_items[work_index].left_reference_candidate =
+                  nearest;
+            }
+          }
+          if (node.barrier) {
+            nearest = nullptr;
+          } else if (node.contains_query_species) {
+            nearest = node.segment;
+          }
+        }
+
+        nearest = nullptr;
+        for (auto node_it = reference_nodes.rbegin();
+             node_it != reference_nodes.rend(); ++node_it) {
+          const auto target_it = target_heads.find(node_it->segment);
+          if (target_it != target_heads.end()) {
+            for (uint32_t work_index = target_it->second;
+                 work_index != kNoExtensionWorkIndex;
+                 work_index =
+                     work_items[work_index].same_reference_next) {
+              work_items[work_index].right_reference_candidate =
+                  nearest;
+            }
+          }
+          if (node_it->barrier) {
+            nearest = nullptr;
+          } else if (node_it->contains_query_species) {
+            nearest = node_it->segment;
+          }
+        }
+
+        // Candidate pointers are now stored directly in work_items. Release
+        // this chromosome's grouping buffer before any KSW2 work begins.
+        std::vector<uint32_t>().swap(reference_context.work_indices);
+      }
+
+      for (const ExtensionWorkItem& work : work_items) {
+        if (work.left_reference_candidate) {
+          ++stats.left_candidate_hits;
+        } else {
+          ++stats.left_candidate_misses;
+        }
+        if (work.right_reference_candidate) {
+          ++stats.right_candidate_hits;
+        } else {
+          ++stats.right_candidate_misses;
+        }
+      }
+      stats.index_seconds = extensionElapsedSeconds(index_start);
+
+      detail::ExtensionSequenceScratch scratch;
+      scratch.reserve();
+
+      const auto right_start = std::chrono::steady_clock::now();
+      for (ExtensionWorkItem& work : work_items) {
+        const auto result = detail::alignIntervalPrepared(
+            work.query_segment,
+            work.reference_segment,
+            work.right_reference_candidate,
+            query_contexts[work.query_context_index].sequence,
+            reference_contexts[work.reference_context_index].sequence,
+            false, zdrop, scratch);
+        recordPreparedExtensionResult(result, false, stats);
+      }
+      stats.right_seconds = extensionElapsedSeconds(right_start);
+
+      const auto left_start = std::chrono::steady_clock::now();
+      for (ExtensionWorkItem& work : work_items) {
+        const auto result = detail::alignIntervalPrepared(
+            work.query_segment,
+            work.reference_segment,
+            work.left_reference_candidate,
+            query_contexts[work.query_context_index].sequence,
+            reference_contexts[work.reference_context_index].sequence,
+            true, zdrop, scratch);
+        recordPreparedExtensionResult(result, true, stats);
+      }
+      stats.left_seconds = extensionElapsedSeconds(left_start);
+    } else {
+      stats.collect_seconds = extensionElapsedSeconds(collect_start);
     }
+
+    total_stats.merge(stats);
+    logExtensionStageStats("species", query_name, stats);
   }
 
-  //for (auto& [sp, g] : species_graphs) {
-  //    if (sp == ref_name) {
-  //        continue;
-  //    }
-  //    for (auto& [chr_name, end] : g.chr2end) {
-  //        SegPtr cur_node = end.head;
-
-  //        while (cur_node != NULL) {
-  //            // pool.enqueue([this, &ref_name, &sp, &chr_name, &end, &cur_node,
-  //            // &managers]() {
-  //            //
-  //            //     end.alignInterval(ref_name, sp, chr_name, cur_node, managers,
-  //            //     false, true);
-  //            //
-  //            // });
-  //            end.alignInterval(ref_name, sp, chr_name, cur_node, managers, true,
-  //                false);
-  //            cur_node = cur_node->primary_path.next.load(std::memory_order_acquire);
-  //        }
-  //    }
-  //}
-  //pool.waitAllTasksDone();
-  // for (auto& [sp, g] : species_graphs) {
-  //     auto it = species_graphs.find(sp);
-  //     if (it != species_graphs.end()) {
-  //         for (auto& [chr_name, end] : it->second.chr2end) {
-  //             end.resortSegments();
-  //         }
-  //     }
-  // }
-  //  调整ref的链表排序
-  auto it = species_graphs.find(ref_name);
-  if (it != species_graphs.end()) {
-    for (auto &[chr_name, end] : it->second.chr2end) {
-      end.resortSegments();
-    }
+  const auto resort_start = std::chrono::steady_clock::now();
+  for (auto& [chromosome, end] : reference_graph.chr2end) {
+    (void)chromosome;
+    end.resortSegments();
   }
-  return;
+  total_stats.resort_seconds = extensionElapsedSeconds(resort_start);
+  logExtensionStageStats("total", "all", total_stats);
 }
 
 /* ==============================================================
