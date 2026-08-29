@@ -7,10 +7,13 @@
 #include "config.hpp"
 #include "index.h"
 #include "minipoa_locator.h"
+#include "ksw2_dispatch.h"
 #include "output_spec.hpp"
 #include "ramax_version.h"
 #include "rare_aligner.h"
+#include "runtime_resources.h"
 #include "sequence_utils.h"
+#include "simd_bytes.h"
 #include "external_msa_runner.h"
 #include <cstdlib>
 
@@ -36,6 +39,12 @@ struct CommonArgs {
     std::vector<std::filesystem::path> output_paths; // CLI/restart multi-output list
     std::vector<RaMAxOutput::OutputSpec> outputs;     // validated, canonical order
     std::filesystem::path work_dir_path = "";   // 工作目录路径（用于中间文件与缓存）
+
+    // Runtime-only resource controls.  They deliberately are not serialized:
+    // restart may choose a different machine, budget, or local scratch disk
+    // without changing the biological configuration identity.
+    std::string memory_limit = "auto";
+    std::filesystem::path temp_dir_path = "";
 
 
     // ========================
@@ -854,7 +863,7 @@ RestartOverrides captureRestartOverrides(const CLI::App& app,
                                          const CommonArgs& values) {
     RestartOverrides overrides;
     overrides.values = values;
-    constexpr std::array<const char*, 32> names{
+    constexpr std::array<const char*, 34> names{
         "--output", "--paf-mode", "--gfa-version", "--gfa-profile", "--chunk_size", "--root", "--ref",
         "--overlap_size", "--min_anchor_length", "--max_anchor_frequency",
         "--search-mode", "--accurate-skip-threshold", "--allow-mem",
@@ -863,7 +872,8 @@ RestartOverrides captureRestartOverrides(const CLI::App& app,
         "--repair-breaks", "--break-span", "--merge-short-blocks",
         "--slow-build", "--sampling-interval", "--sa-sampling-rate",
         "--min-span", "--threads",
-        "--log-level", "--verbose", "--near-distance", "--far-distance"
+        "--log-level", "--verbose", "--near-distance", "--far-distance",
+        "--memory-limit", "--temp-dir"
     };
     for (const char* name : names) {
         if (app.count(name) != 0) overrides.specified.emplace(name);
@@ -919,6 +929,10 @@ void applyRestartOverrides(CommonArgs& args,
     if (overrides.has("--far-distance"))
         args.far_distance = value.far_distance;
     if (overrides.has("--threads")) args.thread_num = value.thread_num;
+    if (overrides.has("--memory-limit"))
+        args.memory_limit = value.memory_limit;
+    if (overrides.has("--temp-dir"))
+        args.temp_dir_path = value.temp_dir_path;
     if (overrides.has("--log-level")) args.log_level = value.log_level;
     if (overrides.has("--verbose")) {
         args.verbose = true;
@@ -1190,6 +1204,14 @@ inline void printRunConfiguration(const CommonArgs& args) {
     // Performance section
     spdlog::info("Performance:");
     spdlog::info("  Thread count          : {}", args.thread_num);
+    spdlog::info("  Byte SIMD kernel      : {}",
+        RaMAxSimd::byteKernelName(RaMAxSimd::selectedByteKernel()));
+    spdlog::info("  KSW2 kernel           : {}", ramax_ksw_selected_kernel());
+    spdlog::info("  Memory limit          : {}", args.memory_limit);
+    spdlog::info("  Temporary directory   : {}",
+        args.temp_dir_path.empty()
+            ? (args.work_dir_path / "perf-spill").string()
+            : args.temp_dir_path.string());
     spdlog::info("  Restart mode          : {}", args.restart ? "Enabled" : "Disabled");
 
 
@@ -1526,6 +1548,19 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
             std::numeric_limits<int>::max()))
         ->type_name("<int>")
         ->transform(trim_whitespace);
+
+    cmd->add_option("--memory-limit", args.memory_limit,
+        "Runtime memory budget: auto or a positive integer with KiB/MiB/GiB/TiB suffix (default: auto).")
+        ->default_val("auto")
+        ->capture_default_str()
+        ->group("Performance")
+        ->type_name("<auto|size>")
+        ->transform(trim_whitespace);
+
+    cmd->add_option("--temp-dir", args.temp_dir_path,
+        "Directory for bounded mmap and lossless spill files (default: <work-dir>/perf-spill).")
+        ->group("Performance")
+        ->type_name("<path>");
 
     // 复用预处理和锚点索引缓存；比对与构图始终重新开始
     auto* restart_flag = cmd->add_flag("--restart", args.restart,
@@ -2594,6 +2629,20 @@ int main(int argc, char** argv) {
 
     // 运行前准备：根据 restart 与否进行目录/参数/配置文件处理
     if (prepareRun(common_args, app, restart_overrides) != 0) {
+        return 1;
+    }
+
+    try {
+        auto& resources =
+            RaMAxResources::RuntimeResourceManager::instance();
+        resources.configure(RaMAxResources::RuntimeResourceConfig{
+            common_args.memory_limit,
+            common_args.temp_dir_path,
+            common_args.work_dir_path,
+            static_cast<size_t>(common_args.thread_num)});
+        resources.logConfiguration();
+    } catch (const std::exception& error) {
+        spdlog::critical("Resource configuration failed: {}", error.what());
         return 1;
     }
 

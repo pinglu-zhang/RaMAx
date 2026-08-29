@@ -119,8 +119,8 @@ unsupported schema version is rejected.
 Restart also rejects a changed seqfile, species mapping, or local FASTA
 size/mtime. Use a new work directory when changing input data. A damaged cache
 artifact is different: RaMAx rebuilds only the affected raw, clean, or
-softmask artifact. The suffix-array index is memory-only and is rebuilt on
-every process start.
+softmask artifact. The suffix-array index is process-local and is rebuilt on
+every process start; temporary Linux mmap backing is not a reusable cache.
 
 ## A wfmash pair times out
 

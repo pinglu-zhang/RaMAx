@@ -56,8 +56,8 @@ FilePath PairRareAligner::buildIndex(const std::string prefix,
 
     ref_index.emplace(prefix, ref_fasta_manager_, sa_sampling_rate);
     spdlog::info(
-        "Suffix-array indexing with prefix: {}, storage: memory-only, "
-        "disk-cache: disabled, sampling rate: {}",
+        "Suffix-array indexing with prefix: {}, storage: process-local, "
+        "persistent-cache: disabled, sampling rate: {}",
         prefix, sa_sampling_rate);
     if (!ref_index->buildIndex({}, fast_build, thread_num)) {
         throw std::runtime_error(
@@ -65,9 +65,11 @@ FilePath PairRareAligner::buildIndex(const std::string prefix,
     }
     ++index_cache_counters->memory_only_built;
     spdlog::info(
-        "Suffix-array indexing finished in memory for {} (K={}, rows={}, "
-        "disk-bytes=0)",
-        prefix, ref_index->samplingRate(), ref_index->storedSuffixCount());
+        "Suffix-array indexing finished for {} (K={}, rows={}, storage={}, "
+        "array-bytes={}, persistent-bytes=0)",
+        prefix, ref_index->samplingRate(), ref_index->storedSuffixCount(),
+        ref_index->fileBacked() ? "file-mapped" : "heap",
+        ref_index->arrayStorageBytes());
     return logical_index_path;
 }
 
@@ -131,10 +133,11 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 		tasks.push_back({ck, Strand::REVERSE});
 	}
 
-	std::vector<MatchVec2DPtr> task_results(tasks.size());
+	std::vector<std::optional<MatchVec2D>> task_results(tasks.size());
 	std::atomic<size_t> completed_tasks{0};
 	size_t next_progress = 1; // 1~20
 	std::exception_ptr task_exception = nullptr;
+	size_t task_exception_index = std::numeric_limits<size_t>::max();
 	std::mutex task_exception_mutex;
 
 	MatchVec3DPtr result = std::make_shared<MatchVec3D>();
@@ -160,12 +163,12 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 			}, query_fasta_manager);
 
 			if (seq.length() < ck.length) {
-				task_results[static_cast<size_t>(task_idx)] = std::make_shared<MatchVec2D>();
+				task_results[static_cast<size_t>(task_idx)].emplace();
 			} else {
 				const SearchMode task_search_mode =
 					(task.strand == Strand::FORWARD) ? search_mode : ACCURATE_SEARCH;
-				task_results[static_cast<size_t>(task_idx)] = ref_index->findAnchors(
-					ck.chr_index, seq, task_search_mode,
+				auto anchors = ref_index->findAnchors(
+					ck.chr_index, std::move(seq), task_search_mode,
 					task.strand,
 					allow_MEM,
 					ck.start,
@@ -175,10 +178,14 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 					ref_global_cache,
 					sampling_interval,
 					accurate_skip_threshold);
+				task_results[static_cast<size_t>(task_idx)].emplace(
+					anchors ? std::move(*anchors) : MatchVec2D{});
 			}
 		} catch (...) {
 			std::lock_guard<std::mutex> lock(task_exception_mutex);
-			if (!task_exception) {
+			const size_t failed_index = static_cast<size_t>(task_idx);
+			if (failed_index < task_exception_index) {
+				task_exception_index = failed_index;
 				task_exception = std::current_exception();
 			}
 		}
@@ -201,10 +208,7 @@ MatchVec3DPtr PairRareAligner::findQueryFileAnchor(
 
 	result->reserve(task_results.size());
 	for (auto& part : task_results) {
-		if (!part) {
-			part = std::make_shared<MatchVec2D>();
-		}
-		result->emplace_back(std::move(*part));
+		result->emplace_back(part ? std::move(*part) : MatchVec2D{});
 	}
 
 
@@ -290,8 +294,6 @@ PairRareAligner::prepareQueryFileAnchor(
     }
     plan->task_results.resize(
         plan->tasks.size());
-    plan->task_errors.resize(
-        plan->tasks.size());
     return plan;
 }
 
@@ -345,9 +347,7 @@ executePreparedAnchorTask(
 
         if (sequence.length() <
             chunk.length) {
-            plan.task_results[task_index] =
-                std::make_shared<
-                    MatchVec2D>();
+            plan.task_results[task_index].emplace();
             return;
         }
         const SearchMode task_search_mode =
@@ -355,10 +355,9 @@ executePreparedAnchorTask(
                     Strand::FORWARD
                 ? plan.search_mode
                 : ACCURATE_SEARCH;
-        plan.task_results[task_index] =
-            ref_index->findAnchors(
+        auto anchors = ref_index->findAnchors(
                 chunk.chr_index,
-                sequence,
+                std::move(sequence),
                 task_search_mode,
                 task.strand,
                 plan.allow_mem,
@@ -368,21 +367,22 @@ executePreparedAnchorTask(
                 max_anchor_frequency,
                 *plan.ref_global_cache,
                 plan.sampling_interval);
+        plan.task_results[task_index].emplace(
+            anchors ? std::move(*anchors) : MatchVec2D{});
     } catch (...) {
-        plan.task_errors[task_index] =
-            std::current_exception();
+        std::lock_guard<std::mutex> lock(plan.failure_mutex);
+        if (task_index < plan.first_failure_index) {
+            plan.first_failure_index = task_index;
+            plan.first_failure = std::current_exception();
+        }
     }
 }
 
 MatchVec3DPtr PairRareAligner::
 collectPreparedAnchorSearch(
     PreparedAnchorSearch& plan) {
-    for (const auto& error :
-         plan.task_errors) {
-        if (error) {
-            std::rethrow_exception(
-                error);
-        }
+    if (plan.first_failure) {
+        std::rethrow_exception(plan.first_failure);
     }
     auto result =
         std::make_shared<MatchVec3D>();
@@ -390,13 +390,9 @@ collectPreparedAnchorSearch(
         plan.task_results.size());
     for (auto& task_result :
          plan.task_results) {
-        if (!task_result) {
-            task_result =
-                std::make_shared<
-                    MatchVec2D>();
-        }
-        result->emplace_back(
-            std::move(*task_result));
+        result->emplace_back(task_result
+            ? std::move(*task_result)
+            : MatchVec2D{});
     }
     return result;
 }

@@ -8,6 +8,8 @@
 #include "anchor.h"
 #include "rare_aligner.h"
 #include "ramesh.h"
+#include "runtime_resources.h"
+#include "sequence_utils.h"
 #include "../src/graph/merge_internal.h"
 
 #include <algorithm>
@@ -28,7 +30,7 @@ namespace {
 std::filesystem::path makeTestDirectory() {
     const auto stamp = std::chrono::steady_clock::now()
         .time_since_epoch().count();
-    auto path = std::filesystem::temp_directory_path() /
+    auto path = std::filesystem::current_path() /
         ("ramax-core-performance-" + std::to_string(stamp));
     std::filesystem::create_directories(path);
     return path;
@@ -1240,10 +1242,142 @@ void testBatchInsertion(const std::filesystem::path& directory) {
               << " ms, batch=" << batch_ms << " ms)\n";
 }
 
+std::map<SpeciesName, SeqPro::SharedManagerVariant> makeSharedManagers(
+    const std::map<SpeciesName, std::filesystem::path>& paths) {
+    std::map<SpeciesName, SeqPro::SharedManagerVariant> managers;
+    for (const auto& [species, path] : paths) {
+        managers.emplace(
+            species,
+            std::make_shared<SeqPro::ManagerVariant>(
+                std::make_unique<SeqPro::SequenceManager>(path)));
+    }
+    return managers;
+}
+
+std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>
+makeRoundManagers(
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers) {
+    std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant> result;
+    // Match the production insertion sequence, while deliberately using names
+    // whose unordered iteration order is not lexical.
+    result.emplace("query-z", managers.at("query-z"));
+    result.emplace("reference", managers.at("reference"));
+    result.emplace("query-a", managers.at("query-a"));
+    result.emplace("query-y", managers.at("query-y"));
+    result.emplace("query-b", managers.at("query-b"));
+    result.emplace("query-c", managers.at("query-c"));
+    return result;
+}
+
+void testBoundedPipelineEquivalence(
+    const std::filesystem::path& directory, bool allow_mem = false) {
+    std::mt19937 generator(0x91a5c3u);
+    std::string reference(50000, 'A');
+    constexpr std::string_view alphabet = "ACGT";
+    for (char& base : reference) base = alphabet[generator() % 4];
+    std::string query_a = reference;
+    std::string query_b = reference;
+    std::string query_c = reference;
+    std::string query_y = reference;
+    std::string query_z = reference;
+    for (size_t index = 503; index < query_a.size(); index += 997) {
+        query_a[index] = alphabet[(query_a[index] - 'A' + 1) & 3U];
+    }
+    for (size_t index = 719; index < query_z.size(); index += 1237) {
+        query_z[index] = alphabet[(generator() + 1) % 4];
+    }
+    for (size_t index = 887; index < query_b.size(); index += 1429) {
+        query_b[index] = alphabet[(generator() + 2) % 4];
+    }
+    for (size_t index = 991; index < query_c.size(); index += 1601) {
+        query_c[index] = alphabet[(generator() + 3) % 4];
+    }
+    for (size_t index = 1093; index < query_y.size(); index += 1741) {
+        query_y[index] = alphabet[generator() % 4];
+    }
+
+    const std::map<SpeciesName, std::filesystem::path> paths{
+        {"reference", directory / "bounded-ref.fa"},
+        {"query-a", directory / "bounded-query-a.fa"},
+        {"query-b", directory / "bounded-query-b.fa"},
+        {"query-c", directory / "bounded-query-c.fa"},
+        {"query-y", directory / "bounded-query-y.fa"},
+        {"query-z", directory / "bounded-query-z.fa"}};
+    writeFile(paths.at("reference"), ">chr1\n" + reference + "\n");
+    writeFile(paths.at("query-a"), ">chr1\n" + query_a + "\n");
+    writeFile(paths.at("query-b"), ">chr1\n" + query_b + "\n");
+    writeFile(paths.at("query-c"), ">chr1\n" + query_c + "\n");
+    writeFile(paths.at("query-y"), ">chr1\n" + query_y + "\n");
+    writeFile(paths.at("query-z"), ">chr1\n" + query_z + "\n");
+
+    auto legacy_managers = makeSharedManagers(paths);
+    auto bounded_managers = makeSharedManagers(paths);
+    auto legacy_round = makeRoundManagers(legacy_managers);
+    auto bounded_round = makeRoundManagers(bounded_managers);
+    SpeciesPathMap species_paths;
+    for (const auto& [species, path] : paths) species_paths[species] = path;
+    MultipleRareAligner legacy(
+        directory / "legacy-pipeline", species_paths, 4,
+        10000, 0, 20, 50, 10000, false);
+    MultipleRareAligner bounded(
+        directory / "bounded-pipeline", species_paths, 4,
+        10000, 0, 20, 50, 10000, false);
+    legacy.allow_mem = allow_mem;
+    bounded.allow_mem = allow_mem;
+    RaMesh::RaMeshMultiGenomeGraph legacy_graph(legacy_managers);
+    RaMesh::RaMeshMultiGenomeGraph bounded_graph(bounded_managers);
+    sdsl::int_vector<0> legacy_cache;
+    sdsl::int_vector<0> bounded_cache;
+    SequenceUtils::buildRefGlobalCache(
+        legacy_managers.at("reference"), 32, legacy_cache);
+    SequenceUtils::buildRefGlobalCache(
+        bounded_managers.at("reference"), 32, bounded_cache);
+
+    auto matches = legacy.alignMultipleGenome(
+        "reference", legacy_round, ACCURATE_SEARCH, true, allow_mem, true,
+        legacy_cache, 32);
+    auto clusters = legacy.filterMultipeSpeciesAnchors(
+        "reference", legacy_round, matches, 65);
+    legacy.constructMultipleGraphsByDp(
+        legacy_managers, "reference", *clusters, legacy_graph, 65, true);
+
+    RaMAxResources::RuntimeResourceManager::instance().configure(
+        RaMAxResources::RuntimeResourceConfig{
+            "auto", directory / "bounded-spill",
+            directory / "bounded-work", 4});
+    bounded.alignClusterConstructBounded(
+        "reference", bounded_round, bounded_managers,
+        ACCURATE_SEARCH, true, allow_mem, true, bounded_cache, 32, 65, true,
+        bounded_graph);
+
+    if (allow_mem) {
+        assert(legacy_graph.materializeSecondaryAlignments() ==
+               bounded_graph.materializeSecondaryAlignments());
+    }
+
+    assert(graphBlockState(legacy_graph) == graphBlockState(bounded_graph));
+    for (const auto& species : {
+             "reference", "query-a", "query-b", "query-c", "query-y",
+             "query-z"}) {
+        assert(graphChromosomeState(legacy_graph, species, "chr1") ==
+               graphChromosomeState(bounded_graph, species, "chr1"));
+    }
+}
+
 }  // namespace
 
 int main() {
     const auto directory = makeTestDirectory();
+    if (std::getenv("RAMAX_RUN_BOUNDED_PIPELINE_ONLY")) {
+        testBoundedPipelineEquivalence(directory);
+        std::filesystem::remove_all(directory);
+        return 0;
+    }
+    if (std::getenv("RAMAX_RUN_BOUNDED_MEM_PIPELINE_ONLY")) {
+        testBoundedPipelineEquivalence(directory, true);
+        std::filesystem::remove_all(directory);
+        return 0;
+    }
     if (std::getenv("RAMAX_RUN_MERGE_STRESS_ONLY")) {
         testMergeRetirementStress(directory);
         std::filesystem::remove_all(directory);

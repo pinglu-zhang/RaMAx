@@ -2711,9 +2711,10 @@ void RaMeshMultiGenomeGraph::verifyThreadSafety(
     spdlog::debug("Verifying thread safety...");
   }
 
-  size_t total_atomic_operations = 0;
+  size_t total_path_link_checks = 0;
 
-  // 检查原子操作的一致性（静态检查）
+  // Graph publication is stage-serialized; verify path links while holding the
+  // containing species graph's read lock.
   for (const auto &[species_name, genome_graph] : species_graphs) {
     std::shared_lock species_lock(genome_graph.rw);
 
@@ -2724,16 +2725,12 @@ void RaMeshMultiGenomeGraph::verifyThreadSafety(
 
       SegPtr current = genome_end.head;
       while (current) {
-        // 检查原子指针的内存序
         SegPtr next_ptr =
             current->primary_path.next.load(std::memory_order_acquire);
         SegPtr prev_ptr =
             current->primary_path.prev.load(std::memory_order_acquire);
 
-        total_atomic_operations += 2;
-
-        // 这里只能做基本的静态检查
-        // 动态竞争条件需要专门的工具检测
+        total_path_link_checks += 2;
 
         current = next_ptr;
       }
@@ -2742,17 +2739,17 @@ void RaMeshMultiGenomeGraph::verifyThreadSafety(
 
   if (options.verbose) {
     spdlog::debug(
-        "Thread safety check completed: {} atomic operations verified",
-        total_atomic_operations);
+        "Thread safety check completed: {} path links verified",
+        total_path_link_checks);
   }
 
   // 添加一般性的线程安全信息
   addVerificationError(result, options, VerificationType::THREAD_SAFETY,
                        ErrorSeverity::INFO, "", "", 0, 0,
-                       "Static thread safety check completed",
-                       "All accesses are properly protected by locks, " +
-                           std::to_string(total_atomic_operations) +
-                           " atomic operations verified");
+                       "Static stage-ownership check completed",
+                       "Graph mutation is serialized by stage ownership; " +
+                           std::to_string(total_path_link_checks) +
+                           " path links verified");
 }
 
 void RaMeshMultiGenomeGraph::verifyPerformanceIssues(
@@ -2828,20 +2825,14 @@ void RaMeshMultiGenomeGraph::verifyPerformanceIssues(
   }
 }
 
-// Safe path-linking implementation.
+// Safe path-linking implementation. Graph mutation stages are serialized, so
+// publishing both directions does not require per-link atomics.
 void RaMeshMultiGenomeGraph::safeLink(SegPtr prev, SegPtr next) {
   if (!prev || !next)
     return;
 
-  /* 1) 先写 next->prev  */
   next->primary_path.prev.store(prev, std::memory_order_relaxed);
-
-  /* 2) 再 CAS prev->next  (确保无并发竞争) */
-  SegPtr exp = next->primary_path.next.load(std::memory_order_acquire); // 旧值
   prev->primary_path.next.store(next, std::memory_order_release);
-
-  /* 3) 发布内存屏障，保证两侧对所有线程可见 */
-  std::atomic_thread_fence(std::memory_order_release);
 }
 
 /* =============================================================

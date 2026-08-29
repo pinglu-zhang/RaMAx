@@ -15,7 +15,9 @@
 
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
+#include "match_spill.h"
 #include "process_memory.h"
+#include "runtime_resources.h"
 #include "SeqPro.h"  // 包含 SeqPro 相关定义
 #include "ramesh.h"  // 包含 RaMesh 图结构定义
 
@@ -38,9 +40,14 @@ namespace {
         }
         spdlog::info(
             "[stage-memory] stage={} event={} rss_kib={} peak_rss_kib={} "
-            "virtual_kib={} cgroup_limit_bytes={} items={} auxiliary={}",
+            "virtual_kib={} physical_bytes={} cgroup_current_bytes={} "
+            "cgroup_peak_bytes={} cgroup_limit_bytes={} "
+            "cgroup_swap_current_bytes={} items={} auxiliary={}",
             stage, event, memory.rss_kib, memory.peak_rss_kib,
-            memory.virtual_kib, memory.cgroup_limit_bytes, items, auxiliary);
+            memory.virtual_kib, memory.physical_memory_bytes,
+            memory.cgroup_current_bytes, memory.cgroup_peak_bytes,
+            memory.cgroup_limit_bytes, memory.cgroup_swap_current_bytes,
+            items, auxiliary);
     }
     struct OpenMPStageActivity {
         std::atomic<size_t> active{0};
@@ -134,6 +141,108 @@ namespace {
         if (first_failure) {
             std::rethrow_exception(first_failure);
         }
+    }
+
+    struct SpeciesAnchorSearchResult {
+        SpeciesName species;
+        MatchVec3DPtr primary;
+        MatchVec3DPtr secondary;
+        bool succeeded = false;
+    };
+
+    std::vector<SpeciesAnchorSearchResult> executeSpeciesAnchorSearchBatch(
+        PairRareAligner& aligner,
+        const std::vector<SpeciesName>& species,
+        std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+        SearchMode search_mode,
+        bool allow_mem,
+        bool allow_short_mum,
+        sdsl::int_vector<0>& ref_global_cache,
+        SeqPro::Length sampling_interval,
+        uint_t thread_num) {
+        struct SpeciesSearchPlans {
+            std::shared_ptr<PreparedAnchorSearch> primary;
+            std::shared_ptr<PreparedAnchorSearch> repeat_masked;
+            std::shared_ptr<PreparedAnchorSearch> repeat_full;
+        };
+        struct WorkItem {
+            PreparedAnchorSearch* plan = nullptr;
+            size_t task_index = 0;
+        };
+
+        std::vector<SpeciesSearchPlans> plans(species.size());
+        std::vector<WorkItem> work_items;
+        const auto appendPlan = [&](const auto& plan) {
+            for (size_t task_index = 0; task_index < plan->tasks.size();
+                 ++task_index) {
+                work_items.push_back({plan.get(), task_index});
+            }
+        };
+        for (size_t species_index = 0; species_index < species.size();
+             ++species_index) {
+            auto& manager = managers.at(species[species_index]);
+            auto& current = plans[species_index];
+            current.primary = aligner.prepareQueryFileAnchor(
+                *manager, search_mode, false, allow_short_mum,
+                ref_global_cache, sampling_interval, true, false);
+            appendPlan(current.primary);
+            if (allow_mem) {
+                current.repeat_masked = aligner.prepareQueryFileAnchor(
+                    *manager, search_mode, true, allow_short_mum,
+                    ref_global_cache, sampling_interval, true, false);
+                current.repeat_full = aligner.prepareQueryFileAnchor(
+                    *manager, search_mode, true, allow_short_mum,
+                    ref_global_cache, sampling_interval, true, true);
+                appendPlan(current.repeat_masked);
+                appendPlan(current.repeat_full);
+            }
+        }
+
+        OpenMPStageActivity activity;
+        const auto start = std::chrono::steady_clock::now();
+        executeParallelStage(
+            work_items.size(), thread_num, activity,
+            [&](size_t work_index) {
+                const auto& item = work_items[work_index];
+                aligner.executePreparedAnchorTask(*item.plan, item.task_index);
+            });
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        spdlog::info(
+            "[parallel-stage] anchor-search-batch: species={} tasks={} "
+            "threads={} max_active={} elapsed_ms={:.3f}",
+            species.size(), work_items.size(),
+            stageWorkerCount(thread_num, work_items.size()),
+            activity.maximum.load(std::memory_order_relaxed), elapsed_ms);
+
+        std::vector<SpeciesAnchorSearchResult> results(species.size());
+        for (size_t species_index = 0; species_index < species.size();
+             ++species_index) {
+            auto& result = results[species_index];
+            result.species = species[species_index];
+            auto& current = plans[species_index];
+            try {
+                result.primary =
+                    aligner.collectPreparedAnchorSearch(*current.primary);
+                if (allow_mem) {
+                    result.secondary = aligner.collectPreparedAnchorSearch(
+                        *current.repeat_masked);
+                    auto full = aligner.collectPreparedAnchorSearch(
+                        *current.repeat_full);
+                    result.secondary->insert(
+                        result.secondary->end(),
+                        std::make_move_iterator(full->begin()),
+                        std::make_move_iterator(full->end()));
+                }
+                result.succeeded = true;
+                spdlog::info("[alignMultipleQuerys] {} aligned.",
+                             result.species);
+            } catch (const std::exception& error) {
+                spdlog::error("[alignMultipleQuerys] {} failed: {}",
+                              result.species, error.what());
+            }
+        }
+        return results;
     }
 
 
@@ -358,12 +467,14 @@ void addAlignedRegionsAsMask(
     spdlog::info("[addAlignedRegionsAsMask] Extracting aligned regions as mask intervals from {} blocks", 
                  graph.blocks.size());
     #endif
-    // 按物种和染色体分组收集区间
-    std::unordered_map<SpeciesName, std::unordered_map<ChrName, std::vector<SeqPro::MaskInterval>>> 
+    using ChromosomeJournal =
+        std::unordered_map<ChrName, std::vector<RaMesh::Segment*>>;
+    std::unordered_map<SpeciesName, ChromosomeJournal>
         species_chr_intervals;
     
     size_t total_intervals = 0;
     size_t valid_blocks = 0;
+    size_t unchanged_intervals = 0;
     
     // 遍历所有 blocks，提取 segment 区间
     for (const auto& weak_block : graph.blocks) {
@@ -387,9 +498,19 @@ void addAlignedRegionsAsMask(
                 continue;
             }
             
-            // 创建遮蔽区间（使用原始坐标）
-            SeqPro::MaskInterval interval(segment->start, segment->start + segment->length);
-            species_chr_intervals[species_name][chr_name].push_back(interval);
+            const uint64_t snapshot =
+                (static_cast<uint64_t>(segment->start) << 32U) |
+                static_cast<uint64_t>(segment->length);
+            if (segment->mask_journal_snapshot == snapshot) {
+                ++unchanged_intervals;
+                continue;
+            }
+
+            // Segment coordinates already use the graph's original coordinate
+            // system. Keep each operation boundary and publication order
+            // unchanged; only exact duplicate intervals are omitted.
+            species_chr_intervals[species_name][chr_name].push_back(
+                segment.get());
             total_intervals++;
         }
     }
@@ -404,10 +525,9 @@ void addAlignedRegionsAsMask(
             auto* masked_manager = ensureMaskedManager(seqpro_managers[species_name]);
             
             size_t species_total_intervals = 0;
-            
             // 按染色体处理区间
-            for (auto& [chr_name, intervals] : chr_intervals) {
-                if (intervals.empty()) continue;
+            for (auto& [chr_name, journal] : chr_intervals) {
+                if (journal.empty()) continue;
                 
                 // 构造序列名（假设格式为染色体名）
                 std::string seq_name = chr_name;
@@ -420,8 +540,14 @@ void addAlignedRegionsAsMask(
                 }
                 
                 // 批量添加区间（segment中的坐标是遮蔽后的坐标，需要转换为原始坐标）
+                std::vector<SeqPro::MaskInterval> intervals;
+                intervals.reserve(journal.size());
+                for (const RaMesh::Segment* segment : journal) {
+                    intervals.emplace_back(
+                        segment->start, segment->start + segment->length);
+                }
                 masked_manager->addMaskIntervals(seq_name, intervals);
-                species_total_intervals += intervals.size();
+                species_total_intervals += journal.size();
                 #ifdef _DEBUG_
                 spdlog::debug("[addAlignedRegionsAsMask] Added {} intervals for {}:{}", 
                              intervals.size(), species_name, seq_name);
@@ -430,6 +556,14 @@ void addAlignedRegionsAsMask(
             
             // 定案该物种的所有遮蔽区间
             masked_manager->finalizeMaskIntervals();
+            for (auto& [unused_chr_name, journal] : chr_intervals) {
+                (void)unused_chr_name;
+                for (RaMesh::Segment* segment : journal) {
+                    segment->mask_journal_snapshot =
+                        (static_cast<uint64_t>(segment->start) << 32U) |
+                        static_cast<uint64_t>(segment->length);
+                }
+            }
             
             spdlog::info("[addAlignedRegionsAsMask] Successfully added {} mask intervals for species {}", 
                         species_total_intervals, species_name);
@@ -440,7 +574,11 @@ void addAlignedRegionsAsMask(
         }
     }
     
-    spdlog::info("[addAlignedRegionsAsMask] Mask interval addition completed for all species");
+    spdlog::info(
+        "[mask-journal] reference={} scanned_blocks={} appended={} "
+        "unchanged_skipped={} touched_species={}",
+        ref_name, valid_blocks, total_intervals, unchanged_intervals,
+        species_chr_intervals.size());
 }
 
 MultipleRareAligner::MultipleRareAligner(
@@ -793,46 +931,14 @@ starAlignment(
         if (legacy_query_count > 0) {
             logStageMemory(
                 "anchor-search", "start", legacy_query_count);
-            SpeciesMatchVec3DPtrMapPtr match_ptr = alignMultipleGenome(
-                current_ref_name,
-                species_fasta_manager_map,
-                ACCURATE_SEARCH,
-                fast_build,
-                allow_mem,
-                allow_short_mum,
-                ref_global_cache,
-                sampling_interval
-            );
+            alignClusterConstructBounded(
+                current_ref_name, species_fasta_manager_map,
+                seqpro_managers, ACCURATE_SEARCH, fast_build,
+                allow_mem, allow_short_mum, ref_global_cache,
+                sampling_interval, min_span, i == 0, *multi_graph);
             logStageMemory(
-                "anchor-search", "complete", match_ptr ? match_ptr->size() : 0);
-
-            spdlog::info("align multiple genome for {} done", current_ref_name);
-
-            // --------------------------------------------------------
-            // 7-4) 过滤 anchors：对多个物种的 anchors 聚簇/筛选，得到 cluster_map
-            // --------------------------------------------------------
-            spdlog::info("filter multiple species anchors for {}", current_ref_name);
-            SpeciesClusterMapPtr cluster_map = filterMultipeSpeciesAnchors(
-                current_ref_name,
-                species_fasta_manager_map,
-                match_ptr,
-                min_span
-            );
-            spdlog::info("filter multiple species anchors for {} done", current_ref_name);
-
-            // --------------------------------------------------------
-            // 7-5) 构建多基因组图：DP 方式构图（i==0 作为 is_first）
-            // --------------------------------------------------------
-            spdlog::info("construct multiple genome graphs for {}", current_ref_name);
-
-            constructMultipleGraphsByDp(
-                seqpro_managers,
-                current_ref_name,
-                *cluster_map,
-                *multi_graph,
-                min_span,
-                i == 0
-            );
+                "anchor-search", "complete", legacy_query_count);
+            spdlog::info("align/filter/construct for {} done", current_ref_name);
         } else {
             if (i == 0) {
                 spdlog::info(
@@ -994,8 +1100,8 @@ starAlignment(
     }
 
     spdlog::info(
-        "[cache-summary] suffix-array storage=memory-only built={} "
-        "disk-reused=0 disk-bytes=0",
+        "[cache-summary] suffix-array storage=process-local built={} "
+        "persistent-reused=0 persistent-bytes=0",
         index_cache_counters->memory_only_built.load());
 
     // 所有轮次完成后，flush logger
@@ -1248,6 +1354,223 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     return result_map;
 }
 
+void MultipleRareAligner::alignClusterConstructBounded(
+    const SpeciesName& ref_name,
+    std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>&
+        species_fasta_manager_map,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    SearchMode search_mode,
+    bool fast_build,
+    bool allow_MEM,
+    bool allow_short_mum,
+    sdsl::int_vector<0>& ref_global_cache,
+    SeqPro::Length sampling_interval,
+    uint_t min_span,
+    bool is_first,
+    RaMesh::RaMeshMultiGenomeGraph& graph) {
+    if (!species_fasta_manager_map.contains(ref_name)) {
+        throw std::runtime_error(
+            "[alignMultipleQuerys] reference species not found: " + ref_name);
+    }
+    validateReferenceSequenceCount(
+        ref_name, species_fasta_manager_map.at(ref_name));
+
+    std::vector<SpeciesName> query_species;
+    query_species.reserve(species_fasta_manager_map.size());
+    for (const auto& [species, unused] : species_fasta_manager_map) {
+        (void)unused;
+        if (species != ref_name) query_species.push_back(species);
+    }
+    if (query_species.empty()) return;
+
+    const uint64_t search_round = round_id;
+    const FilePath result_dir = work_dir / RESULT_DIR /
+        ("group_" + std::to_string(group_id)) /
+        ("round_" + std::to_string(round_id));
+    std::filesystem::create_directories(result_dir);
+    ++round_id;
+
+    auto& resources = RaMAxResources::RuntimeResourceManager::instance();
+    RaMAxSpill::MatchSpillStore spill_store(resources.tempDirectory());
+    struct SearchRecord {
+        SpeciesName species;
+        size_t ordinal = 0;
+        bool succeeded = false;
+        MatchVec3DPtr primary;
+        MatchVec3DPtr secondary;
+        std::filesystem::path primary_spill;
+        std::filesystem::path secondary_spill;
+    };
+    std::vector<SearchRecord> records(query_species.size());
+
+    uint64_t maximum_query_length = 0;
+    for (const auto& species : query_species) {
+        const uint64_t length = std::visit(
+            [](const auto& manager) -> uint64_t {
+                return manager ? manager->getTotalLength() : 0;
+            },
+            *species_fasta_manager_map.at(species));
+        maximum_query_length = std::max(maximum_query_length, length);
+    }
+    uint64_t estimated_per_species = std::max<uint64_t>(
+        64ULL * 1024ULL * 1024ULL,
+        maximum_query_length > std::numeric_limits<uint64_t>::max() / 2ULL
+            ? std::numeric_limits<uint64_t>::max()
+            : maximum_query_length * 2ULL);
+    if (allow_MEM) {
+        estimated_per_species = estimated_per_species >
+                std::numeric_limits<uint64_t>::max() / 3ULL
+            ? std::numeric_limits<uint64_t>::max()
+            : estimated_per_species * 3ULL;
+    }
+    size_t batch_size = resources.boundedConcurrency(
+        query_species.size(), estimated_per_species);
+    // A small cap bounds under-estimation for repeat-rich data while a human
+    // chromosome still exposes enough chunk/strand tasks to occupy the team.
+    batch_size = std::max<size_t>(1, std::min<size_t>(batch_size, 4));
+    const bool spill_all = query_species.size() > batch_size;
+    spdlog::info(
+        "[bounded-pipeline] reference={} queries={} batch_size={} "
+        "estimated_bytes_per_species={} spill_all={}",
+        ref_name, query_species.size(), batch_size, estimated_per_species,
+        spill_all);
+
+    {
+        PairRareAligner aligner(*this);
+        aligner.buildIndex(
+            ref_name, *species_fasta_manager_map.at(ref_name), fast_build);
+        resources.logSnapshot("suffix-array-index", "ready");
+
+        for (size_t begin = 0; begin < query_species.size();
+             begin += batch_size) {
+            if (resources.pressure() >=
+                RaMAxResources::MemoryPressure::CRITICAL) {
+                resources.requireAllocation(
+                    estimated_per_species, "anchor-search-batch");
+            }
+            const size_t end = std::min(query_species.size(), begin + batch_size);
+            std::vector<SpeciesName> batch(
+                query_species.begin() + static_cast<std::ptrdiff_t>(begin),
+                query_species.begin() + static_cast<std::ptrdiff_t>(end));
+            auto batch_results = executeSpeciesAnchorSearchBatch(
+                aligner, batch, species_fasta_manager_map, search_mode,
+                allow_MEM, allow_short_mum, ref_global_cache,
+                sampling_interval, thread_num);
+            const bool spill_batch = spill_all || resources.shouldSpill();
+            for (size_t offset = 0; offset < batch_results.size(); ++offset) {
+                const size_t ordinal = begin + offset;
+                auto& source = batch_results[offset];
+                auto& record = records[ordinal];
+                record.species = source.species;
+                record.ordinal = ordinal;
+                record.succeeded = source.succeeded;
+                if (!source.succeeded) continue;
+                if (spill_batch) {
+                    const RaMAxSpill::MatchSpillIdentity identity{
+                        search_round, ordinal,
+                        RaMAxSpill::MatchSpillKind::PRIMARY,
+                        ref_name, source.species};
+                    record.primary_spill =
+                        spill_store.write(identity, *source.primary);
+                    source.primary.reset();
+                    if (allow_MEM) {
+                        const RaMAxSpill::MatchSpillIdentity secondary_identity{
+                            search_round, ordinal,
+                            RaMAxSpill::MatchSpillKind::SECONDARY_COMBINED,
+                            ref_name, source.species};
+                        record.secondary_spill = spill_store.write(
+                            secondary_identity, *source.secondary);
+                        source.secondary.reset();
+                    }
+                } else {
+                    record.primary = std::move(source.primary);
+                    if (allow_MEM) {
+                        record.secondary = std::move(source.secondary);
+                    }
+                }
+            }
+            resources.logSnapshot(
+                "anchor-search-batch", "complete", estimated_per_species);
+        }
+        // The complete SA/ISA/LCP and search-only task state are released at
+        // this scope boundary before clustering and graph materialization.
+    }
+    resources.logSnapshot("suffix-array-index", "released");
+
+    // Reconstruct the exact two unordered-map iteration orders used by the
+    // legacy all-species pipeline.  This preserves species graph commit and
+    // therefore Block ID/output order even though payloads are consumed one
+    // at a time.
+    SpeciesMatchVec3DPtrMap legacy_result_map;
+    for (const auto& record : records) {
+        if (record.succeeded) legacy_result_map[record.species] = nullptr;
+    }
+    std::vector<SpeciesName> legacy_filter_order;
+    legacy_filter_order.reserve(legacy_result_map.size());
+    for (const auto& [species, unused] : legacy_result_map) {
+        (void)unused;
+        legacy_filter_order.push_back(species);
+    }
+    SpeciesClusterMap legacy_cluster_map;
+    for (const auto& species : legacy_filter_order) {
+        legacy_cluster_map.emplace(species, nullptr);
+    }
+    std::vector<SpeciesName> legacy_commit_order;
+    legacy_commit_order.reserve(legacy_cluster_map.size());
+    for (const auto& [species, unused] : legacy_cluster_map) {
+        (void)unused;
+        legacy_commit_order.push_back(species);
+    }
+    std::unordered_map<SpeciesName, size_t> record_by_species;
+    record_by_species.reserve(records.size());
+    for (size_t index = 0; index < records.size(); ++index) {
+        record_by_species.emplace(records[index].species, index);
+    }
+
+    for (const auto& species : legacy_commit_order) {
+        auto& record = records.at(record_by_species.at(species));
+        MatchVec3DPtr primary = std::move(record.primary);
+        if (!record.primary_spill.empty()) {
+            primary = spill_store.read(
+                record.primary_spill,
+                RaMAxSpill::MatchSpillIdentity{
+                    search_round, record.ordinal,
+                    RaMAxSpill::MatchSpillKind::PRIMARY,
+                    ref_name, species});
+        }
+        MatchVec3DPtr secondary = std::move(record.secondary);
+        if (!record.secondary_spill.empty()) {
+            secondary = spill_store.read(
+                record.secondary_spill,
+                RaMAxSpill::MatchSpillIdentity{
+                    search_round, record.ordinal,
+                    RaMAxSpill::MatchSpillKind::SECONDARY_COMBINED,
+                    ref_name, species});
+        }
+        auto one_species = std::make_shared<SpeciesMatchVec3DPtrMap>();
+        (*one_species)[species] = std::move(primary);
+        secondary_match_map.clear();
+        if (allow_MEM) {
+            secondary_match_map.emplace(species, std::move(secondary));
+        }
+        SpeciesClusterMapPtr clusters = filterMultipeSpeciesAnchors(
+            ref_name, species_fasta_manager_map, one_species, min_span);
+        constructMultipleGraphsByDp(
+            seqpro_managers, ref_name, *clusters, graph, min_span, is_first);
+        if (!record.primary_spill.empty()) {
+            spill_store.consume(record.primary_spill);
+            record.primary_spill.clear();
+        }
+        if (!record.secondary_spill.empty()) {
+            spill_store.consume(record.secondary_spill);
+            record.secondary_spill.clear();
+        }
+        secondary_match_map.clear();
+        secondary_cluster_map.clear();
+        resources.logSnapshot("query-graph-commit", species);
+    }
+}
+
 
 // ------------------------------------------------------------
 // MultipleRareAligner::filterMultipeSpeciesAnchors
@@ -1488,7 +1811,7 @@ SpeciesClusterMapPtr MultipleRareAligner::filterMultipeSpeciesAnchors(
 // 3) 对每个物种：DP 过滤 anchors -> constructGraphByDP 构图
 // ------------------------------------------------------------
 void MultipleRareAligner::constructMultipleGraphsByDp(
-    std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     SpeciesName ref_name,
     const SpeciesClusterMap& species_cluster_map,
     RaMesh::RaMeshMultiGenomeGraph& graph,

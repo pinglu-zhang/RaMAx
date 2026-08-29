@@ -4,7 +4,9 @@
 #include <optional>
 #include <atomic>
 #include <exception>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "config.hpp"
@@ -17,6 +19,11 @@
 #include "cache_manifest.h"
 #include "mash_distance_estimator.h"
 #include "wfmash_router.h"
+
+void addAlignedRegionsAsMask(
+    const RaMesh::RaMeshMultiGenomeGraph& graph,
+    std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+    const SpeciesName& ref_name);
 
 struct IndexCacheCounters {
     std::atomic_size_t memory_only_built{0};
@@ -86,6 +93,20 @@ public:
 
     SpeciesMatchVec3DPtrMapPtr alignMultipleGenome(SpeciesName ref_name, std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& species_fasta_manager_map, SearchMode search_mode, bool fast_build, bool allow_MEM, bool allow_short_mum, sdsl::int_vector<0>& ref_global_cache, SeqPro::Length sampling_interval);
 
+    void alignClusterConstructBounded(
+        const SpeciesName& ref_name,
+        std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& species_fasta_manager_map,
+        const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
+        SearchMode search_mode,
+        bool fast_build,
+        bool allow_MEM,
+        bool allow_short_mum,
+        sdsl::int_vector<0>& ref_global_cache,
+        SeqPro::Length sampling_interval,
+        uint_t min_span,
+        bool is_first,
+        RaMesh::RaMeshMultiGenomeGraph& graph);
+
     SpeciesClusterMapPtr filterMultipeSpeciesAnchors(SpeciesName ref_name, std::unordered_map<SpeciesName, SeqPro::SharedManagerVariant>& species_fm_map, SpeciesMatchVec3DPtrMapPtr species_match_map, uint_t min_span);
 
     void constructMultipleGraphsByGreedy(std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers, SpeciesName ref_name, const SpeciesClusterMap& species_cluster_map, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
@@ -94,7 +115,7 @@ public:
 
     void constructMultipleGraphsByGreedyByRef(std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers, SpeciesName ref_name, const SpeciesClusterMap& species_cluster_map, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
 
-    void constructMultipleGraphsByDp(std::map<SpeciesName, SeqPro::SharedManagerVariant> seqpro_managers, SpeciesName ref_name, const SpeciesClusterMap& species_cluster_map, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span, bool is_first);
+    void constructMultipleGraphsByDp(const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers, SpeciesName ref_name, const SpeciesClusterMap& species_cluster_map, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span, bool is_first);
 
 private:
     // 辅助函数：处理基本区间
@@ -123,8 +144,13 @@ struct PreparedAnchorSearch {
         nullptr;
     SeqPro::Length sampling_interval = 32;
     std::vector<Task> tasks;
-    std::vector<MatchVec2DPtr> task_results;
-    std::vector<std::exception_ptr> task_errors;
+    // Each task owns exactly one value slot.  This avoids one shared_ptr
+    // control block and one exception_ptr slot per chunk/strand task while
+    // retaining the original task order for collection.
+    std::vector<std::optional<MatchVec2D>> task_results;
+    std::mutex failure_mutex;
+    std::exception_ptr first_failure;
+    size_t first_failure_index = std::numeric_limits<size_t>::max();
 };
 
 

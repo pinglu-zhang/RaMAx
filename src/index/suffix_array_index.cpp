@@ -1,4 +1,6 @@
 #include "suffix_array_index.h"
+#include "runtime_resources.h"
+#include "simd_bytes.h"
 #include "CaPS-SA/Suffix_Array.hpp"
 #include "parlay/parallel.h"
 
@@ -17,10 +19,6 @@
 
 #include <omp.h>
 
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
-
 extern "C" {
 #include "divsufsort.h"
 #include "divsufsort64.h"
@@ -31,50 +29,12 @@ namespace {
 // The SIMD comparison kernel and generalized suffix-link interval derivation
 // are adapted from sufkit (MIT). CaPS constructs the complete SA and LCP arrays
 // together; RaMAx keeps only the query/search adapter local.
-struct ByteComparison {
-    int order{0};
-    size_t lcp{0};
-};
+using ByteComparison = RaMAxSimd::ByteComparison;
 
 ByteComparison comparePatternBytes(const uint8_t* text, size_t text_size,
     const uint8_t* pattern, size_t pattern_size, size_t known_lcp = 0) {
-    size_t index = std::min(known_lcp, pattern_size);
-    const size_t scalar_end =
-        std::min(pattern_size, index + static_cast<size_t>(8));
-    while (index < scalar_end) {
-        if (index >= text_size) return {-1, index};
-        const uint8_t left = text[index];
-        const uint8_t right = pattern[index];
-        if (left != right) return {left < right ? -1 : 1, index};
-        ++index;
-    }
-
-#if defined(__SSE2__)
-    while (index + 16 <= pattern_size && index + 16 <= text_size) {
-        const auto left = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(text + index));
-        const auto right = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(pattern + index));
-        const auto equal = _mm_cmpeq_epi8(left, right);
-        const unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(equal));
-        if (mask != 0xFFFFU) {
-            const size_t mismatch = static_cast<size_t>(
-                __builtin_ctz(static_cast<unsigned>(~mask) & 0xFFFFU));
-            const size_t position = index + mismatch;
-            return {text[position] < pattern[position] ? -1 : 1, position};
-        }
-        index += 16;
-    }
-#endif
-
-    while (index < pattern_size) {
-        if (index >= text_size) return {-1, index};
-        const uint8_t left = text[index];
-        const uint8_t right = pattern[index];
-        if (left != right) return {left < right ? -1 : 1, index};
-        ++index;
-    }
-    return {0, index};
+    return RaMAxSimd::compareBytes(
+        text, text_size, pattern, pattern_size, known_lcp);
 }
 
 size_t longestCommonPrefixBytes(const uint8_t* left, const uint8_t* right,
@@ -448,9 +408,11 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
         if (forward_64) {
             RaMAxSuffixDetail::UninitializedBuffer<uint64_t> forward_sa;
             RaMAxSuffixDetail::UninitializedBuffer<uint64_t> forward_lcp;
-            forward_sa.allocate(forward_text.size());
+            forward_sa.allocate(
+                forward_text.size(), "suffix-forward-fallback-sa64");
             if (use_caps_builder) {
-                forward_lcp.allocate(forward_text.size());
+                forward_lcp.allocate(
+                    forward_text.size(), "suffix-forward-fallback-lcp64");
                 forward_fallback_seconds = buildCaPsSaLcp(forward_text,
                     forward_sa, forward_lcp, requested_threads,
                     "forward-fallback");
@@ -465,9 +427,11 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
         } else {
             RaMAxSuffixDetail::UninitializedBuffer<uint32_t> forward_sa;
             RaMAxSuffixDetail::UninitializedBuffer<uint32_t> forward_lcp;
-            forward_sa.allocate(forward_text.size());
+            forward_sa.allocate(
+                forward_text.size(), "suffix-forward-fallback-sa32");
             if (use_caps_builder) {
-                forward_lcp.allocate(forward_text.size());
+                forward_lcp.allocate(
+                    forward_text.size(), "suffix-forward-fallback-lcp32");
                 forward_fallback_seconds = buildCaPsSaLcp(forward_text,
                     forward_sa, forward_lcp, requested_threads,
                     "forward-fallback");
@@ -502,14 +466,33 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
     coordinates_are_64_bit = requires64BitCoordinates(
         reverse_text.size(), use_caps_builder);
     const auto allocation_begin = std::chrono::steady_clock::now();
+    const uint64_t coordinate_width_bytes = coordinates_are_64_bit
+        ? sizeof(uint64_t) : sizeof(uint32_t);
+    const uint64_t suffix_storage_bytes =
+        static_cast<uint64_t>(reverse_text.size()) *
+        coordinate_width_bytes * 3ULL;
+    auto& resources =
+        RaMAxResources::RuntimeResourceManager::instance();
+    if (resources.configured()) {
+        resources.requireAllocation(
+            suffix_storage_bytes, "suffix-array-sa-isa-lcp");
+        resources.requireTempSpace(
+            suffix_storage_bytes, "suffix-array-sa-isa-lcp");
+    }
     if (coordinates_are_64_bit) {
-        suffix_array_64.allocate(reverse_text.size());
-        inverse_suffix_array_64.allocate(reverse_text.size());
-        lcp_64.allocate(reverse_text.size());
+        suffix_array_64.allocate(reverse_text.size(), "suffix-sa64");
+        inverse_suffix_array_64.allocate(reverse_text.size(), "suffix-isa64");
+        lcp_64.allocate(reverse_text.size(), "suffix-lcp64");
+        suffix_array_64.adviseSequential();
+        inverse_suffix_array_64.adviseSequential();
+        lcp_64.adviseSequential();
     } else {
-        suffix_array_32.allocate(reverse_text.size());
-        inverse_suffix_array_32.allocate(reverse_text.size());
-        lcp_32.allocate(reverse_text.size());
+        suffix_array_32.allocate(reverse_text.size(), "suffix-sa32");
+        inverse_suffix_array_32.allocate(reverse_text.size(), "suffix-isa32");
+        lcp_32.allocate(reverse_text.size(), "suffix-lcp32");
+        suffix_array_32.adviseSequential();
+        inverse_suffix_array_32.adviseSequential();
+        lcp_32.adviseSequential();
     }
     const double allocation_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - allocation_begin).count();
@@ -580,6 +563,15 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
         (coordinates_are_64_bit ? lcp_64[0] : lcp_32[0]) != 0) {
         throw std::runtime_error("Suffix-array builder returned invalid dimensions");
     }
+    if (coordinates_are_64_bit) {
+        suffix_array_64.adviseRandom();
+        inverse_suffix_array_64.adviseRandom();
+        lcp_64.adviseRandom();
+    } else {
+        suffix_array_32.adviseRandom();
+        inverse_suffix_array_32.adviseRandom();
+        lcp_32.adviseRandom();
+    }
 
     const auto prefix_begin = std::chrono::steady_clock::now();
     buildPrefixDirectory(requested_threads);
@@ -593,8 +585,9 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
     const uint64_t caps_workspace_estimate = use_caps_builder
         ? 2 * component_bytes : 0;
     spdlog::info(
-        "Suffix-array index built for {}: storage=memory-only, disk-cache=disabled, "
-        "disk-bytes=0, builder={}, threshold=1024MiB, logical-symbols={}, "
+        "Suffix-array index built for {}: storage={}, persistent-cache=disabled, "
+        "persistent-bytes=0, mapped-bytes={}, builder={}, threshold=1024MiB, "
+        "logical-symbols={}, "
         "text-symbols={}, stored-rows={}, sampling-rate=1, coordinates={} bit, "
         "SA-bytes={}, ISA-bytes={}, LCP-bytes={}, caps-workspace-estimate={}, "
         "LCP-source={}, suffix-links=enabled, prefix-k={}, SIMD-search={}, "
@@ -604,17 +597,20 @@ bool Suffix_Array_Index::buildIndex(FilePath output_path, bool fast_mode,
         "buffer-allocation-seconds={:.3f}, reverse-builder-seconds={:.3f}, "
         "lcp-seconds={:.3f}, isa-seconds={:.3f}, prefix-directory-seconds={:.3f}, "
         "total-index-build-seconds={:.3f}, peak-rss-bytes={}",
-        species_name, use_caps_builder ? "CaPS" : "divsufsort",
+        species_name,
+        ((coordinates_are_64_bit && suffix_array_64.fileBacked()) ||
+         (!coordinates_are_64_bit && suffix_array_32.fileBacked()))
+            ? "file-mapped" : "heap",
+        ((coordinates_are_64_bit && suffix_array_64.fileBacked()) ||
+         (!coordinates_are_64_bit && suffix_array_32.fileBacked()))
+            ? suffix_storage_bytes : 0,
+        use_caps_builder ? "CaPS" : "divsufsort",
         total_size, text_size, stored_suffix_count,
         coordinates_are_64_bit ? 64 : 32, component_bytes, component_bytes,
         component_bytes, caps_workspace_estimate,
         use_caps_builder ? "CaPS-joint" : "complete-Kasai",
         kSaPrefixLength,
-#if defined(__SSE2__)
-        "SSE2",
-#else
-        "scalar",
-#endif
+        RaMAxSimd::byteKernelName(RaMAxSimd::selectedByteKernel()),
         concat_seconds, largest_seconds, largest.compared_bytes,
         forward_fallback ? "yes" : "no", forward_fallback_seconds,
         reverse_seconds, allocation_seconds, builder_seconds, lcp_seconds,

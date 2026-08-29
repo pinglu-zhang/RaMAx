@@ -198,6 +198,8 @@ add_subdirectory("${THIRD_PARTY_DIR}/libdivsufsort" EXCLUDE_FROM_ALL)
 
 # ================= 公共源文件 =================
 set(RAMA_COMMON_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_resources.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mapped_file_region.cpp"
     "${PREPROCESS_DIR}/cache_manifest.cpp"
     "${PREPROCESS_DIR}/raw_data_process.cpp"
     "${PREPROCESS_DIR}/newick_tree.cpp"
@@ -205,6 +207,7 @@ set(RAMA_COMMON_SOURCES
     "${PREPROCESS_DIR}/SeqPro.cpp"
     "${PREPROCESS_DIR}/softmask_index.cpp"
     "${INDEX_DIR}/fm_index.cpp"
+    "${INDEX_DIR}/simd_bytes.cpp"
     "${INDEX_DIR}/suffix_array_index.cpp"
     "${INDEX_DIR}/bigBWT_build.cpp"
     "${INDEX_DIR}/bigBWT/newscan.cpp"
@@ -223,11 +226,12 @@ set(RAMA_COMMON_SOURCES
     "${ALIGN_DIR}/dependency_preflight.cpp"
     "${ALIGN_DIR}/reference_profile_merger.cpp"
     "${ALIGN_DIR}/cigar.cpp"
-    "${ALIGN_DIR}/ksw2_extz2_sse.c"
+    "${ALIGN_DIR}/ksw2_dispatch.cpp"
     "${ALIGN_DIR}/pair_rare_aligner.cpp"
     "${ALIGN_DIR}/multiple_rare_aligner.cpp"
     "${ALIGN_DIR}/minipoa_locator.cpp"
     "${ALIGN_DIR}/mash_distance_estimator.cpp"
+    "${ALIGN_DIR}/match_spill.cpp"
     "${ALIGN_DIR}/wfmash_router.cpp"
     "${GRAPH_DIR}/ramesh_node.cpp"
     "${GRAPH_DIR}/ramesh_graph.cpp"
@@ -321,7 +325,20 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-w")
 
 # ================= shared RaMAx core =================
-add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES})
+add_library(ramax_ksw2_sse2 OBJECT "${ALIGN_DIR}/ksw2_extz2_sse.c")
+target_include_directories(ramax_ksw2_sse2 PRIVATE "${INCLUDE_DIR}")
+target_compile_definitions(ramax_ksw2_sse2 PRIVATE
+    KSW_CPU_DISPATCH KSW_SSE2_ONLY)
+target_compile_options(ramax_ksw2_sse2 PRIVATE -msse2)
+
+add_library(ramax_ksw2_sse41 OBJECT "${ALIGN_DIR}/ksw2_extz2_sse.c")
+target_include_directories(ramax_ksw2_sse41 PRIVATE "${INCLUDE_DIR}")
+target_compile_definitions(ramax_ksw2_sse41 PRIVATE KSW_CPU_DISPATCH)
+target_compile_options(ramax_ksw2_sse41 PRIVATE -msse4.1)
+
+add_library(ramax_core STATIC ${RAMA_COMMON_SOURCES}
+    $<TARGET_OBJECTS:ramax_ksw2_sse2>
+    $<TARGET_OBJECTS:ramax_ksw2_sse41>)
 configure_rama_target(ramax_core)
 add_dependencies(ramax_core hal_library)
 target_compile_definitions(ramax_core PRIVATE
@@ -348,35 +365,78 @@ if(BUILD_TESTING)
         COMMAND ramax_wfmash_timeout_test)
     set_tests_properties(ramax_wfmash_timeout_test PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_runtime_resources_spill_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/qa/runtime_resources_spill_test.cpp")
+    configure_rama_target(ramax_runtime_resources_spill_test)
+    target_link_libraries(ramax_runtime_resources_spill_test PRIVATE ramax_core)
+    add_test(NAME ramax_runtime_resources_spill_test
+        COMMAND ramax_runtime_resources_spill_test)
+    set_tests_properties(ramax_runtime_resources_spill_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_simd_dispatch_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/qa/simd_dispatch_test.cpp")
+    configure_rama_target(ramax_simd_dispatch_test)
+    target_compile_definitions(ramax_simd_dispatch_test PRIVATE
+        RAMAX_PERFORMANCE_TEST_HOOKS)
+    target_link_libraries(ramax_simd_dispatch_test PRIVATE ramax_core)
+    add_test(NAME ramax_simd_dispatch_test
+        COMMAND ramax_simd_dispatch_test)
+    set_tests_properties(ramax_simd_dispatch_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_mask_journal_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/qa/mask_journal_test.cpp")
+    configure_rama_target(ramax_mask_journal_test)
+    target_link_libraries(ramax_mask_journal_test PRIVATE ramax_core)
+    add_test(NAME ramax_mask_journal_test COMMAND ramax_mask_journal_test)
+    set_tests_properties(ramax_mask_journal_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    add_executable(ramax_maf_streaming_equivalence_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/qa/maf_streaming_equivalence_test.cpp")
+    configure_rama_target(ramax_maf_streaming_equivalence_test)
+    target_link_libraries(ramax_maf_streaming_equivalence_test PRIVATE ramax_core)
+    add_test(NAME ramax_maf_streaming_equivalence_test
+        COMMAND ramax_maf_streaming_equivalence_test)
+    set_tests_properties(ramax_maf_streaming_equivalence_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-    add_executable(ramax_mash_distance_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
-    configure_rama_target(ramax_mash_distance_test)
-    target_link_libraries(ramax_mash_distance_test PRIVATE ramax_core)
-    add_test(NAME ramax_mash_distance_test
-        COMMAND ramax_mash_distance_test)
-    set_tests_properties(ramax_mash_distance_test PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
+        add_executable(ramax_mash_distance_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/mash_distance_estimator_test.cpp")
+        configure_rama_target(ramax_mash_distance_test)
+        target_link_libraries(ramax_mash_distance_test PRIVATE ramax_core)
+        add_test(NAME ramax_mash_distance_test
+            COMMAND ramax_mash_distance_test)
+        set_tests_properties(ramax_mash_distance_test PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
 
-    add_executable(ramax_wfmash_router_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/wfmash_router_test.cpp")
-    configure_rama_target(ramax_wfmash_router_test)
-    target_link_libraries(ramax_wfmash_router_test PRIVATE ramax_core)
-    add_test(NAME ramax_wfmash_router_test
-        COMMAND ramax_wfmash_router_test)
-    set_tests_properties(ramax_wfmash_router_test PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wfmash_router_test.cpp")
+        add_executable(ramax_wfmash_router_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/wfmash_router_test.cpp")
+        configure_rama_target(ramax_wfmash_router_test)
+        target_link_libraries(ramax_wfmash_router_test PRIVATE ramax_core)
+        add_test(NAME ramax_wfmash_router_test
+            COMMAND ramax_wfmash_router_test)
+        set_tests_properties(ramax_wfmash_router_test PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
 
-    add_executable(ramax_gfa_export_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfa_export_test.cpp")
-    configure_rama_target(ramax_gfa_export_test)
-    target_link_libraries(ramax_gfa_export_test PRIVATE ramax_core)
-    add_test(NAME ramax_gfa_export_test
-        COMMAND ramax_gfa_export_test)
-    set_tests_properties(ramax_gfa_export_test PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfa_export_test.cpp")
+        add_executable(ramax_gfa_export_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfa_export_test.cpp")
+        configure_rama_target(ramax_gfa_export_test)
+        target_link_libraries(ramax_gfa_export_test PRIVATE ramax_core)
+        add_test(NAME ramax_gfa_export_test
+            COMMAND ramax_gfa_export_test)
+        set_tests_properties(ramax_gfa_export_test PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core_graph_performance_equivalence_test.cpp")
         add_executable(ramax_core_graph_performance_equivalence_test
@@ -397,30 +457,57 @@ install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
 if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-    add_executable(ramax_hal_export_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
-    configure_rama_target(ramax_hal_export_test)
-    target_link_libraries(ramax_hal_export_test PRIVATE ramax_core)
-    add_dependencies(ramax_hal_export_test hal_library)
-    add_test(NAME ramax_hal_export COMMAND ramax_hal_export_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
+        add_executable(ramax_hal_export_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")
+        configure_rama_target(ramax_hal_export_test)
+        target_link_libraries(ramax_hal_export_test PRIVATE ramax_core)
+        add_dependencies(ramax_hal_export_test hal_library)
+        add_test(NAME ramax_hal_export COMMAND ramax_hal_export_test)
+    endif()
 
-    add_executable(ramax_hal_softmask_export_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp")
-    configure_rama_target(ramax_hal_softmask_export_test)
-    target_link_libraries(ramax_hal_softmask_export_test PRIVATE ramax_core)
-    add_dependencies(ramax_hal_softmask_export_test hal_library)
-    add_test(NAME ramax_hal_softmask_export
-        COMMAND ramax_hal_softmask_export_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp")
+        add_executable(ramax_hal_softmask_export_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_softmask_export_test.cpp")
+        configure_rama_target(ramax_hal_softmask_export_test)
+        target_link_libraries(ramax_hal_softmask_export_test PRIVATE ramax_core)
+        add_dependencies(ramax_hal_softmask_export_test hal_library)
+        add_test(NAME ramax_hal_softmask_export
+            COMMAND ramax_hal_softmask_export_test)
+    endif()
 
-    add_executable(ramax_zero_gap_missing_species_merge_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp"
-        ${RAMA_COMMON_SOURCES})
-    configure_rama_target(ramax_zero_gap_missing_species_merge_test)
-    target_compile_definitions(ramax_zero_gap_missing_species_merge_test
-        PRIVATE RAMAX_KSW_TEST_HOOKS)
-    add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
-    add_test(NAME ramax_zero_gap_missing_species_merge
-        COMMAND ramax_zero_gap_missing_species_merge_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp")
+        # This regression test exercises the optional scalar generic-score hook
+        # inside both runtime-dispatched KSW2 variants. Target compile
+        # definitions do not propagate into object libraries, so build
+        # dedicated test objects instead of linking the production objects (or
+        # compiling a second public ksw_extz2_sse symbol).
+        add_library(ramax_ksw2_test_sse2 OBJECT
+            "${ALIGN_DIR}/ksw2_extz2_sse.c")
+        target_include_directories(ramax_ksw2_test_sse2 PRIVATE "${INCLUDE_DIR}")
+        target_compile_definitions(ramax_ksw2_test_sse2 PRIVATE
+            KSW_CPU_DISPATCH KSW_SSE2_ONLY RAMAX_KSW_TEST_HOOKS)
+        target_compile_options(ramax_ksw2_test_sse2 PRIVATE -msse2)
+
+        add_library(ramax_ksw2_test_sse41 OBJECT
+            "${ALIGN_DIR}/ksw2_extz2_sse.c")
+        target_include_directories(ramax_ksw2_test_sse41 PRIVATE "${INCLUDE_DIR}")
+        target_compile_definitions(ramax_ksw2_test_sse41 PRIVATE
+            KSW_CPU_DISPATCH RAMAX_KSW_TEST_HOOKS)
+        target_compile_options(ramax_ksw2_test_sse41 PRIVATE -msse4.1)
+
+        add_executable(ramax_zero_gap_missing_species_merge_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_gap_missing_species_merge_test.cpp"
+            ${RAMA_COMMON_SOURCES}
+            $<TARGET_OBJECTS:ramax_ksw2_test_sse2>
+            $<TARGET_OBJECTS:ramax_ksw2_test_sse41>)
+        configure_rama_target(ramax_zero_gap_missing_species_merge_test)
+        target_compile_definitions(ramax_zero_gap_missing_species_merge_test
+            PRIVATE RAMAX_KSW_TEST_HOOKS)
+        add_dependencies(ramax_zero_gap_missing_species_merge_test hal_library)
+        add_test(NAME ramax_zero_gap_missing_species_merge
+            COMMAND ramax_zero_gap_missing_species_merge_test)
+    endif()
 endif()
 
 # Optional companion tools are self-contained under tools/.  A tool that was

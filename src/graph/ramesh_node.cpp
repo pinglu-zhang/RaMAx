@@ -6,11 +6,72 @@
 #include "ramesh.h"
 #include <algorithm>
 #include <iomanip>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace RaMesh {
+    namespace detail {
+        namespace {
+            struct TransparentStringHash {
+                using is_transparent = void;
+
+                size_t operator()(std::string_view value) const noexcept {
+                    return std::hash<std::string_view>{}(value);
+                }
+                size_t operator()(const std::string& value) const noexcept {
+                    return (*this)(std::string_view(value));
+                }
+            };
+
+            struct TransparentStringEqual {
+                using is_transparent = void;
+
+                bool operator()(std::string_view left,
+                                std::string_view right) const noexcept {
+                    return left == right;
+                }
+            };
+
+            struct GraphNamePool {
+                std::mutex mutex;
+                std::unordered_set<std::string, TransparentStringHash,
+                                   TransparentStringEqual> values;
+            };
+
+            GraphNamePool& graphNamePool() {
+                // Process-lifetime storage makes every InternedGraphName
+                // pointer stable, including during static teardown.
+                static auto* pool = new GraphNamePool();
+                return *pool;
+            }
+        }
+
+        const std::string& internGraphName(std::string_view value) {
+            using LocalCache =
+                std::unordered_map<std::string_view, const std::string*,
+                                   TransparentStringHash,
+                                   TransparentStringEqual>;
+            thread_local LocalCache local_cache;
+            const auto local = local_cache.find(value);
+            if (local != local_cache.end()) return *local->second;
+
+            auto& pool = graphNamePool();
+            const std::string* interned = nullptr;
+            {
+                std::lock_guard lock(pool.mutex);
+                const auto [position, inserted] = pool.values.emplace(value);
+                (void)inserted;
+                interned = &*position;
+            }
+            local_cache.emplace(std::string_view(*interned), interned);
+            return *interned;
+        }
+    }
+
     namespace {
         std::atomic<uint64_t> g_next_block_id{1};
 
@@ -267,22 +328,22 @@ namespace RaMesh {
 
     SegPtr Segment::createHead()
     {
-        auto* h = new Segment();
+        auto h = std::make_shared<Segment>();
         h->seg_role = SegmentRole::HEAD;
         h->align_role = AlignRole::PRIMARY;
         h->primary_path.next.store(nullptr, std::memory_order_relaxed);
         h->primary_path.prev.store(nullptr, std::memory_order_relaxed);
-        return std::shared_ptr<Segment>(h);
+        return h;
     }
 
     SegPtr Segment::createTail()
     {
-        auto* t = new Segment();
+        auto t = std::make_shared<Segment>();
         t->seg_role = SegmentRole::TAIL;
         t->align_role = AlignRole::PRIMARY;
         t->primary_path.next.store(nullptr, std::memory_order_relaxed);
         t->primary_path.prev.store(nullptr, std::memory_order_relaxed);
-        return std::shared_ptr<Segment>(t);
+        return t;
     }
 
     //void Segment::linkChain(const std::vector<SegPtr>& segs)

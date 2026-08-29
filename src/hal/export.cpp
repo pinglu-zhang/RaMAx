@@ -3,6 +3,7 @@
 #include "align.h"
 #include "dependency_preflight.h"
 #include "external_tool.h"
+#include "runtime_resources.h"
 
 #include "halAlignmentInstance.h"
 
@@ -11,6 +12,7 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -58,41 +60,81 @@ namespace {
 
 struct LeafRow {
     std::string row_id;
-    std::string leaf_name;
-    std::string chr_name;
-    std::string hal_sequence_name;
+    InternedGraphName leaf_name;
+    InternedGraphName chr_name;
+    InternedGraphName hal_sequence_name;
     uint64_t segment_start = 0;
     uint32_t segment_length = 0;
     bool reversed = false;
     std::string aligned;
 };
+static_assert(sizeof(void*) != 8 || sizeof(LeafRow) <= 104);
 
 struct BlockMSA {
-    BlockPtr block;
     uint64_t block_id = 0;
-    std::string ref_row_id;
     size_t alignment_length = 0;
     bool secondary_homology = false;
-    ExportBlockOrderKey order_key;
+    AnchorPathKey order_path;
+    uint64_t order_ref_start = 0;
     std::vector<LeafRow> leaf_rows;
 };
+static_assert(sizeof(void*) != 8 || sizeof(BlockMSA) <= 72);
+
+struct OrderedBlockBuild {
+    size_t input_index = 0;
+    AnchorPathKey order_path;
+    uint64_t order_ref_start = 0;
+    uint64_t block_id = 0;
+};
+static_assert(sizeof(void*) != 8 || sizeof(OrderedBlockBuild) <= 40);
+
+bool orderedBlockBuildLess(const OrderedBlockBuild& left,
+                           const OrderedBlockBuild& right) {
+    return std::tie(left.order_path.first, left.order_path.second,
+                    left.order_ref_start, left.block_id) <
+           std::tie(right.order_path.first, right.order_path.second,
+                    right.order_ref_start, right.block_id);
+}
 
 struct LeafRunSpan {
     std::string row_id;
-    std::string leaf_name;
-    std::string chr_name;
-    std::string hal_sequence_name;
+    InternedGraphName leaf_name;
+    InternedGraphName chr_name;
+    InternedGraphName hal_sequence_name;
     uint64_t start = 0;
     uint32_t length = 0;
     bool reversed = false;
     std::string dna;
 };
+static_assert(sizeof(void*) != 8 || sizeof(LeafRunSpan) <= 104);
 
 struct LeafOccurrence {
     uint64_t run_id = 0;
-    LeafRunSpan span;
+    // ColumnRun storage is finalized before leaf paths are built and remains
+    // stable until HAL emission completes.  Borrowing the span avoids a
+    // second copy of every occurrence DNA string.
+    const LeafRunSpan* span = nullptr;
     bool forward_to_canonical = true;
     uint32_t copy_index = 0;
+};
+static_assert(sizeof(void*) != 8 || sizeof(LeafOccurrence) <= 24);
+
+struct PackedNodePresence {
+    std::vector<uint64_t> words;
+
+    void reset(size_t node_count) {
+        words.assign((node_count + 63U) / 64U, 0);
+    }
+
+    void set(size_t node_id) noexcept {
+        words[node_id >> 6U] |=
+            uint64_t{1} << (node_id & 63U);
+    }
+
+    [[nodiscard]] bool test(size_t node_id) const noexcept {
+        return (words[node_id >> 6U] &
+                (uint64_t{1} << (node_id & 63U))) != 0;
+    }
 };
 
 struct ColumnRun {
@@ -101,12 +143,11 @@ struct ColumnRun {
     uint32_t col_beg = 0;
     uint32_t col_end = 0;
     bool secondary_homology = false;
-    std::vector<uint8_t> leaf_present;
     std::vector<LeafRunSpan> leaf_spans;
     std::vector<uint64_t> source_block_ids;
-    std::vector<uint8_t> present_by_node;
-    std::vector<double> presence_margin;
+    PackedNodePresence present_by_node;
 };
+static_assert(sizeof(void*) != 8 || sizeof(ColumnRun) <= 104);
 
 struct OrientedOccurrence {
     OccurrenceId occurrence_id = 0;
@@ -195,7 +236,6 @@ struct ChildEdgeContribution {
 
 struct FastInferenceResult {
     std::vector<uint8_t> present_by_node;
-    std::vector<double> margin;
 };
 
 struct NodeModelBuildTimings {
@@ -373,17 +413,6 @@ void validateLeafNamesExact(
     throw std::runtime_error(message.str());
 }
 
-std::string stripGaps(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        if (c != '-') {
-            out.push_back(c);
-        }
-    }
-    return out;
-}
-
 std::string formatScaffoldName(const std::string& genome_name, size_t index) {
     std::ostringstream oss;
     oss << genome_name << ".scf" << std::setw(6) << std::setfill('0') << index;
@@ -413,7 +442,6 @@ FastInferenceResult inferDescendantUnionFast(
 
     FastInferenceResult result;
     result.present_by_node.assign(tree.nodes.size(), 0);
-    result.margin.assign(tree.nodes.size(), 1.0);
     for (int leaf_id : tree.leaf_ids) {
         const int leaf_index = tree.nodes[leaf_id].leaf_index;
         result.present_by_node[leaf_id] = leaf_present[static_cast<size_t>(leaf_index)];
@@ -426,6 +454,36 @@ FastInferenceResult inferDescendantUnionFast(
             });
     }
     return result;
+}
+
+void inferRunDescendantUnionFast(
+    const TreeMeta& tree,
+    ColumnRun& run) {
+    run.present_by_node.reset(tree.nodes.size());
+    for (const auto& span : run.leaf_spans) {
+        const auto node_it = tree.name_to_id.find(span.leaf_name);
+        if (node_it == tree.name_to_id.end()) {
+            throw std::runtime_error(
+                "HAL run leaf is absent from the phylogeny");
+        }
+        const auto& node = tree.nodes[node_it->second];
+        if (!node.is_leaf || node.id < 0) {
+            throw std::runtime_error(
+                "HAL run occurrence belongs to a non-leaf node");
+        }
+        run.present_by_node.set(static_cast<size_t>(node.id));
+    }
+    for (int node_id : tree.internal_postorder) {
+        const auto& node = tree.nodes[node_id];
+        for (int child_id : node.children) {
+            if (run.present_by_node.test(
+                    static_cast<size_t>(child_id))) {
+                run.present_by_node.set(
+                    static_cast<size_t>(node_id));
+                break;
+            }
+        }
+    }
 }
 
 BlockMSA buildBlockMSA(
@@ -556,15 +614,11 @@ BlockMSA buildBlockMSA(
     }
 
     BlockMSA msa;
-    msa.block = block;
     msa.block_id = block->block_id;
-    msa.ref_row_id = ref_row_id;
     msa.alignment_length = sequences.at(ref_row_id).size();
     msa.secondary_homology = secondary_homology;
-    msa.order_key.ref_species = block->ref_species;
-    msa.order_key.ref_chr = block->ref_chr;
-    msa.order_key.ref_start = ref_row_it->second.segment_start;
-    msa.order_key.block_id = block->block_id;
+    msa.order_path = AnchorPathKey{block->ref_species, block->ref_chr};
+    msa.order_ref_start = ref_row_it->second.segment_start;
     msa.leaf_rows.reserve(rows.size());
 
     for (auto& [row_id, aligned] : sequences) {
@@ -610,26 +664,64 @@ BlockMSA buildBlockMSA(
     return msa;
 }
 
-std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, const TreeMeta& tree) {
-    std::vector<ColumnRun> runs;
-    uint64_t next_run_id = 1;
-    for (const auto& msa : block_msas) {
-        if (!msa.block || msa.alignment_length == 0) {
+std::optional<OrderedBlockBuild> describeBlockForOrderedBuild(
+    const std::weak_ptr<Block>& weak_block,
+    size_t input_index) {
+    const BlockPtr block = weak_block.lock();
+    if (!block) {
+        return std::nullopt;
+    }
+
+    OrderedBlockBuild descriptor;
+    descriptor.input_index = input_index;
+    descriptor.order_path =
+        AnchorPathKey{block->ref_species, block->ref_chr};
+    descriptor.block_id = block->block_id;
+
+    bool found_reference = false;
+    std::shared_lock block_lock(block->rw);
+    for (const auto& [path, segment] : block->anchors) {
+        if (!segment || !segment->isPrimary() ||
+            path.first != block->ref_species ||
+            path.second != block->ref_chr) {
+            continue;
+        }
+        if (!found_reference ||
+            segment->start <
+                descriptor.order_ref_start) {
+            descriptor.order_ref_start =
+                segment->start;
+            found_reference = true;
+        }
+    }
+    return descriptor;
+}
+
+void appendColumnRuns(std::vector<BlockMSA>& block_msas,
+                      const TreeMeta& tree,
+                      std::vector<ColumnRun>& runs,
+                      uint64_t& next_run_id) {
+    for (auto& msa : block_msas) {
+        if (msa.block_id == 0 || msa.alignment_length == 0) {
             continue;
         }
 
         std::vector<AlignedOccurrence> aligned_rows;
         aligned_rows.reserve(msa.leaf_rows.size());
-        for (const auto& row : msa.leaf_rows) {
+        for (auto& row : msa.leaf_rows) {
             aligned_rows.push_back(AlignedOccurrence{
-                row.row_id,
-                row.leaf_name,
-                row.chr_name,
+                std::move(row.row_id),
+                std::move(row.leaf_name),
+                std::move(row.chr_name),
                 row.segment_start,
                 row.segment_length,
                 row.reversed,
-                row.aligned});
+                std::move(row.aligned)});
         }
+        // The sorted BlockMSA is consumed exactly once.  Release its row
+        // metadata before projecting this block so completed ColumnRuns do
+        // not coexist with a second full copy of every aligned row.
+        std::vector<LeafRow>().swap(msa.leaf_rows);
 
         for (auto& projection : projectElementaryRuns(aligned_rows)) {
             ColumnRun run;
@@ -641,7 +733,6 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
             run.col_end = projection.col_end;
             run.secondary_homology =
                 msa.secondary_homology;
-            run.leaf_present.assign(tree.leaf_ids.size(), 0);
             run.leaf_spans.reserve(projection.occurrences.size());
 
             for (auto& occurrence : projection.occurrences) {
@@ -649,7 +740,6 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
                 if (node_it == tree.name_to_id.end()) {
                     throw std::runtime_error("HAL export failed: projected leaf is absent from the phylogeny");
                 }
-                const auto& leaf_node = tree.nodes[node_it->second];
                 LeafRunSpan span;
                 span.row_id = std::move(occurrence.row_id);
                 span.leaf_name = std::move(occurrence.genome_name);
@@ -660,12 +750,10 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
                 span.reversed = occurrence.reversed;
                 span.dna = std::move(occurrence.dna);
                 run.leaf_spans.push_back(std::move(span));
-                run.leaf_present[static_cast<size_t>(leaf_node.leaf_index)] = 1;
             }
             runs.push_back(std::move(run));
         }
     }
-    return runs;
 }
 
 struct RunCoordinateTransform {
@@ -1572,18 +1660,42 @@ TreeMeta buildLeafOnlyTree(
     return leaf_tree;
 }
 
-std::vector<BlockMSA> buildLeafBlockMSAs(
+std::vector<ColumnRun> buildLeafColumnRunsStreaming(
     const std::vector<std::weak_ptr<Block>>& blocks,
     const TreeMeta& leaf_tree,
     const std::map<
         SpeciesName,
         SeqPro::SharedManagerVariant>&
         seqpro_managers) {
-    std::vector<BlockMSA> block_msas;
-    block_msas.reserve(blocks.size());
-    for (const auto& weak_block : blocks) {
+    std::vector<OrderedBlockBuild> ordered_blocks;
+    ordered_blocks.reserve(blocks.size());
+    for (size_t input_index = 0;
+         input_index < blocks.size();
+         ++input_index) {
+        auto descriptor =
+            describeBlockForOrderedBuild(
+                blocks[input_index],
+                input_index);
+        if (descriptor) {
+            ordered_blocks.push_back(
+                std::move(*descriptor));
+        }
+    }
+    std::sort(
+        ordered_blocks.begin(),
+        ordered_blocks.end(),
+        orderedBlockBuildLess);
+
+    std::vector<ColumnRun> runs;
+    runs.reserve(ordered_blocks.size());
+    std::vector<BlockMSA> one_msa;
+    one_msa.reserve(1);
+    uint64_t next_run_id = 1;
+    for (const auto& descriptor :
+         ordered_blocks) {
         const auto block =
-            weak_block.lock();
+            blocks[descriptor.input_index]
+                .lock();
         if (!block) {
             continue;
         }
@@ -1592,22 +1704,27 @@ std::vector<BlockMSA> buildLeafBlockMSAs(
             leaf_tree,
             seqpro_managers,
             nullptr);
-        if (msa.block &&
+        if (msa.block_id != 0 &&
             !msa.leaf_rows.empty()) {
-            block_msas.push_back(
+            if (msa.order_path !=
+                    descriptor.order_path ||
+                msa.order_ref_start !=
+                    descriptor.order_ref_start ||
+                msa.block_id !=
+                    descriptor.block_id) {
+                throw std::runtime_error(
+                    "MAF ordered Block descriptor no longer "
+                    "matches its built MSA");
+            }
+            one_msa.push_back(
                 std::move(msa));
+            appendColumnRuns(
+                one_msa, leaf_tree,
+                runs, next_run_id);
+            one_msa.clear();
         }
     }
-    std::sort(
-        block_msas.begin(),
-        block_msas.end(),
-        [](const BlockMSA& lhs,
-           const BlockMSA& rhs) {
-            return exportBlockOrderLess(
-                lhs.order_key,
-                rhs.order_key);
-        });
-    return block_msas;
+    return runs;
 }
 
 std::unordered_set<uint64_t>
@@ -1620,15 +1737,11 @@ findRejectedSecondaryHomologyBlocksImpl(
     const TreeMeta leaf_tree =
         buildLeafOnlyTree(
             seqpro_managers);
-    const auto block_msas =
-        buildLeafBlockMSAs(
+    auto runs =
+        buildLeafColumnRunsStreaming(
             blocks,
             leaf_tree,
             seqpro_managers);
-    auto runs =
-        buildColumnRuns(
-            block_msas,
-            leaf_tree);
     auto selection =
         selectCoordinateConsistentSecondaryRuns(
             runs);
@@ -1744,7 +1857,6 @@ void finalizeNormalizedRun(
         unique_spans.push_back(std::move(span));
     }
     run.leaf_spans = std::move(unique_spans);
-    run.leaf_present.assign(tree.leaf_ids.size(), 0);
     for (const auto& span : run.leaf_spans) {
         const auto node_it =
             tree.name_to_id.find(span.leaf_name);
@@ -1757,8 +1869,6 @@ void finalizeNormalizedRun(
             throw std::runtime_error(
                 "HAL normalized occurrence belongs to a non-leaf node");
         }
-        run.leaf_present[
-            static_cast<size_t>(node.leaf_index)] = 1;
     }
 }
 
@@ -2844,15 +2954,11 @@ void exportCanonicalMafImpl(
     const TreeMeta leaf_tree =
         buildLeafOnlyTree(
             seqpro_managers);
-    const auto block_msas =
-        buildLeafBlockMSAs(
+    auto runs =
+        buildLeafColumnRunsStreaming(
             blocks,
             leaf_tree,
             seqpro_managers);
-    auto runs =
-        buildColumnRuns(
-            block_msas,
-            leaf_tree);
     const size_t projected_run_count =
         runs.size();
     const auto selection =
@@ -3196,22 +3302,21 @@ std::vector<EdgeSupport> collectAdjacencySupport(
             std::string_view sequence_name;
             for (const auto& occurrence :
                  path_it->second) {
+                const auto& span = *occurrence.span;
                 if (!sequence_name.empty() &&
                     sequence_name !=
-                        occurrence.span
-                            .hal_sequence_name) {
+                        span.hal_sequence_name) {
                     reset_path();
                 }
                 sequence_name =
-                    occurrence.span
-                        .hal_sequence_name;
+                    span.hal_sequence_name.str();
                 add_occurrence(
                     occurrence.run_id,
                     occurrence.copy_index,
                     occurrence
                         .forward_to_canonical,
-                    occurrence.span.start,
-                    occurrence.span.length);
+                    span.start,
+                    span.length);
             }
         } else {
             const auto model_it =
@@ -3340,16 +3445,17 @@ std::unordered_map<std::string, std::vector<LeafOccurrence>> buildLeafPaths(
     std::unordered_map<std::string, std::vector<LeafOccurrence>> paths;
     for (const auto& run : runs) {
         for (const auto& span : run.leaf_spans) {
-            paths[span.leaf_name].push_back(LeafOccurrence{run.run_id, span, !span.reversed});
+            paths[span.leaf_name].push_back(
+                LeafOccurrence{run.run_id, &span, !span.reversed});
         }
     }
     for (auto& [leaf_name, ordered] : paths) {
         std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-            if (a.span.hal_sequence_name != b.span.hal_sequence_name) {
-                return a.span.hal_sequence_name < b.span.hal_sequence_name;
+            if (a.span->hal_sequence_name != b.span->hal_sequence_name) {
+                return a.span->hal_sequence_name < b.span->hal_sequence_name;
             }
-            if (a.span.start != b.span.start) {
-                return a.span.start < b.span.start;
+            if (a.span->start != b.span->start) {
+                return a.span->start < b.span->start;
             }
             return a.run_id < b.run_id;
         });
@@ -3511,13 +3617,12 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
             };
             for (const auto& occurrence :
                  path_it->second) {
+                const auto& span = *occurrence.span;
                 if (sequence_name !=
-                    occurrence.span
-                        .hal_sequence_name) {
+                    span.hal_sequence_name) {
                     flush_sequence();
                     sequence_name =
-                        occurrence.span
-                            .hal_sequence_name;
+                        span.hal_sequence_name.str();
                     first = nullptr;
                     last = nullptr;
                 }
@@ -3633,7 +3738,8 @@ NodeModel buildNodeModel(
     std::vector<uint64_t> candidate_runs;
     candidate_runs.reserve(runs.size());
     for (const auto& run : runs) {
-        if (run.present_by_node[node_id]) {
+        if (run.present_by_node.test(
+                static_cast<size_t>(node_id))) {
             candidate_runs.push_back(run.run_id);
         }
     }
@@ -3730,14 +3836,15 @@ NodeModel buildNodeModel(
             std::vector<ContextOccurrence> path;
             std::string sequence_name;
             for (const auto& occurrence : path_it->second) {
+                const auto& span = *occurrence.span;
                 if (!sequence_name.empty() &&
-                    occurrence.span.hal_sequence_name !=
+                    span.hal_sequence_name !=
                         sequence_name) {
                     add_context_path(child_id, path);
                     path.clear();
                 }
                 sequence_name =
-                    occurrence.span.hal_sequence_name;
+                    span.hal_sequence_name;
                 path.push_back(ContextOccurrence{
                     occurrence.run_id,
                     occurrence.copy_index,
@@ -3946,7 +4053,8 @@ NodeModel buildNodeModel(
         const auto* run = run_by_id.at(run_id);
         donor_candidates.clear();
         for (const auto& child : child_inputs) {
-            if (!run->present_by_node[child.child_id]) {
+            if (!run->present_by_node.test(
+                    static_cast<size_t>(child.child_id))) {
                 continue;
             }
             if (child.is_leaf) {
@@ -5014,7 +5122,8 @@ void appendInternalChildTopEmissions(
                     "Missing run metadata while building local internal child emissions");
             }
             const auto& run = *run_it->second;
-            if (run.present_by_node[parent_id]) {
+            if (run.present_by_node.test(
+                    static_cast<size_t>(parent_id))) {
                 const auto parent_occurrences_it =
                     parent_model.occurrences_by_run.find(
                         occurrence.run_id);
@@ -5099,7 +5208,9 @@ void appendLeafChildTopEmissions(
     auto path_it = leaf_paths.find(species_name);
     if (path_it != leaf_paths.end()) {
         for (const auto& occurrence : path_it->second) {
-            windows_by_sequence[occurrence.span.hal_sequence_name].push_back(occurrence);
+            windows_by_sequence[
+                occurrence.span->hal_sequence_name]
+                .push_back(occurrence);
         }
     }
 
@@ -5113,22 +5224,23 @@ void appendLeafChildTopEmissions(
         uint64_t chr_length = fetchSequenceLength(mgr_it->second, chr_name);
         auto& windows = windows_by_sequence[emission.seq_name];
         std::sort(windows.begin(), windows.end(), [](const auto& lhs, const auto& rhs) {
-            if (lhs.span.start != rhs.span.start) {
-                return lhs.span.start < rhs.span.start;
+            if (lhs.span->start != rhs.span->start) {
+                return lhs.span->start < rhs.span->start;
             }
             return lhs.run_id < rhs.run_id;
         });
 
         uint64_t cursor = 0;
         for (const auto& occurrence : windows) {
-            const auto& span = occurrence.span;
+            const auto& span = *occurrence.span;
             if (span.start > cursor) {
                 emission.tops.push_back(
                     TopSegmentLine{0, cursor, static_cast<uint32_t>(span.start - cursor), std::nullopt, true});
             }
             const auto& run =
                 *run_by_id.at(occurrence.run_id);
-            if (run.present_by_node[parent_id]) {
+            if (run.present_by_node.test(
+                    static_cast<size_t>(parent_id))) {
                 const auto parent_occurrences_it =
                     parent_model.occurrences_by_run.find(
                         occurrence.run_id);
@@ -5392,7 +5504,7 @@ BinaryInferenceResult inferDescendantUnion(
     auto fast = inferDescendantUnionFast(tree, leaf_states);
     BinaryInferenceResult result;
     result.present_by_node = std::move(fast.present_by_node);
-    result.margin = std::move(fast.margin);
+    result.margin.assign(tree.nodes.size(), 1.0);
     result.score0.resize(tree.nodes.size(), 0.0);
     result.score1.resize(tree.nodes.size(), 0.0);
     for (const auto& node : tree.nodes) {
@@ -5436,7 +5548,7 @@ std::vector<ElementaryRunProjection> projectElementaryRuns(
 
     std::unordered_set<std::string> row_ids;
     row_ids.reserve(rows.size());
-    std::vector<std::vector<uint32_t>> prefixes(rows.size());
+    std::vector<uint32_t> non_gap_before(rows.size(), 0);
     for (size_t row_index = 0; row_index < rows.size(); ++row_index) {
         const auto& row = rows[row_index];
         if (!row_ids.insert(row.row_id).second) {
@@ -5445,12 +5557,11 @@ std::vector<ElementaryRunProjection> projectElementaryRuns(
         if (row.aligned_dna.size() != column_count) {
             throw std::runtime_error("Aligned occurrence rows have inconsistent column counts");
         }
-        auto& prefix = prefixes[row_index];
-        prefix.assign(column_count + 1, 0);
+        uint32_t non_gap_count = 0;
         for (size_t col = 0; col < column_count; ++col) {
-            prefix[col + 1] = prefix[col] + (row.aligned_dna[col] != '-' ? 1u : 0u);
+            non_gap_count += row.aligned_dna[col] != '-' ? 1U : 0U;
         }
-        if (prefix.back() != row.segment_length) {
+        if (non_gap_count != row.segment_length) {
             throw std::runtime_error(
                 "Aligned occurrence non-gap length differs from its source segment: " + row.row_id);
         }
@@ -5482,14 +5593,15 @@ std::vector<ElementaryRunProjection> projectElementaryRuns(
             if (row.aligned_dna[col] == '-') {
                 continue;
             }
-            uint32_t non_gap_before = prefixes[row_index][col];
-            uint32_t run_length = prefixes[row_index][next] - non_gap_before;
+            const uint32_t row_non_gap_before = non_gap_before[row_index];
+            const uint32_t run_length = static_cast<uint32_t>(next - col);
             LeafInterval interval = projectLeafInterval(
                 row.segment_start,
                 row.segment_length,
                 row.reversed,
-                non_gap_before,
+                row_non_gap_before,
                 run_length);
+            non_gap_before[row_index] += run_length;
 
             ProjectedOccurrence occurrence;
             occurrence.row_id = row.row_id;
@@ -5498,7 +5610,11 @@ std::vector<ElementaryRunProjection> projectElementaryRuns(
             occurrence.start = interval.start;
             occurrence.length = interval.length;
             occurrence.reversed = !interval.forward_to_parent;
-            occurrence.dna = stripGaps(row.aligned_dna.substr(col, next - col));
+            // same_mask() guarantees that a participating row is non-gap
+            // across this complete elementary run.  Copy the final DNA once
+            // instead of allocating a substring and filtering it again.
+            occurrence.dna.assign(
+                row.aligned_dna.data() + col, next - col);
             projection.occurrences.push_back(std::move(occurrence));
         }
         if (!projection.occurrences.empty()) {
@@ -7398,60 +7514,178 @@ void exportToHal(
     validateLeafNamesExact(parser, seqpro_managers);
     TreeMeta tree = buildTreeMeta(parser);
     local_stats.internal_node_count = tree.internal_postorder.size();
+    auto& resources =
+        RaMAxResources::RuntimeResourceManager::instance();
+    if (resources.configured()) {
+        resources.logSnapshot(
+            "hal-export", "start");
+    }
 
     auto build_msa_begin = Clock::now();
-    std::vector<BlockPtr> live_blocks;
-    live_blocks.reserve(blocks.size());
-    for (const auto& weak_block : blocks) {
-        if (auto block = weak_block.lock()) {
-            live_blocks.push_back(std::move(block));
+    std::vector<OrderedBlockBuild> ordered_blocks;
+    ordered_blocks.reserve(blocks.size());
+    for (size_t input_index = 0;
+         input_index < blocks.size();
+         ++input_index) {
+        auto descriptor =
+            describeBlockForOrderedBuild(
+                blocks[input_index], input_index);
+        if (descriptor) {
+            ordered_blocks.push_back(
+                std::move(*descriptor));
         }
     }
-    local_stats.block_count = live_blocks.size();
+    std::sort(
+        ordered_blocks.begin(),
+        ordered_blocks.end(),
+        orderedBlockBuildLess);
+    const Clock::duration descriptor_build_time =
+        Clock::now() - build_msa_begin;
+    local_stats.block_count =
+        ordered_blocks.size();
 
-    std::vector<std::optional<BlockMSA>> block_results(live_blocks.size());
-    std::exception_ptr build_failure;
-    std::mutex build_failure_mutex;
-    const int build_threads = std::max(1, config.parallel_threads);
+    int build_threads =
+        std::max(1, config.parallel_threads);
+    if (resources.configured()) {
+        constexpr uint64_t kEstimatedMsaTaskBytes =
+            64ULL * 1024ULL * 1024ULL;
+        build_threads = std::min(
+            build_threads,
+            static_cast<int>(
+                std::max<size_t>(
+                    1,
+                    resources.boundedConcurrency(
+                        ordered_blocks.size(),
+                        kEstimatedMsaTaskBytes))));
+    }
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+        build_threads = 1;
+    }
+#endif
+    const size_t batch_capacity =
+        std::max<size_t>(
+            1,
+            std::min<size_t>(
+                256,
+                static_cast<size_t>(build_threads) *
+                    8));
+    std::vector<ColumnRun> runs;
+    runs.reserve(ordered_blocks.size());
+    uint64_t next_run_id = 1;
+    Clock::duration msa_build_time{};
+    Clock::duration run_projection_time{};
+
+    for (size_t batch_begin = 0;
+         batch_begin < ordered_blocks.size();
+         batch_begin += batch_capacity) {
+        const size_t batch_size =
+            std::min(
+                batch_capacity,
+                ordered_blocks.size() -
+                    batch_begin);
+        std::vector<std::optional<BlockMSA>>
+            block_results(batch_size);
+        std::exception_ptr build_failure;
+        std::mutex build_failure_mutex;
+        size_t build_failure_index =
+            std::numeric_limits<size_t>::max();
+        const auto batch_build_begin =
+            Clock::now();
 #pragma omp parallel for schedule(dynamic) num_threads(build_threads)
-    for (int64_t i = 0; i < static_cast<int64_t>(live_blocks.size()); ++i) {
-        try {
-            BlockMSA msa = buildBlockMSA(
-                live_blocks[static_cast<size_t>(i)],
-                tree,
-                seqpro_managers,
-                &softmask_indexes);
-            if (msa.block && !msa.leaf_rows.empty()) {
-                block_results[static_cast<size_t>(i)] = std::move(msa);
-            }
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(build_failure_mutex);
-            if (!build_failure) {
-                build_failure = std::current_exception();
+        for (int64_t local_index = 0;
+             local_index <
+                 static_cast<int64_t>(batch_size);
+             ++local_index) {
+            const size_t slot =
+                static_cast<size_t>(local_index);
+            const auto& descriptor =
+                ordered_blocks[batch_begin + slot];
+            try {
+                const BlockPtr block =
+                    blocks[descriptor.input_index]
+                        .lock();
+                if (!block) {
+                    continue;
+                }
+                BlockMSA msa = buildBlockMSA(
+                    block,
+                    tree,
+                    seqpro_managers,
+                    &softmask_indexes);
+                if (msa.block_id == 0 ||
+                    msa.leaf_rows.empty()) {
+                    continue;
+                }
+                if (msa.order_path !=
+                        descriptor.order_path ||
+                    msa.order_ref_start !=
+                        descriptor.order_ref_start ||
+                    msa.block_id !=
+                        descriptor.block_id) {
+                    throw std::runtime_error(
+                        "HAL ordered Block descriptor no longer "
+                        "matches its built MSA");
+                }
+                block_results[slot] =
+                    std::move(msa);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(
+                    build_failure_mutex);
+                if (descriptor.input_index <
+                    build_failure_index) {
+                    build_failure_index =
+                        descriptor.input_index;
+                    build_failure =
+                        std::current_exception();
+                }
             }
         }
-    }
-    if (build_failure) {
-        std::rethrow_exception(build_failure);
-    }
+        msa_build_time +=
+            Clock::now() - batch_build_begin;
+        if (build_failure) {
+            std::rethrow_exception(
+                build_failure);
+        }
 
-    std::vector<BlockMSA> block_msas;
-    block_msas.reserve(live_blocks.size());
-    for (auto& result : block_results) {
-        if (result) {
-            block_msas.push_back(std::move(*result));
+        std::vector<BlockMSA> batch_msas;
+        batch_msas.reserve(batch_size);
+        for (auto& result : block_results) {
+            if (result) {
+                batch_msas.push_back(
+                    std::move(*result));
+            }
+        }
+        local_stats.msa_count +=
+            batch_msas.size();
+        const auto project_begin =
+            Clock::now();
+        appendColumnRuns(
+            batch_msas, tree, runs,
+            next_run_id);
+        run_projection_time +=
+            Clock::now() - project_begin;
+        if (resources.configured()) {
+            resources.requireAllocation(
+                0, "HAL column-run projection");
         }
     }
-    std::sort(block_msas.begin(), block_msas.end(), [](const BlockMSA& a, const BlockMSA& b) {
-        return exportBlockOrderLess(a.order_key, b.order_key);
-    });
-    local_stats.msa_count = block_msas.size();
-    local_stats.build_msa_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_msa_begin).count());
-    spdlog::info("HAL export built {} leaf-only block MSAs", block_msas.size());
+    std::vector<OrderedBlockBuild>().swap(
+        ordered_blocks);
+    local_stats.build_msa_ms =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    descriptor_build_time +
+                    msa_build_time)
+                .count());
+    spdlog::info(
+        "HAL export built and projected {} leaf-only block MSAs "
+        "in batches of at most {} using {} thread(s)",
+        local_stats.msa_count,
+        batch_capacity, build_threads);
 
     auto build_runs_begin = Clock::now();
-    auto runs = buildColumnRuns(block_msas, tree);
     const size_t projected_run_count = runs.size();
     const auto secondary_selection =
         selectCoordinateConsistentSecondaryRuns(runs);
@@ -7481,17 +7715,68 @@ void exportToHal(
         normalization.duplicate_leaf_occurrences);
     sanitizeLeafCoverage(runs, seqpro_managers);
     local_stats.build_runs_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_runs_begin).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - build_runs_begin + run_projection_time).count());
 
     auto infer_presence_begin = Clock::now();
-    for (size_t i = 0; i < runs.size(); ++i) {
-        auto& run = runs[i];
-        auto inference = inferDescendantUnionFast(tree, run.leaf_present);
-        run.present_by_node = std::move(inference.present_by_node);
-        run.presence_margin = std::move(inference.margin);
-        if ((i + 1) % 100000 == 0 || i + 1 == runs.size()) {
-            spdlog::info("HAL export inferred binary presence for {}/{} runs", i + 1, runs.size());
+    std::exception_ptr inference_failure;
+    std::mutex inference_failure_mutex;
+    size_t inference_failure_index =
+        std::numeric_limits<size_t>::max();
+    int inference_threads = build_threads;
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+        inference_threads = 1;
+    }
+#endif
+#pragma omp parallel for schedule(static) num_threads(inference_threads)
+    for (int64_t i = 0;
+         i < static_cast<int64_t>(runs.size());
+         ++i) {
+        try {
+            inferRunDescendantUnionFast(
+                tree, runs[static_cast<size_t>(i)]);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(
+                inference_failure_mutex);
+            const size_t failed_index =
+                static_cast<size_t>(i);
+            if (failed_index <
+                inference_failure_index) {
+                inference_failure_index =
+                    failed_index;
+                inference_failure =
+                    std::current_exception();
+            }
         }
+    }
+    if (inference_failure) {
+        std::rethrow_exception(
+            inference_failure);
+    }
+    uint64_t packed_presence_bytes = 0;
+    for (const auto& run : runs) {
+        const uint64_t run_bytes =
+            static_cast<uint64_t>(
+                run.present_by_node.words.size()) *
+            sizeof(uint64_t);
+        if (run_bytes >
+            std::numeric_limits<uint64_t>::max() -
+                packed_presence_bytes) {
+            packed_presence_bytes =
+                std::numeric_limits<uint64_t>::max();
+            break;
+        }
+        packed_presence_bytes += run_bytes;
+    }
+    spdlog::info(
+        "HAL export inferred packed binary presence for {} runs "
+        "using {} thread(s), {} bytes retained",
+        runs.size(), inference_threads,
+        packed_presence_bytes);
+    if (resources.configured()) {
+        resources.logSnapshot(
+            "hal-export", "presence-ready");
     }
     local_stats.infer_presence_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - infer_presence_begin).count());
@@ -7513,6 +7798,10 @@ void exportToHal(
     for (const auto& [node_id, model] : models) {
         (void)node_id;
         local_stats.scaffold_count += model.sequences.size();
+    }
+    if (resources.configured()) {
+        resources.logSnapshot(
+            "hal-export", "models-ready");
     }
 
     std::filesystem::path abs_hal_path = std::filesystem::absolute(hal_path);
@@ -7616,6 +7905,10 @@ void exportToHal(
         local_stats.aligned_top_count,
         local_stats.paralogous_top_count,
         local_stats.paralogy_self_adjacency_count);
+    if (resources.configured()) {
+        resources.logSnapshot(
+            "hal-export", "complete");
+    }
     if (stats_out != nullptr) {
         *stats_out = local_stats;
     }

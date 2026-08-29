@@ -198,9 +198,11 @@ by `cmake --install` and its prefix.
 ## Restart compatibility
 
 RaMAx 1.0.8 treats restart as cache reuse, not alignment checkpointing. It
-reuses validated raw/clean FASTA artifacts, rebuilds the memory-only suffix
-array, then reruns anchor search, clustering, graph construction, and export
-from the beginning:
+reuses validated raw/clean FASTA artifacts, rebuilds the complete suffix-array
+index, then reruns anchor search, clustering, graph construction, and export
+from the beginning. On Linux, the complete SA/ISA/LCP buffers use temporary
+file-backed mappings so the resource manager can reclaim cold pages; they are
+not a persistent index cache:
 
 ```bash
 ramax --restart -w work
@@ -216,7 +218,8 @@ loaded with explicit compatibility defaults and migrated to schema 6; all
 older workdirs use `--sa-sampling-rate 1`; the suffix-array backend accepts
 only this complete-array value. References below 1024 MiB use divsufsort,
 while references at or above the threshold use CaPS. The suffix-array index is
-never written to or restored from the work directory. Older work directories
+never restored across runs and its temporary mapping is unlinked immediately;
+restart always rebuilds it. Older work directories
 use `--gfa-profile exact`, and schemas before 4 default to
 GFA 1.1 when no GFA version was persisted.
 

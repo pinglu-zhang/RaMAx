@@ -11,7 +11,11 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <ostream>
 #include <shared_mutex>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include <chrono>
 #include <algorithm>
 
@@ -50,14 +54,189 @@ namespace RaMesh {
         }
     };
 
-    using ChrHeadMap = std::unordered_multimap<SpeciesChrPair, SegPtr, SpeciesChrPairHash>;
+    namespace detail {
+        // Returned references remain valid for the process lifetime. Graph
+        // path names are few compared with Block occurrences, so interning
+        // removes repeated string payloads without changing textual identity.
+        const std::string& internGraphName(std::string_view value);
+    }
+
+    class InternedGraphName {
+    public:
+        InternedGraphName()
+            : value_(&detail::internGraphName(std::string_view{})) {}
+        InternedGraphName(const InternedGraphName&) noexcept = default;
+        InternedGraphName(InternedGraphName&&) noexcept = default;
+        explicit InternedGraphName(const std::string& value)
+            : value_(&detail::internGraphName(value)) {}
+        explicit InternedGraphName(std::string_view value)
+            : value_(&detail::internGraphName(value)) {}
+        explicit InternedGraphName(const char* value)
+            : value_(&detail::internGraphName(
+                  value ? std::string_view(value) : std::string_view{})) {}
+
+        [[nodiscard]] const std::string& str() const noexcept {
+            return *value_;
+        }
+        [[nodiscard]] bool empty() const noexcept { return value_->empty(); }
+        operator const std::string&() const noexcept { return *value_; }
+
+        InternedGraphName& operator=(const InternedGraphName&) = default;
+        InternedGraphName& operator=(InternedGraphName&&) noexcept = default;
+        InternedGraphName& operator=(const std::string& value) {
+            value_ = &detail::internGraphName(value);
+            return *this;
+        }
+        InternedGraphName& operator=(std::string_view value) {
+            value_ = &detail::internGraphName(value);
+            return *this;
+        }
+        InternedGraphName& operator=(const char* value) {
+            value_ = &detail::internGraphName(
+                value ? std::string_view(value) : std::string_view{});
+            return *this;
+        }
+
+        friend bool operator==(const InternedGraphName& left,
+                               const InternedGraphName& right) noexcept {
+            return left.value_ == right.value_ || left.str() == right.str();
+        }
+        friend bool operator<(const InternedGraphName& left,
+                              const InternedGraphName& right) noexcept {
+            return left.str() < right.str();
+        }
+        friend bool operator==(const InternedGraphName& left,
+                               std::string_view right) noexcept {
+            return left.str() == right;
+        }
+        friend bool operator==(const InternedGraphName& left,
+                               const std::string& right) noexcept {
+            return left.str() == right;
+        }
+        friend bool operator==(const InternedGraphName& left,
+                               const char* right) noexcept {
+            return left.str() == (right ? right : "");
+        }
+        friend bool operator==(const char* left,
+                               const InternedGraphName& right) noexcept {
+            return right == left;
+        }
+        friend std::ostream& operator<<(std::ostream& output,
+                                        const InternedGraphName& value) {
+            return output << value.str();
+        }
+        friend std::string operator+(const InternedGraphName& left,
+                                     std::string_view right) {
+            std::string result = left.str();
+            result.append(right);
+            return result;
+        }
+        friend std::string operator+(std::string_view left,
+                                     const InternedGraphName& right) {
+            std::string result(left);
+            result.append(right.str());
+            return result;
+        }
+        friend std::string operator+(std::string left,
+                                     const InternedGraphName& right) {
+            left.append(right.str());
+            return left;
+        }
+        friend std::string operator+(const char* left,
+                                     const InternedGraphName& right) {
+            std::string result(left ? left : "");
+            result.append(right.str());
+            return result;
+        }
+
+    private:
+        const std::string* value_;
+    };
+    static_assert(sizeof(InternedGraphName) == sizeof(const std::string*));
+
+    struct AnchorPathKey {
+        InternedGraphName first;
+        InternedGraphName second;
+
+        AnchorPathKey() = default;
+        AnchorPathKey(std::string_view species, std::string_view chromosome)
+            : first(species), second(chromosome) {}
+        AnchorPathKey(std::string_view species,
+                      const InternedGraphName& chromosome)
+            : first(species), second(chromosome) {}
+        AnchorPathKey(const InternedGraphName& species,
+                      std::string_view chromosome)
+            : first(species), second(chromosome) {}
+        AnchorPathKey(const InternedGraphName& species,
+                      const InternedGraphName& chromosome)
+            : first(species), second(chromosome) {}
+        AnchorPathKey(const SpeciesChrPair& key)
+            : first(key.first), second(key.second) {}
+
+        operator SpeciesChrPair() const {
+            return SpeciesChrPair{first.str(), second.str()};
+        }
+
+        friend bool operator==(const AnchorPathKey& left,
+                               const AnchorPathKey& right) noexcept {
+            return left.first == right.first && left.second == right.second;
+        }
+        friend bool operator<(const AnchorPathKey& left,
+                              const AnchorPathKey& right) noexcept {
+            return left.first < right.first ||
+                (!(right.first < left.first) && left.second < right.second);
+        }
+    };
+    static_assert(sizeof(AnchorPathKey) == 2 * sizeof(const std::string*));
+
+    struct AnchorPathKeyHash {
+        std::size_t operator()(const AnchorPathKey& key) const noexcept {
+            // Keep the exact legacy hash combination so bucket placement and
+            // unordered_multimap iteration order remain unchanged.
+            const std::size_t h1 = std::hash<std::string>{}(key.first.str());
+            const std::size_t h2 = std::hash<std::string>{}(key.second.str());
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL +
+                         (h1 << 6) + (h1 >> 2));
+        }
+    };
+
+    using ChrHeadMap =
+        std::unordered_multimap<AnchorPathKey, SegPtr, AnchorPathKeyHash>;
 
     // ────────────────────────────────────────────────
-    // Intrusive concurrent list node
+    // Graph path links are published only by serial graph mutation stages.
+    // Read-only OpenMP/export phases do not overlap those stages, so an
+    // atomic<shared_ptr> adds per-node synchronization state without providing
+    // safety to the other directly accessed Segment fields.  Preserve the
+    // existing load/store call shape while keeping one ordinary shared_ptr.
     // ────────────────────────────────────────────────
+    class StageSharedLink {
+    public:
+        StageSharedLink() = default;
+        StageSharedLink(const StageSharedLink&) = delete;
+        StageSharedLink& operator=(const StageSharedLink&) = delete;
+        StageSharedLink(StageSharedLink&&) = delete;
+        StageSharedLink& operator=(StageSharedLink&&) = delete;
+
+        [[nodiscard]] SegPtr load(
+            std::memory_order = std::memory_order_seq_cst) const noexcept {
+            return value_;
+        }
+
+        void store(
+            SegPtr desired,
+            std::memory_order = std::memory_order_seq_cst) noexcept {
+            value_ = std::move(desired);
+        }
+
+    private:
+        SegPtr value_;
+    };
+    static_assert(sizeof(StageSharedLink) == sizeof(SegPtr));
+
     struct RaMeshPath {
-        std::atomic<SegPtr> next{ nullptr };
-        std::atomic<SegPtr> prev{ nullptr };
+        StageSharedLink next;
+        StageSharedLink prev;
     };
 
     // ────────────────────────────────────────────────
@@ -65,6 +244,25 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     enum class AlignRole : uint8_t { PRIMARY = 0, SECONDARY = 1 };
     enum class SegmentRole : uint8_t { SEGMENT = 0, HEAD = 1, TAIL = 2 };
+
+    // Segment fields are mutated only by the serial graph publication stages;
+    // OpenMP preparation and export phases are read-only and never overlap a
+    // publication stage.  Keeping a full pthread rwlock in every Segment costs
+    // dozens of bytes per graph occurrence without providing synchronization
+    // that the rest of the direct field accesses actually use.  This lockable
+    // compatibility token preserves existing lock call sites while ownership
+    // remains at the graph/stage boundary.
+    class StageSharedMutex {
+    public:
+        void lock() noexcept {}
+        bool try_lock() noexcept { return true; }
+        void unlock() noexcept {}
+        void lock_shared() noexcept {}
+        bool try_lock_shared() noexcept { return true; }
+        void unlock_shared() noexcept {}
+    };
+    static_assert(std::is_empty_v<StageSharedMutex>);
+    static_assert(sizeof(StageSharedMutex) == 1);
 
     // ────────────────────────────────────────────────
     // Segment / Sentinel
@@ -77,13 +275,22 @@ namespace RaMesh {
         Strand      strand{ Strand::FORWARD };
         AlignRole   align_role{ AlignRole::PRIMARY };
         SegmentRole seg_role{ SegmentRole::SEGMENT };
+        bool left_extend{ false };
+        bool right_extend{ false };
 
         RaMeshPath  primary_path;
         BlockPtr   parent_block;
 
-        bool left_extend{ false };
-		bool right_extend{ false };
-        mutable std::shared_mutex rw;        // guards non‑list fields
+        // Last interval appended to the multi-round mask journal.  Duplicate
+        // intervals do not affect the merged mask, so retaining this compact
+        // coordinate snapshot avoids rebuilding and sorting unchanged mask
+        // records in every later round. UINT64_MAX means never published.
+        uint64_t mask_journal_snapshot{UINT64_MAX};
+        // Source compatibility for legacy per-Segment lock call sites.  The
+        // token is stateless and graph mutation is stage-serialized, so one
+        // class-wide instance avoids consuming a byte plus tail padding in
+        // every occurrence.
+        inline static StageSharedMutex rw{};
 
         // ――― predicates ―――
         [[nodiscard]] bool isHead()      const noexcept { return seg_role == SegmentRole::HEAD; }
@@ -118,11 +325,14 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class Block : public std::enable_shared_from_this<Block> {
     public:
-        SpeciesName ref_species; // guard: rw
-        ChrName   ref_chr;      // guard: rw
+        InternedGraphName ref_species; // guard: rw
+        InternedGraphName ref_chr;     // guard: rw
         uint64_t  block_id{ 0 }; // stable export identity
         ChrHeadMap anchors;     // guard: rw (head sentinel of every chr)
-        mutable std::shared_mutex rw;
+        // Blocks follow the same stage-publication contract as Segments.  A
+        // per-Block pthread rwlock dominates the metadata size at large graph
+        // scales, while all parallel users of anchors are read-only.
+        inline static StageSharedMutex rw{};
 
         static BlockPtr create(std::size_t hint = 1);
         static BlockPtr createEmpty(const SpeciesName& ref_species,

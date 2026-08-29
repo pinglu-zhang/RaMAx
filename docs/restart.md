@@ -3,8 +3,10 @@
 ## What restart means
 
 RaMAx 1.0.8 uses `--restart` to reuse expensive input preparation. The
-suffix-array index is memory-only and is rebuilt by every process; restart is
-not an alignment checkpoint system.
+suffix-array index is process-local and is rebuilt by every process; restart
+is not an alignment checkpoint system. Linux may back the complete SA/ISA/LCP
+buffers with immediately unlinked temporary mappings, but those mappings are
+not persistent index artifacts.
 
 Reusable state:
 
@@ -87,7 +89,14 @@ published only after successful completion. Their completion markers record
 cache format, source identity, file size, and mtime. A missing, incomplete,
 changed, or unloadable cache item is rebuilt independently.
 
-Suffix-array indexes are created in memory at the beginning of each reference round and are never read from or written to disk. The persisted `--sa-sampling-rate` value must be `1`; other values are rejected before index construction. Restart therefore rebuilds the suffix array while continuing to reuse eligible preprocessing artifacts. Existing `.saidx` files from older runs are ignored and are not deleted.
+Suffix-array indexes are created at the beginning of each reference round and
+are never restored across processes. Linux uses unlinked temporary file-backed
+mappings for complete SA/ISA/LCP buffers when the runtime resource manager is
+active; non-Linux builds use heap storage. The persisted
+`--sa-sampling-rate` value must be `1`; other values are rejected before index
+construction. Restart therefore rebuilds the suffix array while continuing to
+reuse eligible preprocessing artifacts. Existing `.saidx` files from older
+runs are ignored and are not deleted.
 Each reference round builds its suffix array when reached. `--slow-build`
 continues to control the historical text/sentinel layout; it does not enable a
 disk cache.

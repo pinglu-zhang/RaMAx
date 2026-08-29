@@ -2,8 +2,8 @@
 #define SUFFIX_ARRAY_INDEX_H
 
 #include "index.h"
+#include "mapped_file_region.h"
 
-#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <new>
@@ -22,43 +22,38 @@ public:
     UninitializedBuffer() = default;
     UninitializedBuffer(const UninitializedBuffer&) = delete;
     UninitializedBuffer& operator=(const UninitializedBuffer&) = delete;
-    UninitializedBuffer(UninitializedBuffer&& other) noexcept
-        : data_(std::exchange(other.data_, nullptr)),
-          size_(std::exchange(other.size_, 0)) {}
-    UninitializedBuffer& operator=(UninitializedBuffer&& other) noexcept {
-        if (this != &other) {
-            clear();
-            data_ = std::exchange(other.data_, nullptr);
-            size_ = std::exchange(other.size_, 0);
-        }
-        return *this;
-    }
+    UninitializedBuffer(UninitializedBuffer&&) noexcept = default;
+    UninitializedBuffer& operator=(UninitializedBuffer&&) noexcept = default;
     ~UninitializedBuffer() { clear(); }
 
-    void allocate(size_t count) {
+    void allocate(size_t count, std::string_view label = "suffix-buffer") {
         clear();
         if (count == 0) return;
         if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
             throw std::bad_array_new_length();
         }
-        data_ = static_cast<T*>(std::malloc(count * sizeof(T)));
-        if (data_ == nullptr) throw std::bad_alloc();
+        region_.allocate(count * sizeof(T), label);
         size_ = count;
     }
     void clear() noexcept {
-        std::free(data_);
-        data_ = nullptr;
+        region_.clear();
         size_ = 0;
     }
-    T* data() noexcept { return data_; }
-    const T* data() const noexcept { return data_; }
+    T* data() noexcept { return static_cast<T*>(region_.data()); }
+    const T* data() const noexcept {
+        return static_cast<const T*>(region_.data());
+    }
     size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
-    T& operator[](size_t index) noexcept { return data_[index]; }
-    const T& operator[](size_t index) const noexcept { return data_[index]; }
+    T& operator[](size_t index) noexcept { return data()[index]; }
+    const T& operator[](size_t index) const noexcept { return data()[index]; }
+    void adviseSequential() noexcept { region_.adviseSequential(); }
+    void adviseRandom() noexcept { region_.adviseRandom(); }
+    void adviseDontNeed() noexcept { region_.adviseDontNeed(); }
+    bool fileBacked() const noexcept { return region_.fileBacked(); }
 
 private:
-    T* data_{nullptr};
+    RaMAxResources::MappedFileRegion region_;
     size_t size_{0};
 };
 
@@ -130,6 +125,16 @@ public:
     uint_t textSize() const noexcept { return text_size; }
     uint_t storedSuffixCount() const noexcept {
         return stored_suffix_count;
+    }
+    bool fileBacked() const noexcept {
+        return coordinates_are_64_bit
+            ? suffix_array_64.fileBacked()
+            : suffix_array_32.fileBacked();
+    }
+    uint64_t arrayStorageBytes() const noexcept {
+        return static_cast<uint64_t>(stored_suffix_count) *
+            (coordinates_are_64_bit ? sizeof(uint64_t) : sizeof(uint32_t)) *
+            3ULL;
     }
 
     SpeciesName species_name;

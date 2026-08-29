@@ -204,7 +204,24 @@ RAMAx_THREADS=16 ramax \
 ```
 
 An explicit `--threads` value takes precedence over the environment default.
-Use fewer threads when memory is the limiting resource.
+Use fewer threads when memory is the limiting resource. Large runs can also
+set an explicit budget and place temporary mappings and lossless Match spill
+on local NVMe:
+
+```bash
+ramax \
+  -i /data/project/seqfile.txt \
+  -o /data/project/results/alignment.maf \
+  -w /data/project/work/ramax-maf \
+  -t 64 \
+  --memory-limit 900GiB \
+  --temp-dir /mnt/nvme/ramax-spill
+```
+
+`--memory-limit auto` is the default. The budget and temporary directory
+control only batching and storage residency; they do not change anchor,
+clustering, DP, graph, or export ordering. Spill records are raw, versioned,
+lossless records and preserve Match/vector order.
 
 ## Work-directory lifecycle
 
@@ -218,9 +235,11 @@ preserves the work directory after a successful export so that
 Failed or interrupted runs also leave it in place for diagnosis and restart.
 
 On restart, RaMAx retains reusable raw, clean, and softmask preprocessing
-artifacts. It rebuilds the complete in-memory suffix-array index, archives the
+artifacts. It rebuilds the complete suffix-array index, archives the
 previous log, removes stale `result/`, `mask_interval/`, and `minipoa_tmp/`
-directories, and starts alignment from the first reference round.
+directories, and starts alignment from the first reference round. Linux backs
+the complete SA/ISA/LCP buffers with immediately unlinked temporary mappings;
+these mappings are runtime storage, not a restart cache.
 
 Always place the final MAF, HAL, or PAF outside the work directory:
 
