@@ -8,6 +8,7 @@
 #include "anchor.h"
 #include "rare_aligner.h"
 #include "ramesh.h"
+#include "../src/anchor/anchor_link_internal.h"
 #include "../src/graph/merge_internal.h"
 
 #include <algorithm>
@@ -118,6 +119,110 @@ void testSequenceViewsAndKswSummary(const std::filesystem::path& directory) {
     AlignmentResult exact_raw = ramaxExtendAlignKSW2RawForTesting(
         {exact, false}, {exact, false}, 400);
     assert(exact_optimized.cigar == exact_raw.cigar);
+}
+
+Anchor makeLinkingAnchor(uint32_t ref_start, uint32_t query_start,
+                         Strand strand) {
+    constexpr uint32_t length = 20;
+    return Anchor(
+        0, ref_start, length, 0, query_start, length, strand,
+        length, length, Cigar_t{cigarToInt('M', length)});
+}
+
+AnchorVec makeLinkingPair(uint32_t gap, Strand strand) {
+    constexpr uint32_t length = 20;
+    constexpr uint32_t first_ref = 100;
+    constexpr uint32_t first_forward_query = 100;
+    constexpr uint32_t first_reverse_query = 220000;
+    const uint32_t second_ref = first_ref + length + gap;
+    const uint32_t first_query = strand == FORWARD
+        ? first_forward_query : first_reverse_query;
+    const uint32_t second_query = strand == FORWARD
+        ? first_forward_query + length + gap
+        : first_reverse_query - length - gap;
+    AnchorVec anchors;
+    anchors.push_back(makeLinkingAnchor(first_ref, first_query, strand));
+    anchors.push_back(makeLinkingAnchor(second_ref, second_query, strand));
+    return anchors;
+}
+
+void testAnchorLinkGapBoundaries(const std::filesystem::path& directory) {
+    const auto reference_path = directory / "anchor-link-reference.fa";
+    const auto query_path = directory / "anchor-link-query.fa";
+    writeFile(reference_path,
+              ">chr1\n" + std::string(250000, 'A') + "\n");
+    writeFile(query_path,
+              ">chr1\n" + std::string(250000, 'A') + "\n");
+    SeqPro::ManagerVariant reference_manager{
+        std::make_unique<SeqPro::SequenceManager>(reference_path)};
+    SeqPro::ManagerVariant query_manager{
+        std::make_unique<SeqPro::SequenceManager>(query_path)};
+
+    for (const uint32_t gap :
+         {0U, 1U, 9999U, 10000U, 10001U, 50000U, 100000U, 100001U}) {
+        AnchorVec anchors = makeLinkingPair(gap, FORWARD);
+        AnchorLinkDetail::Statistics split_statistics;
+        const auto components =
+            AnchorLinkDetail::splitAnchorComponents(anchors, &split_statistics);
+        const size_t expected_components = gap <= 10000 ? 1 : 2;
+        assert(components.size() == expected_components);
+        assert(components.front().begin == 0);
+        assert(components.back().end == 2);
+        assert(split_statistics.long_gap_rejections ==
+               (gap <= 10000 ? 0U : 1U));
+        assert(split_statistics.maximum_seen_gap ==
+               (gap <= 10000 ? 0U : gap));
+
+        AnchorLinkDetail::Statistics statistics;
+        auto output = AnchorLinkDetail::linkAnchorRange(
+            anchors, 0, anchors.size(), reference_manager, query_manager,
+            &statistics);
+        if (gap <= 10000) {
+            assert(output.size() == 1);
+            assert(statistics.sequence_extractions == 2);
+            assert(statistics.direct_ksw_calls == 1);
+            assert(statistics.fallback_ksw_calls == 0);
+            assert(statistics.long_gap_rejections == 0);
+            assert(output.front()->ref_len == 40 + gap);
+            assert(output.front()->qry_len == 40 + gap);
+        } else {
+            assert(output.size() == 2);
+            assert(statistics.sequence_extractions == 0);
+            assert(statistics.direct_ksw_calls == 0);
+            assert(statistics.fallback_ksw_calls == 0);
+            assert(statistics.long_gap_rejections >= 1);
+            assert(statistics.maximum_seen_gap == gap);
+        }
+    }
+
+    for (const uint32_t gap : {9999U, 10000U, 10001U, 100000U}) {
+        const AnchorVec reverse = makeLinkingPair(gap, REVERSE);
+        const auto components =
+            AnchorLinkDetail::splitAnchorComponents(reverse);
+        assert(components.size() == (gap <= 10000 ? 1U : 2U));
+    }
+
+    AnchorVec prefix_maximum;
+    prefix_maximum.emplace_back(
+        0, 100, 20000, 0, 100, 20000, FORWARD,
+        20000, 20000, Cigar_t{cigarToInt('M', 20000)});
+    prefix_maximum.push_back(makeLinkingAnchor(200, 200, FORWARD));
+    prefix_maximum.push_back(makeLinkingAnchor(30100, 30100, FORWARD));
+    AnchorLinkDetail::Statistics split_statistics;
+    auto components =
+        AnchorLinkDetail::splitAnchorComponents(
+            prefix_maximum, &split_statistics);
+    assert(components.size() == 1);
+    assert(split_statistics.long_gap_rejections == 0);
+    prefix_maximum.back().ref_start = 30101;
+    split_statistics = {};
+    components = AnchorLinkDetail::splitAnchorComponents(
+        prefix_maximum, &split_statistics);
+    assert(components.size() == 2);
+    assert(split_statistics.long_gap_rejections == 1);
+    assert(split_statistics.maximum_seen_gap == 10001);
+    assert(components[0].begin == 0 && components[0].end == 2);
+    assert(components[1].begin == 2 && components[1].end == 3);
 }
 
 AnchorPtr makeAnchor(uint32_t ref_start, uint32_t ref_length,
@@ -1257,6 +1362,7 @@ int main() {
         return 0;
     }
     testSequenceViewsAndKswSummary(directory);
+    testAnchorLinkGapBoundaries(directory);
     testDpEquivalence();
     testDpPerformanceSmoke();
     testExtendRefNodesEquivalence(directory);

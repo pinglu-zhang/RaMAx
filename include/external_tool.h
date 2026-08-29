@@ -1,6 +1,7 @@
 #ifndef RAMAX_EXTERNAL_TOOL_H
 #define RAMAX_EXTERNAL_TOOL_H
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -12,6 +13,7 @@ namespace RaMAxExternalTool {
 struct CommandResult {
     int exit_code{0};
     bool timed_out{false};
+    bool cancelled{false};
     int termination_signal{0};
     std::chrono::milliseconds elapsed{0};
 };
@@ -22,6 +24,9 @@ struct RunOptions {
     std::chrono::milliseconds termination_grace{std::chrono::seconds(10)};
     std::chrono::milliseconds poll_interval{std::chrono::milliseconds(200)};
     bool create_process_group{false};
+    // The caller owns this flag and must keep it alive until run() returns.
+    // Cancellation uses the same process-group cleanup guarantees as timeout.
+    const std::atomic<bool>* cancellation_requested{nullptr};
 };
 
 bool isExecutable(const std::filesystem::path& candidate);

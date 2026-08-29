@@ -1,4 +1,5 @@
 #include "anchor.h"
+#include "anchor_link_internal.h"
 #include <SeqPro.h>
 #include "data_process.h"
 
@@ -864,8 +865,6 @@ void linkClusters(AnchorPtrVec& anchors,
             // ========== 在 push_back 前，尝试与 linked.back() 的 gap 比对 ==========
             if (!linked.empty()) {
                 const int LOOK_BACK = 2000;
-                const int_t MAX_GAP = 100000;
-
                 auto best_it = linked.rend();  // 初始化为无效
                 int_t best_score = std::numeric_limits<int_t>::max();
                 int checked = 0;
@@ -895,8 +894,12 @@ void linkClusters(AnchorPtrVec& anchors,
                             - static_cast<int_t>((*curr)->qry_start + (*curr)->qry_len);
                     }
 
-                    if (ref_gap < 0 || qry_gap < 0 || ref_gap > MAX_GAP || qry_gap > MAX_GAP)
+                    if (ref_gap < 0 || qry_gap < 0 ||
+                        !linkedGapCanBeAligned(
+                            static_cast<Coord_t>(ref_gap),
+                            static_cast<Coord_t>(qry_gap))) {
                         continue;
+                    }
 
                     long greater = std::max(ref_gap, qry_gap);
                     long lesser = std::min(ref_gap, qry_gap);
@@ -1027,12 +1030,481 @@ inline bool intervalOverlap(Coord_t a_lo, Coord_t a_hi, Coord_t b_lo, Coord_t b_
     return !(a_hi <= b_lo || b_hi <= a_lo);
 }
 
+namespace AnchorLinkDetail {
+
+namespace {
+
+uint64_t saturatingAdd(uint64_t left, uint64_t right) {
+    return right > std::numeric_limits<uint64_t>::max() - left
+        ? std::numeric_limits<uint64_t>::max()
+        : left + right;
+}
+
+uint64_t saturatingMultiply(uint64_t left, uint64_t right) {
+    if (left != 0 &&
+        right > std::numeric_limits<uint64_t>::max() / left) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return left * right;
+}
+
+uint64_t estimatedGapCells(Coord_t ref_gap, Coord_t query_gap) {
+    const uint64_t maximum = std::max<uint64_t>(ref_gap, query_gap);
+    const uint64_t band = static_cast<uint64_t>(auto_band(
+        static_cast<int>(ref_gap), static_cast<int>(query_gap)));
+    return saturatingMultiply(maximum, saturatingAdd(band, band) + 1);
+}
+
+void observeGap(Statistics* statistics, int_t ref_gap, int_t query_gap,
+                bool rejected) {
+    if (!statistics || ref_gap < 0 || query_gap < 0) return;
+    statistics->maximum_seen_gap = std::max<uint64_t>(
+        statistics->maximum_seen_gap,
+        static_cast<uint64_t>(std::max(ref_gap, query_gap)));
+    if (rejected) ++statistics->long_gap_rejections;
+}
+
+}  // namespace
+
+AnchorVec materializeClusterAnchors(
+    MatchClusterVec& clusters,
+    const SeqPro::ManagerVariant& ref_mgr,
+    const SeqPro::ManagerVariant& qry_mgr) {
+    std::sort(clusters.begin(), clusters.end(),
+        [](const MatchCluster& left, const MatchCluster& right) {
+            if (left.empty() || right.empty()) {
+                return left.size() < right.size();
+            }
+            return left.front().ref_start < right.front().ref_start;
+        });
+
+    MatchClusterVec cleaned;
+    cleaned.reserve(clusters.size());
+    bool have_previous = false;
+    ChrIndex previous_ref_chromosome = 0;
+    ChrIndex previous_query_chromosome = 0;
+    Strand previous_strand = FORWARD;
+    Coord_t previous_ref_end = 0;
+    Coord_t previous_query_low = 0;
+    Coord_t previous_query_high = 0;
+
+    const auto query_bounds = [](const MatchCluster& cluster) {
+        Coord_t low = std::numeric_limits<Coord_t>::max();
+        Coord_t high = 0;
+        for (const auto& match : cluster) {
+            const Coord_t first = match.qry_start;
+            const Coord_t second = match.qry_start + len2(match);
+            low = std::min(low, std::min(first, second));
+            high = std::max(high, std::max(first, second));
+        }
+        if (low == std::numeric_limits<Coord_t>::max()) low = 0;
+        return std::pair<Coord_t, Coord_t>{low, high};
+    };
+
+    for (auto& cluster : clusters) {
+        if (cluster.empty()) continue;
+        if (!have_previous ||
+            cluster.front().ref_chr_index != previous_ref_chromosome ||
+            cluster.front().qry_chr_index != previous_query_chromosome ||
+            cluster.front().strand() != previous_strand) {
+            MatchCluster kept = std::move(cluster);
+            previous_ref_chromosome = kept.front().ref_chr_index;
+            previous_query_chromosome = kept.front().qry_chr_index;
+            previous_strand = kept.front().strand();
+            previous_ref_end = kept.back().ref_start + len1(kept.back());
+            const auto [low, high] = query_bounds(kept);
+            previous_query_low = low;
+            previous_query_high = high;
+            cleaned.push_back(std::move(kept));
+            have_previous = true;
+            continue;
+        }
+
+        MatchCluster pruned;
+        pruned.reserve(cluster.size());
+        for (auto& match : cluster) {
+            const bool reference_ok = match.ref_start >= previous_ref_end;
+            const Coord_t first = match.qry_start;
+            const Coord_t second = match.qry_start + len2(match);
+            const Coord_t low = std::min(first, second);
+            const Coord_t high = std::max(first, second);
+            const bool query_ok = !intervalOverlap(
+                low, high, previous_query_low, previous_query_high);
+            if (reference_ok && query_ok) {
+                pruned.push_back(std::move(match));
+            }
+        }
+        if (pruned.empty()) continue;
+        previous_ref_end = pruned.back().ref_start + len1(pruned.back());
+        const auto [low, high] = query_bounds(pruned);
+        previous_query_low = low;
+        previous_query_high = high;
+        cleaned.push_back(std::move(pruned));
+    }
+    clusters.swap(cleaned);
+    MatchClusterVec().swap(cleaned);
+
+    AnchorVec anchors;
+    anchors.reserve(clusters.size());
+    for (auto& cluster : clusters) {
+        if (cluster.empty()) continue;
+        anchors.push_back(extendClusterToAnchor(cluster, ref_mgr, qry_mgr));
+        anchors.back().is_linked = false;
+        MatchCluster().swap(cluster);
+    }
+    MatchClusterVec().swap(clusters);
+    return anchors;
+}
+
+std::vector<ComponentRange> splitAnchorComponents(
+    const AnchorVec& anchors,
+    Statistics* statistics) {
+    std::vector<ComponentRange> components;
+    if (anchors.empty()) return components;
+    size_t begin = 0;
+    uint64_t prefix_maximum_end =
+        static_cast<uint64_t>(anchors.front().ref_start) +
+        anchors.front().ref_len;
+    const auto append_component = [&](size_t first, size_t last) {
+        const uint64_t length = last - first;
+        uint64_t cost = saturatingAdd(
+            length,
+            saturatingMultiply(length, std::min<uint64_t>(length, 2000)));
+        for (size_t index = first + 1; index < last; ++index) {
+            const Anchor& previous = anchors[index - 1];
+            const Anchor& current = anchors[index];
+            if (previous.ref_chr_index != current.ref_chr_index ||
+                previous.qry_chr_index != current.qry_chr_index ||
+                previous.strand != current.strand) {
+                continue;
+            }
+            const int64_t ref_gap = static_cast<int64_t>(current.ref_start) -
+                static_cast<int64_t>(previous.ref_start + previous.ref_len);
+            const int64_t query_gap = current.strand == FORWARD
+                ? static_cast<int64_t>(current.qry_start) -
+                    static_cast<int64_t>(
+                        previous.qry_start + previous.qry_len)
+                : static_cast<int64_t>(previous.qry_start) -
+                    static_cast<int64_t>(current.qry_start + current.qry_len);
+            if (ref_gap < 0 || query_gap < 0 ||
+                !linkedGapCanBeAligned(
+                    static_cast<Coord_t>(ref_gap),
+                    static_cast<Coord_t>(query_gap))) {
+                continue;
+            }
+            cost = saturatingAdd(cost, estimatedGapCells(
+                static_cast<Coord_t>(ref_gap),
+                static_cast<Coord_t>(query_gap)));
+        }
+        components.push_back({first, last, cost});
+    };
+
+    for (size_t index = 1; index < anchors.size(); ++index) {
+        const Anchor& previous = anchors[index - 1];
+        const Anchor& current = anchors[index];
+        const bool key_changed =
+            previous.ref_chr_index != current.ref_chr_index ||
+            previous.qry_chr_index != current.qry_chr_index ||
+            previous.strand != current.strand;
+        const uint64_t current_start = current.ref_start;
+        const bool separated = current_start > prefix_maximum_end &&
+            current_start - prefix_maximum_end >
+                kMaximumLinkedGapAlignmentLength;
+        if (key_changed || separated) {
+            if (!key_changed && separated && statistics) {
+                ++statistics->long_gap_rejections;
+                statistics->maximum_seen_gap = std::max<uint64_t>(
+                    statistics->maximum_seen_gap,
+                    current_start - prefix_maximum_end);
+            }
+            append_component(begin, index);
+            begin = index;
+            prefix_maximum_end =
+                static_cast<uint64_t>(current.ref_start) + current.ref_len;
+        } else {
+            prefix_maximum_end = std::max<uint64_t>(
+                prefix_maximum_end,
+                static_cast<uint64_t>(current.ref_start) + current.ref_len);
+        }
+    }
+    append_component(begin, anchors.size());
+    return components;
+}
+
+AnchorPtrVec linkAnchorRange(
+    AnchorVec& anchors,
+    size_t begin,
+    size_t end,
+    const SeqPro::ManagerVariant& ref_mgr,
+    const SeqPro::ManagerVariant& qry_mgr,
+    Statistics* statistics) {
+    if (begin > end || end > anchors.size()) {
+        throw std::out_of_range("Invalid Anchor linking component range");
+    }
+    AnchorPtrVec output;
+    if (begin == end) return output;
+    std::vector<size_t> linked;
+    linked.reserve(end - begin);
+    constexpr size_t kNoIndex = std::numeric_limits<size_t>::max();
+    constexpr int kCandidateLimit = 2000;
+    constexpr int kLookBack = 2000;
+    constexpr int_t kBreakLength = 200;
+    ManagedSequenceSlice reference_slice;
+    ManagedSequenceSlice query_slice;
+
+    size_t current_index = begin;
+    while (current_index < end) {
+        Anchor& current = anchors[current_index];
+        if (current.is_linked) {
+            ++current_index;
+            continue;
+        }
+
+        size_t best_index = kNoIndex;
+        int_t best_score = std::numeric_limits<int_t>::max();
+        int looked = 0;
+        for (size_t index = current_index + 1;
+             index < end && looked < kCandidateLimit; ++index) {
+            Anchor& candidate = anchors[index];
+            if (candidate.is_linked) continue;
+            ++looked;
+            if (statistics) ++statistics->candidate_checks;
+            const int_t ref_gap = static_cast<int_t>(candidate.ref_start) -
+                static_cast<int_t>(current.ref_start + current.ref_len);
+            const int_t query_gap = current.strand == FORWARD
+                ? static_cast<int_t>(candidate.qry_start) -
+                    static_cast<int_t>(current.qry_start + current.qry_len)
+                : static_cast<int_t>(current.qry_start) -
+                    static_cast<int_t>(candidate.qry_start + candidate.qry_len);
+            if (ref_gap < 0 || query_gap < 0) continue;
+            const long greater = std::max(ref_gap, query_gap);
+            const long lesser = std::min(ref_gap, query_gap);
+            if (greater < kBreakLength ||
+                greater - lesser <= kBreakLength) {
+                best_index = index;
+                break;
+            }
+            const int_t score = (greater << 1) - lesser;
+            if (best_score > score) {
+                best_score = score;
+                best_index = index;
+            }
+        }
+
+        bool reached = false;
+        if (best_index != kNoIndex) {
+            Anchor& best = anchors[best_index];
+            const Coord_t ref_gap_begin = current.ref_start + current.ref_len;
+            const Coord_t ref_gap_length = best.ref_start - ref_gap_begin;
+            Coord_t query_gap_begin = 0;
+            Coord_t query_gap_length = 0;
+            if (current.strand == FORWARD) {
+                query_gap_begin = current.qry_start + current.qry_len;
+                query_gap_length = best.qry_start - query_gap_begin;
+            } else {
+                query_gap_begin = best.qry_start + best.qry_len;
+                query_gap_length = current.qry_start - query_gap_begin;
+            }
+
+            const bool alignable = linkedGapCanBeAligned(
+                ref_gap_length, query_gap_length);
+            observeGap(statistics, ref_gap_length, query_gap_length,
+                       !alignable);
+            if (alignable) {
+                if (statistics) {
+                    statistics->sequence_extractions += 2;
+                    ++statistics->direct_ksw_calls;
+                    statistics->estimated_ksw_cells = saturatingAdd(
+                        statistics->estimated_ksw_cells,
+                        estimatedGapCells(ref_gap_length, query_gap_length));
+                }
+                loadSequenceSlice(ref_mgr, current.ref_chr_index,
+                    ref_gap_begin, ref_gap_length, false, reference_slice);
+                loadSequenceSlice(qry_mgr, current.qry_chr_index,
+                    query_gap_begin, query_gap_length,
+                    current.strand == REVERSE, query_slice);
+                AlignmentResult gap = extendAlignKSW2Result(
+                    reference_slice.view, query_slice.view,
+                    2 * kBreakLength);
+                if (gap.summary.reference_length == ref_gap_length &&
+                    gap.summary.query_length == query_gap_length) {
+                    reached = true;
+                    current.ref_len = best.ref_start + best.ref_len -
+                        current.ref_start;
+                    if (current.strand == FORWARD) {
+                        current.qry_len = best.qry_start + best.qry_len -
+                            current.qry_start;
+                    } else {
+                        current.qry_len = current.qry_start + current.qry_len -
+                            best.qry_start;
+                        current.qry_start = best.qry_start;
+                    }
+                    current.cigar.reserve(current.cigar.size() +
+                        gap.cigar.size() + best.cigar.size());
+                    appendCigarMove(current.cigar, gap.cigar);
+                    appendCigarMove(current.cigar, best.cigar);
+                    current.alignment_length += best.alignment_length +
+                        gap.summary.alignment_length;
+                    current.aligned_base += gap.summary.match_length +
+                        best.aligned_base;
+                    best.is_linked = true;
+                }
+            }
+        }
+
+        if (!reached) {
+            if (!linked.empty()) {
+                size_t best_linked_position = kNoIndex;
+                int_t linked_best_score = std::numeric_limits<int_t>::max();
+                int checked = 0;
+                for (size_t position = linked.size();
+                     position > 0 && checked < kLookBack;
+                     --position, ++checked) {
+                    const Anchor& previous = anchors[linked[position - 1]];
+                    if (statistics) ++statistics->candidate_checks;
+                    if (previous.strand != current.strand ||
+                        previous.ref_chr_index != current.ref_chr_index ||
+                        previous.qry_chr_index != current.qry_chr_index) {
+                        continue;
+                    }
+                    const int_t ref_gap = static_cast<int_t>(current.ref_start) -
+                        static_cast<int_t>(
+                            previous.ref_start + previous.ref_len);
+                    const int_t query_gap = current.strand == FORWARD
+                        ? static_cast<int_t>(current.qry_start) -
+                            static_cast<int_t>(
+                                previous.qry_start + previous.qry_len)
+                        : static_cast<int_t>(previous.qry_start) -
+                            static_cast<int_t>(
+                                current.qry_start + current.qry_len);
+                    if (ref_gap < 0 || query_gap < 0) continue;
+                    const bool alignable = linkedGapCanBeAligned(
+                        static_cast<Coord_t>(ref_gap),
+                        static_cast<Coord_t>(query_gap));
+                    observeGap(statistics, ref_gap, query_gap, !alignable);
+                    if (!alignable) continue;
+                    const long greater = std::max(ref_gap, query_gap);
+                    const long lesser = std::min(ref_gap, query_gap);
+                    const int_t score = (greater << 1) - lesser;
+                    if (score < linked_best_score) {
+                        linked_best_score = score;
+                        best_linked_position = position - 1;
+                    }
+                }
+
+                if (best_linked_position != kNoIndex) {
+                    const Anchor& previous =
+                        anchors[linked[best_linked_position]];
+                    const Coord_t ref_gap_begin =
+                        previous.ref_start + previous.ref_len;
+                    const Coord_t ref_gap_length =
+                        current.ref_start - ref_gap_begin;
+                    Coord_t query_gap_begin = 0;
+                    Coord_t query_gap_length = 0;
+                    if (current.strand == FORWARD) {
+                        query_gap_begin = previous.qry_start + previous.qry_len;
+                        query_gap_length = current.qry_start - query_gap_begin;
+                    } else {
+                        query_gap_begin = current.qry_start + current.qry_len;
+                        query_gap_length = previous.qry_start - query_gap_begin;
+                    }
+                    if (statistics) {
+                        statistics->sequence_extractions += 2;
+                        ++statistics->fallback_ksw_calls;
+                        statistics->estimated_ksw_cells = saturatingAdd(
+                            statistics->estimated_ksw_cells,
+                            estimatedGapCells(
+                                ref_gap_length, query_gap_length));
+                    }
+                    loadSequenceSlice(ref_mgr, current.ref_chr_index,
+                        ref_gap_begin, ref_gap_length, false, reference_slice);
+                    loadSequenceSlice(qry_mgr, current.qry_chr_index,
+                        query_gap_begin, query_gap_length,
+                        current.strand == REVERSE, query_slice);
+                    AlignmentResult gap = extendAlignKSW2Result(
+                        reference_slice.view, query_slice.view,
+                        2 * kBreakLength);
+                    if (gap.summary.reference_length == ref_gap_length &&
+                        gap.summary.query_length == query_gap_length) {
+                        current.ref_len += gap.summary.reference_length;
+                        current.qry_len += gap.summary.query_length;
+                        current.alignment_length +=
+                            gap.summary.alignment_length;
+                        current.aligned_base += gap.summary.match_length;
+                        current.ref_start -= gap.summary.reference_length;
+                        if (current.strand == FORWARD) {
+                            current.qry_start -= gap.summary.query_length;
+                        }
+                        prependCigar(current.cigar, gap.cigar);
+                    }
+                }
+            }
+
+            linked.push_back(current_index);
+            const Coord_t current_ref_end = current.ref_start + current.ref_len;
+            const Coord_t current_query_end = current.strand == FORWARD
+                ? current.qry_start + current.qry_len
+                : current.qry_start;
+            const size_t stop = best_index == kNoIndex ? end : best_index;
+            for (size_t index = current_index + 1; index < stop; ++index) {
+                Anchor& candidate = anchors[index];
+                if (candidate.is_linked) continue;
+                const Coord_t candidate_ref_end =
+                    candidate.ref_start + candidate.ref_len;
+                const Coord_t candidate_query_end = current.strand == FORWARD
+                    ? candidate.qry_start + candidate.qry_len
+                    : candidate.qry_start;
+                if (candidate_ref_end <= current_ref_end &&
+                    ((current.strand == FORWARD &&
+                      candidate_query_end <= current_query_end) ||
+                     (current.strand == REVERSE &&
+                      candidate_query_end >= current_query_end))) {
+                    candidate.is_linked = true;
+                    Cigar_t().swap(candidate.cigar);
+                }
+            }
+            while (current_index < end) {
+                const Anchor& candidate = anchors[current_index];
+                if (!candidate.is_linked &&
+                    candidate.ref_start >= current_ref_end) {
+                    break;
+                }
+                ++current_index;
+            }
+        }
+    }
+
+    output.reserve(linked.size());
+    for (const size_t index : linked) {
+        anchors[index].is_linked = false;
+        output.push_back(std::make_shared<Anchor>(std::move(anchors[index])));
+    }
+    return output;
+}
+
+}  // namespace AnchorLinkDetail
+
 namespace {
 
 AnchorPtrVec linkClustersByValue(
     MatchClusterVec& clusters,
     const SeqPro::ManagerVariant& ref_mgr,
     const SeqPro::ManagerVariant& qry_mgr) {
+    {
+        AnchorVec values = AnchorLinkDetail::materializeClusterAnchors(
+            clusters, ref_mgr, qry_mgr);
+        const auto components =
+            AnchorLinkDetail::splitAnchorComponents(values);
+        AnchorPtrVec linked;
+        for (const auto& component : components) {
+            auto output = AnchorLinkDetail::linkAnchorRange(
+                values, component.begin, component.end, ref_mgr, qry_mgr);
+            linked.insert(linked.end(),
+                std::make_move_iterator(output.begin()),
+                std::make_move_iterator(output.end()));
+        }
+        return linked;
+    }
     std::sort(clusters.begin(), clusters.end(),
         [](const MatchCluster& left, const MatchCluster& right) {
             return left.front().ref_start < right.front().ref_start;
@@ -1121,7 +1593,6 @@ AnchorPtrVec linkClustersByValue(
     constexpr size_t kNoIndex = std::numeric_limits<size_t>::max();
     constexpr int kCandidateLimit = 2000;
     constexpr int kLookBack = 2000;
-    constexpr int_t kMaximumFallbackGap = 100000;
     constexpr int_t kBreakLength = 200;
     ManagedSequenceSlice reference_slice;
     ManagedSequenceSlice query_slice;
@@ -1235,8 +1706,9 @@ AnchorPtrVec linkClustersByValue(
                         : static_cast<int_t>(previous.qry_start) -
                             static_cast<int_t>(current.qry_start + current.qry_len);
                     if (ref_gap < 0 || query_gap < 0 ||
-                        ref_gap > kMaximumFallbackGap ||
-                        query_gap > kMaximumFallbackGap) {
+                        !linkedGapCanBeAligned(
+                            static_cast<Coord_t>(ref_gap),
+                            static_cast<Coord_t>(query_gap))) {
                         continue;
                     }
                     const long greater = std::max(ref_gap, query_gap);

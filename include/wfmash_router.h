@@ -65,8 +65,16 @@ struct PairThreadSchedule {
     size_t workers() const { return threads_per_worker.size(); }
 };
 
+struct MappingChunkPlan {
+    std::vector<size_t> chunk_by_record;
+    std::vector<uint64_t> estimated_cost;
+    std::vector<size_t> record_count;
+};
+
 struct ExecutionPolicy {
     uint_t minimum_threads_per_process{4};
+    uint_t maximum_alignment_processes{4};
+    uint_t alignment_chunks_per_worker{4};
     std::chrono::milliseconds pair_timeout{std::chrono::hours(1)};
     std::chrono::milliseconds termination_grace{std::chrono::seconds(10)};
     std::chrono::milliseconds poll_interval{std::chrono::milliseconds(200)};
@@ -92,6 +100,13 @@ uint_t threadsPerTask(size_t tasks, uint_t total_threads);
 PairThreadSchedule pairThreadSchedule(
     size_t tasks, uint_t total_threads,
     uint_t minimum_threads_per_process = 4);
+
+uint64_t mappingAlignmentCost(const ParsedPafRecord& record);
+MappingChunkPlan makeMappingChunkPlan(
+    const std::vector<uint64_t>& record_costs, size_t requested_chunks);
+std::vector<size_t> allocateMappingChunks(
+    const std::vector<uint64_t>& species_costs,
+    const std::vector<size_t>& species_records, size_t target_chunks);
 
 }  // namespace WfmashRouterDetail
 

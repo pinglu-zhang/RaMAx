@@ -15,6 +15,7 @@
 
 #include "rare_aligner.h"
 #include "anchor.h"  // 包含 UnionFind 定义
+#include "../anchor/anchor_link_internal.h"
 #include "process_memory.h"
 #include "SeqPro.h"  // 包含 SeqPro 相关定义
 #include "ramesh.h"  // 包含 RaMesh 图结构定义
@@ -1540,6 +1541,11 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
     std::vector<std::vector<AnchorPtrVec>>
         secondary_extensions(
             species_list.size());
+    std::vector<std::vector<AnchorVec>>
+        primary_materialized(species_list.size());
+    std::vector<std::vector<AnchorVec>>
+        secondary_materialized(species_list.size());
+
     std::vector<ExtensionWorkItem>
         extension_work;
 
@@ -1616,6 +1622,8 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         primary_extensions[species_index]
             .resize(primary_map.size());
         size_t primary_index = 0;
+        primary_materialized[species_index]
+            .resize(primary_map.size());
         for (const auto& [key, group] :
              primary_map) {
             (void)key;
@@ -1640,6 +1648,10 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     .resize(
                         secondary_it->second->size());
                 size_t secondary_index = 0;
+                secondary_materialized[
+                    species_index]
+                    .resize(
+                        secondary_it->second->size());
                 for (const auto& [key, group] :
                       *secondary_it->second) {
                     (void)key;
@@ -1660,9 +1672,6 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         extension_work.end(),
         [](const ExtensionWorkItem& left,
            const ExtensionWorkItem& right) {
-            if (left.heavy != right.heavy) {
-                return left.heavy > right.heavy;
-            }
             if (left.cost != right.cost) {
                 return left.cost > right.cost;
             }
@@ -1684,25 +1693,34 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
         "cluster-extension", "start", extension_work.size());
     const auto extension_start =
         std::chrono::steady_clock::now();
-    const auto runExtensionRange = [&](size_t begin, size_t end,
-                                       int dynamic_chunk) {
-        executeParallelStage(
-        end - begin,
+    const auto materialization_start = extension_start;
+    std::atomic<size_t> materialized_groups{0};
+    std::mutex materialization_progress_mutex;
+    auto last_materialization_progress = materialization_start;
+    executeParallelStage(
+        extension_work.size(),
         thread_num,
         extension_activity,
-        [&](size_t relative_index) {
-            const size_t work_index = begin + relative_index;
+        [&](size_t work_index) {
             const auto& item =
                 extension_work[work_index];
             auto& manager = *species_managers[item.species_index];
-            if (item.secondary) {
+            if (is_first) {
+                AnchorVec& destination = item.secondary
+                    ? secondary_materialized[item.species_index]
+                          [item.group_index]
+                    : primary_materialized[item.species_index]
+                          [item.group_index];
+                destination = AnchorLinkDetail::materializeClusterAnchors(
+                    *item.group, *pra.ref_seqpro_manager, manager);
+            } else if (item.secondary) {
                 secondary_extensions[
                     item.species_index]
                     [item.group_index] =
                     pra.extendClusterGroupToAnchors(
                         manager,
                         *item.group,
-                        is_first);
+                        false);
             } else {
                 primary_extensions[
                     item.species_index]
@@ -1710,12 +1728,270 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
                     pra.extendClusterGroupToAnchors(
                         manager,
                         *item.group,
-                        is_first);
+                        false);
             }
-        }, dynamic_chunk);
+            const size_t completed = materialized_groups.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if ((completed & 255U) == 0) {
+                std::unique_lock<std::mutex> lock(
+                    materialization_progress_mutex, std::try_to_lock);
+                const auto now = std::chrono::steady_clock::now();
+                if (lock.owns_lock() &&
+                    now - last_materialization_progress >=
+                        std::chrono::minutes(5)) {
+                    last_materialization_progress = now;
+                    spdlog::info(
+                        "[cluster-extension-progress] phase=materialize "
+                        "groups={}/{} active={} max_active={}",
+                        completed, extension_work.size(),
+                        extension_activity.active.load(
+                            std::memory_order_relaxed),
+                        extension_activity.maximum.load(
+                            std::memory_order_relaxed));
+                    logStageMemory(
+                        "cluster-extension-materialize", "progress",
+                        completed, extension_work.size());
+                }
+            }
+        }, 1);
+    const double materialization_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - materialization_start).count();
+    logStageMemory(
+        "cluster-extension-materialize", "complete",
+        materialized_groups.load(std::memory_order_relaxed),
+        extension_work.size());
+
+    struct ComponentWorkItem {
+        uint32_t species_index{0};
+        uint32_t group_index{0};
+        uint32_t component_index{0};
+        size_t begin{0};
+        size_t end{0};
+        uint64_t cost{0};
+        size_t output_slot{0};
+        bool secondary{false};
     };
-    runExtensionRange(0, heavy_work_items, 1);
-    runExtensionRange(heavy_work_items, extension_work.size(), 64);
+    std::vector<ComponentWorkItem> component_work;
+    std::vector<AnchorPtrVec> component_outputs;
+    std::vector<std::vector<std::vector<size_t>>> primary_component_slots(
+        species_list.size());
+    std::vector<std::vector<std::vector<size_t>>> secondary_component_slots(
+        species_list.size());
+    size_t component_count = 0;
+    AnchorLinkDetail::Statistics split_statistics;
+
+    if (is_first) {
+        for (size_t species_index = 0;
+             species_index < species_list.size(); ++species_index) {
+            primary_component_slots[species_index].resize(
+                primary_materialized[species_index].size());
+            secondary_component_slots[species_index].resize(
+                secondary_materialized[species_index].size());
+            const auto append_components = [&](AnchorVec& anchors,
+                                               size_t group_index,
+                                               bool secondary) {
+                const auto ranges =
+                    AnchorLinkDetail::splitAnchorComponents(
+                        anchors, &split_statistics);
+                auto& slots = secondary
+                    ? secondary_component_slots[species_index][group_index]
+                    : primary_component_slots[species_index][group_index];
+                slots.reserve(ranges.size());
+                for (size_t component_index = 0;
+                     component_index < ranges.size(); ++component_index) {
+                    const auto& range = ranges[component_index];
+                    const size_t output_slot = component_outputs.size();
+                    component_outputs.emplace_back();
+                    slots.push_back(output_slot);
+                    component_work.push_back({
+                        static_cast<uint32_t>(species_index),
+                        static_cast<uint32_t>(group_index),
+                        static_cast<uint32_t>(component_index),
+                        range.begin, range.end, range.estimated_cost,
+                        output_slot, secondary});
+                }
+            };
+            for (size_t group = 0;
+                 group < primary_materialized[species_index].size(); ++group) {
+                append_components(
+                    primary_materialized[species_index][group], group, false);
+            }
+            for (size_t group = 0;
+                 group < secondary_materialized[species_index].size(); ++group) {
+                append_components(
+                    secondary_materialized[species_index][group], group, true);
+            }
+        }
+        component_count = component_work.size();
+        std::sort(component_work.begin(), component_work.end(),
+            [](const ComponentWorkItem& left,
+               const ComponentWorkItem& right) {
+                if (left.cost != right.cost) return left.cost > right.cost;
+                if (left.species_index != right.species_index) {
+                    return left.species_index < right.species_index;
+                }
+                if (left.secondary != right.secondary) {
+                    return left.secondary < right.secondary;
+                }
+                if (left.group_index != right.group_index) {
+                    return left.group_index < right.group_index;
+                }
+                return left.component_index < right.component_index;
+            });
+
+        std::atomic<uint64_t> candidate_checks{0};
+        std::atomic<uint64_t> sequence_extractions{0};
+        std::atomic<uint64_t> direct_ksw_calls{0};
+        std::atomic<uint64_t> fallback_ksw_calls{0};
+        std::atomic<uint64_t> long_gap_rejections{
+            split_statistics.long_gap_rejections};
+        std::atomic<uint64_t> maximum_seen_gap{
+            split_statistics.maximum_seen_gap};
+        std::atomic<uint64_t> estimated_ksw_cells{0};
+        std::atomic<size_t> completed_components{0};
+        std::atomic<uint64_t> slowest_component_microseconds{0};
+        std::mutex progress_mutex;
+        auto last_progress = std::chrono::steady_clock::now();
+        const auto linking_start = last_progress;
+        executeParallelStage(
+            component_work.size(), thread_num, extension_activity,
+            [&](size_t work_index) {
+                const auto& item = component_work[work_index];
+                auto& manager = *species_managers[item.species_index];
+                AnchorVec& anchors = item.secondary
+                    ? secondary_materialized[item.species_index]
+                          [item.group_index]
+                    : primary_materialized[item.species_index]
+                          [item.group_index];
+                const auto component_started =
+                    std::chrono::steady_clock::now();
+                AnchorLinkDetail::Statistics statistics;
+                component_outputs[item.output_slot] =
+                    AnchorLinkDetail::linkAnchorRange(
+                        anchors, item.begin, item.end,
+                        *pra.ref_seqpro_manager, manager, &statistics);
+                candidate_checks.fetch_add(
+                    statistics.candidate_checks, std::memory_order_relaxed);
+                sequence_extractions.fetch_add(
+                    statistics.sequence_extractions, std::memory_order_relaxed);
+                direct_ksw_calls.fetch_add(
+                    statistics.direct_ksw_calls, std::memory_order_relaxed);
+                fallback_ksw_calls.fetch_add(
+                    statistics.fallback_ksw_calls, std::memory_order_relaxed);
+                long_gap_rejections.fetch_add(
+                    statistics.long_gap_rejections, std::memory_order_relaxed);
+                estimated_ksw_cells.fetch_add(
+                    statistics.estimated_ksw_cells, std::memory_order_relaxed);
+                uint64_t observed = maximum_seen_gap.load(
+                    std::memory_order_relaxed);
+                while (observed < statistics.maximum_seen_gap &&
+                       !maximum_seen_gap.compare_exchange_weak(
+                           observed, statistics.maximum_seen_gap,
+                           std::memory_order_relaxed)) {
+                }
+                const uint64_t component_microseconds =
+                    static_cast<uint64_t>(std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - component_started)
+                        .count());
+                observed = slowest_component_microseconds.load(
+                    std::memory_order_relaxed);
+                while (observed < component_microseconds &&
+                       !slowest_component_microseconds.compare_exchange_weak(
+                           observed, component_microseconds,
+                           std::memory_order_relaxed)) {
+                }
+                const size_t completed = completed_components.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if ((completed & 255U) == 0) {
+                    std::unique_lock<std::mutex> lock(
+                        progress_mutex, std::try_to_lock);
+                    const auto now = std::chrono::steady_clock::now();
+                    if (lock.owns_lock() &&
+                        now - last_progress >= std::chrono::minutes(5)) {
+                        last_progress = now;
+                        spdlog::info(
+                            "[cluster-extension-progress] phase=link "
+                            "groups={}/{} components={}/{} "
+                            "active={} max_active={} candidate_checks={} "
+                            "sequence_extractions={} direct_ksw={} "
+                            "fallback_ksw={} long_gap_rejections={} "
+                            "maximum_seen_gap={} "
+                            "completed_ksw_cells={}",
+                            materialized_groups.load(
+                                std::memory_order_relaxed),
+                            extension_work.size(), completed,
+                            component_work.size(),
+                            extension_activity.active.load(
+                                std::memory_order_relaxed),
+                            extension_activity.maximum.load(
+                                std::memory_order_relaxed),
+                            candidate_checks.load(std::memory_order_relaxed),
+                            sequence_extractions.load(
+                                std::memory_order_relaxed),
+                            direct_ksw_calls.load(std::memory_order_relaxed),
+                            fallback_ksw_calls.load(std::memory_order_relaxed),
+                            long_gap_rejections.load(
+                                std::memory_order_relaxed),
+                            maximum_seen_gap.load(std::memory_order_relaxed),
+                            estimated_ksw_cells.load(
+                                std::memory_order_relaxed));
+                        logStageMemory(
+                            "cluster-extension", "progress", completed,
+                            component_work.size());
+                    }
+                }
+            }, 1);
+        const double linking_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - linking_start).count();
+
+        for (size_t species_index = 0;
+             species_index < species_list.size(); ++species_index) {
+            const auto collect = [&](auto& slots_by_group,
+                                     auto& destinations) {
+                for (size_t group = 0;
+                     group < slots_by_group.size(); ++group) {
+                    auto& destination = destinations[group];
+                    for (const size_t slot : slots_by_group[group]) {
+                        auto& output = component_outputs[slot];
+                        destination.insert(destination.end(),
+                            std::make_move_iterator(output.begin()),
+                            std::make_move_iterator(output.end()));
+                    }
+                }
+            };
+            collect(primary_component_slots[species_index],
+                    primary_extensions[species_index]);
+            collect(secondary_component_slots[species_index],
+                    secondary_extensions[species_index]);
+        }
+        spdlog::info(
+            "[cluster-extension-summary] groups={}/{} components={}/{} "
+            "active_workers={} max_active_workers={} candidate_checks={} "
+            "sequence_extractions={} direct_ksw={} fallback_ksw={} "
+            "long_gap_rejections={} maximum_seen_gap={} "
+            "estimated_ksw_cells={} completed_ksw_cells={} "
+            "materialization_seconds={:.6f} linking_seconds={:.6f} "
+            "slowest_component_seconds={:.6f}",
+            materialized_groups.load(std::memory_order_relaxed),
+            extension_work.size(),
+            completed_components.load(std::memory_order_relaxed),
+            component_work.size(),
+            extension_activity.active.load(std::memory_order_relaxed),
+            extension_activity.maximum.load(std::memory_order_relaxed),
+            candidate_checks.load(std::memory_order_relaxed),
+            sequence_extractions.load(std::memory_order_relaxed),
+            direct_ksw_calls.load(std::memory_order_relaxed),
+            fallback_ksw_calls.load(std::memory_order_relaxed),
+            long_gap_rejections.load(std::memory_order_relaxed),
+            maximum_seen_gap.load(std::memory_order_relaxed),
+            estimated_ksw_cells.load(std::memory_order_relaxed),
+            estimated_ksw_cells.load(std::memory_order_relaxed),
+            materialization_seconds, linking_seconds,
+            static_cast<double>(slowest_component_microseconds.load(
+                std::memory_order_relaxed)) / 1000000.0);
+    }
     const double extension_ms =
         std::chrono::duration<
             double,
@@ -1723,13 +1999,17 @@ void MultipleRareAligner::constructMultipleGraphsByDp(
             std::chrono::steady_clock::now() -
             extension_start)
             .count();
+    std::vector<std::vector<AnchorVec>>().swap(primary_materialized);
+    std::vector<std::vector<AnchorVec>>().swap(secondary_materialized);
+    std::vector<ComponentWorkItem>().swap(component_work);
+    std::vector<AnchorPtrVec>().swap(component_outputs);
     spdlog::info(
         "[parallel-stage] cluster-extension: "
-        "tasks={}, heavy={}, light={}, threads={}, max_active={}, "
+        "groups={}, components={}, heavy={}, threads={}, max_active={}, "
         "elapsed_ms={:.3f}",
         extension_work.size(),
+        component_count,
         heavy_work_items,
-        extension_work.size() - heavy_work_items,
         stageWorkerCount(
             thread_num,
             extension_work.size()),

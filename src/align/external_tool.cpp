@@ -29,9 +29,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 CommandResult decodeStatus(
-    int status, std::chrono::milliseconds elapsed, bool timed_out) {
+    int status, std::chrono::milliseconds elapsed, bool timed_out,
+    bool cancelled = false) {
     CommandResult result;
     result.timed_out = timed_out;
+    result.cancelled = cancelled;
     result.elapsed = elapsed;
     if (WIFSIGNALED(status)) {
         result.termination_signal = WTERMSIG(status);
@@ -39,6 +41,9 @@ CommandResult decodeStatus(
     if (timed_out) {
         // Keep timeout distinct from a command that naturally exits 124.
         result.exit_code = 124;
+    } else if (cancelled) {
+        // Keep cooperative cancellation distinct from a natural child exit.
+        result.exit_code = 125;
     } else if (WIFEXITED(status)) {
         result.exit_code = WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
@@ -246,7 +251,10 @@ CommandResult run(
     }
 
     int status = 0;
-    if (options.timeout <= std::chrono::milliseconds::zero()) {
+    const bool has_timeout =
+        options.timeout > std::chrono::milliseconds::zero();
+    const bool can_cancel = options.cancellation_requested != nullptr;
+    if (!has_timeout && !can_cancel) {
         waitBlocking(pid, status, executable);
         return decodeStatus(
             status,
@@ -255,8 +263,11 @@ CommandResult run(
             false);
     }
 
-    const auto deadline = start + options.timeout;
-    while (Clock::now() < deadline) {
+    const auto deadline = has_timeout
+        ? start + options.timeout
+        : Clock::time_point::max();
+    bool cancelled = false;
+    while (true) {
         const pid_t waited = waitWithoutBlocking(pid, status);
         if (waited == pid) {
             return decodeStatus(
@@ -265,7 +276,17 @@ CommandResult run(
                     Clock::now() - start),
                 false);
         }
-        sleepUntilNextPoll(deadline, options.poll_interval);
+        if (can_cancel &&
+            options.cancellation_requested->load(std::memory_order_relaxed)) {
+            cancelled = true;
+            break;
+        }
+        if (has_timeout && Clock::now() >= deadline) break;
+        const auto next_poll = has_timeout
+            ? deadline
+            : Clock::now() +
+                  std::max(std::chrono::milliseconds(1), options.poll_interval);
+        sleepUntilNextPoll(next_poll, options.poll_interval);
     }
 
     // Close the race where the child exits between the final poll and timeout.
@@ -292,7 +313,7 @@ CommandResult run(
                 status,
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - start),
-                true);
+                !cancelled, cancelled);
         }
         sleepUntilNextPoll(grace_deadline, options.poll_interval);
     }
@@ -320,7 +341,7 @@ CommandResult run(
         status,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - start),
-        true);
+        !cancelled, cancelled);
 }
 
 std::string readText(const std::filesystem::path& path) {
