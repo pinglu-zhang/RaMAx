@@ -4,7 +4,6 @@ project(RaMAx VERSION 1.0.9 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
-enable_testing()
 
 # MSVC 热重载支持
 if(POLICY CMP0141)
@@ -338,6 +337,7 @@ target_link_libraries(ramax PRIVATE ramax_core)
 
 add_dependencies(ramax hal_library)
 
+option(BUILD_TESTING "Build CTest-based RaMAx tests" OFF)
 include(CTest)
 if(BUILD_TESTING)
     add_executable(ramax_wfmash_timeout_test
