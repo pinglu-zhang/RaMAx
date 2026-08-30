@@ -1,5 +1,6 @@
 ﻿#include "index.h"
 #include <sdsl/io.hpp>
+#include <omp.h>
 
 namespace {
 
@@ -120,22 +121,16 @@ bool FM_Index::buildIndexUsingCaPSImpl(const std::string& T,
     // ------------------------------
     sdsl::int_vector<8> BWT(n);
 
-    ThreadPool pool(thread_count);
-    size_t chunk_size = (n + thread_count - 1) / thread_count;
-
-    for (uint_t t = 0; t < thread_count; ++t) {
-        size_t start = t * chunk_size;
-        size_t end = std::min(start + chunk_size, n);
-
-        pool.enqueue([&T, &SA, &BWT, n, start, end]() {
-            for (size_t i = start; i < end; ++i) {
-                size_t si = static_cast<size_t>(SA[i]);
-                // (si + n - 1) % n：实现 SA[i]==0 时回绕
-                BWT[i] = static_cast<uint8_t>(T[(si + n - 1) % n]);
-            }
-        });
+    const int bwt_threads = omp_in_parallel()
+        ? 1
+        : static_cast<int>(std::max<uint_t>(1, thread_count));
+#pragma omp parallel for schedule(static) num_threads(bwt_threads)
+    for (long long raw_i = 0; raw_i < static_cast<long long>(n); ++raw_i) {
+        const size_t i = static_cast<size_t>(raw_i);
+        const size_t si = static_cast<size_t>(SA[i]);
+        // (si + n - 1) % n：实现 SA[i]==0 时回绕
+        BWT[i] = static_cast<uint8_t>(T[(si + n - 1) % n]);
     }
-    pool.waitAllTasksDone();
 
     // ------------------------------
     // 构建采样 SA：每 sample_rate 个 SA 采一次
@@ -206,21 +201,16 @@ bool FM_Index::buildIndexUsingDivsufsort(uint_t thread_count) {
     // ------------------------------
     sdsl::int_vector<8> BWT(n);
 
-    ThreadPool pool(thread_count);
-    size_t chunk_size = (n + thread_count - 1) / thread_count;
-
-    for (uint_t t = 0; t < thread_count; ++t) {
-        size_t start = t * chunk_size;
-        size_t end = std::min(start + chunk_size, n);
-
-        pool.enqueue([&T, &SA, &BWT, n, start, end]() {
-            for (size_t i = start; i < end; ++i) {
-                saidx_t si = SA[i];
-                BWT[i] = static_cast<uint8_t>(T[(static_cast<size_t>(si) + n - 1) % n]);
-            }
-        });
+    const int bwt_threads = omp_in_parallel()
+        ? 1
+        : static_cast<int>(std::max<uint_t>(1, thread_count));
+#pragma omp parallel for schedule(static) num_threads(bwt_threads)
+    for (long long raw_i = 0; raw_i < static_cast<long long>(n); ++raw_i) {
+        const size_t i = static_cast<size_t>(raw_i);
+        const saidx_t si = SA[i];
+        BWT[i] = static_cast<uint8_t>(
+            T[(static_cast<size_t>(si) + n - 1) % n]);
     }
-    pool.waitAllTasksDone();
 
     // ------------------------------
     // 构建采样 SA

@@ -11,7 +11,6 @@
 #include "index.h"
 #include "suffix_array_index.h"
 #include "SeqPro.h"
-#include "threadpool.h"
 #include "ramesh.h"
 #include "structural_break_repair.h"
 #include "short_block_repair.h"
@@ -207,9 +206,6 @@ public:
 
     void constructGraphByGreedyByRef(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, MatchClusterVecPtr cluster_vec_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, 
         uint_t min_span, bool isMultiple=false);
-    void constructGraphByDpByRef(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, MatchClusterVecPtr cluster_vec_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, ThreadPool& pool, uint_t thread_num, uint_t min_span, bool isMultiple);
-    
-    
     ClusterVecPtrByStrandByQueryRefPtr filterPairSpeciesAnchors(SpeciesName query_name, MatchVec3DPtr& anchors, SeqPro::ManagerVariant& query_fasta_manager, RaMesh::RaMeshMultiGenomeGraph& graph, uint_t min_span);
 
     AnchorBySQR_SparsePtr extendClusterToAnchorByChr(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, ClusterBySQR_SparsePtr cluster, bool is_first);
@@ -218,7 +214,7 @@ public:
     void filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map,uint_t ref_chr_cnt, uint_t qry_chr_cnt);
     AnchorPtrVec extendClusterGroupToAnchors(
         SeqPro::ManagerVariant& query_seqpro_manager,
-        MatchClusterVecPtr cluster_group,
+        MatchClusterVec& cluster_group,
         bool is_first);
 
     void filterAnchorByDPDimension(
@@ -226,11 +222,26 @@ public:
         uint_t chromosome_id,
         bool filter_ref);
 
+    void filterAnchorVectorByDP(
+        AnchorPtrVec anchors,
+        bool filter_ref);
 
-    void constructGraphByDP(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph);
+    static uint64_t dpTreapFallbackCount();
+
+
+    void constructGraphByDP(const SpeciesName& query_name,
+                            SeqPro::ManagerVariant& query_seqpro_manager,
+                            AnchorBySQR_SparsePtr anchor_ptr,
+                            RaMesh::RaMeshMultiGenomeGraph& graph);
     void registerSecondaryAnchors(SpeciesName query_name, SeqPro::ManagerVariant& query_seqpro_manager, AnchorBySQR_SparsePtr anchor_ptr, RaMesh::RaMeshMultiGenomeGraph& graph, bool initial_round);
 
 };
 
+#ifdef RAMAX_PERFORMANCE_TEST_HOOKS
+void ramaxFilterAnchorsByDpOptimizedForTesting(
+    AnchorPtrVec anchors, bool filter_ref);
+void ramaxFilterAnchorsByDpLegacyForTesting(
+    AnchorPtrVec anchors, bool filter_ref);
+#endif
 
 #endif

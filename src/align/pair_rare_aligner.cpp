@@ -656,35 +656,42 @@ AnchorPtrVec PairRareAligner::
 extendClusterGroupToAnchors(
     SeqPro::ManagerVariant&
         query_seqpro_manager,
-    MatchClusterVecPtr cluster_group,
+    MatchClusterVec& cluster_group,
     bool is_first) {
     AnchorPtrVec anchors;
-    if (!cluster_group ||
-        cluster_group->empty()) {
+    if (cluster_group.empty()) {
         return anchors;
     }
     if (!is_first) {
         for (auto& cluster :
-             *cluster_group) {
-            for (auto& match : cluster) {
-                MatchVec single_match{
-                    match};
-                Anchor anchor =
-                    extendClusterToAnchor(
-                        single_match,
-                        *ref_seqpro_manager,
-                        query_seqpro_manager);
+             cluster_group) {
+            anchors.reserve(anchors.size() + cluster.size());
+            for (const auto& match : cluster) {
+                const uint_t length = match.match_len();
+                Anchor anchor(
+                    match.ref_chr_index,
+                    match.ref_start,
+                    length,
+                    match.qry_chr_index,
+                    match.qry_start,
+                    length,
+                    match.strand(),
+                    length,
+                    length,
+                    Cigar_t{cigarToInt('M', length)});
                 anchors.push_back(
                     std::make_shared<Anchor>(
                         std::move(anchor)));
             }
+            MatchCluster().swap(cluster);
         }
     } else {
         anchors = linkClusters(
-            *cluster_group,
+            cluster_group,
             *ref_seqpro_manager,
             query_seqpro_manager);
     }
+    MatchClusterVec().swap(cluster_group);
     return anchors;
 }
 
@@ -715,7 +722,7 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
         AnchorPtrVec anchors =
             extendClusterGroupToAnchors(
                 query_seqpro_manager,
-                tmp_p,
+                *tmp_p,
                 is_first);
 
         if (!anchors.empty()) {
@@ -761,8 +768,410 @@ AnchorBySQR_SparsePtr PairRareAligner::extendClusterToAnchorByChr(SpeciesName qu
     return result;
 }
 
+namespace {
 
+constexpr size_t kDpWindow = 5000;
+constexpr size_t kMaximumRetainedDpAnchors = 131072;
+std::atomic<uint64_t> dp_treap_fallback_count{0};
 
+struct DpTreapBest {
+    double value = -std::numeric_limits<double>::infinity();
+    size_t index = std::numeric_limits<size_t>::max();
+
+    bool valid() const {
+        return index != std::numeric_limits<size_t>::max();
+    }
+};
+
+DpTreapBest betterDpBest(DpTreapBest left, DpTreapBest right) {
+    if (!left.valid()) return right;
+    if (!right.valid()) return left;
+    if (right.value > left.value ||
+        (right.value == left.value && right.index < left.index)) {
+        return right;
+    }
+    return left;
+}
+
+uint64_t splitmix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+struct DpTreapNode {
+    long long interval_end = 0;
+    size_t original_index = 0;
+    uint64_t priority = 0;
+    double dp = 0;
+    int left = -1;
+    int right = -1;
+    DpTreapBest subtree_best;
+};
+
+class FixedWindowDpTreap {
+public:
+    explicit FixedWindowDpTreap(std::vector<DpTreapNode>& storage)
+        : nodes_(storage) {}
+
+    void reset(size_t node_count) {
+        nodes_.resize(node_count);
+        root_ = -1;
+    }
+
+    void insert(size_t slot, long long interval_end,
+                size_t original_index, double dp) {
+        auto& node = nodes_[slot];
+        node.interval_end = interval_end;
+        node.original_index = original_index;
+        node.priority = splitmix64(original_index);
+        node.dp = dp;
+        node.left = -1;
+        node.right = -1;
+        node.subtree_best = std::isnan(dp)
+            ? DpTreapBest{}
+            : DpTreapBest{dp, original_index};
+        root_ = insertNode(root_, static_cast<int>(slot));
+    }
+
+    void erase(long long interval_end, size_t original_index) {
+        root_ = eraseNode(root_, interval_end, original_index);
+    }
+
+    DpTreapBest bestAll() const {
+        return bestForNode(root_);
+    }
+
+    DpTreapBest bestEndingAtOrBefore(long long coordinate) const {
+        DpTreapBest best;
+        int current = root_;
+        while (current >= 0) {
+            const auto& node = nodes_[current];
+            if (node.interval_end <= coordinate) {
+                best = betterDpBest(best, bestForNode(node.left));
+                if (!std::isnan(node.dp)) {
+                    best = betterDpBest(
+                        best, {node.dp, node.original_index});
+                }
+                current = node.right;
+            } else {
+                current = node.left;
+            }
+        }
+        return best;
+    }
+
+private:
+    bool keyLess(int left, int right) const {
+        const auto& lhs = nodes_[left];
+        const auto& rhs = nodes_[right];
+        return lhs.interval_end < rhs.interval_end ||
+            (lhs.interval_end == rhs.interval_end &&
+             lhs.original_index < rhs.original_index);
+    }
+
+    DpTreapBest bestForNode(int node) const {
+        return node < 0 ? DpTreapBest{} : nodes_[node].subtree_best;
+    }
+
+    void update(int node) {
+        if (node < 0) return;
+        auto best = std::isnan(nodes_[node].dp)
+            ? DpTreapBest{}
+            : DpTreapBest{nodes_[node].dp,
+                          nodes_[node].original_index};
+        best = betterDpBest(best, bestForNode(nodes_[node].left));
+        best = betterDpBest(best, bestForNode(nodes_[node].right));
+        nodes_[node].subtree_best = best;
+    }
+
+    void split(int node, int key, int& left, int& right) {
+        if (node < 0) {
+            left = right = -1;
+            return;
+        }
+        if (keyLess(node, key)) {
+            left = node;
+            split(nodes_[node].right, key,
+                  nodes_[node].right, right);
+            update(left);
+        } else {
+            right = node;
+            split(nodes_[node].left, key,
+                  left, nodes_[node].left);
+            update(right);
+        }
+    }
+
+    int merge(int left, int right) {
+        if (left < 0) return right;
+        if (right < 0) return left;
+        if (nodes_[left].priority > nodes_[right].priority) {
+            nodes_[left].right = merge(nodes_[left].right, right);
+            update(left);
+            return left;
+        }
+        nodes_[right].left = merge(left, nodes_[right].left);
+        update(right);
+        return right;
+    }
+
+    int insertNode(int root, int node) {
+        if (root < 0) return node;
+        if (nodes_[node].priority > nodes_[root].priority) {
+            split(root, node, nodes_[node].left, nodes_[node].right);
+            update(node);
+            return node;
+        }
+        if (keyLess(node, root)) {
+            nodes_[root].left = insertNode(nodes_[root].left, node);
+        } else {
+            nodes_[root].right = insertNode(nodes_[root].right, node);
+        }
+        update(root);
+        return root;
+    }
+
+    int eraseNode(int root, long long interval_end,
+                  size_t original_index) {
+        if (root < 0) return -1;
+        const auto& node = nodes_[root];
+        if (node.interval_end == interval_end &&
+            node.original_index == original_index) {
+            return merge(node.left, node.right);
+        }
+        if (interval_end < node.interval_end ||
+            (interval_end == node.interval_end &&
+             original_index < node.original_index)) {
+            nodes_[root].left = eraseNode(
+                nodes_[root].left, interval_end, original_index);
+        } else {
+            nodes_[root].right = eraseNode(
+                nodes_[root].right, interval_end, original_index);
+        }
+        update(root);
+        return root;
+    }
+
+    std::vector<DpTreapNode>& nodes_;
+    int root_ = -1;
+};
+
+struct DpWorkspace {
+    std::vector<double> dp;
+    std::vector<int_t> pre;
+    std::vector<DpTreapNode> treap_nodes;
+};
+
+thread_local DpWorkspace retained_dp_workspace;
+
+void filterAnchorsByDpTreap(AnchorPtrVec result, bool filter_ref) {
+    if (result.empty()) return;
+    std::sort(result.begin(), result.end(),
+        [filter_ref](const AnchorPtr& left, const AnchorPtr& right) {
+            return filter_ref ? left->ref_start < right->ref_start
+                              : left->qry_start < right->qry_start;
+        });
+
+    DpWorkspace temporary_workspace;
+    DpWorkspace& workspace = result.size() <= kMaximumRetainedDpAnchors
+        ? retained_dp_workspace : temporary_workspace;
+    workspace.dp.assign(result.size(), 0);
+    workspace.pre.assign(result.size(), -1);
+    FixedWindowDpTreap treap(workspace.treap_nodes);
+    treap.reset(std::min(result.size(), kDpWindow + 1));
+
+    const auto interval = [&](size_t index) {
+        if (filter_ref) {
+            return std::pair<long long, long long>{
+                static_cast<long long>(result[index]->ref_start),
+                static_cast<long long>(result[index]->ref_len)};
+        }
+        return std::pair<long long, long long>{
+            static_cast<long long>(result[index]->qry_start),
+            static_cast<long long>(result[index]->qry_len)};
+    };
+    const auto legacyPredecessor = [&](size_t current, double score) {
+        const size_t begin = current > kDpWindow
+            ? current - kDpWindow : 0;
+        const auto [current_start, current_length] = interval(current);
+        const long long current_end = current_start + current_length;
+        for (size_t previous = begin; previous < current; ++previous) {
+            const auto [previous_start, previous_length] = interval(previous);
+            const long long previous_end = previous_start + previous_length;
+            const long long overlap = std::max(
+                0LL, std::min(previous_end, current_end) -
+                         std::max(previous_start, current_start));
+            const long long shorter =
+                std::min(previous_length, current_length);
+            const double overlap_ratio = shorter > 0
+                ? static_cast<double>(overlap) /
+                    static_cast<double>(shorter)
+                : 0.0;
+            if (overlap_ratio <= 0.0) {
+                const double candidate = workspace.dp[previous] +
+                    score - static_cast<double>(overlap);
+                if (candidate > workspace.dp[current]) {
+                    workspace.dp[current] = candidate;
+                    workspace.pre[current] = static_cast<int_t>(previous);
+                }
+            }
+        }
+    };
+
+    uint64_t local_fallbacks = 0;
+    for (size_t index = 0; index < result.size(); ++index) {
+        const double identity = static_cast<float>(
+            result[index]->aligned_base) /
+            result[index]->alignment_length;
+        const double score = result[index]->alignment_length *
+            pow(identity, 2);
+        workspace.dp[index] = score;
+
+        if (index > kDpWindow) {
+            const size_t expired = index - kDpWindow - 1;
+            const auto [start, length] = interval(expired);
+            treap.erase(start + length, expired);
+        }
+
+        const auto [current_start, current_length] = interval(index);
+        const DpTreapBest best = current_length == 0
+            ? treap.bestAll()
+            : treap.bestEndingAtOrBefore(current_start);
+        bool fallback = result[index]->alignment_length == 0 ||
+            !std::isfinite(score) ||
+            (best.valid() && !std::isfinite(best.value));
+        if (best.valid() && !fallback) {
+            const double candidate = best.value + score;
+            const double previous_representable = std::nextafter(
+                best.value, -std::numeric_limits<double>::infinity());
+            fallback = previous_representable + score == candidate;
+            if (!fallback && candidate > workspace.dp[index]) {
+                workspace.dp[index] = candidate;
+                workspace.pre[index] = static_cast<int_t>(best.index);
+            }
+        }
+        if (fallback) {
+            workspace.dp[index] = score;
+            workspace.pre[index] = -1;
+            legacyPredecessor(index, score);
+            ++local_fallbacks;
+        }
+
+        treap.insert(index % (kDpWindow + 1),
+            current_start + current_length, index,
+            workspace.dp[index]);
+    }
+    dp_treap_fallback_count.fetch_add(
+        local_fallbacks, std::memory_order_relaxed);
+
+    uint_t best = 0;
+    size_t best_index = 0;
+    for (size_t index = 0; index < result.size(); ++index) {
+        if (workspace.dp[index] > best) {
+            best = workspace.dp[index];
+            best_index = index;
+        }
+    }
+    for (int index = static_cast<int>(best_index); index >= 0;
+         index = workspace.pre[index]) {
+        if (filter_ref) result[index]->ref_selected = true;
+        else result[index]->qry_selected = true;
+        if (workspace.pre[index] == -1) break;
+    }
+}
+
+void filterAnchorsByDpLegacy(AnchorPtrVec result, bool filter_ref) {
+    if (result.empty()) return;
+    std::sort(result.begin(), result.end(),
+        [filter_ref](const AnchorPtr& left, const AnchorPtr& right) {
+            return filter_ref ? left->ref_start < right->ref_start
+                              : left->qry_start < right->qry_start;
+        });
+    std::vector<double> dp(result.size(), 0);
+    std::vector<int_t> pre(result.size(), -1);
+    const auto interval = [&](size_t index) {
+        if (filter_ref) {
+            return std::pair<long long, long long>{
+                static_cast<long long>(result[index]->ref_start),
+                static_cast<long long>(result[index]->ref_len)};
+        }
+        return std::pair<long long, long long>{
+            static_cast<long long>(result[index]->qry_start),
+            static_cast<long long>(result[index]->qry_len)};
+    };
+    for (size_t index = 0; index < result.size(); ++index) {
+        const double identity = static_cast<float>(
+            result[index]->aligned_base) /
+            result[index]->alignment_length;
+        const double score = result[index]->alignment_length *
+            pow(identity, 2);
+        dp[index] = score;
+        const size_t begin = index > kDpWindow
+            ? index - kDpWindow : 0;
+        for (size_t previous = begin; previous < index; ++previous) {
+            const auto [previous_start, previous_length] = interval(previous);
+            const auto [current_start, current_length] = interval(index);
+            const long long previous_end =
+                previous_start + previous_length;
+            const long long current_end = current_start + current_length;
+            const long long overlap = std::max(
+                0LL, std::min(previous_end, current_end) -
+                         std::max(previous_start, current_start));
+            const long long shorter =
+                std::min(previous_length, current_length);
+            const double overlap_ratio = shorter > 0
+                ? static_cast<double>(overlap) /
+                    static_cast<double>(shorter)
+                : 0.0;
+            if (overlap_ratio <= 0.0) {
+                const double candidate = dp[previous] + score -
+                    static_cast<double>(overlap);
+                if (candidate > dp[index]) {
+                    dp[index] = candidate;
+                    pre[index] = static_cast<int_t>(previous);
+                }
+            }
+        }
+    }
+    uint_t best = 0;
+    size_t best_index = 0;
+    for (size_t index = 0; index < result.size(); ++index) {
+        if (dp[index] > best) {
+            best = dp[index];
+            best_index = index;
+        }
+    }
+    for (int index = static_cast<int>(best_index); index >= 0;
+         index = pre[index]) {
+        if (filter_ref) result[index]->ref_selected = true;
+        else result[index]->qry_selected = true;
+        if (pre[index] == -1) break;
+    }
+}
+
+}  // namespace
+
+uint64_t PairRareAligner::dpTreapFallbackCount() {
+    return dp_treap_fallback_count.load(std::memory_order_relaxed);
+}
+
+void ramaxFilterAnchorsByDpOptimizedForTesting(
+    AnchorPtrVec anchors, bool filter_ref) {
+    filterAnchorsByDpTreap(std::move(anchors), filter_ref);
+}
+
+void ramaxFilterAnchorsByDpLegacyForTesting(
+    AnchorPtrVec anchors, bool filter_ref) {
+    filterAnchorsByDpLegacy(std::move(anchors), filter_ref);
+}
+
+static void filterAnchorsByDP(AnchorPtrVec result, bool filter_ref)
+{
+	filterAnchorsByDpTreap(std::move(result), filter_ref);
+	return;
+}
 
 static void filterChrByDP(
 	AnchorBySQR_SparsePtr anchor_map,
@@ -770,178 +1179,17 @@ static void filterChrByDP(
 	bool filter_ref)
 {
 	AnchorPtrVec result;
-
 	if (!anchor_map) return;
-
-	for (auto & a_vec : *anchor_map)
-	{
-		if (a_vec.size() > 0)
-		{
-			uint_t ref_idx = a_vec[0]->ref_chr_index;
-			uint_t qry_idx = a_vec[0]->qry_chr_index;
-			if (filter_ref)
-			{
-				if (ref_idx == id)
-				{
-					result.insert(result.end(), a_vec.begin(), a_vec.end());
-				}
-			}else
-			{
-				if (qry_idx == id)
-				{
-					result.insert(result.end(), a_vec.begin(), a_vec.end());
-				}
-			}
+	for (auto& a_vec : *anchor_map) {
+		if (a_vec.empty()) continue;
+		const uint_t chromosome_id = filter_ref
+			? a_vec.front()->ref_chr_index
+			: a_vec.front()->qry_chr_index;
+		if (chromosome_id == id) {
+			result.insert(result.end(), a_vec.begin(), a_vec.end());
 		}
 	}
-
-	if (result.empty()) return;
-
-	// ====== DP 部分 ======
-
-	// 1. 排序
-	std::sort(result.begin(), result.end(),
-		[filter_ref](const AnchorPtr& a, const AnchorPtr& b) {
-			return filter_ref ? (a->ref_start < b->ref_start)
-				: (a->qry_start < b->qry_start);
-		});
-
-	//size_t n = result.size();
-	std::vector<double> dp(result.size(), 0);
-	std::vector<int_t> pre(result.size(), -1);
-
-	constexpr double OVERLAP_MAX_FRAC = 0; // allow overlap up to 10% of the SHORTER interval
-	constexpr double OVERLAP_PENALTY_W = 1.0; // per-base penalty weight to subtract when overlapping
-
-	size_t K = 5000; // 可调参数
-	auto interval = [&](size_t idx) -> std::pair<long long, long long> {
-		if (filter_ref) {
-			return { static_cast<long long>(result[idx]->ref_start), static_cast<long long>(result[idx]->ref_len) };
-		} else {
-			return { static_cast<long long>(result[idx]->qry_start), static_cast<long long>(result[idx]->qry_len) };
-		}
-	};
-	///
-	for (size_t i = 0; i < result.size(); ++i) {
-		double idy = static_cast<float>(result[i]->aligned_base) / result[i]->alignment_length;
-		double score_i = result[i]->alignment_length * pow(idy, 2);
-		// if (score_i > 1000000 || result[i]->cigar.size() == 0) {
-		// 	continue;
-		// }
-		// if (filter_ref == true && id != result[i]->ref_chr_index)
-		// {
-		// 	continue;
-		// }
-		// if (filter_ref == false && id != result[i]->qry_chr_index)
-		// {
-		// 	continue;
-		// }
-		dp[i] = score_i;
-
-
-		// 只回看最近 K 个 j
-		size_t j_start = (i > K ? i - K : 0);
-		//size_t j_start = 0;
-		for (size_t j = j_start; j < i; ++j) {
-			auto [sj, lj] = interval(j);
-			auto [si, li] = interval(i);
-			long long ej = sj + lj;
-			long long ei = si + li;
-
-
-			// compute overlap length in [start, end)
-			long long overlap = std::max(0LL, std::min(ej, ei) - std::max(sj, si));
-			long long short_len = std::min(lj, li);
-			double overlap_ratio = (short_len > 0) ? static_cast<double>(overlap) / static_cast<double>(short_len) : 0.0;
-
-
-			// Accept if no overlap OR small (<=10%) overlap, otherwise skip this predecessor j
-			if (overlap_ratio <= OVERLAP_MAX_FRAC) {
-				// penalty proportional to the absolute overlap length
-				double penalty = OVERLAP_PENALTY_W * static_cast<double>(overlap);
-				double candidate = dp[j] + score_i - penalty;
-				if (candidate > dp[i]) {
-					dp[i] = candidate;
-					pre[i] = j;
-				}
-			}
-		}
-		
-	}
-	// 3. 找最大值
-	uint_t best = 0;
-	size_t best_idx = 0;
-	for (size_t i = 0; i < result.size(); ++i) {
-		if (dp[i] > best) {
-			best = dp[i];
-			best_idx = i;
-		}
-	}
-
-	// 4. 回溯并标记
-	for (int i = static_cast<int>(best_idx); i >= 0; i = pre[i]) {
-		if (filter_ref)
-			result[i]->ref_selected = true;
-		else
-			result[i]->qry_selected = true;
-		if (pre[i] == -1) break;
-	}
-
-	// ----------------------------------------------------
-// 检查选中的比对是否存在重叠
-// ----------------------------------------------------
-#ifdef _DEBUG_
-	bool hasOverlap = false;
-
-	// 收集所有选中的 index
-	std::vector<int> selected;
-	for (int i = 0; i < (int)result.size(); ++i) {
-		if ((filter_ref && result[i]->ref_selected) ||
-			(!filter_ref && result[i]->qry_selected))
-			selected.push_back(i);
-	}
-
-	// 按 ref_start 或 qry_start 排序
-	std::sort(selected.begin(), selected.end(),
-		[&](int a, int b) {
-			return filter_ref
-				? (result[a]->ref_start < result[b]->ref_start)
-				: (result[a]->qry_start < result[b]->qry_start);
-		});
-
-
-	// 检查相邻区间是否重叠
-	for (size_t i = 1; i < selected.size(); ++i) {
-		auto& prev = result[selected[i - 1]];
-		auto& curr = result[selected[i]];
-
-		if (filter_ref) {
-			if (curr->ref_start < prev->ref_start + prev->ref_len) {
-				hasOverlap = true;
-				std::cerr << "[Overlap] Ref overlap between "
-					<< selected[i - 1] << " and " << selected[i]
-					<< " (" << prev->ref_start << "-" << prev->ref_start + prev->ref_len
-						<< " vs " << curr->ref_start << "-" << curr->ref_start + curr->ref_len
-						<< ")\n";
-			}
-		}
-		else {
-			if (curr->qry_start < prev->qry_start + prev->qry_len) {
-				hasOverlap = true;
-				std::cerr << "[Overlap] Qry overlap between "
-					<< selected[i - 1] << " and " << selected[i]
-					<< " (" << prev->qry_start << "-" << prev->qry_start + prev->qry_len
-						<< " vs " << curr->qry_start << "-" << curr->qry_start + curr->qry_len
-						<< ")\n";
-			}
-		}
-	}
-
-	if (!hasOverlap)
-		spdlog::debug("No overlaps detected in final selection.");
-	else
-		spdlog::debug("Overlaps found in final selection!");
-#endif
+	filterAnchorsByDP(std::move(result), filter_ref);
 }
 
 void PairRareAligner::
@@ -953,6 +1201,11 @@ filterAnchorByDPDimension(
         std::move(anchor_map),
         chromosome_id,
         filter_ref);
+}
+
+void PairRareAligner::filterAnchorVectorByDP(
+    AnchorPtrVec anchors, bool filter_ref) {
+    filterAnchorsByDP(std::move(anchors), filter_ref);
 }
 
 void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t ref_chr_cnt, uint_t qry_chr_cnt) {
@@ -971,30 +1224,28 @@ void PairRareAligner::filterAnchorByDP(AnchorBySQR_SparsePtr anchor_map, uint_t 
 }
 
 void PairRareAligner::constructGraphByDP(
-    SpeciesName query_name,
+    const SpeciesName& query_name,
     SeqPro::ManagerVariant& query_seqpro_manager,
     AnchorBySQR_SparsePtr anchor_ptr,
     RaMesh::RaMeshMultiGenomeGraph& graph) {
+    std::vector<Anchor*> selected;
     for (auto& anchor_group : *anchor_ptr) {
-        for (const auto& anchor : anchor_group) {
+        for (auto& anchor : anchor_group) {
             if (!anchor->ref_selected ||
                 !anchor->qry_selected) {
                 continue;
             }
-            try {
-                graph.insertAnchorIntoGraph(
-                    *ref_seqpro_manager,
-                    query_seqpro_manager,
-                    ref_name,
-                    query_name,
-                    *anchor,
-                    false);
-            } catch (const std::exception& error) {
-                spdlog::error(
-                    "Error inserting anchor into graph: {}",
-                    error.what());
-            }
+            selected.push_back(anchor.get());
         }
+    }
+    graph.insertAnchorsIntoGraphBatch(
+        *ref_seqpro_manager,
+        query_seqpro_manager,
+        ref_name,
+        query_name,
+        selected);
+    for (auto& anchor_group : *anchor_ptr) {
+        AnchorPtrVec().swap(anchor_group);
     }
 }
 

@@ -31,6 +31,20 @@ removes a query from the first-round native suffix-array path. Failed wfmash
 queries fall back to RaMAx's in-memory suffix-array aligner, and all later
 rounds use the same native backend. The reserved `--far-distance` default is
 `0.02` and does not yet affect routing.
+
+wfmash pairs share the RaMAx thread budget without oversubscription. Each
+running pair receives at least four threads unless RaMAx itself was started
+with fewer than four threads; the number of concurrent pairs is selected from
+that minimum and the number of runnable queries. Queries are ordered by total
+bases, then contig count and Mash distance, so larger jobs start first. Mapping,
+alignment, retry-lock waiting, and any
+alignment retry share a fixed 60-minute budget per query. When that budget is
+exhausted, RaMAx terminates the complete wfmash process group, records a
+`timeout_fallback` entry in `<workdir>/wfmash/round_0/routing.tsv`, and sends the
+query through the normal first-round suffix-array path. Partial PAF, temporary
+files, and stderr logs remain available for diagnosis but are never published
+as a successful wfmash result.
+
 RaMAx requires Mash 2.3, PGGB-compatible wfmash
 `v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.23.1. All wfmash
 FAI files are produced by `samtools faidx`, including indexes for multi-FASTA

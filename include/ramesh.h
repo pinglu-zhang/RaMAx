@@ -143,6 +143,13 @@ namespace RaMesh {
             const ChrName& ref_chr,
             const ChrName& qry_chr,
             const BlockPtr& blk);
+
+        static std::pair<SegPtr, SegPtr> createSegmentPair(Anchor& anchor,
+            const SpeciesName& ref_name,
+            const SpeciesName& qry_name,
+            const ChrName& ref_chr,
+            const ChrName& qry_chr,
+            const BlockPtr& blk);
             
         // ――― deletion methods ―――
         void removeAllSegments();
@@ -158,7 +165,7 @@ namespace RaMesh {
     // ────────────────────────────────────────────────
     class GenomeEnd {
     public:
-        static constexpr uint_t kSampleStep = 100000;
+        static constexpr uint_t kSampleStep = 8192;
         GenomeEnd();
         GenomeEnd(GenomeEnd&&)            noexcept = default;
         GenomeEnd& operator=(GenomeEnd&&) noexcept = default;
@@ -168,6 +175,7 @@ namespace RaMesh {
         SegPtr findSurrounding(uint_t range_start);
 
         void insertSegment(const SegPtr seg);
+        void insertSegmentsSorted(const std::vector<SegPtr>& segments);
 
         void clearAllSegments();
         
@@ -179,7 +187,13 @@ namespace RaMesh {
 
         void resortSegments();
 
-        void alignInterval(const SpeciesName ref_name, const SpeciesName query_name, const ChrName query_chr_name, SegPtr cur_node, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, bool is_left_extend, int_t zdrop);
+        void alignInterval(const SpeciesName& ref_name,
+                           const SpeciesName& query_name,
+                           const ChrName& query_chr_name,
+                           SegPtr cur_node,
+                           const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+                           bool is_left_extend,
+                           int_t zdrop);
 
         void removeOverlap(bool if_ref);
 
@@ -236,7 +250,18 @@ namespace RaMesh {
    //     void insertAnchorVecIntoGraph(SpeciesName ref_name, SpeciesName qry_name,
 			//const AnchorVec& anchor_vec);
 
-        void insertAnchorIntoGraph(SeqPro::ManagerVariant& ref_mgr, SeqPro::ManagerVariant& qry_mgr, SpeciesName ref_name, SpeciesName qry_name, const Anchor& anchor, bool isMultiple=false);
+        void insertAnchorIntoGraph(SeqPro::ManagerVariant& ref_mgr,
+                                   SeqPro::ManagerVariant& qry_mgr,
+                                   const SpeciesName& ref_name,
+                                   const SpeciesName& qry_name,
+                                   const Anchor& anchor,
+                                   bool isMultiple=false);
+        void insertAnchorsIntoGraphBatch(
+            SeqPro::ManagerVariant& ref_mgr,
+            SeqPro::ManagerVariant& qry_mgr,
+            const SpeciesName& ref_name,
+            const SpeciesName& qry_name,
+            const std::vector<Anchor*>& anchors);
 
         void registerSecondaryAnchorCandidate(
             SpeciesName ref_species,
@@ -270,7 +295,10 @@ namespace RaMesh {
         };
 
 
-		void extendRefNodes(const SpeciesName& ref_name, std::map<SpeciesName, SeqPro::SharedManagerVariant> managers, int_t zdrop);
+		void extendRefNodes(
+            const SpeciesName& ref_name,
+            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+            int_t zdrop);
         
         // 图正确性验证函数
         bool verifyGraphCorrectness(bool verbose = false, bool show_detailed_segments = false) const;

@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <tuple>
 
 #ifdef _OPENMP
@@ -285,6 +286,7 @@ void ensureFai(const std::filesystem::path& samtools,
 struct PreparedQuery {
     SpeciesName species;
     double distance{0.0};
+    uint64_t total_bases{0};
     SeqPro::SharedManagerVariant manager;
     std::filesystem::path fasta;
     std::vector<SequenceRecord> records;
@@ -393,7 +395,8 @@ std::vector<ParsedPafRecord> parseAndValidatePaf(
     const std::filesystem::path& path,
     const std::vector<SequenceRecord>& reference_records,
     const std::vector<SequenceRecord>& query_records,
-    bool require_cigar) {
+    bool require_cigar,
+    bool allow_empty = false) {
     const auto references = recordMap(reference_records);
     const auto queries = recordMap(query_records);
     std::ifstream input(path, std::ios::binary);
@@ -423,7 +426,7 @@ std::vector<ParsedPafRecord> parseAndValidatePaf(
         }
     }
     if (!input.eof()) throw std::runtime_error("Cannot finish reading PAF: " + path.string());
-    if (parsed.empty()) {
+    if (parsed.empty() && !allow_empty) {
         throw std::runtime_error("wfmash PAF has no alignments: " + path.string());
     }
     return parsed;
@@ -518,26 +521,119 @@ struct PairExecutionResult {
     bool success{false};
     AnchorVec anchors;
     std::string error;
+    bool timed_out{false};
+    size_t mapping_records{0};
+    size_t chunk_count{0};
+    size_t alignment_workers{0};
+    std::string routing_detail;
 };
+
+class WfmashPairTimeout : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+using SteadyClock = std::chrono::steady_clock;
+
+std::chrono::milliseconds remainingPairBudget(
+    SteadyClock::time_point deadline) {
+    const auto now = SteadyClock::now();
+    if (now >= deadline) return std::chrono::milliseconds::zero();
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+}
+
+std::string timeoutDetail(
+    const PreparedQuery& query, std::string_view stage,
+    SteadyClock::time_point pair_started,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        SteadyClock::now() - pair_started);
+    return "wfmash " + std::string(stage) + " timeout for " + query.species +
+           " after " + std::to_string(elapsed.count()) +
+           " ms (pair budget " + std::to_string(policy.pair_timeout.count()) +
+           " ms)";
+}
+
+RaMAxExternalTool::CommandResult runWfmashStage(
+    const std::filesystem::path& wfmash,
+    const std::vector<std::string>& arguments,
+    const std::filesystem::path& stdout_path,
+    const std::filesystem::path& stderr_path,
+    const PreparedQuery& query,
+    std::string_view stage,
+    size_t worker_index,
+    uint_t pair_threads,
+    SteadyClock::time_point pair_started,
+    SteadyClock::time_point deadline,
+    const WfmashRouterDetail::ExecutionPolicy& policy,
+    const std::atomic<bool>* cancellation_requested = nullptr) {
+    const auto remaining = remainingPairBudget(deadline);
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw WfmashPairTimeout(
+            timeoutDetail(query, stage, pair_started, policy));
+    }
+    const auto pair_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            SteadyClock::now() - pair_started);
+    spdlog::info(
+        "[wfmash-router] {} stage={} start worker={} threads={} "
+        "pair_elapsed_ms={} remaining_ms={}",
+        query.species, stage, worker_index, pair_threads,
+        pair_elapsed.count(), remaining.count());
+
+    RaMAxExternalTool::RunOptions run_options;
+    run_options.timeout = remaining;
+    run_options.termination_grace = policy.termination_grace;
+    run_options.poll_interval = policy.poll_interval;
+    run_options.create_process_group = true;
+    run_options.cancellation_requested = cancellation_requested;
+    const auto result = RaMAxExternalTool::run(
+        wfmash, arguments, stdout_path, stderr_path, run_options);
+    spdlog::info(
+        "[wfmash-router] {} stage={} complete worker={} threads={} "
+        "elapsed_ms={} exit_code={} timed_out={} cancelled={} signal={}",
+        query.species, stage, worker_index, pair_threads,
+        result.elapsed.count(), result.exit_code,
+        result.timed_out ? "true" : "false",
+        result.cancelled ? "true" : "false", result.termination_signal);
+    if (result.timed_out) {
+        throw WfmashPairTimeout(
+            timeoutDetail(query, stage, pair_started, policy));
+    }
+    return result;
+}
 
 PairExecutionResult executePair(
     const std::filesystem::path& wfmash,
     uint_t pair_threads,
+    size_t worker_index,
     const std::filesystem::path& reference_fasta,
     const std::vector<SequenceRecord>& reference_records,
     const SeqPro::SharedManagerVariant& reference_manager,
-    const PreparedQuery& query) {
+    const PreparedQuery& query,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    const auto pair_started = SteadyClock::now();
+    const auto deadline = pair_started + policy.pair_timeout;
     try {
-        std::filesystem::create_directories(query.directory / "tmp");
+        const auto tmp_root = query.directory / "tmp";
+        const auto mapping_tmp = tmp_root / "mapping.attempt1";
+        const auto alignment_attempt1_tmp = tmp_root / "alignment.attempt1";
+        const auto alignment_retry_tmp = tmp_root / "alignment.attempt2";
+        std::filesystem::create_directories(mapping_tmp);
+        std::filesystem::create_directories(alignment_attempt1_tmp);
+        std::filesystem::create_directories(alignment_retry_tmp);
         const auto mappings = query.directory / "mappings.paf";
         auto mappings_partial = mappings;
         mappings_partial += ".part";
         const auto mapping_stderr = query.directory / "mapping.stderr.log";
-        const auto mapping_result = RaMAxExternalTool::run(
+        const auto mapping_result = runWfmashStage(
             wfmash,
-            buildMappingArguments(pair_threads, query.directory / "tmp",
+            buildMappingArguments(pair_threads, mapping_tmp,
                                   reference_fasta, query.fasta),
-            mappings_partial, mapping_stderr);
+            mappings_partial, mapping_stderr, query, "mapping",
+            worker_index, pair_threads, pair_started, deadline, policy);
         if (mapping_result.exit_code != 0) {
             throw std::runtime_error("wfmash mapping exited " +
                                      std::to_string(mapping_result.exit_code));
@@ -551,20 +647,33 @@ PairExecutionResult executePair(
         const auto alignment_stderr = query.directory / "alignment.stderr.log";
         const auto first_alignment_stderr =
             query.directory / "alignment.attempt1.stderr.log";
-        auto alignment_result = RaMAxExternalTool::run(
+        auto alignment_result = runWfmashStage(
             wfmash,
-            buildAlignmentArguments(pair_threads, query.directory / "tmp",
+            buildAlignmentArguments(pair_threads, alignment_attempt1_tmp,
                                     mappings_partial,
                                     reference_fasta, query.fasta),
-            alignment_partial, first_alignment_stderr);
+            alignment_partial, first_alignment_stderr, query,
+            "alignment-attempt1", worker_index, pair_threads,
+            pair_started, deadline, policy);
         if (alignment_result.exit_code != 0) {
             const int first_exit_code = alignment_result.exit_code;
             spdlog::warn(
                 "[wfmash-router] {} parallel alignment exited {}; "
                 "retrying once under the process-wide serial guard",
                 query.species, first_exit_code);
-            std::lock_guard<std::mutex> retry_guard(
-                wfmash_alignment_retry_mutex);
+            std::unique_lock<std::mutex> retry_guard(
+                wfmash_alignment_retry_mutex, std::defer_lock);
+            while (!retry_guard.try_lock()) {
+                const auto remaining = remainingPairBudget(deadline);
+                if (remaining <= std::chrono::milliseconds::zero()) {
+                    throw WfmashPairTimeout(timeoutDetail(
+                        query, "retry-lock", pair_started, policy));
+                }
+                std::this_thread::sleep_for(std::min(
+                    remaining,
+                    std::max(std::chrono::milliseconds(1),
+                             policy.poll_interval)));
+            }
             std::ifstream mapping_check(mappings_partial, std::ios::binary);
             if (!mapping_check || mapping_check.peek() == std::ifstream::traits_type::eof()) {
                 throw std::runtime_error(
@@ -572,12 +681,14 @@ PairExecutionResult executePair(
                     "initial exit " + std::to_string(first_exit_code));
             }
             mapping_check.close();
-            alignment_result = RaMAxExternalTool::run(
+            alignment_result = runWfmashStage(
                 wfmash,
-                buildAlignmentArguments(pair_threads, query.directory / "tmp",
+                buildAlignmentArguments(pair_threads, alignment_retry_tmp,
                                         mappings_partial,
                                         reference_fasta, query.fasta),
-                alignment_partial, alignment_stderr);
+                alignment_partial, alignment_stderr, query,
+                "alignment-retry", worker_index, pair_threads,
+                pair_started, deadline, policy);
             if (alignment_result.exit_code != 0) {
                 throw std::runtime_error(
                     "wfmash alignment exited " +
@@ -610,10 +721,656 @@ PairExecutionResult executePair(
         // path and only publishes the stable user-facing name afterward.
         atomicPublish(mappings_partial, mappings);
         atomicPublish(alignment_partial, alignment);
-        return {true, std::move(anchors), {}};
+        return {
+            .success = true,
+            .anchors = std::move(anchors),
+            .error = {},
+            .timed_out = false,
+            .mapping_records = 0,
+            .chunk_count = 0,
+            .alignment_workers = 0,
+            .routing_detail = {}};
+    } catch (const WfmashPairTimeout& error) {
+        spdlog::warn(
+            "[wfmash-router] {} timed out; returning to native fallback: {}",
+            query.species, error.what());
+        return {
+            .success = false, .anchors = {}, .error = error.what(),
+            .timed_out = true, .mapping_records = 0, .chunk_count = 0,
+            .alignment_workers = 0, .routing_detail = {}};
     } catch (const std::exception& error) {
-        return {false, {}, error.what()};
+        return {
+            .success = false, .anchors = {}, .error = error.what(),
+            .timed_out = false, .mapping_records = 0, .chunk_count = 0,
+            .alignment_workers = 0, .routing_detail = {}};
     }
+}
+
+struct MappingExecutionResult {
+    bool success{false};
+    bool timed_out{false};
+    std::string error;
+    std::filesystem::path mapping;
+    std::vector<uint64_t> record_costs;
+    uint64_t total_cost{0};
+};
+
+struct AlignmentChunkExecutionResult {
+    bool attempted{false};
+    bool success{false};
+    bool timed_out{false};
+    bool cancelled{false};
+    int exit_code{0};
+    uint_t threads{0};
+    size_t retry_count{0};
+    size_t output_records{0};
+    int64_t start_unix_ms{0};
+    std::chrono::milliseconds elapsed{0};
+    std::string error;
+};
+
+struct AlignmentChunkWork {
+    size_t query_index{0};
+    size_t chunk_index{0};
+    size_t record_count{0};
+    uint64_t estimated_cost{0};
+    std::filesystem::path root;
+    std::filesystem::path mapping;
+    std::filesystem::path output;
+    std::filesystem::path first_stderr;
+    std::filesystem::path retry_stderr;
+    std::filesystem::path first_tmp;
+    std::filesystem::path retry_tmp;
+};
+
+struct SpeciesAlignmentState {
+    explicit SpeciesAlignmentState(size_t chunks)
+        : results(chunks) {}
+
+    std::mutex mutex;
+    std::atomic<bool> cancellation_requested{false};
+    bool started{false};
+    SteadyClock::time_point started_at{};
+    SteadyClock::time_point deadline{};
+    size_t failure_order{std::numeric_limits<size_t>::max()};
+    size_t failure_chunk{std::numeric_limits<size_t>::max()};
+    bool timed_out{false};
+    std::string error;
+    std::vector<AlignmentChunkExecutionResult> results;
+};
+
+uint64_t saturatingCostAdd(uint64_t left, uint64_t right) {
+    return right > std::numeric_limits<uint64_t>::max() - left
+        ? std::numeric_limits<uint64_t>::max()
+        : left + right;
+}
+
+MappingExecutionResult executeMappingStage(
+    const std::filesystem::path& wfmash,
+    uint_t pair_threads,
+    size_t worker_index,
+    const std::filesystem::path& reference_fasta,
+    const std::vector<SequenceRecord>& reference_records,
+    const PreparedQuery& query,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    MappingExecutionResult result;
+    const auto started = SteadyClock::now();
+    const auto deadline = started + policy.pair_timeout;
+    try {
+        const auto mapping_tmp = query.directory / "tmp" / "mapping.attempt1";
+        std::filesystem::create_directories(mapping_tmp);
+        result.mapping = query.directory / "mappings.paf";
+        auto partial = result.mapping;
+        partial += ".part";
+        const auto command = runWfmashStage(
+            wfmash,
+            buildMappingArguments(pair_threads, mapping_tmp,
+                                  reference_fasta, query.fasta),
+            partial, query.directory / "mapping.stderr.log", query,
+            "mapping", worker_index, pair_threads, started, deadline, policy);
+        if (command.exit_code != 0) {
+            throw std::runtime_error(
+                "wfmash mapping exited " + std::to_string(command.exit_code));
+        }
+        auto parsed = parseAndValidatePaf(
+            partial, reference_records, query.records, false);
+        result.record_costs.reserve(parsed.size());
+        for (const auto& record : parsed) {
+            const uint64_t cost =
+                WfmashRouterDetail::mappingAlignmentCost(record);
+            result.record_costs.push_back(cost);
+            result.total_cost = saturatingCostAdd(result.total_cost, cost);
+        }
+        parsed.clear();
+        atomicPublish(partial, result.mapping);
+        result.success = true;
+    } catch (const WfmashPairTimeout& error) {
+        result.timed_out = true;
+        result.error = error.what();
+    } catch (const std::exception& error) {
+        result.error = error.what();
+    }
+    return result;
+}
+
+std::string chunkStem(size_t chunk_index) {
+    std::ostringstream stem;
+    stem << "chunk-" << std::setw(5) << std::setfill('0') << chunk_index;
+    return stem.str();
+}
+
+std::vector<AlignmentChunkWork> writeMappingChunks(
+    const PreparedQuery& query,
+    size_t query_index,
+    const MappingExecutionResult& mapping,
+    size_t requested_chunks) {
+    const auto plan = WfmashRouterDetail::makeMappingChunkPlan(
+        mapping.record_costs, requested_chunks);
+    if (plan.chunk_by_record.empty()) {
+        throw std::runtime_error(
+            "Cannot split an empty wfmash mapping PAF for " + query.species);
+    }
+
+    static std::atomic<uint64_t> generation{0};
+    const uint64_t run_id = generation.fetch_add(1, std::memory_order_relaxed);
+    const auto ticks = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto root = query.directory /
+        ("alignment-chunks." + std::to_string(ticks) + "." +
+         std::to_string(run_id));
+    std::filesystem::create_directories(root);
+
+    std::vector<AlignmentChunkWork> work(plan.estimated_cost.size());
+    std::vector<std::ofstream> outputs;
+    outputs.reserve(work.size());
+    for (size_t chunk = 0; chunk < work.size(); ++chunk) {
+        const std::string stem = chunkStem(chunk);
+        AlignmentChunkWork& item = work[chunk];
+        item.query_index = query_index;
+        item.chunk_index = chunk;
+        item.record_count = plan.record_count[chunk];
+        item.estimated_cost = plan.estimated_cost[chunk];
+        item.root = root;
+        item.mapping = root / (stem + ".mapping.paf");
+        item.output = root / (stem + ".alignment.paf.part");
+        item.first_stderr = root / (stem + ".attempt1.stderr.log");
+        item.retry_stderr = root / (stem + ".attempt2.stderr.log");
+        item.first_tmp = root / (stem + ".alignment.attempt1");
+        item.retry_tmp = root / (stem + ".alignment.attempt2");
+        std::filesystem::create_directories(item.first_tmp);
+        std::filesystem::create_directories(item.retry_tmp);
+        outputs.emplace_back(item.mapping,
+            std::ios::binary | std::ios::trunc);
+        if (!outputs.back()) {
+            throw std::runtime_error(
+                "Cannot create wfmash mapping chunk " + item.mapping.string());
+        }
+    }
+
+    std::ifstream input(mapping.mapping, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "Cannot reopen validated mapping PAF " + mapping.mapping.string());
+    }
+    std::string line;
+    size_t record_index = 0;
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        if (record_index >= plan.chunk_by_record.size()) {
+            throw std::runtime_error("Mapping PAF changed while creating chunks");
+        }
+        const size_t chunk = plan.chunk_by_record[record_index++];
+        outputs[chunk] << line << '\n';
+    }
+    if (!input.eof() || record_index != plan.chunk_by_record.size()) {
+        throw std::runtime_error("Mapping PAF changed while creating chunks");
+    }
+    for (auto& output : outputs) {
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Cannot finalize wfmash mapping chunk");
+        }
+    }
+    return work;
+}
+
+void recordAlignmentFailure(
+    SpeciesAlignmentState& state,
+    size_t failure_order,
+    size_t failure_chunk,
+    std::string error,
+    bool timed_out) {
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (failure_order < state.failure_order) {
+            state.failure_order = failure_order;
+            state.failure_chunk = failure_chunk;
+            state.error = std::move(error);
+            state.timed_out = timed_out;
+        }
+    }
+    state.cancellation_requested.store(true, std::memory_order_relaxed);
+}
+
+bool acquireRetryGuard(
+    std::unique_lock<std::mutex>& guard,
+    const SpeciesAlignmentState& state,
+    SteadyClock::time_point deadline,
+    std::chrono::milliseconds poll_interval) {
+    while (SteadyClock::now() < deadline) {
+        if (state.cancellation_requested.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const auto remaining = remainingPairBudget(deadline);
+        if (remaining <= std::chrono::milliseconds::zero()) return false;
+        if (guard.try_lock()) {
+            if (state.cancellation_requested.load(
+                    std::memory_order_relaxed)) {
+                guard.unlock();
+                return false;
+            }
+            return true;
+        }
+        std::this_thread::sleep_for(std::min(
+            remaining,
+            std::max(std::chrono::milliseconds(1), poll_interval)));
+    }
+    return false;
+}
+
+void executeAlignmentChunk(
+    const std::filesystem::path& wfmash,
+    const std::filesystem::path& reference_fasta,
+    const PreparedQuery& query,
+    AlignmentChunkWork& work,
+    SpeciesAlignmentState& state,
+    size_t failure_order,
+    size_t worker_index,
+    uint_t pair_threads,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    auto& result = state.results.at(work.chunk_index);
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.cancellation_requested.load(std::memory_order_relaxed)) {
+            result.cancelled = true;
+            result.error = "cancelled before launch";
+            return;
+        }
+        if (!state.started) {
+            state.started = true;
+            state.started_at = SteadyClock::now();
+            state.deadline = state.started_at + policy.pair_timeout;
+        }
+    }
+
+    result.attempted = true;
+    result.threads = pair_threads;
+    result.start_unix_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto chunk_started = SteadyClock::now();
+    struct ElapsedRecorder {
+        SteadyClock::time_point started;
+        std::chrono::milliseconds& elapsed;
+        ~ElapsedRecorder() {
+            elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                SteadyClock::now() - started);
+        }
+    } elapsed_recorder{chunk_started, result.elapsed};
+    try {
+        const auto run_attempt = [&](bool retry) {
+            return runWfmashStage(
+                wfmash,
+                buildAlignmentArguments(
+                    pair_threads, retry ? work.retry_tmp : work.first_tmp,
+                    work.mapping, reference_fasta, query.fasta),
+                work.output, retry ? work.retry_stderr : work.first_stderr,
+                query,
+                retry ? "alignment-chunk-retry" : "alignment-chunk",
+                worker_index, pair_threads, state.started_at, state.deadline,
+                policy, &state.cancellation_requested);
+        };
+
+        auto command = run_attempt(false);
+        result.exit_code = command.exit_code;
+        if (command.cancelled) {
+            result.cancelled = true;
+            result.error = "cancelled after another chunk failure";
+            return;
+        }
+        if (command.exit_code != 0) {
+            const int first_exit = command.exit_code;
+            std::unique_lock<std::mutex> retry_guard(
+                wfmash_alignment_retry_mutex, std::defer_lock);
+            if (!acquireRetryGuard(
+                    retry_guard, state, state.deadline, policy.poll_interval)) {
+                if (state.cancellation_requested.load(
+                        std::memory_order_relaxed)) {
+                    result.cancelled = true;
+                    result.error = "cancelled while waiting for retry";
+                    return;
+                }
+                throw WfmashPairTimeout(
+                    timeoutDetail(query, "chunk-retry-lock",
+                                  state.started_at, policy));
+            }
+            ++result.retry_count;
+            command = run_attempt(true);
+            result.exit_code = command.exit_code;
+            if (command.cancelled) {
+                result.cancelled = true;
+                result.error = "cancelled during chunk retry";
+                return;
+            }
+            if (command.exit_code != 0) {
+                throw std::runtime_error(
+                    "wfmash alignment chunk " +
+                    std::to_string(work.chunk_index) + " exited " +
+                    std::to_string(first_exit) + " and retry exited " +
+                    std::to_string(command.exit_code));
+            }
+        }
+        result.success = true;
+    } catch (const WfmashPairTimeout& error) {
+        result.timed_out = true;
+        result.error = error.what();
+        recordAlignmentFailure(
+            state, failure_order, work.chunk_index, result.error, true);
+    } catch (const std::exception& error) {
+        result.error = error.what();
+        recordAlignmentFailure(
+            state, failure_order, work.chunk_index, result.error, false);
+    }
+}
+
+void writeChunkManifest(
+    const PreparedQuery& query,
+    const std::vector<AlignmentChunkWork>& work,
+    const SpeciesAlignmentState& state) {
+    std::ostringstream output;
+    output << "species\tchunk_id\tmapping_records\testimated_cost\tthreads\t"
+              "start_unix_ms\twall_ms\texit_code\ttimeout\tcancelled\t"
+              "retry_count\toutput_records\tstatus\n";
+    for (size_t index = 0; index < work.size(); ++index) {
+        const auto& item = work[index];
+        const auto& result = state.results[index];
+        output << query.species << '\t' << item.chunk_index << '\t'
+               << item.record_count << '\t' << item.estimated_cost << '\t'
+               << result.threads << '\t' << result.start_unix_ms << '\t'
+               << result.elapsed.count() << '\t' << result.exit_code << '\t'
+               << (result.timed_out ? "true" : "false") << '\t'
+               << (result.cancelled ? "true" : "false") << '\t'
+               << result.retry_count << '\t' << result.output_records << '\t'
+               << (result.success ? "success" :
+                   result.cancelled ? "cancelled" :
+                   result.attempted ? "failed" : "not_started") << '\n';
+    }
+    writeAtomicText(query.directory / "alignment_chunks.tsv", output.str());
+}
+
+void concatenateChunkLogs(
+    const PreparedQuery& query,
+    const std::vector<AlignmentChunkWork>& work) {
+    const auto final_path = query.directory / "alignment.stderr.log";
+    auto partial = final_path;
+    partial += ".part";
+    std::ofstream output(partial, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error(
+            "Cannot create consolidated alignment log for " + query.species);
+    }
+    for (const auto& item : work) {
+        for (const auto& path : {item.first_stderr, item.retry_stderr}) {
+            std::ifstream input(path, std::ios::binary);
+            if (!input) continue;
+            output << "===== " << path.filename().string() << " =====\n";
+            if (input.peek() != std::ifstream::traits_type::eof()) {
+                output << input.rdbuf();
+            }
+            output << '\n';
+        }
+    }
+    output.flush();
+    if (!output) {
+        throw std::runtime_error(
+            "Cannot finalize consolidated alignment log for " + query.species);
+    }
+    atomicPublish(partial, final_path);
+}
+
+std::vector<PairExecutionResult> executeChunkedPairs(
+    const std::filesystem::path& wfmash,
+    const std::filesystem::path& reference_fasta,
+    const std::vector<SequenceRecord>& reference_records,
+    const SeqPro::SharedManagerVariant& reference_manager,
+    std::vector<PreparedQuery>& queries,
+    const std::vector<size_t>& runnable,
+    const WfmashRouterDetail::PairThreadSchedule& schedule,
+    const WfmashRouterDetail::ExecutionPolicy& policy) {
+    std::vector<PairExecutionResult> pair_results(queries.size());
+    std::vector<MappingExecutionResult> mappings(queries.size());
+    if (runnable.empty()) return pair_results;
+
+    const int workers = static_cast<int>(schedule.workers());
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+    for (size_t position = 0; position < runnable.size(); ++position) {
+        const size_t query_index = runnable[position];
+        size_t worker_index = 0;
+#ifdef _OPENMP
+        worker_index = static_cast<size_t>(omp_get_thread_num());
+#endif
+        mappings[query_index] = executeMappingStage(
+            wfmash, schedule.threads_per_worker.at(worker_index), worker_index,
+            reference_fasta, reference_records, queries[query_index], policy);
+    }
+
+    std::vector<size_t> successful;
+    for (const size_t query_index : runnable) {
+        auto& mapping = mappings[query_index];
+        if (!mapping.success) {
+            pair_results[query_index].error = mapping.error;
+            pair_results[query_index].timed_out = mapping.timed_out;
+            continue;
+        }
+        successful.push_back(query_index);
+    }
+    std::sort(successful.begin(), successful.end());
+    if (successful.empty()) return pair_results;
+
+    std::vector<uint64_t> species_costs;
+    std::vector<size_t> species_records;
+    species_costs.reserve(successful.size());
+    species_records.reserve(successful.size());
+    for (const size_t query_index : successful) {
+        species_costs.push_back(mappings[query_index].total_cost);
+        species_records.push_back(mappings[query_index].record_costs.size());
+    }
+    const size_t target_chunks = std::max<size_t>(
+        successful.size(),
+        schedule.workers() * policy.alignment_chunks_per_worker);
+    const auto chunk_counts = WfmashRouterDetail::allocateMappingChunks(
+        species_costs, species_records, target_chunks);
+
+    std::vector<std::vector<AlignmentChunkWork>> chunks(queries.size());
+    std::vector<std::unique_ptr<SpeciesAlignmentState>> states(queries.size());
+    for (size_t position = 0; position < successful.size(); ++position) {
+        const size_t query_index = successful[position];
+        try {
+            chunks[query_index] = writeMappingChunks(
+                queries[query_index], query_index, mappings[query_index],
+                chunk_counts[position]);
+            states[query_index] = std::make_unique<SpeciesAlignmentState>(
+                chunks[query_index].size());
+            mappings[query_index].record_costs.clear();
+            mappings[query_index].record_costs.shrink_to_fit();
+        } catch (const std::exception& error) {
+            pair_results[query_index].error = error.what();
+        }
+    }
+
+    struct OrderedChunk {
+        size_t query_index{0};
+        size_t local_index{0};
+        uint64_t cost{0};
+    };
+    std::vector<OrderedChunk> first_wave;
+    std::vector<OrderedChunk> remainder;
+    for (const size_t query_index : successful) {
+        if (!states[query_index]) continue;
+        std::vector<size_t> order(chunks[query_index].size());
+        for (size_t index = 0; index < order.size(); ++index) order[index] = index;
+        std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+            const auto& lhs = chunks[query_index][left];
+            const auto& rhs = chunks[query_index][right];
+            if (lhs.estimated_cost != rhs.estimated_cost) {
+                return lhs.estimated_cost > rhs.estimated_cost;
+            }
+            return lhs.chunk_index < rhs.chunk_index;
+        });
+        first_wave.push_back({query_index, order.front(),
+                              chunks[query_index][order.front()].estimated_cost});
+        for (size_t position = 1; position < order.size(); ++position) {
+            const size_t local = order[position];
+            remainder.push_back({query_index, local,
+                                 chunks[query_index][local].estimated_cost});
+        }
+    }
+    const auto order_less = [](const OrderedChunk& left,
+                               const OrderedChunk& right) {
+        if (left.cost != right.cost) return left.cost > right.cost;
+        if (left.query_index != right.query_index) {
+            return left.query_index < right.query_index;
+        }
+        return left.local_index < right.local_index;
+    };
+    std::sort(first_wave.begin(), first_wave.end(), order_less);
+    std::sort(remainder.begin(), remainder.end(), order_less);
+    std::vector<OrderedChunk> order;
+    order.reserve(first_wave.size() + remainder.size());
+    order.insert(order.end(), first_wave.begin(), first_wave.end());
+    order.insert(order.end(), remainder.begin(), remainder.end());
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+    for (size_t position = 0; position < order.size(); ++position) {
+        const auto selected = order[position];
+        size_t worker_index = 0;
+#ifdef _OPENMP
+        worker_index = static_cast<size_t>(omp_get_thread_num());
+#endif
+        executeAlignmentChunk(
+            wfmash, reference_fasta, queries[selected.query_index],
+            chunks[selected.query_index][selected.local_index],
+            *states[selected.query_index], position, worker_index,
+            schedule.threads_per_worker.at(worker_index), policy);
+    }
+
+    for (const size_t query_index : successful) {
+        if (!states[query_index]) continue;
+        auto& state = *states[query_index];
+        auto& pair = pair_results[query_index];
+        pair.mapping_records = species_records[
+            static_cast<size_t>(std::find(
+                successful.begin(), successful.end(), query_index) -
+                successful.begin())];
+        pair.chunk_count = chunks[query_index].size();
+        pair.alignment_workers = schedule.workers();
+
+        bool failed = false;
+        size_t failed_chunk = std::numeric_limits<size_t>::max();
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            failed = !state.error.empty();
+            if (failed) {
+                pair.error = state.error;
+                pair.timed_out = state.timed_out;
+                failed_chunk = state.failure_chunk;
+            }
+        }
+        if (!failed) {
+            for (const auto& result : state.results) {
+                if (!result.success) {
+                    failed = true;
+                    pair.error = result.error.empty()
+                        ? "wfmash alignment chunk did not complete"
+                        : result.error;
+                    pair.timed_out = result.timed_out;
+                    break;
+                }
+            }
+        }
+
+        try {
+            if (!failed) {
+                std::vector<ParsedPafRecord> parsed;
+                for (size_t chunk = 0;
+                     chunk < chunks[query_index].size(); ++chunk) {
+                    auto records = parseAndValidatePaf(
+                        chunks[query_index][chunk].output,
+                        reference_records, queries[query_index].records,
+                        true, true);
+                    state.results[chunk].output_records = records.size();
+                    parsed.insert(parsed.end(),
+                        std::make_move_iterator(records.begin()),
+                        std::make_move_iterator(records.end()));
+                }
+                if (parsed.empty()) {
+                    throw std::runtime_error(
+                        "wfmash chunked alignment produced no alignments");
+                }
+                sortAndDeduplicatePaf(parsed);
+                const auto normalization =
+                    WfmashRouterDetail::normalizePafForGraph(parsed);
+                spdlog::info(
+                    "[wfmash-router] {} graph-safe PAF normalization: "
+                    "input={} trimmed={} skipped={} output={} chunks={}",
+                    queries[query_index].species,
+                    normalization.input_records,
+                    normalization.trimmed_records,
+                    normalization.skipped_records, parsed.size(),
+                    chunks[query_index].size());
+                const auto alignment =
+                    queries[query_index].directory / "alignment.paf";
+                auto partial = alignment;
+                partial += ".part";
+                writeCanonicalPaf(partial, parsed);
+                pair.anchors = makeAnchors(
+                    std::move(parsed), reference_manager,
+                    queries[query_index].manager,
+                    queries[query_index].alias_to_original);
+                concatenateChunkLogs(
+                    queries[query_index], chunks[query_index]);
+                atomicPublish(partial, alignment);
+                pair.success = true;
+            }
+        } catch (const std::exception& error) {
+            failed = true;
+            pair.success = false;
+            pair.error = error.what();
+        }
+
+        writeChunkManifest(
+            queries[query_index], chunks[query_index], state);
+        pair.routing_detail =
+            "mapping_records=" + std::to_string(pair.mapping_records) +
+            ";chunks=" + std::to_string(pair.chunk_count) +
+            ";alignment_workers=" +
+                std::to_string(pair.alignment_workers) +
+            (failed_chunk == std::numeric_limits<size_t>::max()
+                ? std::string{}
+                : ";failed_chunk=" + std::to_string(failed_chunk));
+        if (pair.success && !chunks[query_index].empty()) {
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(
+                chunks[query_index].front().root, cleanup_error);
+            if (cleanup_error) {
+                spdlog::warn(
+                    "[wfmash-router] cannot remove successful chunk scratch "
+                    "for {}: {}",
+                    queries[query_index].species, cleanup_error.message());
+            }
+        }
+    }
+    return pair_results;
 }
 
 }  // namespace
@@ -778,6 +1535,129 @@ ParsedPafRecord parsePafLine(std::string_view line, bool require_cigar) {
     return record;
 }
 
+uint64_t mappingAlignmentCost(const ParsedPafRecord& record) {
+    const uint64_t query_span = record.query_end - record.query_start;
+    const uint64_t target_span = record.target_end - record.target_start;
+    const uint64_t span = std::max(query_span, target_span);
+    const uint64_t errors = std::max<uint64_t>(
+        1, record.block_length - record.matches);
+    if (span != 0 &&
+        errors > std::numeric_limits<uint64_t>::max() / span) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return std::max<uint64_t>(
+        1, span * errors / std::max<uint64_t>(1, record.block_length));
+}
+
+MappingChunkPlan makeMappingChunkPlan(
+    const std::vector<uint64_t>& record_costs, size_t requested_chunks) {
+    MappingChunkPlan plan;
+    if (record_costs.empty()) return plan;
+    const size_t chunk_count = std::max<size_t>(
+        1, std::min(requested_chunks, record_costs.size()));
+    plan.chunk_by_record.resize(record_costs.size());
+    plan.estimated_cost.assign(chunk_count, 0);
+    plan.record_count.assign(chunk_count, 0);
+
+    std::vector<size_t> order(record_costs.size());
+    for (size_t index = 0; index < order.size(); ++index) order[index] = index;
+    std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+        if (record_costs[left] != record_costs[right]) {
+            return record_costs[left] > record_costs[right];
+        }
+        return left < right;
+    });
+
+    for (const size_t record_index : order) {
+        size_t selected = 0;
+        for (size_t chunk = 1; chunk < chunk_count; ++chunk) {
+            if (plan.estimated_cost[chunk] < plan.estimated_cost[selected]) {
+                selected = chunk;
+            }
+        }
+        plan.chunk_by_record[record_index] = selected;
+        ++plan.record_count[selected];
+        const uint64_t cost = record_costs[record_index];
+        plan.estimated_cost[selected] =
+            cost > std::numeric_limits<uint64_t>::max() -
+                       plan.estimated_cost[selected]
+                ? std::numeric_limits<uint64_t>::max()
+                : plan.estimated_cost[selected] + cost;
+    }
+    return plan;
+}
+
+std::vector<size_t> allocateMappingChunks(
+    const std::vector<uint64_t>& species_costs,
+    const std::vector<size_t>& species_records, size_t target_chunks) {
+    if (species_costs.size() != species_records.size()) {
+        throw std::runtime_error("wfmash chunk allocation input size mismatch");
+    }
+    std::vector<size_t> chunks(species_costs.size(), 0);
+    size_t nonempty = 0;
+    size_t total_records = 0;
+    for (size_t index = 0; index < species_records.size(); ++index) {
+        if (species_records[index] == 0) continue;
+        chunks[index] = 1;
+        ++nonempty;
+        total_records = species_records[index] >
+                std::numeric_limits<size_t>::max() - total_records
+            ? std::numeric_limits<size_t>::max()
+            : total_records + species_records[index];
+    }
+    if (nonempty == 0) return chunks;
+    const size_t bounded_target = std::min(
+        total_records, std::max(target_chunks, nonempty));
+    size_t remaining = bounded_target - nonempty;
+
+    while (remaining != 0) {
+        unsigned __int128 total_weight = 0;
+        for (size_t index = 0; index < chunks.size(); ++index) {
+            if (chunks[index] < species_records[index]) {
+                total_weight += std::max<uint64_t>(1, species_costs[index]);
+            }
+        }
+        if (total_weight == 0) break;
+
+        std::vector<size_t> grants(chunks.size(), 0);
+        size_t granted = 0;
+        for (size_t index = 0; index < chunks.size(); ++index) {
+            const size_t capacity = species_records[index] - chunks[index];
+            if (capacity == 0) continue;
+            const unsigned __int128 numerator =
+                static_cast<unsigned __int128>(remaining) *
+                std::max<uint64_t>(1, species_costs[index]);
+            const size_t quota = static_cast<size_t>(numerator / total_weight);
+            grants[index] = std::min(capacity, quota);
+            granted += grants[index];
+        }
+        if (granted == 0) {
+            size_t selected = chunks.size();
+            unsigned __int128 selected_remainder = 0;
+            for (size_t index = 0; index < chunks.size(); ++index) {
+                if (chunks[index] >= species_records[index]) continue;
+                const unsigned __int128 numerator =
+                    static_cast<unsigned __int128>(remaining) *
+                    std::max<uint64_t>(1, species_costs[index]);
+                const unsigned __int128 remainder = numerator % total_weight;
+                if (selected == chunks.size() ||
+                    remainder > selected_remainder) {
+                    selected = index;
+                    selected_remainder = remainder;
+                }
+            }
+            if (selected == chunks.size()) break;
+            grants[selected] = 1;
+            granted = 1;
+        }
+        for (size_t index = 0; index < chunks.size(); ++index) {
+            chunks[index] += grants[index];
+        }
+        remaining -= std::min(remaining, granted);
+    }
+    return chunks;
+}
+
 namespace {
 
 using IntervalSet = std::map<uint64_t, uint64_t>;
@@ -938,17 +1818,51 @@ uint_t threadsPerTask(size_t tasks, uint_t total_threads) {
     return std::max<uint_t>(1, total_threads / static_cast<uint_t>(tasks));
 }
 
+PairThreadSchedule pairThreadSchedule(
+    size_t tasks, uint_t total_threads,
+    uint_t minimum_threads_per_process) {
+    PairThreadSchedule schedule;
+    if (tasks == 0) return schedule;
+
+    const uint_t normalized_threads = std::max<uint_t>(1, total_threads);
+    const uint_t normalized_minimum =
+        std::max<uint_t>(1, minimum_threads_per_process);
+    const size_t workers = normalized_threads < normalized_minimum
+        ? 1
+        : std::max<size_t>(
+              1, std::min<size_t>(
+                     tasks, normalized_threads / normalized_minimum));
+    schedule.threads_per_worker.resize(workers);
+    const uint_t base = normalized_threads / static_cast<uint_t>(workers);
+    const uint_t remainder = normalized_threads % static_cast<uint_t>(workers);
+    for (size_t worker = 0; worker < workers; ++worker) {
+        schedule.threads_per_worker[worker] =
+            base + (worker < remainder ? 1U : 0U);
+    }
+    return schedule;
+}
+
 }  // namespace WfmashRouterDetail
 
 FirstRoundWfmashRouter::FirstRoundWfmashRouter(
     std::filesystem::path samtools_executable,
     std::filesystem::path wfmash_executable,
     std::filesystem::path output_directory,
-    uint_t threads)
+    uint_t threads,
+    WfmashRouterDetail::ExecutionPolicy execution_policy)
     : samtools_executable_(std::move(samtools_executable)),
       wfmash_executable_(std::move(wfmash_executable)),
       output_directory_(std::move(output_directory)),
-      threads_(std::max<uint_t>(1, threads)) {
+      threads_(std::max<uint_t>(1, threads)),
+      execution_policy_(execution_policy) {
+    if (execution_policy_.minimum_threads_per_process == 0 ||
+        execution_policy_.maximum_alignment_processes == 0 ||
+        execution_policy_.alignment_chunks_per_worker == 0 ||
+        execution_policy_.pair_timeout <= std::chrono::milliseconds::zero() ||
+        execution_policy_.termination_grace < std::chrono::milliseconds::zero() ||
+        execution_policy_.poll_interval <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error("Invalid wfmash execution policy");
+    }
     if (!RaMAxExternalTool::isExecutable(samtools_executable_)) {
         throw std::runtime_error("samtools is required but was not found");
     }
@@ -1013,6 +1927,14 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         query.directory = output_directory_ / safeName(query.species);
         std::filesystem::create_directories(query.directory);
         createAliasedView(query, reference_names, output_directory_ / "views");
+        for (const auto& record : query.records) {
+            if (record.length >
+                std::numeric_limits<uint64_t>::max() - query.total_bases) {
+                query.total_bases = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            query.total_bases += record.length;
+        }
         queries.push_back(std::move(query));
     }
     std::sort(queries.begin(), queries.end(), [](const auto& left, const auto& right) {
@@ -1063,27 +1985,44 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         else spdlog::warn("[wfmash-router] {} falls back to legacy: {}",
                           queries[i].species, queries[i].error);
     }
-    const uint_t pair_threads = WfmashRouterDetail::threadsPerTask(
-        std::max<size_t>(1, queries.size()), threads_);
-    const size_t workers = WfmashRouterDetail::workerCount(runnable.size(), threads_);
-    spdlog::info(
-        "[wfmash-router] reference={} near={} far={} candidates={} workers={} threads_per_pair={} params={}",
-        reference, near_distance, far_distance, queries.size(), workers,
-        pair_threads, kWfmashParameterSummary);
 
-    std::vector<PairExecutionResult> pair_results(queries.size());
-
-    if (!runnable.empty()) {
-        const int omp_workers = static_cast<int>(
-            WfmashRouterDetail::workerCount(runnable.size(), threads_));
-#pragma omp parallel for schedule(dynamic) num_threads(omp_workers)
-        for (size_t position = 0; position < runnable.size(); ++position) {
-            const size_t index = runnable[position];
-            pair_results[index] = executePair(
-                wfmash_executable_, pair_threads, reference_fasta,
-                reference_records, reference_it->second, queries[index]);
+    std::sort(runnable.begin(), runnable.end(), [&](size_t left, size_t right) {
+        const auto& lhs = queries[left];
+        const auto& rhs = queries[right];
+        if (lhs.total_bases != rhs.total_bases) {
+            return lhs.total_bases > rhs.total_bases;
         }
+        if (lhs.records.size() != rhs.records.size()) {
+            return lhs.records.size() > rhs.records.size();
+        }
+        if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
+        return lhs.species < rhs.species;
+    });
+
+    const size_t process_slots = std::min<size_t>(
+        runnable.size(), execution_policy_.maximum_alignment_processes);
+    const auto pair_schedule = WfmashRouterDetail::pairThreadSchedule(
+        process_slots, threads_,
+        execution_policy_.minimum_threads_per_process);
+    std::ostringstream thread_budgets;
+    for (size_t worker = 0;
+         worker < pair_schedule.threads_per_worker.size(); ++worker) {
+        if (worker != 0) thread_budgets << ',';
+        thread_budgets << pair_schedule.threads_per_worker[worker];
     }
+    spdlog::info(
+        "[wfmash-router] reference={} near={} far={} candidates={} "
+        "runnable={} workers={} thread_budgets=[{}] pair_timeout_ms={} "
+        "chunks_per_worker={} params={}",
+        reference, near_distance, far_distance, queries.size(), runnable.size(),
+        pair_schedule.workers(), thread_budgets.str(),
+        execution_policy_.pair_timeout.count(),
+        execution_policy_.alignment_chunks_per_worker, kWfmashParameterSummary);
+
+    std::vector<PairExecutionResult> pair_results = executeChunkedPairs(
+        wfmash_executable_, reference_fasta, reference_records,
+        reference_it->second, queries, runnable, pair_schedule,
+        execution_policy_);
 
     std::ostringstream routing;
     routing << "species\tdistance\tbackend\tstatus\tdetail\n";
@@ -1097,12 +2036,21 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
             routing << queries[i].species << '\t' << std::setprecision(17)
                     << queries[i].distance << "\twfmash\tsuccess\t"
                     << result.anchors_by_species.at(queries[i].species).size()
-                    << " anchors\n";
+                    << " anchors";
+            if (!pair_results[i].routing_detail.empty()) {
+                routing << ';' << pair_results[i].routing_detail;
+            }
+            routing << '\n';
         } else {
-            const std::string detail = !queries[i].error.empty()
+            const std::string base_detail = !queries[i].error.empty()
                 ? queries[i].error : pair_results[i].error;
+            const std::string detail = pair_results[i].routing_detail.empty()
+                ? base_detail
+                : base_detail + ";" + pair_results[i].routing_detail;
             routing << queries[i].species << '\t' << std::setprecision(17)
-                    << queries[i].distance << "\tlegacy\tfallback\t"
+                    << queries[i].distance << "\tlegacy\t"
+                    << (pair_results[i].timed_out
+                        ? "timeout_fallback" : "fallback") << '\t'
                     << detail << '\n';
             spdlog::warn("[wfmash-router] {} falls back to legacy: {}",
                          queries[i].species, detail);
@@ -1123,7 +2071,18 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
              << samtools_version_ << '\n'
              << "wfmash\t" << wfmash_executable_.string() << '\t'
              << wfmash_version_ << '\n'
-             << "parameters\t" << kWfmashParameterSummary << '\n';
+             << "parameters\t" << kWfmashParameterSummary << '\n'
+             << "execution_policy\tminimum_threads_per_process="
+             << execution_policy_.minimum_threads_per_process
+             << ";pair_timeout_ms=" << execution_policy_.pair_timeout.count()
+             << ";maximum_alignment_processes="
+             << execution_policy_.maximum_alignment_processes
+             << ";alignment_chunks_per_worker="
+             << execution_policy_.alignment_chunks_per_worker
+             << ";termination_grace_ms="
+             << execution_policy_.termination_grace.count()
+             << ";poll_interval_ms="
+             << execution_policy_.poll_interval.count() << '\n';
     writeAtomicText(output_directory_ / "tools.tsv", versions.str());
     return result;
 }
