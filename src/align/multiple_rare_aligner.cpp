@@ -349,99 +349,192 @@ void addAlignedRegionsAsMask(
     const RaMesh::RaMeshMultiGenomeGraph& graph,
     std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     const SpeciesName& ref_name) {
-    
     if (graph.blocks.empty()) {
         spdlog::info("[addAlignedRegionsAsMask] No blocks to process for masking");
         return;
     }
-    
-    #ifdef _DEBUG_
-    spdlog::info("[addAlignedRegionsAsMask] Extracting aligned regions as mask intervals from {} blocks", 
-                 graph.blocks.size());
-    #endif
-    // 按物种和染色体分组收集区间
-    std::unordered_map<SpeciesName, std::unordered_map<ChrName, std::vector<SeqPro::MaskInterval>>> 
-        species_chr_intervals;
-    
-    size_t total_intervals = 0;
+
+    logStageMemory("aligned-mask", "start", graph.blocks.size());
+    const auto collect_started = std::chrono::steady_clock::now();
+    using ChromosomeJournal =
+        std::unordered_map<ChrName, std::vector<RaMesh::Segment*>>;
+    std::unordered_map<SpeciesName, ChromosomeJournal>
+        species_chr_journal;
+
     size_t valid_blocks = 0;
-    
-    // 遍历所有 blocks，提取 segment 区间
+    size_t scanned_segments = 0;
+    size_t changed_segments = 0;
+    size_t unchanged_segments = 0;
+
     for (const auto& weak_block : graph.blocks) {
         auto block_ptr = weak_block.lock();
         if (!block_ptr) continue;
-        
-        valid_blocks++;
+
+        ++valid_blocks;
         std::shared_lock block_lock(block_ptr->rw);
-        
-        // 处理该 block 中的所有 anchors
+
         for (const auto& [species_chr_pair, segment] : block_ptr->anchors) {
             const auto& [species_name, chr_name] = species_chr_pair;
-            
-            // 只处理有效的 segment
+            ++scanned_segments;
             if (!segment || !segment->isSegment() || segment->length == 0) {
                 continue;
             }
-            
-            // 检查该物种是否在 seqpro_managers 中
-            if (seqpro_managers.find(species_name) == seqpro_managers.end()) {
+
+            if (!seqpro_managers.contains(species_name)) {
                 continue;
             }
-            
-            // 创建遮蔽区间（使用原始坐标）
-            SeqPro::MaskInterval interval(segment->start, segment->start + segment->length);
-            species_chr_intervals[species_name][chr_name].push_back(interval);
-            total_intervals++;
+
+            if (segment->mask_journal_length != 0 &&
+                segment->mask_journal_start == segment->start &&
+                segment->mask_journal_length == segment->length) {
+                ++unchanged_segments;
+                continue;
+            }
+
+            species_chr_journal[species_name][chr_name].push_back(
+                segment.get());
+            ++changed_segments;
         }
     }
-    #ifdef _DEBUG_
-    spdlog::info("[addAlignedRegionsAsMask] Collected {} intervals from {} valid blocks across {} species", 
-                 total_intervals, valid_blocks, species_chr_intervals.size());
-    #endif
-    // 为每个物种批量添加遮蔽区间
-    for (auto& [species_name, chr_intervals] : species_chr_intervals) {
+
+    const double collect_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - collect_started)
+            .count();
+    size_t committed_segments = 0;
+    size_t missing_sequences = 0;
+    size_t touched_chromosomes = 0;
+
+    for (auto& [species_name, chr_journals] : species_chr_journal) {
+        const auto species_started = std::chrono::steady_clock::now();
         try {
-            // 确保该物种的 manager 是 MaskedSequenceManager
-            auto* masked_manager = ensureMaskedManager(seqpro_managers[species_name]);
-            
-            size_t species_total_intervals = 0;
-            
-            // 按染色体处理区间
-            for (auto& [chr_name, intervals] : chr_intervals) {
-                if (intervals.empty()) continue;
-                
-                // 构造序列名（假设格式为染色体名）
-                std::string seq_name = chr_name;
-                
-                                // 检查序列是否存在
-                if (masked_manager->getSequenceId(seq_name) == SeqPro::SequenceIndex::INVALID_ID) {
-                    spdlog::warn("[addAlignedRegionsAsMask] Sequence not found: {}:{}, skipping", 
-                                species_name, seq_name);
+            auto* masked_manager =
+                ensureMaskedManager(seqpro_managers.at(species_name));
+            std::vector<SeqPro::MaskIntervalDelta> deltas;
+            deltas.reserve(chr_journals.size());
+            std::vector<RaMesh::Segment*> publish_journal;
+
+            size_t species_candidates = 0;
+            for (const auto& [unused_chr_name, journal] : chr_journals) {
+                (void)unused_chr_name;
+                species_candidates += journal.size();
+            }
+            publish_journal.reserve(species_candidates);
+
+            for (auto& [chr_name, journal] : chr_journals) {
+                if (journal.empty()) {
                     continue;
                 }
-                
-                // 批量添加区间（segment中的坐标是遮蔽后的坐标，需要转换为原始坐标）
-                masked_manager->addMaskIntervals(seq_name, intervals);
-                species_total_intervals += intervals.size();
-                #ifdef _DEBUG_
-                spdlog::debug("[addAlignedRegionsAsMask] Added {} intervals for {}:{}", 
-                             intervals.size(), species_name, seq_name);
-                #endif
+
+                const SeqPro::SequenceId seq_id =
+                    masked_manager->getSequenceId(chr_name);
+                if (seq_id == SeqPro::SequenceIndex::INVALID_ID) {
+                    spdlog::warn(
+                        "[addAlignedRegionsAsMask] Sequence not found: {}:{}, skipping",
+                        species_name, chr_name);
+                    ++missing_sequences;
+                    continue;
+                }
+
+                SeqPro::MaskIntervalDelta delta;
+                delta.sequence_id = seq_id;
+                delta.intervals.reserve(journal.size());
+                for (RaMesh::Segment* segment : journal) {
+                    delta.intervals.emplace_back(
+                        segment->start,
+                        segment->start + segment->length);
+                }
+                publish_journal.insert(
+                    publish_journal.end(), journal.begin(), journal.end());
+                deltas.push_back(std::move(delta));
             }
-            
-            // 定案该物种的所有遮蔽区间
-            masked_manager->finalizeMaskIntervals();
-            
-            spdlog::info("[addAlignedRegionsAsMask] Successfully added {} mask intervals for species {}", 
-                        species_total_intervals, species_name);
+
+            const SeqPro::MaskBatchMergeStats stats =
+                masked_manager->applyFinalizedMaskDeltas(
+                    std::move(deltas));
+            for (RaMesh::Segment* segment : publish_journal) {
+                segment->mask_journal_start = segment->start;
+                segment->mask_journal_length = segment->length;
+            }
+
+            committed_segments += publish_journal.size();
+            touched_chromosomes += stats.touched_sequences;
+
+            const double species_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - species_started)
+                    .count();
+            const RaMAxMemory::ProcessMemorySnapshot memory =
+                RaMAxMemory::readProcessMemorySnapshot();
+            if (memory.available) {
+                spdlog::info(
+                    "[mask-finalize] species={} incoming_intervals={} "
+                    "normalized_delta_intervals={} previous_intervals={} "
+                    "final_intervals={} touched_chromosomes={} "
+                    "sort_seconds={:.6f} merge_seconds={:.6f} "
+                    "metadata_seconds={:.6f} wall_seconds={:.6f} "
+                    "rss_kib={} peak_rss_kib={}",
+                    species_name, stats.incoming_intervals,
+                    stats.normalized_delta_intervals,
+                    stats.previous_intervals, stats.final_intervals,
+                    stats.touched_sequences, stats.sort_seconds,
+                    stats.merge_seconds, stats.metadata_seconds,
+                    species_seconds, memory.rss_kib, memory.peak_rss_kib);
+            } else {
+                spdlog::info(
+                    "[mask-finalize] species={} incoming_intervals={} "
+                    "normalized_delta_intervals={} previous_intervals={} "
+                    "final_intervals={} touched_chromosomes={} "
+                    "sort_seconds={:.6f} merge_seconds={:.6f} "
+                    "metadata_seconds={:.6f} wall_seconds={:.6f} "
+                    "memory_available=false",
+                    species_name, stats.incoming_intervals,
+                    stats.normalized_delta_intervals,
+                    stats.previous_intervals, stats.final_intervals,
+                    stats.touched_sequences, stats.sort_seconds,
+                    stats.merge_seconds, stats.metadata_seconds,
+                    species_seconds);
+            }
+
+            spdlog::info(
+                "[addAlignedRegionsAsMask] Successfully added {} mask intervals for species {}",
+                publish_journal.size(), species_name);
+        } catch (const std::exception& e) {
+            spdlog::error(
+                "[addAlignedRegionsAsMask] Error processing species {}: {}",
+                species_name, e.what());
         }
-        catch (const std::exception& e) {
-            spdlog::error("[addAlignedRegionsAsMask] Error processing species {}: {}", 
-                         species_name, e.what());
-        }
+
+        ChromosomeJournal released;
+        chr_journals.swap(released);
     }
-    
-    spdlog::info("[addAlignedRegionsAsMask] Mask interval addition completed for all species");
+
+    const RaMAxMemory::ProcessMemorySnapshot memory =
+        RaMAxMemory::readProcessMemorySnapshot();
+    if (memory.available) {
+        spdlog::info(
+            "[mask-journal] reference={} scanned_blocks={} scanned_segments={} "
+            "changed_candidates={} appended={} unchanged_skipped={} "
+            "missing_sequences={} touched_species={} touched_chromosomes={} "
+            "collect_seconds={:.6f} rss_kib={} peak_rss_kib={}",
+            ref_name, valid_blocks, scanned_segments, changed_segments,
+            committed_segments, unchanged_segments, missing_sequences,
+            species_chr_journal.size(), touched_chromosomes,
+            collect_seconds, memory.rss_kib, memory.peak_rss_kib);
+    } else {
+        spdlog::info(
+            "[mask-journal] reference={} scanned_blocks={} scanned_segments={} "
+            "changed_candidates={} appended={} unchanged_skipped={} "
+            "missing_sequences={} touched_species={} touched_chromosomes={} "
+            "collect_seconds={:.6f} memory_available=false",
+            ref_name, valid_blocks, scanned_segments, changed_segments,
+            committed_segments, unchanged_segments, missing_sequences,
+            species_chr_journal.size(), touched_chromosomes,
+            collect_seconds);
+    }
+    logStageMemory(
+        "aligned-mask", "complete",
+        committed_segments, unchanged_segments);
 }
 
 MultipleRareAligner::MultipleRareAligner(

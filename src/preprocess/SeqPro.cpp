@@ -3,7 +3,9 @@
 #include <cctype>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -20,6 +22,31 @@ namespace SeqPro {
 // ========================
 
 const std::vector<MaskInterval> MaskManager::empty_intervals_;
+
+namespace {
+
+size_t compactSortedMaskIntervals(std::vector<MaskInterval>& intervals) {
+  if (intervals.empty()) {
+    return 0;
+  }
+
+  size_t write = 0;
+  for (size_t read = 1; read < intervals.size(); ++read) {
+    if (intervals[write].end >= intervals[read].start) {
+      intervals[write].end =
+          std::max(intervals[write].end, intervals[read].end);
+    } else {
+      ++write;
+      if (write != read) {
+        intervals[write] = std::move(intervals[read]);
+      }
+    }
+  }
+  intervals.resize(write + 1);
+  return intervals.size();
+}
+
+}  // namespace
 
 bool MaskManager::loadFromIntervalFile(const std::filesystem::path &interval_file, bool append) {
   std::ifstream file(interval_file);
@@ -325,28 +352,11 @@ SequenceId MaskManager::getOrCreateSequenceId(const std::string &seq_name) {
 void MaskManager::sortAndMergeIntervals(std::vector<MaskInterval> &intervals) {
   if (intervals.empty()) return;
 
-  // 排序
   std::sort(intervals.begin(), intervals.end(),
             [](const MaskInterval &a, const MaskInterval &b) {
               return a.start < b.start;
             });
-
-  // 合并重叠区间
-  std::vector<MaskInterval> merged;
-  merged.reserve(intervals.size());
-  merged.push_back(intervals[0]);
-
-  for (size_t i = 1; i < intervals.size(); ++i) {
-    if (merged.back().end >= intervals[i].start) {
-      // 重叠，合并
-      merged.back().end = std::max(merged.back().end, intervals[i].end);
-    } else {
-      // 不重叠，添加新区间
-      merged.push_back(intervals[i]);
-    }
-  }
-
-  intervals = std::move(merged);
+  compactSortedMaskIntervals(intervals);
 }
 
 // === MaskManager 批量操作支持实现 ===
@@ -367,6 +377,118 @@ void MaskManager::finalizeMaskIntervals(SequenceId seq_id) {
   if (it != mask_intervals_.end()) {
     sortAndMergeIntervals(it->second);
   }
+}
+
+MaskBatchMergeStats MaskManager::mergeFinalizedMaskIntervals(
+    SequenceId seq_id, std::vector<MaskInterval> intervals) {
+  MaskBatchMergeStats stats;
+  stats.incoming_intervals = intervals.size();
+
+  const auto existing_it = mask_intervals_.find(seq_id);
+  stats.previous_intervals =
+      existing_it == mask_intervals_.end() ? 0 : existing_it->second.size();
+  stats.final_intervals = stats.previous_intervals;
+  if (intervals.empty()) {
+    return stats;
+  }
+
+  stats.touched_sequences = 1;
+  const auto sort_started = std::chrono::steady_clock::now();
+  std::sort(intervals.begin(), intervals.end(),
+            [](const MaskInterval& left, const MaskInterval& right) {
+              return left.start < right.start;
+            });
+  compactSortedMaskIntervals(intervals);
+  stats.sort_seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - sort_started)
+          .count();
+  stats.normalized_delta_intervals = intervals.size();
+
+  const auto merge_started = std::chrono::steady_clock::now();
+  auto& existing = mask_intervals_[seq_id];
+  if (existing.empty()) {
+    existing = std::move(intervals);
+  } else {
+    const size_t existing_size = existing.size();
+    const size_t delta_size = intervals.size();
+    if (delta_size > std::numeric_limits<size_t>::max() - existing_size) {
+      throw std::length_error("Mask interval merge exceeds vector capacity");
+    }
+
+    existing.resize(existing_size + delta_size);
+    size_t existing_index = existing_size;
+    size_t delta_index = delta_size;
+    size_t write_index = existing_size + delta_size;
+
+    while (existing_index > 0 && delta_index > 0) {
+      if (existing[existing_index - 1].start >
+          intervals[delta_index - 1].start) {
+        existing[--write_index] =
+            std::move(existing[--existing_index]);
+      } else {
+        existing[--write_index] =
+            std::move(intervals[--delta_index]);
+      }
+    }
+    while (delta_index > 0) {
+      existing[--write_index] =
+          std::move(intervals[--delta_index]);
+    }
+    while (existing_index > 0) {
+      existing[--write_index] =
+          std::move(existing[--existing_index]);
+    }
+
+    compactSortedMaskIntervals(existing);
+  }
+
+  stats.final_intervals = existing.size();
+  stats.merge_seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - merge_started)
+          .count();
+  return stats;
+}
+
+FinalizedMaskSummary MaskManager::summarizeFinalizedIntervals(
+    SequenceId seq_id, Length original_length) const {
+  FinalizedMaskSummary summary;
+  summary.masked_sequence_length = original_length;
+  if (original_length == 0) {
+    return summary;
+  }
+
+  const auto it = mask_intervals_.find(seq_id);
+  if (it == mask_intervals_.end() || it->second.empty()) {
+    return summary;
+  }
+
+  Position current_pos = 0;
+  bool count_masked_bases = true;
+  for (const auto& interval : it->second) {
+    if (count_masked_bases) {
+      if (interval.start >= original_length) {
+        count_masked_bases = false;
+      } else {
+        const Position interval_end =
+            std::min(interval.end, original_length);
+        summary.masked_bases += interval_end - interval.start;
+      }
+    }
+
+    if (current_pos < interval.start) {
+      ++summary.separator_count;
+    }
+    current_pos = std::max(current_pos, interval.end);
+  }
+  if (current_pos < original_length) {
+    ++summary.separator_count;
+  }
+
+  summary.masked_sequence_length =
+      original_length - summary.masked_bases;
+  return summary;
 }
 
 void MaskManager::clearMaskIntervals(SequenceId seq_id) {
@@ -1613,6 +1735,54 @@ void MaskedSequenceManager::addMaskIntervals(SequenceId seq_id,
   cache_valid_ = false;
 }
 
+MaskBatchMergeStats MaskedSequenceManager::applyFinalizedMaskDeltas(
+    std::vector<MaskIntervalDelta> deltas) {
+  MaskBatchMergeStats total;
+  bool changed = false;
+
+  for (auto& delta : deltas) {
+    if (delta.intervals.empty()) {
+      continue;
+    }
+    if (delta.sequence_id == SequenceIndex::INVALID_ID ||
+        delta.sequence_id >= getSequenceCount()) {
+      throw SequenceException(
+          "Invalid sequence ID: " + std::to_string(delta.sequence_id));
+    }
+
+    changed = true;
+    cache_valid_ = false;
+    if (unfinalized_sequences_.count(delta.sequence_id)) {
+      mask_manager_.finalizeMaskIntervals(delta.sequence_id);
+      unfinalized_sequences_.erase(delta.sequence_id);
+    }
+
+    const MaskBatchMergeStats sequence_stats =
+        mask_manager_.mergeFinalizedMaskIntervals(
+            delta.sequence_id, std::move(delta.intervals));
+    total.touched_sequences += sequence_stats.touched_sequences;
+    total.incoming_intervals += sequence_stats.incoming_intervals;
+    total.normalized_delta_intervals +=
+        sequence_stats.normalized_delta_intervals;
+    total.previous_intervals += sequence_stats.previous_intervals;
+    total.final_intervals += sequence_stats.final_intervals;
+    total.sort_seconds += sequence_stats.sort_seconds;
+    total.merge_seconds += sequence_stats.merge_seconds;
+  }
+
+  if (!changed) {
+    return total;
+  }
+
+  const auto metadata_started = std::chrono::steady_clock::now();
+  refreshMaskMetadataAndCache();
+  total.metadata_seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - metadata_started)
+          .count();
+  return total;
+}
+
 bool MaskedSequenceManager::loadMaskIntervalsFromFile(const std::filesystem::path &file_path, 
                                                     bool append) {
   if (!append) {
@@ -1635,28 +1805,7 @@ void MaskedSequenceManager::finalizeMaskIntervals() {
   for (SequenceId seq_id : sequences_to_finalize) {
     finalizeMaskIntervals(seq_id);
   }
-  Position current_masked_pos = 0;
-  auto seq_names = getSequenceNames();
-
-  for (size_t i = 0; i < seq_names.size(); ++i) {
-    SequenceId seq_id = getSequenceId(seq_names[i]);
-
-    // 获取序列信息并更新masked_global_start_pos
-    auto *seq_info = const_cast<SequenceInfo *>(
-        original_manager_->getIndex().getSequenceInfo(seq_id));
-    if (seq_info) {
-      seq_info->masked_global_start_pos = current_masked_pos;
-      seq_info->masked_length = getSequenceLengthWithSeparators(seq_id);
-    }
-
-    // 累加当前序列的遮蔽后长度（包含间隔符）
-    current_masked_pos += getSequenceLengthWithSeparators(seq_id);
-
-    // 添加染色体间间隔符（除了最后一个序列）
-    if (i < seq_names.size() - 1) {
-      current_masked_pos += 1;
-    }
-  }
+  refreshMaskMetadataAndCache();
 }
 
 void MaskedSequenceManager::finalizeMaskIntervals(const std::string &seq_name) {
@@ -1672,6 +1821,42 @@ void MaskedSequenceManager::finalizeMaskIntervals(SequenceId seq_id) {
     unfinalized_sequences_.erase(seq_id);
     cache_valid_ = false;
   }
+}
+
+void MaskedSequenceManager::refreshMaskMetadataAndCache() {
+  const size_t sequence_count = getSequenceCount();
+  global_offset_cache_.clear();
+  global_offset_cache_.reserve(sequence_count);
+  total_masked_length_ = 0;
+  Position current_masked_pos_with_separators = 0;
+
+  for (size_t index = 0; index < sequence_count; ++index) {
+    const SequenceId seq_id = static_cast<SequenceId>(index);
+    auto* seq_info = const_cast<SequenceInfo*>(
+        original_manager_->getIndex().getSequenceInfo(seq_id));
+    if (!seq_info) {
+      throw SequenceException(
+          "Invalid sequence ID while refreshing mask metadata: " +
+          std::to_string(seq_id));
+    }
+
+    const FinalizedMaskSummary summary =
+        mask_manager_.summarizeFinalizedIntervals(
+            seq_id, seq_info->length);
+    global_offset_cache_[seq_id] = total_masked_length_;
+    total_masked_length_ += summary.masked_sequence_length;
+
+    seq_info->masked_global_start_pos =
+        current_masked_pos_with_separators;
+    seq_info->masked_length =
+        summary.masked_sequence_length + summary.separator_count;
+    current_masked_pos_with_separators += seq_info->masked_length;
+    if (index + 1 < sequence_count) {
+      ++current_masked_pos_with_separators;
+    }
+  }
+
+  cache_valid_ = true;
 }
 
 void MaskedSequenceManager::clearMaskIntervals(const std::string &seq_name) {
