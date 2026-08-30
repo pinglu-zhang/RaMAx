@@ -1,7 +1,7 @@
 # Packaging and releasing RaMAx
 
 This document describes the current Linux x86-64 release workflow. The
-commands below target RaMAx 1.0.8. Update the version-specific values together
+commands below target RaMAx 1.0.9. Update the version-specific values together
 for a later release rather than copying an older packaging guide.
 
 ## Release contract
@@ -10,7 +10,7 @@ The Conda package and Docker image contain RaMAx and the external tools needed
 by the installed workflow:
 
 ```text
-RaMAx      1.0.8
+RaMAx      1.0.9
 Mash       2.3=hb105d93_9
 wfmash     0.14.0=h11f254b_0 (v0.14.0-0-g517e1bc)
 Samtools   1.23.1=ha83d96e_0
@@ -35,7 +35,7 @@ Run release commands from the intended release checkout:
 ```bash
 cd /mnt/d/code/RaMAx
 
-test "$(sed -n 's/^project(RaMAx VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "1.0.8"
+test "$(sed -n 's/^project(RaMAx VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "1.0.9"
 test -x bin/halAppendCactusSubtree
 git status --short
 git rev-parse HEAD
@@ -74,7 +74,7 @@ expected package is build number 0:
 ```bash
 RAMAX_CONDA_PACKAGE=$(find "$CONDA_PREFIX/conda-bld/linux-64" \
   -maxdepth 1 \
-  -name 'ramax-1.0.8-*_0.conda' \
+  -name 'ramax-1.0.9-*_0.conda' \
   -print \
   | sort \
   | tail -n 1)
@@ -90,25 +90,25 @@ Install the local package in a new environment outside the source tree:
 ```bash
 CONDA_CHANNEL_PRIORITY=flexible \
 conda create -y \
-  -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test \
+  -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test \
   --override-channels \
   -c "file://$CONDA_PREFIX/conda-bld" \
   -c malab \
   -c bioconda \
   -c conda-forge \
-  ramax=1.0.8
+  ramax=1.0.9
 
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test ramax --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test mash --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test wfmash --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test samtools --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.8-test minipoa -v
+conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test ramax --version
+conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test mash --version
+conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test wfmash --version
+conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test samtools --version
+conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test minipoa -v
 ```
 
 Expected key output:
 
 ```text
-RaMAx version 1.0.8
+RaMAx version 1.0.9
 2.3
 v0.14.0-0-g517e1bc
 samtools 1.23.1
@@ -124,7 +124,7 @@ Upload only after the clean installation passes:
 anaconda upload --user malab "$RAMAX_CONDA_PACKAGE"
 ```
 
-After upload, solve and install `ramax=1.0.8` from the remote channels in a
+After upload, solve and install `ramax=1.0.9` from the remote channels in a
 new environment before declaring the Conda release complete.
 
 ## Build the Docker image
@@ -140,7 +140,7 @@ cd /mnt/d/code/RaMAx
 docker build \
   --progress=plain \
   --build-arg BUILD_JOBS=16 \
-  -t ramax:1.0.8 \
+  -t ramax:1.0.9 \
   .
 ```
 
@@ -150,9 +150,9 @@ layers; `--no-cache` is not part of the standard release command.
 ### Validate the local Docker image
 
 ```bash
-docker run --rm ramax:1.0.8 --version
+docker run --rm ramax:1.0.9 --version
 
-docker run --rm --entrypoint bash ramax:1.0.8 -lc '
+docker run --rm --entrypoint bash ramax:1.0.9 -lc '
 set -euo pipefail
 
 ramax --version
@@ -181,29 +181,29 @@ fixed version first:
 ```bash
 docker login -u pingluzhang
 
-docker tag ramax:1.0.8 pingluzhang/ramax:1.0.8
-docker push pingluzhang/ramax:1.0.8
+docker tag ramax:1.0.9 pingluzhang/ramax:1.0.9
+docker push pingluzhang/ramax:1.0.9
 ```
 
 Verify that the remote manifest exists:
 
 ```bash
-docker buildx imagetools inspect pingluzhang/ramax:1.0.8
+docker buildx imagetools inspect pingluzhang/ramax:1.0.9
 ```
 
 Only after the fixed tag passes remote pull and runtime validation should the
 moving `latest` tag be updated:
 
 ```bash
-docker tag ramax:1.0.8 pingluzhang/ramax:latest
+docker tag ramax:1.0.9 pingluzhang/ramax:latest
 docker push pingluzhang/ramax:latest
 ```
 
 Users should prefer the fixed tag for reproducibility:
 
 ```bash
-docker pull pingluzhang/ramax:1.0.8
-docker run --rm pingluzhang/ramax:1.0.8 --version
+docker pull pingluzhang/ramax:1.0.9
+docker run --rm pingluzhang/ramax:1.0.9 --version
 ```
 
 ## Create the release tag
@@ -215,9 +215,9 @@ pushed normally, and both remote package formats pass validation:
 cd /mnt/d/code/RaMAx
 
 git status --short
-git tag -a v1.0.8 -m "RaMAx 1.0.8" HEAD
-git push origin dev-suffix
-git push origin v1.0.8
+git tag -a v1.0.9 -m "RaMAx 1.0.9" HEAD
+git push origin dev
+git push origin v1.0.9
 ```
 
 Do not move or force-push an older release tag. Record the final Git commit,

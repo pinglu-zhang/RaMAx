@@ -2,7 +2,7 @@
 
 ## What restart means
 
-RaMAx 1.0.8 uses `--restart` to reuse expensive input preparation. The
+RaMAx 1.0.8 and later use `--restart` to reuse expensive input preparation. The
 suffix-array index is memory-only and is rebuilt by every process; restart is
 not an alignment checkpoint system.
 

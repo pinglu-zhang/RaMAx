@@ -123,7 +123,7 @@ RUN set -eux; \
     install -m 0644 LICENSE /opt/ramax/share/licenses/ramax/RaMAx-LICENSE; \
     install -m 0644 third_party/hal/LICENSE.txt /opt/ramax/share/licenses/ramax/HAL-LICENSE; \
     /opt/ramax/bin/ramax --help >/dev/null; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.8"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.9"; \
     test -x /opt/ramax/bin/ramax-paf-fasta; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     test ! -e /src/bin; \
@@ -132,7 +132,7 @@ RUN set -eux; \
 FROM ubuntu:22.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RAMAX_VERSION=1.0.8
+ARG RAMAX_VERSION=1.0.9
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="RaMAx" \
@@ -159,7 +159,7 @@ RUN apt-get update \
 COPY --from=builder /opt/ramax /opt/ramax
 
 RUN set -eux; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.8"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.9"; \
     /opt/ramax/bin/ramax --help >/dev/null; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax | tee /tmp/ramax.ldd; \

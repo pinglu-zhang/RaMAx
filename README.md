@@ -9,7 +9,7 @@ HAL output additionally requires a Newick species tree as the first record.
 ### Conda
 
 ```bash
-conda install -c malab -c conda-forge -c bioconda ramax=1.0.8 -y
+conda install -c malab -c conda-forge -c bioconda ramax=1.0.9 -y
 
 ramax --version
 ```
@@ -17,8 +17,8 @@ ramax --version
 ### Docker
 
 ```bash
-docker pull pingluzhang/ramax:1.0.8
-docker run --rm pingluzhang/ramax:1.0.8 --version
+docker pull pingluzhang/ramax:1.0.9
+docker run --rm pingluzhang/ramax:1.0.9 --version
 ```
 
 ## Quick start
@@ -197,10 +197,10 @@ by `cmake --install` and its prefix.
 
 ## Restart compatibility
 
-RaMAx 1.0.8 treats restart as cache reuse, not alignment checkpointing. It
-reuses validated raw/clean FASTA artifacts, rebuilds the memory-only suffix
-array, then reruns anchor search, clustering, graph construction, and export
-from the beginning:
+RaMAx 1.0.8 and later treat restart as cache reuse, not alignment
+checkpointing. RaMAx reuses validated raw/clean FASTA artifacts, rebuilds the
+memory-only suffix array, then reruns anchor search, clustering, graph
+construction, and export from the beginning:
 
 ```bash
 ramax --restart -w work
