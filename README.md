@@ -9,7 +9,7 @@ HAL output additionally requires a Newick species tree as the first record.
 ### Conda
 
 ```bash
-conda install -y -c malab ramax=1.0.8
+conda install -c malab -c conda-forge -c bioconda ramax=1.0.9 -y
 
 ramax --version
 ```
@@ -17,8 +17,8 @@ ramax --version
 ### Docker
 
 ```bash
-docker pull pingluzhang/ramax:1.0.8
-docker run --rm pingluzhang/ramax:1.0.8 --version
+docker pull pingluzhang/ramax:1.0.9
+docker run --rm pingluzhang/ramax:1.0.9 --version
 ```
 
 ## Quick start
@@ -55,16 +55,13 @@ audit-preserving `--gfa-profile exact`; `--gfa-profile compact` enables the
 lossless compact-v2-balanced transforms and keeps an exact shadow under
 `work/gfa/`.
 
-For seqwish, generate the matching qualified FASTA directly from the same
-seqfile. Keep `-k 0` to preserve the aligned-base relationships guaranteed by
-the default `connected` PAF mode:
 
 ```bash
 ramax-paf-fasta -i seqfile.txt -o sequences.fa.gz
 ramax -i seqfile.txt -w work -t 16 \
   -o alignment.paf \
   -o alignment.maf
-seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa -k 0
+seqwish -s sequences.fa.gz -p alignment.paf -g graph.gfa
 ```
 
 For a normalized PGGB graph, write an uncompressed FASTA, index it, and reuse
@@ -81,16 +78,6 @@ pggb -i sequences.fa -o pggb-out -a alignment.paf -n <genome-count> \
 The detailed operator guide covers directory layout, validation, failure
 handling, the direct seqwish route, the PGGB route, and a completed
 seven-genome Chr09 example: [PAF-to-GFA workflow](docs/paf-to-gfa-workflow.md).
-
-The graph optimizations are enabled by default. `--optimize-blocks` is an
-explicit, repeatable way to request the same default set. The defaults are:
-
-```text
---merge-blocks --merge-gap 100
---realign-missing --realign-span 3000 --zero-gap-span 200
---repair-breaks --break-span 1000
---merge-short-blocks
-```
 
 Run `ramax --help` for the complete core-alignment options.
 
@@ -210,10 +197,10 @@ by `cmake --install` and its prefix.
 
 ## Restart compatibility
 
-RaMAx 1.0.8 treats restart as cache reuse, not alignment checkpointing. It
-reuses validated raw/clean FASTA artifacts, rebuilds the memory-only suffix
-array, then reruns anchor search, clustering, graph construction, and export
-from the beginning:
+RaMAx 1.0.8 and later treat restart as cache reuse, not alignment
+checkpointing. RaMAx reuses validated raw/clean FASTA artifacts, rebuilds the
+memory-only suffix array, then reruns anchor search, clustering, graph
+construction, and export from the beginning:
 
 ```bash
 ramax --restart -w work

@@ -5,6 +5,7 @@
 #include "anchor.h"
 #include "mash_distance_estimator.h"
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -58,6 +59,27 @@ struct PafNormalizationStats {
     size_t skipped_records{0};
 };
 
+struct PairThreadSchedule {
+    std::vector<uint_t> threads_per_worker;
+
+    size_t workers() const { return threads_per_worker.size(); }
+};
+
+struct MappingChunkPlan {
+    std::vector<size_t> chunk_by_record;
+    std::vector<uint64_t> estimated_cost;
+    std::vector<size_t> record_count;
+};
+
+struct ExecutionPolicy {
+    uint_t minimum_threads_per_process{4};
+    uint_t maximum_alignment_processes{4};
+    uint_t alignment_chunks_per_worker{4};
+    std::chrono::milliseconds pair_timeout{std::chrono::hours(1)};
+    std::chrono::milliseconds termination_grace{std::chrono::seconds(10)};
+    std::chrono::milliseconds poll_interval{std::chrono::milliseconds(200)};
+};
+
 std::string validateSamtoolsVersion(std::string_view output);
 std::string validateWfmashVersion(std::string_view output);
 std::vector<FaiRecord> parseFai(std::istream& input);
@@ -75,6 +97,16 @@ std::vector<std::string> alignmentArguments(
     const std::filesystem::path& query);
 size_t workerCount(size_t tasks, uint_t total_threads);
 uint_t threadsPerTask(size_t tasks, uint_t total_threads);
+PairThreadSchedule pairThreadSchedule(
+    size_t tasks, uint_t total_threads,
+    uint_t minimum_threads_per_process = 4);
+
+uint64_t mappingAlignmentCost(const ParsedPafRecord& record);
+MappingChunkPlan makeMappingChunkPlan(
+    const std::vector<uint64_t>& record_costs, size_t requested_chunks);
+std::vector<size_t> allocateMappingChunks(
+    const std::vector<uint64_t>& species_costs,
+    const std::vector<size_t>& species_records, size_t target_chunks);
 
 }  // namespace WfmashRouterDetail
 
@@ -84,7 +116,8 @@ public:
         std::filesystem::path samtools_executable,
         std::filesystem::path wfmash_executable,
         std::filesystem::path output_directory,
-        uint_t threads);
+        uint_t threads,
+        WfmashRouterDetail::ExecutionPolicy execution_policy = {});
 
     FirstRoundWfmashResult run(
         const SpeciesName& reference,
@@ -101,6 +134,7 @@ private:
     std::filesystem::path wfmash_executable_;
     std::filesystem::path output_directory_;
     uint_t threads_{1};
+    WfmashRouterDetail::ExecutionPolicy execution_policy_;
     std::string samtools_version_;
     std::string wfmash_version_;
 };

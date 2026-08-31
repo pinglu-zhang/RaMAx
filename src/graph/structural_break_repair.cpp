@@ -4,7 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
-#include <future>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -18,10 +18,11 @@
 #include <utility>
 #include <vector>
 
+#include <omp.h>
+
 #include "align.h"
 #include "ramesh.h"
 #include "spdlog/spdlog.h"
-#include "threadpool.h"
 
 namespace RaMesh::StructuralBreakRepair {
 namespace {
@@ -1033,19 +1034,30 @@ Result repairAnchorBoundedStructuralBreaks(
                 std::move(selected[index]), managers, options);
         }
     } else if (!selected.empty()) {
-        ThreadPool pool(std::min<size_t>(options.parallel_threads,
-                                         selected.size()));
-        std::vector<std::future<Prepared>> futures;
-        futures.reserve(selected.size());
-        for (auto& candidate : selected) {
-            futures.push_back(pool.enqueue(
-                [&managers, &options](Candidate value) {
-                    return prepareCandidate(std::move(value), managers, options);
-                },
-                std::move(candidate)));
+        const int workers = static_cast<int>(std::min<size_t>(
+            options.parallel_threads, selected.size()));
+        std::mutex failure_mutex;
+        std::exception_ptr first_failure;
+        size_t first_failure_index = selected.size();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers) \
+    if(workers > 1 && !omp_in_parallel())
+        for (long long raw_index = 0;
+             raw_index < static_cast<long long>(selected.size());
+             ++raw_index) {
+            const size_t index = static_cast<size_t>(raw_index);
+            try {
+                prepared[index] = prepareCandidate(
+                    std::move(selected[index]), managers, options);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(failure_mutex);
+                if (index < first_failure_index) {
+                    first_failure_index = index;
+                    first_failure = std::current_exception();
+                }
+            }
         }
-        for (size_t index = 0; index < futures.size(); ++index) {
-            prepared[index] = futures[index].get();
+        if (first_failure) {
+            std::rethrow_exception(first_failure);
         }
     }
 

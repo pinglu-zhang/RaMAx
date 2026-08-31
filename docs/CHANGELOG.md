@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.9 - 2026-08-30
+
+- Improved end-to-end performance across anchor processing, cluster extension,
+  chromosome-level dynamic programming, graph extension, and deterministic
+  multi-graph merging.
+- Reduced long-tail latency by scheduling expensive alignment work by estimated
+  cost and improving parallel cluster-extension coordination.
+- Added workload-aware wfmash scheduling that shares the RaMAx thread budget
+  without oversubscribing the host.
+- Added a fixed per-query wfmash time budget. Timed-out process groups are
+  terminated safely, recorded for diagnosis, and rerouted to the native RaMAx
+  alignment path.
+- Reduced peak and retained memory by releasing consumed anchors, clusters,
+  CIGAR buffers, Blocks, and Segments earlier.
+- Accelerated reference-node extension scans and graph merging while preserving
+  alignment semantics, deterministic ordering, and existing output formats.
+
 ## 1.0.8 - 2026-08-26
 
 - Replaced native anchor search with a complete in-memory SA/ISA/LCP backend.

@@ -11,8 +11,10 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <variant>
 
@@ -87,6 +89,28 @@ struct MaskInterval {
   Length length() const { return end - start; }
 
   template <class Archive> void serialize(Archive &ar) { ar(start, end); }
+};
+
+struct MaskIntervalDelta {
+  SequenceId sequence_id{UINT32_MAX};
+  std::vector<MaskInterval> intervals;
+};
+
+struct MaskBatchMergeStats {
+  size_t touched_sequences{0};
+  size_t incoming_intervals{0};
+  size_t normalized_delta_intervals{0};
+  size_t previous_intervals{0};
+  size_t final_intervals{0};
+  double sort_seconds{0.0};
+  double merge_seconds{0.0};
+  double metadata_seconds{0.0};
+};
+
+struct FinalizedMaskSummary {
+  Length masked_bases{0};
+  Length masked_sequence_length{0};
+  Length separator_count{0};
 };
 
 // === 序列信息结构 ===
@@ -195,6 +219,10 @@ public:
   // === 批量操作支持 ===
   void addMaskIntervals(SequenceId seq_id, const std::vector<MaskInterval> &intervals);
   void finalizeMaskIntervals(SequenceId seq_id);
+  MaskBatchMergeStats mergeFinalizedMaskIntervals(
+      SequenceId seq_id, std::vector<MaskInterval> intervals);
+  FinalizedMaskSummary summarizeFinalizedIntervals(
+      SequenceId seq_id, Length original_length) const;
   void clearMaskIntervals(SequenceId seq_id);
 
 private:
@@ -223,6 +251,17 @@ public:
   // 获取子序列（原始坐标）
   std::string getSubSequence(const std::string &seq_name, Position start, Length length) const;
   std::string getSubSequence(SequenceId seq_id, Position start, Length length) const;
+
+  // Returns a non-owning view only when the requested range is physically
+  // contiguous in the mapped FASTA. The view remains valid for this manager's
+  // lifetime. Wrapped FASTA ranges that cross a physical line return false.
+  bool tryGetContiguousSubSequence(SequenceId seq_id, Position start,
+                                   Length length, std::string_view &view) const;
+
+  // Owning fallback that reuses caller-managed storage. Existing string-return
+  // APIs keep their original behavior.
+  void getSubSequenceInto(SequenceId seq_id, Position start, Length length,
+                          std::string &output) const;
 
   // 全局坐标获取（原始坐标）
   std::string getSubSequenceGlobal(Position global_start, Length length) const;
@@ -306,6 +345,8 @@ private:
   // 内部方法
   void buildIndex();
   std::string extractSequence(const SequenceInfo &info, Position start, Length length) const;
+  void extractSequenceInto(const SequenceInfo &info, Position start, Length length,
+                           std::string &output) const;
 };
 
 // === 遮蔽序列管理器 ===
@@ -431,6 +472,8 @@ public:
   void addMaskInterval(const std::string &seq_name, const MaskInterval &interval);
   void addMaskIntervals(const std::string &seq_name, const std::vector<MaskInterval> &intervals);
   void addMaskIntervals(SequenceId seq_id, const std::vector<MaskInterval> &intervals);
+  MaskBatchMergeStats applyFinalizedMaskDeltas(
+      std::vector<MaskIntervalDelta> deltas);
 
   // 从文件批量加载区间
   bool loadMaskIntervalsFromFile(const std::filesystem::path &file_path, bool append = false);
@@ -473,6 +516,7 @@ private:
   // 坐标转换和定案辅助函数
   MaskInterval convertMaskedToOriginalInterval(SequenceId seq_id, const MaskInterval &masked_interval) const;
   void ensureFinalized(SequenceId seq_id) const;
+  void refreshMaskMetadataAndCache();
 
   // 间隔符相关的坐标转换辅助函数
   Position convertSeparatedToMaskedPosition(SequenceId seq_id, Position separated_pos) const;

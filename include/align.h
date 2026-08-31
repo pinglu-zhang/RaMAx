@@ -4,6 +4,7 @@
 #include "ksw2.h"
 #include "config.hpp"              // 包含基本类型定义，如 int_t、uint_t 等
 #include <cstdlib>
+#include <string_view>
 // ------------------------------------------------------------------
 // 类型定义
 // ------------------------------------------------------------------
@@ -212,6 +213,25 @@ AlignCount countAlignedBases(const Cigar_t& cigar);
 uint32_t countQryLength(const Cigar_t& cigar);
 uint32_t countRefLength(const Cigar_t& cigar);
 
+struct CigarSummary {
+    uint32_t reference_length = 0;
+    uint32_t query_length = 0;
+    uint32_t alignment_length = 0;
+    uint32_t match_length = 0;
+};
+
+struct AlignmentResult {
+    Cigar_t cigar;
+    CigarSummary summary;
+};
+
+struct KswSequenceView {
+    std::string_view bases;
+    bool reverse_complement = false;
+};
+
+CigarSummary summarizeCigar(const Cigar_t& cigar);
+
 
 
 
@@ -394,12 +414,21 @@ inline KSW2AlignConfig makeTurboKSW2Config3(int qlen, int tlen,
 
 
 Cigar_t globalAlignKSW2(const std::string& ref, const std::string& query);
+AlignmentResult globalAlignKSW2Result(KswSequenceView ref,
+                                      KswSequenceView query);
 Cigar_t globalAlignKSW2_2(const std::string& ref, const std::string& query);
 Cigar_t globalAlignKSW2BandedPublic(const std::string& ref,
                                     const std::string& query);
 Cigar_t extendAlignKSW2(const std::string& ref,
     const std::string& query,
     int zdrop = 200);
+AlignmentResult extendAlignKSW2Result(KswSequenceView ref,
+                                      KswSequenceView query,
+                                      int zdrop = 200);
+#ifdef RAMAX_PERFORMANCE_TEST_HOOKS
+AlignmentResult ramaxExtendAlignKSW2RawForTesting(
+    KswSequenceView ref, KswSequenceView query, int zdrop = 200);
+#endif
 
 /* ────────────────────────────────────────────────────────────
  * 主函数：就地合并

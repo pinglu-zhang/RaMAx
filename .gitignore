@@ -444,3 +444,7 @@ recipe/conda_build_config.yaml
 recipe/meta.yaml
 recipe/build.sh
 /.codex/
+/.codex-staging/
+/scripts/
+RAMAX_EVAL_CODEX_GUIDE.md
+/tools/
