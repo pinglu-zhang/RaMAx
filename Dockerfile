@@ -43,12 +43,12 @@ RUN set -eux; \
     description="$(file "${helper}")"; \
     printf '%s\n' "${description}"; \
     printf '%s\n' "${description}" | grep -q 'ELF 64-bit.*x86-64'; \
-    readelf -d "${helper}"; \
-    objdump -T "${helper}" | grep -o 'GLIBC_[0-9.]*' | sort -Vu; \
     if printf '%s\n' "${description}" | grep -q 'statically linked'; then \
         helper_help="$("${helper}" --help 2>&1 || true)"; \
         printf '%s\n' "${helper_help}" | grep -q 'USAGE:'; \
     else \
+        readelf -d "${helper}"; \
+        objdump -T "${helper}" | grep -o 'GLIBC_[0-9.]*' | sort -Vu; \
         before_ldd="$(ldd "${helper}")"; \
         printf '%s\n' "${before_ldd}"; \
         if printf '%s\n' "${before_ldd}" | grep -qE 'not found|/mnt/sda/'; then exit 1; fi; \
