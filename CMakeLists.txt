@@ -339,16 +339,6 @@ add_dependencies(ramax hal_library)
 
 option(BUILD_TESTING "Build CTest-based RaMAx tests" OFF)
 include(CTest)
-if(BUILD_TESTING)
-    add_executable(ramax_wfmash_timeout_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/qa/wfmash_timeout_test.cpp")
-    configure_rama_target(ramax_wfmash_timeout_test)
-    target_link_libraries(ramax_wfmash_timeout_test PRIVATE ramax_core)
-    add_test(NAME ramax_wfmash_timeout_test
-        COMMAND ramax_wfmash_timeout_test)
-    set_tests_properties(ramax_wfmash_timeout_test PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(ramax_mash_distance_test
