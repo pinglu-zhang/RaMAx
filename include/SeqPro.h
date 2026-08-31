@@ -14,6 +14,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <variant>
 
@@ -88,6 +89,28 @@ struct MaskInterval {
   Length length() const { return end - start; }
 
   template <class Archive> void serialize(Archive &ar) { ar(start, end); }
+};
+
+struct MaskIntervalDelta {
+  SequenceId sequence_id{UINT32_MAX};
+  std::vector<MaskInterval> intervals;
+};
+
+struct MaskBatchMergeStats {
+  size_t touched_sequences{0};
+  size_t incoming_intervals{0};
+  size_t normalized_delta_intervals{0};
+  size_t previous_intervals{0};
+  size_t final_intervals{0};
+  double sort_seconds{0.0};
+  double merge_seconds{0.0};
+  double metadata_seconds{0.0};
+};
+
+struct FinalizedMaskSummary {
+  Length masked_bases{0};
+  Length masked_sequence_length{0};
+  Length separator_count{0};
 };
 
 // === 序列信息结构 ===
@@ -196,6 +219,10 @@ public:
   // === 批量操作支持 ===
   void addMaskIntervals(SequenceId seq_id, const std::vector<MaskInterval> &intervals);
   void finalizeMaskIntervals(SequenceId seq_id);
+  MaskBatchMergeStats mergeFinalizedMaskIntervals(
+      SequenceId seq_id, std::vector<MaskInterval> intervals);
+  FinalizedMaskSummary summarizeFinalizedIntervals(
+      SequenceId seq_id, Length original_length) const;
   void clearMaskIntervals(SequenceId seq_id);
 
 private:
@@ -445,6 +472,8 @@ public:
   void addMaskInterval(const std::string &seq_name, const MaskInterval &interval);
   void addMaskIntervals(const std::string &seq_name, const std::vector<MaskInterval> &intervals);
   void addMaskIntervals(SequenceId seq_id, const std::vector<MaskInterval> &intervals);
+  MaskBatchMergeStats applyFinalizedMaskDeltas(
+      std::vector<MaskIntervalDelta> deltas);
 
   // 从文件批量加载区间
   bool loadMaskIntervalsFromFile(const std::filesystem::path &file_path, bool append = false);
@@ -487,6 +516,7 @@ private:
   // 坐标转换和定案辅助函数
   MaskInterval convertMaskedToOriginalInterval(SequenceId seq_id, const MaskInterval &masked_interval) const;
   void ensureFinalized(SequenceId seq_id) const;
+  void refreshMaskMetadataAndCache();
 
   // 间隔符相关的坐标转换辅助函数
   Position convertSeparatedToMaskedPosition(SequenceId seq_id, Position separated_pos) const;

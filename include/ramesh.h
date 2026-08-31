@@ -82,7 +82,13 @@ namespace RaMesh {
         BlockPtr   parent_block;
 
         bool left_extend{ false };
-		bool right_extend{ false };
+        bool right_extend{ false };
+        // Last interval successfully published to the cumulative mask set.
+        // A zero journal length means unpublished; zero-length graph segments
+        // are never eligible for masking. Two native-width fields keep this
+        // exact in both 32-bit and M64 builds.
+        uint_t mask_journal_start{ 0 };
+        uint_t mask_journal_length{ 0 };
         mutable std::shared_mutex rw;        // guards non‑list fields
 
         // ――― predicates ―――
