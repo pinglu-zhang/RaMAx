@@ -1,4 +1,8 @@
+ARG RAMAX_VERSION=1.0.9
+
 FROM mambaorg/micromamba:2.3.2 AS alignment-tools
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 USER root
 RUN micromamba create -y --strict-channel-priority \
@@ -17,6 +21,8 @@ RUN micromamba create -y --strict-channel-priority \
     && test "$(/opt/ramax/bin/samtools --version | sed -n '2p')" = "Using htslib 1.23.1"
 
 FROM ubuntu:22.04 AS cactus-helper
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -54,8 +60,11 @@ RUN set -eux; \
 
 FROM ubuntu:22.04 AS builder
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ARG DEBIAN_FRONTEND=noninteractive
 ARG BUILD_JOBS=4
+ARG RAMAX_VERSION
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -90,6 +99,7 @@ COPY third_party ./third_party
 RUN set -eux; \
     test ! -e /src/tests; \
     test ! -e /src/tools/ramax-paf-fasta/build/ramax-paf-fasta; \
+    test "$(sed -n 's/^project(RaMAx VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "${RAMAX_VERSION}"; \
     hdf5_cflags="$(pkg-config --cflags hdf5)"; \
     hdf5_libs="$(pkg-config --libs hdf5)"; \
     export CFLAGS="${hdf5_cflags}"; \
@@ -123,7 +133,7 @@ RUN set -eux; \
     install -m 0644 LICENSE /opt/ramax/share/licenses/ramax/RaMAx-LICENSE; \
     install -m 0644 third_party/hal/LICENSE.txt /opt/ramax/share/licenses/ramax/HAL-LICENSE; \
     /opt/ramax/bin/ramax --help >/dev/null; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.9"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version ${RAMAX_VERSION}"; \
     test -x /opt/ramax/bin/ramax-paf-fasta; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     test ! -e /src/bin; \
@@ -131,8 +141,10 @@ RUN set -eux; \
 
 FROM ubuntu:22.04 AS runtime
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RAMAX_VERSION=1.0.9
+ARG RAMAX_VERSION
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="RaMAx" \
@@ -159,7 +171,7 @@ RUN apt-get update \
 COPY --from=builder /opt/ramax /opt/ramax
 
 RUN set -eux; \
-    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version 1.0.9"; \
+    test "$(/opt/ramax/bin/ramax --version)" = "RaMAx version ${RAMAX_VERSION}"; \
     /opt/ramax/bin/ramax --help >/dev/null; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax | tee /tmp/ramax.ldd; \
