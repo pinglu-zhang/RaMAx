@@ -60,6 +60,8 @@ struct LeafRow {
     std::string row_id;
     std::string leaf_name;
     std::string chr_name;
+    // Internal species-qualified key.  The public HAL leaf sequence name is
+    // the original chr_name and is assigned only when emissions are written.
     std::string hal_sequence_name;
     uint64_t segment_start = 0;
     uint32_t segment_length = 0;
@@ -81,6 +83,8 @@ struct LeafRunSpan {
     std::string row_id;
     std::string leaf_name;
     std::string chr_name;
+    // Internal species-qualified key; never emit this as the HAL sequence
+    // name because HAL sequence names are scoped by genome.
     std::string hal_sequence_name;
     uint64_t start = 0;
     uint32_t length = 0;
@@ -277,7 +281,7 @@ std::vector<std::string> fetchSequenceNames(const VariantLike& shared_mv) {
     }, *shared_mv);
 }
 
-std::string makeLeafSequenceName(
+std::string makeQualifiedLeafSequenceName(
     const std::string& species,
     const std::string& chr) {
     const std::string prefix =
@@ -385,9 +389,7 @@ std::string stripGaps(const std::string& s) {
 }
 
 std::string formatScaffoldName(const std::string& genome_name, size_t index) {
-    std::ostringstream oss;
-    oss << genome_name << ".scf" << std::setw(6) << std::setfill('0') << index;
-    return oss.str();
+    return genome_name + "refChr" + std::to_string(index);
 }
 
 std::vector<int> computePostorderInternal(const TreeMeta& tree, int node_id) {
@@ -521,7 +523,7 @@ BlockMSA buildBlockMSA(
       row.leaf_name = species_chr.first;
       row.chr_name = species_chr.second;
       row.hal_sequence_name =
-          makeLeafSequenceName(species_chr.first, species_chr.second);
+          makeQualifiedLeafSequenceName(species_chr.first, species_chr.second);
       row.segment_start = segment->start;
       row.segment_length = segment->length;
       row.reversed = (segment->strand == Strand::REVERSE);
@@ -654,7 +656,7 @@ std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, 
                 span.row_id = std::move(occurrence.row_id);
                 span.leaf_name = std::move(occurrence.genome_name);
                 span.chr_name = std::move(occurrence.sequence_name);
-                span.hal_sequence_name = makeLeafSequenceName(span.leaf_name, span.chr_name);
+                span.hal_sequence_name = makeQualifiedLeafSequenceName(span.leaf_name, span.chr_name);
                 span.start = occurrence.start;
                 span.length = occurrence.length;
                 span.reversed = occurrence.reversed;
@@ -4074,7 +4076,7 @@ NodeModel buildNodeModel(
 
     auto sequence_materialize_begin = Clock::now();
     model.sequences.reserve(assembly.sequences.size());
-    size_t scaffold_index = 1;
+    size_t scaffold_index = 0;
     for (const auto& assembled_sequence : assembly.sequences) {
         SequenceModel sequence;
         sequence.seq_name = formatScaffoldName(
@@ -4732,7 +4734,7 @@ void projectInternalChildContainer(
     uint64_t new_scaffold_gap_bases = 0;
     child_model.sequences.reserve(
         fragments_by_parent_sequence.size());
-    size_t scaffold_index = 1;
+    size_t scaffold_index = 0;
     for (auto& [parent_rank,
                 parent_fragments] :
          fragments_by_parent_sequence) {
@@ -5104,14 +5106,16 @@ void appendLeafChildTopEmissions(
     }
 
     for (const auto& chr_name : fetchSequenceNames(mgr_it->second)) {
+        const std::string qualified_sequence_name =
+            makeQualifiedLeafSequenceName(species_name, chr_name);
         SequenceEmission emission;
         emission.genome_name = species_name;
-        emission.seq_name = makeLeafSequenceName(species_name, chr_name);
+        emission.seq_name = chr_name;
         emission.bottom_count = 0;
         emission.leaf_source = std::make_pair(species_name, chr_name);
 
         uint64_t chr_length = fetchSequenceLength(mgr_it->second, chr_name);
-        auto& windows = windows_by_sequence[emission.seq_name];
+        auto& windows = windows_by_sequence[qualified_sequence_name];
         std::sort(windows.begin(), windows.end(), [](const auto& lhs, const auto& rhs) {
             if (lhs.span.start != rhs.span.start) {
                 return lhs.span.start < rhs.span.start;
