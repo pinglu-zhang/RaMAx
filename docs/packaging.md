@@ -137,20 +137,33 @@ arguments.
 ```bash
 cd /mnt/d/code/RaMAx
 
+RAMAX_VERSION=1.0.9
+test -z "$(git status --porcelain --untracked-files=no)"
+RAMAX_VCS_REF="$(git rev-parse HEAD)"
+
 docker build \
   --progress=plain \
+  --build-arg RAMAX_VERSION="${RAMAX_VERSION}" \
+  --build-arg VCS_REF="${RAMAX_VCS_REF}" \
   --build-arg BUILD_JOBS=16 \
-  -t ramax:1.0.9 \
+  -t "ramax:${RAMAX_VERSION}" \
   .
 ```
 
 Reduce `BUILD_JOBS` when memory is limited. A normal rebuild may reuse Docker
 layers; `--no-cache` is not part of the standard release command.
 
+The build fails if `RAMAX_VERSION` does not match the version declared by
+`project(RaMAx VERSION ...)`. `VCS_REF` records the exact source commit in the
+OCI image metadata.
+
 ### Validate the local Docker image
 
 ```bash
 docker run --rm ramax:1.0.9 --version
+
+docker image inspect ramax:1.0.9 \
+  --format 'version={{ index .Config.Labels "org.opencontainers.image.version" }} revision={{ index .Config.Labels "org.opencontainers.image.revision" }}'
 
 docker run --rm --entrypoint bash ramax:1.0.9 -lc '
 set -euo pipefail

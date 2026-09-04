@@ -43,6 +43,17 @@ sequences and writes leaf/ancestor segments without changing the source FASTA
 coordinates. `--root` controls the preferred artificial root name and is valid
 only for HAL output.
 
+Leaf sequence names preserve the sequence IDs read from the source FASTA. RaMAx
+does not add a species prefix, remove an existing prefix, or otherwise rewrite
+those IDs. Sequence names are scoped by their HAL genome, so different leaf
+genomes may each contain a sequence such as `chr1`. Internally, RaMAx still uses
+species-qualified keys to keep those sequences distinct. Reconstructed ancestor
+sequences follow the Cactus-compatible, zero-based naming convention
+`<genome>refChr<N>`, for example `rootrefChr0` and `anc1refChr0`.
+
+This HAL naming policy does not change MAF source names. Existing HAL files are
+also unchanged; the policy applies when a new HAL is exported.
+
 Validate a HAL file with the HAL utilities:
 
 ```bash
