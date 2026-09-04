@@ -17,6 +17,7 @@
 #include "anchor.h"  // 包含 UnionFind 定义
 #include "../anchor/anchor_link_internal.h"
 #include "process_memory.h"
+#include "reference_selection_internal.h"
 #include "SeqPro.h"  // 包含 SeqPro 相关定义
 #include "ramesh.h"  // 包含 RaMesh 图结构定义
 
@@ -242,10 +243,12 @@ void exportMaskIntervalsToDirectory(
 
     void validateReferenceSequenceCount(
         const SpeciesName& ref_name,
-        const SeqPro::SharedManagerVariant& manager_variant) {
+        const SeqPro::SharedManagerVariant& manager_variant,
+        bool allow_reference_count_fallback) {
 
         const size_t sequence_count = getManagerSequenceCount(manager_variant);
-        if (isReferenceEligibleSequenceCount(sequence_count)) {
+        if (isReferenceEligibleSequenceCount(sequence_count) ||
+            (allow_reference_count_fallback && sequence_count > 0)) {
             return;
         }
 
@@ -738,9 +741,26 @@ starAlignment(
     };
     std::sort(species_qualities.begin(), species_qualities.end(), quality_order_less);
 
+    const size_t fallback_index =
+        RaMAxReferenceSelection::enableMinimumSequenceFallback(species_qualities);
+    const bool using_fallback_reference = fallback_index != species_qualities.size();
+    if (using_fallback_reference) {
+        const auto& fallback = species_qualities[fallback_index];
+        spdlog::warn(
+            "[reference-selection] No genome satisfies max_allowed={}. "
+            "Using minimum-sequence genome {} (sequence_count={}) as the sole "
+            "fallback reference for one alignment round.",
+            kMaxReferenceSequenceCount, fallback.name, fallback.sequence_count);
+        if (!ref_name.empty() && ref_name != fallback.name) {
+            spdlog::warn(
+                "[reference-selection] Requested reference {} is overridden by "
+                "minimum-sequence fallback {}.", ref_name, fallback.name);
+        }
+    }
+
     // ------------------------------------------------------------
     // 3) 将指定的 ref_name 移动到最前面（如果存在于列表）
-    //    若显式指定的 reference 超过序列数阈值，则直接报错
+    //    有常规候选时，显式 reference 超限仍报错；兜底模式固定选择最少序列者
     // ------------------------------------------------------------
     auto ref_it = std::find_if(
         species_qualities.begin(),
@@ -749,7 +769,7 @@ starAlignment(
             return quality.name == ref_name;
         }
     );
-    if (ref_it != species_qualities.end()) {
+    if (!using_fallback_reference && ref_it != species_qualities.end()) {
         if (!ref_it->reference_eligible) {
             throw std::runtime_error(
                 "[reference-selection] Explicit reference " + ref_it->name +
@@ -765,7 +785,7 @@ starAlignment(
 
     // ------------------------------------------------------------
     // 4) 提取排序后的物种名列表 species_order，并单独构建合法 reference 列表
-    //    超过序列数阈值的物种保留为 query，但不会进入 reference_order
+    //    超限物种保留为 query；全部超限时仅兜底物种进入 reference_order
     // ------------------------------------------------------------
     std::vector<SpeciesName> species_order;
     species_order.reserve(species_qualities.size());
@@ -783,8 +803,8 @@ starAlignment(
     uint_t reference_num = reference_order.size();
     if (reference_num == 0) {
         throw std::runtime_error(
-            "[reference-selection] No eligible reference genome found. Genomes with sequence_count > " +
-            std::to_string(kMaxReferenceSequenceCount) + " cannot be used as reference.");
+            "[reference-selection] No nonempty reference genome found; "
+            "minimum-sequence fallback is unavailable.");
     }
 
     // 打印物种处理顺序
@@ -837,7 +857,7 @@ starAlignment(
 
     // ------------------------------------------------------------
     // 7) 决定轮数：only_one_round 只跑 1 轮，否则只遍历合法 reference
-    //    超过序列数阈值的物种保留为 query，但不会作为 reference
+    //    兜底模式 reference_num 为 1，因此也只运行一轮
     // ------------------------------------------------------------
     uint_t round = only_one_round ? 1 : reference_num;
     std::unordered_set<SpeciesName> processed_reference_species;
@@ -895,7 +915,8 @@ starAlignment(
                 allow_mem,
                 allow_short_mum,
                 ref_global_cache,
-                sampling_interval
+                sampling_interval,
+                using_fallback_reference
             );
             logStageMemory(
                 "anchor-search", "complete", match_ptr ? match_ptr->size() : 0);
@@ -1119,14 +1140,16 @@ SpeciesMatchVec3DPtrMapPtr MultipleRareAligner::alignMultipleGenome(
     bool                       allow_MEM,
     bool                       allow_short_mum,
     sdsl::int_vector<0>& ref_global_cache,
-    SeqPro::Length sampling_interval)
+    SeqPro::Length sampling_interval,
+    bool allow_reference_count_fallback)
 {
     secondary_match_map.clear();
     /* ---------- 0. 合法性检查 ---------- */
     if (!species_fasta_manager_map.count(ref_name))
         throw std::runtime_error("[alignMultipleQuerys] reference species not found: " + ref_name);
 
-    validateReferenceSequenceCount(ref_name, species_fasta_manager_map.at(ref_name));
+    validateReferenceSequenceCount(ref_name, species_fasta_manager_map.at(ref_name),
+                                   allow_reference_count_fallback);
 
     if (species_fasta_manager_map.size() <= 1) {
         spdlog::warn("[alignMultipleQuerys] only reference genome present, nothing to align.");

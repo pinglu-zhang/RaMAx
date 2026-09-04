@@ -33,7 +33,7 @@ binary.
 | Option | Type/default/range | Description |
 |---|---|---|
 | `--chunk_size` | integer; `10000000`; `1000000..INT_MAX` bp | Reference/query chunk size used during parallel anchor search. |
-| `--ref` | string; automatic | Prefer a named genome as reference. When omitted, RaMAx determines reference order from assembly statistics. |
+| `--ref` | string; automatic | Prefer a named genome as reference. Normally only genomes with 1–10,000 sequences are eligible. If none qualify, RaMAx overrides this preference and selects the nonempty genome with the fewest sequences as the sole reference for one round; ties use assembly N50, total length, then name. |
 | `--overlap_size` | integer; `0`; `0..INT_MAX` bp | Overlap between adjacent chunks. It must be smaller than `--chunk_size`. |
 | `--min_anchor_length` | integer; `20`; `1..INT_MAX` bp | Minimum anchor length. |
 | `--max_anchor_frequency` | integer; `50`; `0..INT_MAX` | Maximum accepted anchor occurrence frequency. |
