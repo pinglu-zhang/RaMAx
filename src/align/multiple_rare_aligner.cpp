@@ -23,7 +23,7 @@
 // 辅助函数：根据CIGAR字符串计算query区间对应关系
 namespace {
 
-    constexpr size_t kMaxReferenceSequenceCount = 100000;
+    constexpr size_t kMaxReferenceSequenceCount = 10000;
 
     void logStageMemory(std::string_view stage,
                         std::string_view event,
