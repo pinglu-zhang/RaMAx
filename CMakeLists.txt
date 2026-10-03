@@ -458,6 +458,10 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
 option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
 if(RAMAX_BUILD_TESTS)
     enable_testing()
+    add_executable(ramax_wfmash_normalization_test qa/wfmash_normalization_test.cpp)
+    configure_rama_target(ramax_wfmash_normalization_test)
+    target_link_libraries(ramax_wfmash_normalization_test PRIVATE ramax_core)
+    add_test(NAME ramax_wfmash_normalization_test COMMAND ramax_wfmash_normalization_test)
     add_executable(ramax_hal_memory_test
         "${CMAKE_CURRENT_SOURCE_DIR}/qa/hal_memory_test.cpp")
     configure_rama_target(ramax_hal_memory_test)

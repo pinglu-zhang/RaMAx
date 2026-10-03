@@ -53,10 +53,19 @@ struct ParsedPafRecord {
     std::string cigar_text;
 };
 
+struct PafNormalizationRecordStats {
+    std::string decision;
+    uint64_t accepted_query_bases{0};
+    size_t recovered_fragments{0};
+    uint64_t recovered_query_bases{0};
+};
+
 struct PafNormalizationStats {
     size_t input_records{0};
     size_t trimmed_records{0};
     size_t skipped_records{0};
+    size_t recovered_fragments{0};
+    std::vector<PafNormalizationRecordStats> records;
 };
 
 struct PairThreadSchedule {
