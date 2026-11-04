@@ -1,6 +1,6 @@
 # RaMAx documentation
 
-This directory contains the detailed documentation for RaMAx 1.0.9.
+This directory contains the detailed documentation for RaMAx 1.1.0.
 
 ## Getting started
 

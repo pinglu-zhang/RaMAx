@@ -1,236 +1,105 @@
-# Packaging and releasing RaMAx
+# Packaging and releasing RaMAx 1.1.0
 
-This document describes the current Linux x86-64 release workflow. The
-commands below target RaMAx 1.0.9. Update the version-specific values together
-for a later release rather than copying an older packaging guide.
+The release is built from committed `dev` code, merged into `master`, and
+identified by the annotated `v1.1.0` tag. Experimental server `dev-pan` worktree
+changes are excluded. Use a clean, independent checkout for release work.
 
-## Release contract
+## Supported distributions
 
-The Conda package and Docker image contain RaMAx and the external tools needed
-by the installed workflow:
+- Conda: `malab/ramax`, version `1.1.0`, build number `0`, `linux-64`.
+- Docker Hub: `pingluzhang/ramax:1.1.0`, `linux/amd64`.
+- GitHub Release: source archives, the Conda package, `SHA256SUMS` and
+  `BUILD_INFO.json`. There is no standalone binary archive.
 
-```text
-RaMAx      1.0.9
-Mash       2.3=hb105d93_9
-wfmash     0.14.0=h11f254b_0 (v0.14.0-0-g517e1bc)
-Samtools   1.23.1=ha83d96e_0
-HTSlib     1.23.1=h633afcb_0
-minipoa    1.4.2=hd5d28ae_0
-```
+The runtime tool versions remain Mash 2.3 (`hb105d93_9`), wfmash 0.14.0
+(`h11f254b_0`), Samtools 1.23.1 (`ha83d96e_0`), HTSlib 1.23.1
+(`h633afcb_0`) and minipoa 1.4.2 (`hd5d28ae_0`). HAL is linked into RaMAx;
+no `halAppendCactusSubtree` binary is needed. Conda targets the glibc 2.17
+sysroot. Both packages disable `-march=native`.
 
-Mash build `hb105d93_9` and wfmash 0.14 use the same GSL 2.7 series.
-Samtools/HTSlib 1.23.1 is the exact pair used by the wfmash routing stage.
-The Conda recipe uses HDF5 1.14, while the Ubuntu 22.04 Docker builder uses
-the distribution HDF5 development package.
-HAL export uses the linked HAL/HDF5 libraries; no Cactus append executable is
-required.
+## Validation before tagging
 
-Packaging validation establishes that the binaries build, start, resolve their
-runtime libraries, and report the expected versions. It is not evidence of
-cross-platform biological equivalence, alignment quality, or performance.
+The `Release validation and publication` workflow runs on pull requests to
+`dev` and `master`. PR jobs never publish. They validate version consistency,
+build the committed source, run release metadata and output-validator tests,
+and exercise all four output formats on a deterministic three-genome fixture.
+The old internal `qa/` directory and its CMake targets are removed. Release
+validation helpers live under `ci/` and are not installed in the packages. GFA walks and HAL leaf DNA are compared with the complete original
+contigs; MAF sequence rows and PAF coordinate/CIGAR consumption are checked.
+An independent HAL reader checks the generated hierarchy.
 
-## Source preflight
+Conda is built with flexible channel priority using `malab`, `bioconda` and
+`conda-forge`. It is installed into a fresh environment before the integration
+fixture is run. Docker is built without pushing, then tested through a bind
+mount as the runner's non-root user. The tested image is retained with
+`docker save`; publishing loads this exact artifact rather than rebuilding it.
 
-Run release commands from the intended release checkout:
+The source version in `CMakeLists.txt`, `recipe/meta.yaml` and `Dockerfile`
+must agree. Update the current installation documentation and changelog entry;
+never rename versions in historical changelog entries.
 
-```bash
-cd /mnt/d/code/RaMAx
-
-test "$(sed -n 's/^project(RaMAx VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "1.0.9"
-git status --short
-git rev-parse HEAD
-```
-
-Do not create or push the release tag until both package formats pass their
-local validation.
-
-## Build the Conda package
-
-Use flexible channel priority so the Bioconda tools and current conda-forge
-runtime dependency chain can be solved together:
+For an authorized local packaging run in a disposable checkout:
 
 ```bash
-source /home/zpl/miniconda3/etc/profile.d/conda.sh
-conda activate conda
+RAMAX_CONDA_SOURCE=path conda build recipe \
+  -c malab -c bioconda -c conda-forge --no-anaconda-upload \
+  --output-folder /path/outside/the/source/conda-bld
 
-cd /mnt/d/code/RaMAx/recipe
-
-export CONDA_CHANNEL_PRIORITY=flexible
-export CPU_COUNT=2
-export CONDA_BUILD_MAX_JOBS=2
-export RAMAX_CONDA_SOURCE=path
-
-conda build . \
-  --override-channels \
-  -c malab \
-  -c bioconda \
-  -c conda-forge \
-  --no-anaconda-upload
+docker build --build-arg RAMAX_VERSION=1.1.0 \
+  --build-arg VCS_REF="$(git rev-parse HEAD)" \
+  --build-arg BUILD_JOBS=2 -t ramax:1.1.0 .
 ```
 
-`--no-anaconda-upload` keeps build and upload as separate release gates. The
-expected package is build number 0:
+Build and test before creating the release tag. Use the PR merge candidates to
+check the final source tree before merging preparation into `dev`, then `dev`
+into `master`. Preserve branch history; do not force-update branches or tags.
+
+## Credentials and publication
+
+Configure repository Secrets `DOCKERHUB_TOKEN` (write access for `pingluzhang`)
+and `ANACONDA_API_TOKEN` (upload access to `malab`) before publication. Use access
+tokens through the corresponding tools/Secrets, never in files or logs.
+GitHub Release publication uses the workflow's `GITHUB_TOKEN` with contents
+write permission. Package or branch-protection approvals, if configured on the
+repository, must be satisfied through their normal GitHub controls.
+
+After the final master commit is validated:
 
 ```bash
-RAMAX_CONDA_PACKAGE=$(find "$CONDA_PREFIX/conda-bld/linux-64" \
-  -maxdepth 1 \
-  -name 'ramax-1.0.9-*_0.conda' \
-  -print \
-  | sort \
-  | tail -n 1)
-
-test -n "$RAMAX_CONDA_PACKAGE"
-printf '%s\n' "$RAMAX_CONDA_PACKAGE"
+git tag -a v1.1.0 -m "RaMAx 1.1.0" <validated-master-commit>
+git push origin v1.1.0
 ```
 
-### Validate a clean Conda installation
+The tag workflow rebuilds and validates the frozen tagged source, retains both
+package artifacts, creates a Draft Release and publishes versioned Conda and
+Docker artifacts. It then performs fresh public-channel installation and a
+Docker Hub pull, repeats the integration checks, attaches checksums and source/
+image identity, advances Docker `1.2` and `latest`, and publishes the Release.
+Existing versioned artifacts are reused only when their content identity
+matches; different same-named artifacts are never overwritten.
 
-Install the local package in a new environment outside the source tree:
+## Resume after credentials or network failures
+
+Keep the failed run and its artifacts. Select the `Resume a validated release`
+workflow, give `v1.1.0` and the original tag-validation run ID. It verifies the
+source identity, validation records and retained checksums, and publishes those
+artifacts without rebuilding. The original three build/validation jobs must
+have succeeded. A draft or partial publication is not a completed release.
+If the run's retained artifacts have expired, stop and review the recovery
+rather than silently replacing published versioned content.
+
+## Completion
+
+Check all public entry points:
 
 ```bash
-CONDA_CHANNEL_PRIORITY=flexible \
-conda create -y \
-  -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test \
-  --override-channels \
-  -c "file://$CONDA_PREFIX/conda-bld" \
-  -c malab \
-  -c bioconda \
-  -c conda-forge \
-  ramax=1.0.9
-
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test ramax --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test mash --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test wfmash --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test samtools --version
-conda run -p /mnt/d/Result/RaMAx/package/ramax-1.0.9-test minipoa -v
+conda create -n ramax120 -c malab -c conda-forge -c bioconda ramax=1.1.0
+conda run -n ramax120 ramax --version
+docker pull pingluzhang/ramax:1.1.0
+docker run --rm pingluzhang/ramax:1.1.0 --version
 ```
 
-Expected key output:
-
-```text
-RaMAx version 1.0.9
-2.3
-v0.14.0-0-g517e1bc
-samtools 1.23.1
-Using htslib 1.23.1
-minipoa version 1.4.2
-```
-
-### Upload the Conda package
-
-Upload only after the clean installation passes:
-
-```bash
-anaconda upload --user malab "$RAMAX_CONDA_PACKAGE"
-```
-
-After upload, solve and install `ramax=1.0.9` from the remote channels in a
-new environment before declaring the Conda release complete.
-
-## Build the Docker image
-
-The Dockerfile installs the exact companion-tool builds into `/opt/ramax` and
-links HAL storage into `ramax`. It uses the local Docker frontend and does not
-require named build contexts or user-supplied integrity arguments.
-
-```bash
-cd /mnt/d/code/RaMAx
-
-RAMAX_VERSION=1.0.9
-test -z "$(git status --porcelain --untracked-files=no)"
-RAMAX_VCS_REF="$(git rev-parse HEAD)"
-
-docker build \
-  --progress=plain \
-  --build-arg RAMAX_VERSION="${RAMAX_VERSION}" \
-  --build-arg VCS_REF="${RAMAX_VCS_REF}" \
-  --build-arg BUILD_JOBS=16 \
-  -t "ramax:${RAMAX_VERSION}" \
-  .
-```
-
-Reduce `BUILD_JOBS` when memory is limited. A normal rebuild may reuse Docker
-layers; `--no-cache` is not part of the standard release command.
-
-The build fails if `RAMAX_VERSION` does not match the version declared by
-`project(RaMAx VERSION ...)`. `VCS_REF` records the exact source commit in the
-OCI image metadata.
-
-### Validate the local Docker image
-
-```bash
-docker run --rm ramax:1.0.9 --version
-
-docker image inspect ramax:1.0.9 \
-  --format 'version={{ index .Config.Labels "org.opencontainers.image.version" }} revision={{ index .Config.Labels "org.opencontainers.image.revision" }}'
-
-docker run --rm --entrypoint bash ramax:1.0.9 -lc '
-set -euo pipefail
-
-ramax --version
-ramax-paf-fasta --version
-mash --version
-wfmash --version
-samtools --version | head -n 2
-minipoa -v
-
-for executable in ramax wfmash minipoa; do
-    report="$(ldd "$(command -v "$executable")" 2>&1 || true)"
-    printf "%s\n" "$report"
-    if printf "%s\n" "$report" | grep -q "not found"; then
-        exit 1
-    fi
-done
-'
-```
-
-## Upload to Docker Hub
-
-Docker Hub is the canonical container registry for this release. Push the
-fixed version first:
-
-```bash
-docker login -u pingluzhang
-
-docker tag ramax:1.0.9 pingluzhang/ramax:1.0.9
-docker push pingluzhang/ramax:1.0.9
-```
-
-Verify that the remote manifest exists:
-
-```bash
-docker buildx imagetools inspect pingluzhang/ramax:1.0.9
-```
-
-Only after the fixed tag passes remote pull and runtime validation should the
-moving `latest` tag be updated:
-
-```bash
-docker tag ramax:1.0.9 pingluzhang/ramax:latest
-docker push pingluzhang/ramax:latest
-```
-
-Users should prefer the fixed tag for reproducibility:
-
-```bash
-docker pull pingluzhang/ramax:1.0.9
-docker run --rm pingluzhang/ramax:1.0.9 --version
-```
-
-## Create the release tag
-
-Create a new annotated tag after the release commit is final, the branch is
-pushed normally, and both remote package formats pass validation:
-
-```bash
-cd /mnt/d/code/RaMAx
-
-git status --short
-git tag -a v1.0.9 -m "RaMAx 1.0.9" HEAD
-git push origin dev
-git push origin v1.0.9
-```
-
-Do not move or force-push an older release tag. Record the final Git commit,
-Conda package filename, Docker manifest digest, and validation results in the
-release notes.
+Record the final master/dev commits, annotated tag, Release URL, Conda package
+SHA-256, Docker digest and validation reports. All public installations must
+pass before reporting the release complete. Packaging checks do not establish
+new biological accuracy or performance claims.

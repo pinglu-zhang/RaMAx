@@ -1,4 +1,4 @@
-ARG RAMAX_VERSION=1.0.9
+ARG RAMAX_VERSION=1.1.0
 
 FROM mambaorg/micromamba:2.3.2 AS alignment-tools
 

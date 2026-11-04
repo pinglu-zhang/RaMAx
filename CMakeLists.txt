@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.0.9 LANGUAGES C CXX)
+project(RaMAx VERSION 1.1.0 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -455,20 +455,22 @@ install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/licenses/ramax")
 
-option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
+option(RAMAX_BUILD_TESTS "Build optional extended regression tests" OFF)
 if(RAMAX_BUILD_TESTS)
     enable_testing()
-    add_executable(ramax_wfmash_normalization_test qa/wfmash_normalization_test.cpp)
-    configure_rama_target(ramax_wfmash_normalization_test)
-    target_link_libraries(ramax_wfmash_normalization_test PRIVATE ramax_core)
-    add_test(NAME ramax_wfmash_normalization_test COMMAND ramax_wfmash_normalization_test)
-    add_executable(ramax_hal_memory_test
-        "${CMAKE_CURRENT_SOURCE_DIR}/qa/hal_memory_test.cpp")
-    configure_rama_target(ramax_hal_memory_test)
-    target_link_libraries(ramax_hal_memory_test PRIVATE ramax_core)
-    add_test(NAME ramax_hal_memory_test COMMAND ramax_hal_memory_test)
-    set_tests_properties(ramax_hal_memory_test PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
+# Release-only readers and metadata checks; never part of installed products.
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(ramax_release_hal_check ci/release_hal_check.cpp)
+    configure_rama_target(ramax_release_hal_check)
+    target_link_libraries(ramax_release_hal_check PRIVATE ramax_core)
+    add_test(NAME ramax_release_metadata_test
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/ci -p release_checks_test.py -v)
+    set_tests_properties(ramax_release_metadata_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")

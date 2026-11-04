@@ -1,0 +1,12 @@
+name: ramax-release-runtime
+channels:
+  - malab
+  - bioconda
+  - conda-forge
+dependencies:
+  - python=3.11
+  - mash=2.3=hb105d93_9
+  - wfmash=0.14.0=h11f254b_0
+  - samtools=1.23.1=ha83d96e_0
+  - htslib=1.23.1=h633afcb_0
+  - minipoa=1.4.2=hd5d28ae_0

@@ -1,0 +1,76 @@
+name: Resume a validated release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable release tag
+        required: true
+        default: v1.1.0
+        type: string
+      validated_run_id:
+        description: Original tagged-source run with all three successful validation artifacts
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download retained validation artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.validated_run_id }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          for artifact in source-evidence conda-package docker-image; do
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir "artifacts/$artifact"
+          done
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          auto-activate-base: true
+          channel-priority: flexible
+      - name: Prepare publishing tools and credentials
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+        run: |
+          test -n "$DOCKERHUB_TOKEN"
+          test -n "$ANACONDA_API_TOKEN"
+          conda install -y -n base -c conda-forge anaconda-client
+          sudo apt-get update
+          sudo apt-get install -y libhdf5-cpp-103-1 libtbb12 libcurl4
+      - uses: docker/login-action@v3
+        with:
+          username: pingluzhang
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Resume publication without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.validated_run_id }}
+          CONDA_LOCAL_REPODATA_TTL: '0'
+        run: python ci/publish_release.py --tag "$RELEASE_TAG" --validated-run-id "$RUN_ID" --artifacts artifacts --work "$RUNNER_TEMP/publication"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publication-record
+          path: ${{ runner.temp }}/publication/
+          if-no-files-found: warn

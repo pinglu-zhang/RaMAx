@@ -21,6 +21,8 @@ mono_crash.*
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/
+!docs/releases/
+!docs/releases/*.md
 x64/
 x86/
 [Ww][Ii][Nn]32/
@@ -432,16 +434,11 @@ bin/output.maf
 /interval.py
 /unaligned.txt
 
-# Local-only packaging and CI files
-/.github/
+# Local-only development files
 submodule.zip
 /.clang-format
 /tmp/
-recipe/run_test.sh
 .gitignore
-recipe/conda_build_config.yaml
-recipe/meta.yaml
-recipe/build.sh
 /.codex/
 /.codex-staging/
 /scripts/

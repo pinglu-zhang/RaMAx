@@ -10,7 +10,6 @@ benchmark
 recipe
 scripts
 tests
-qa
 package
 packaging-sources
 wfmash_router_integration_artifacts

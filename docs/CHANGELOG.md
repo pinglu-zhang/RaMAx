@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.0 - 2026-11-04
+
+- Export HAL directly through the bundled HAL library, without requiring a
+  Cactus append executable. Preserve leaf contig names and softmask.
+- Share bounded export preparation between MAF and HAL and release the source
+  graph when it is no longer needed by remaining outputs.
+- Honor an explicit first-round reference and use the least fragmented
+  nonempty genome as a fallback when all inputs exceed the automatic limit.
+- Recover non-overlapping PAF fragments during wfmash graph normalization.
+- Prepare Linux x86-64 Conda and Docker Hub packaging from the same versioned
+  source, with installed-package and four-format integration checks.
+- Remove the internal `qa/` source directory and its build targets; keep
+  release-only validation helpers under `ci/`.
+- This release uses the committed dev implementation; experimental dev-pan
+  modes and local collinear refinement are not included.
+
 ## Unreleased
 
 - Write HAL in-process, removing the external `halAppendCactusSubtree`
