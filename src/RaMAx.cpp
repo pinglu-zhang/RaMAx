@@ -4,10 +4,12 @@
 #include "SeqPro.h"
 #include "data_process.h"
 #include "dependency_preflight.h"
+#include "hal/export.h"
 #include "config.hpp"
 #include "index.h"
 #include "minipoa_locator.h"
 #include "output_spec.hpp"
+#include "process_memory.h"
 #include "ramax_version.h"
 #include "rare_aligner.h"
 #include "sequence_utils.h"
@@ -16,8 +18,13 @@
 
 #include <array>
 #include <cmath>
+#include <exception>
 #include <regex>
 #include <unordered_set>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 // ------------------------------------------------------------------
 // 通用命令行参数结构体（支持 cereal 序列化）
@@ -1083,25 +1090,6 @@ bool hasOutputFormat(const CommonArgs& args,
     return RaMAxOutput::hasFormat(args.outputs, format);
 }
 
-void validateHalAppendDependencyForOutputs(const CommonArgs& args) {
-    const bool hal_output_requested =
-        hasOutputFormat(args, MultipleGenomeOutputFormat::HAL);
-    const auto executable =
-        RaMAxDependencies::locateHalAppendCactusSubtreeExecutable();
-    RaMAxDependencies::validateHalAppendCactusSubtree(
-        executable, hal_output_requested);
-
-    if (executable.empty()) {
-        spdlog::warn(
-            "[dependency-preflight] halAppendCactusSubtree was not found; "
-            "continuing because no HAL output was requested");
-    } else {
-        spdlog::info(
-            "[dependency-preflight] halAppendCactusSubtree={}",
-            executable.string());
-    }
-}
-
 std::string requiredMinipoaExecutable() {
     const auto executable =
         RaMesh::Alignment::locateMinipoaExecutable();
@@ -1838,7 +1826,6 @@ static int runRestartMode(CommonArgs& common_args,
     applyRestartOverrides(loaded, overrides);
     applyGraphOptimizationOptions(app, loaded);
     configureOutputs(loaded, loaded.output_paths);
-    validateHalAppendDependencyForOutputs(loaded);
 
     if (loaded.overlap_size >= loaded.chunk_size) {
         throw std::runtime_error("Overlap size must be less than chunk size.");
@@ -1894,7 +1881,6 @@ static int runNormalMode(CommonArgs& common_args, const CLI::App& app) {
 
     applyGraphOptimizationOptions(app, common_args);
     configureOutputs(common_args, common_args.output_paths);
-    validateHalAppendDependencyForOutputs(common_args);
 
     if (!hasOutputFormat(common_args, MultipleGenomeOutputFormat::PAF) &&
         common_args.paf_mode_explicit) {
@@ -2347,6 +2333,64 @@ static bool exportResults(
     std::vector<ExportAttempt> attempts;
     attempts.reserve(common_args.outputs.size());
     bool all_succeeded = true;
+    std::shared_ptr<const RaMesh::hal_export::PreparedExportInput> prepared_input;
+    std::exception_ptr preparation_failure;
+    size_t remaining_graph_outputs = std::count_if(
+        common_args.outputs.begin(), common_args.outputs.end(),
+        [](const RaMAxOutput::OutputSpec& output) {
+            return output.format == MultipleGenomeOutputFormat::PAF ||
+                   output.format == MultipleGenomeOutputFormat::GFA;
+        });
+    bool source_graph_released = false;
+    auto log_export_memory = [](const char* stage) {
+        const auto memory = RaMAxMemory::readProcessMemorySnapshot();
+        spdlog::info(
+            "[export-memory] stage={} rss_kib={} peak_rss_kib={} available={}",
+            stage, memory.rss_kib, memory.peak_rss_kib, memory.available);
+    };
+    auto require_prepared_input = [&]()
+        -> const RaMesh::hal_export::PreparedExportInput& {
+        if (preparation_failure) {
+            std::rethrow_exception(preparation_failure);
+        }
+        if (!prepared_input) {
+            log_export_memory("shared-input-before");
+            try {
+                prepared_input = RaMesh::hal_export::prepareExportInput(
+                    graph->blocks, seqpro_managers, common_args.work_dir_path,
+                    common_args.thread_num);
+            } catch (...) {
+                preparation_failure = std::current_exception();
+                throw;
+            }
+            log_export_memory("shared-input-ready");
+        }
+        // OutputSpec keeps MAF, PAF, GFA, HAL in canonical order. A prepared
+        // input contains no graph references; only PAF/GFA still need the graph.
+        if (remaining_graph_outputs == 0 && !source_graph_released) {
+            graph->clearAllGraphs();
+            for (const auto& [species, shared_manager] : seqpro_managers) {
+                (void)species;
+                std::visit([](const auto& manager) {
+                    using Pointer = std::decay_t<decltype(manager)>;
+                    if constexpr (std::is_same_v<
+                                      Pointer,
+                                      std::unique_ptr<SeqPro::SequenceManager>>) {
+                        manager->releaseMappedPages();
+                    } else {
+                        manager->getOriginalManager().releaseMappedPages();
+                    }
+                }, *shared_manager);
+            }
+#if defined(__GLIBC__)
+            // Return freed graph arenas before replaying the export input.
+            ::malloc_trim(0);
+#endif
+            source_graph_released = true;
+            log_export_memory("source-graph-released");
+        }
+        return *prepared_input;
+    };
 
     for (const auto& output : common_args.outputs) {
         const auto started = std::chrono::steady_clock::now();
@@ -2356,8 +2400,8 @@ static bool exportResults(
             switch (output.format) {
             case MultipleGenomeOutputFormat::MAF:
                 spdlog::info("Exporting MAF to {}...", output.path.string());
-                graph->exportToMaf(
-                    output.path, seqpro_managers, false);
+                RaMesh::hal_export::exportToMaf(
+                    require_prepared_input(), output.path, seqpro_managers, false);
                 break;
 
             case MultipleGenomeOutputFormat::PAF: {
@@ -2390,16 +2434,29 @@ static bool exportResults(
                 break;
             }
 
-            case MultipleGenomeOutputFormat::HAL:
+            case MultipleGenomeOutputFormat::HAL: {
                 spdlog::info("Exporting HAL to {}...", output.path.string());
-                graph->exportToHal(
-                    output.path,
-                    seqpro_managers,
-                    newick_tree,
-                    common_args.root_name,
-                    static_cast<int>(common_args.thread_num),
-                    softmask_path_map);
+                const auto& input = require_prepared_input();
+                if (softmask_path_map.size() != seqpro_managers.size()) {
+                    throw std::runtime_error(
+                        "HAL export requires one soft-mask index per leaf genome");
+                }
+                for (const auto& [species, unused_manager] : seqpro_managers) {
+                    (void)unused_manager;
+                    if (!softmask_path_map.contains(species)) {
+                        throw std::runtime_error(
+                            "Missing HAL soft-mask index for species: " + species);
+                    }
+                }
+                const auto softmask_indexes = SoftMask::loadIndexes(softmask_path_map);
+                RaMesh::hal_export::exportToHal(
+                    input, output.path, seqpro_managers, newick_tree,
+                    common_args.root_name, softmask_indexes,
+                    RaMesh::hal_export::ExportConfig{
+                        .parallel_threads = common_args.thread_num,
+                    });
                 break;
+            }
 
             case MultipleGenomeOutputFormat::UNKNOWN:
                 throw std::runtime_error(
@@ -2413,6 +2470,10 @@ static bool exportResults(
                 "{} export failed for {}: {}",
                 RaMAxOutput::formatName(output.format),
                 output.path.string(), attempt.error);
+        }
+        if (output.format == MultipleGenomeOutputFormat::PAF ||
+            output.format == MultipleGenomeOutputFormat::GFA) {
+            --remaining_graph_outputs;
         }
         attempt.elapsed_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -2568,10 +2629,10 @@ int main(int argc, char** argv) {
     // log policy after loading its configuration.
     configureLogLevel(common_args);
 
-    // Resolve the three unconditional external dependencies before creating or
-    // mutating the work directory. CLI11 has already handled --help and
-    // --version, so those informational commands remain dependency-free. The
-    // HAL-only helper is checked after the effective output list is known.
+    // Resolve the three external dependencies required by every normal run
+    // before creating or mutating the work directory. CLI11 has already
+    // handled --help and --version, so those informational commands remain
+    // dependency-free.
     try {
         const auto dependencies =
             RaMAxDependencies::requireUnconditionalStartupDependencies();

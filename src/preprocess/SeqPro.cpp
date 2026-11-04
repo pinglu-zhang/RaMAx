@@ -1,7 +1,10 @@
 #include "SeqPro.h"
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <fcntl.h>
+#include <cstring>
+#include <mutex>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -637,6 +640,33 @@ std::span<const char> MemoryMapper::getData(Position offset, Length length) cons
   return std::span<const char>(data_ptr, length);
 }
 
+void MemoryMapper::releaseMappedPages() const {
+  if (!isValid()) {
+    throw FileException("Memory mapper is not valid");
+  }
+  if (file_size_ == 0) {
+    return;
+  }
+
+#if defined(MADV_DONTNEED)
+  if (::madvise(mapped_data_, file_size_, MADV_DONTNEED) != 0) {
+    const int error = errno;
+    throw FileException("Cannot release mapped file pages: " +
+                        std::string(std::strerror(error)));
+  }
+#elif defined(POSIX_MADV_DONTNEED)
+  const int error =
+      ::posix_madvise(mapped_data_, file_size_, POSIX_MADV_DONTNEED);
+  if (error != 0) {
+    throw FileException("Cannot release mapped file pages: " +
+                        std::string(std::strerror(error)));
+  }
+#else
+  throw FileException(
+      "Releasing mapped file pages is not supported on this platform");
+#endif
+}
+
 void MemoryMapper::cleanup() {
   if (mapped_data_ && mapped_data_ != MAP_FAILED) {
     munmap(mapped_data_, file_size_);
@@ -814,6 +844,14 @@ void SequenceManager::getSubSequenceInto(
   }
   length = std::min(length, info->length - start);
   extractSequenceInto(*info, start, length, output);
+}
+
+void SequenceManager::releaseMappedPages() const {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  if (!memory_mapper_) {
+    throw FileException("Sequence manager has no memory mapper");
+  }
+  memory_mapper_->releaseMappedPages();
 }
 
 std::string SequenceManager::extractSequence(const SequenceInfo &info, Position start, Length length) const {

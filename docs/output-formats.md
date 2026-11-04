@@ -14,6 +14,14 @@ through a temporary file. If one exporter fails, later formats are still
 attempted; successful files remain, the command exits nonzero, and the work
 directory is retained.
 
+## Shared MAF/HAL preparation
+
+MAF and HAL share alignment preparation when requested together. Temporary
+data is stored in the work directory, so allow additional disk space beyond
+the final output files. Memory usage still grows with input size.
+Each output is published independently; failure of one format does not remove
+another format's successful output.
+
 ## MAF
 
 MAF output does not require a species tree. The seqfile may begin directly with
@@ -54,12 +62,23 @@ sequences follow the Cactus-compatible, zero-based naming convention
 This HAL naming policy does not change MAF source names. Existing HAL files are
 also unchanged; the policy applies when a new HAL is exported.
 
+HAL is written in-process through the linked HAL/HDF5 libraries; no external
+append executable is required. Leaf DNA and softmask are preserved from the
+source FASTA. Intermediate data is processed incrementally to reduce peak
+memory, but HAL export is not constant-memory.
+
 Validate a HAL file with the HAL utilities:
 
 ```bash
 halValidate /data/project/results/alignment.hal
 halStats /data/project/results/alignment.hal
 ```
+
+Validation checks structural consistency, not equality between alignments.
+Binary HAL checksums may differ because of HDF5 layout or multithreaded
+ancestor ordering. Compare tree structure, sequence names, coordinates, and
+DNA when checking whether two outputs agree.
+
 
 ## PAF
 

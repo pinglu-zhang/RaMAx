@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.0.9 LANGUAGES C CXX)
+project(RaMAx VERSION 1.1.0 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -18,6 +18,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
+option(CMAKE_INSTALL_RPATH_USE_LINK_PATH
+    "Retain external library search paths in installed executables" ON)
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/ramax_version.h.in"
@@ -102,16 +104,25 @@ endif()
 option(RAMAX_NATIVE_ARCH "Build ramax with -march=native" ON)
 option(RAMAX_EMBED_TOOL_PATHS
     "Embed resolved external-tool paths in the RaMAx binary" ON)
-set(RAMAX_TOOL_BIN_DIR "${CMAKE_SOURCE_DIR}/bin" CACHE PATH
-    "Directory containing RaMAx external tools for source builds")
-if(NOT RAMAX_TOOL_BIN_DIR OR NOT IS_DIRECTORY "${RAMAX_TOOL_BIN_DIR}")
-    message(FATAL_ERROR
-        "RAMAX_TOOL_BIN_DIR is not an existing directory: ${RAMAX_TOOL_BIN_DIR}")
+set(_ramax_default_tool_bin_dir "${CMAKE_SOURCE_DIR}/bin")
+if(NOT IS_DIRECTORY "${_ramax_default_tool_bin_dir}")
+    set(_ramax_default_tool_bin_dir "")
 endif()
-get_filename_component(RAMAX_RESOLVED_TOOL_BIN_DIR
-    "${RAMAX_TOOL_BIN_DIR}" REALPATH)
-message(STATUS
-    "RaMAx external-tool directory: ${RAMAX_RESOLVED_TOOL_BIN_DIR}")
+set(RAMAX_TOOL_BIN_DIR "${_ramax_default_tool_bin_dir}" CACHE PATH
+    "Optional existing directory containing RaMAx external tools")
+if(RAMAX_TOOL_BIN_DIR)
+    if(NOT IS_DIRECTORY "${RAMAX_TOOL_BIN_DIR}")
+        message(FATAL_ERROR
+            "RAMAX_TOOL_BIN_DIR is not an existing directory: ${RAMAX_TOOL_BIN_DIR}")
+    endif()
+    get_filename_component(RAMAX_RESOLVED_TOOL_BIN_DIR
+        "${RAMAX_TOOL_BIN_DIR}" REALPATH)
+    message(STATUS
+        "RaMAx external-tool directory: ${RAMAX_RESOLVED_TOOL_BIN_DIR}")
+else()
+    set(RAMAX_RESOLVED_TOOL_BIN_DIR "")
+    message(STATUS "No external-tool directory; runtime uses sibling/PATH lookup")
+endif()
 
 set(RAMAX_MINIPOA_EXECUTABLE "" CACHE FILEPATH
     "Explicit minipoa executable; empty uses the shared tool lookup order")
@@ -121,8 +132,6 @@ set(RAMAX_SAMTOOLS_EXECUTABLE "" CACHE FILEPATH
     "Explicit Samtools 1.23.1 executable; empty uses shared tool lookup")
 set(RAMAX_WFMASH_EXECUTABLE "" CACHE FILEPATH
     "Explicit PGGB-compatible wfmash v0.14 executable; empty uses shared lookup")
-set(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE "" CACHE FILEPATH
-    "Explicit halAppendCactusSubtree executable; empty uses shared lookup")
 
 function(resolve_ramax_tool configured_variable tool_name display_name output_variable)
     if(${configured_variable})
@@ -136,7 +145,7 @@ function(resolve_ramax_tool configured_variable tool_name display_name output_va
         set(_resolved "")
         set(_bundled_candidate
             "${RAMAX_RESOLVED_TOOL_BIN_DIR}/${tool_name}")
-        if(EXISTS "${_bundled_candidate}")
+        if(RAMAX_RESOLVED_TOOL_BIN_DIR AND EXISTS "${_bundled_candidate}")
             message(STATUS
                 "Using ${display_name} from RAMAX_TOOL_BIN_DIR: "
                 "${_bundled_candidate}")
@@ -164,10 +173,6 @@ resolve_ramax_tool(RAMAX_SAMTOOLS_EXECUTABLE samtools "Samtools 1.23.1"
                    RAMAX_RESOLVED_SAMTOOLS)
 resolve_ramax_tool(RAMAX_WFMASH_EXECUTABLE wfmash "wfmash v0.14.0-0-g517e1bc"
                    RAMAX_RESOLVED_WFMASH)
-resolve_ramax_tool(RAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE
-                   halAppendCactusSubtree "halAppendCactusSubtree"
-                   RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE)
-
 resolve_ramax_tool(RAMAX_MINIPOA_EXECUTABLE minipoa "minipoa"
                    RAMAX_RESOLVED_MINIPOA)
 
@@ -175,15 +180,12 @@ set(RAMAX_COMPILED_MINIPOA "${RAMAX_RESOLVED_MINIPOA}")
 set(RAMAX_COMPILED_MASH "${RAMAX_RESOLVED_MASH}")
 set(RAMAX_COMPILED_SAMTOOLS "${RAMAX_RESOLVED_SAMTOOLS}")
 set(RAMAX_COMPILED_WFMASH "${RAMAX_RESOLVED_WFMASH}")
-set(RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE
-    "${RAMAX_RESOLVED_HAL_APPEND_CACTUS_SUBTREE}")
 set(RAMAX_COMPILED_TOOL_BIN_DIR "${RAMAX_RESOLVED_TOOL_BIN_DIR}")
 if(NOT RAMAX_EMBED_TOOL_PATHS)
     set(RAMAX_COMPILED_MINIPOA "")
     set(RAMAX_COMPILED_MASH "")
     set(RAMAX_COMPILED_SAMTOOLS "")
     set(RAMAX_COMPILED_WFMASH "")
-    set(RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE "")
     set(RAMAX_COMPILED_TOOL_BIN_DIR "")
     message(STATUS
         "External-tool paths will not be embedded; runtime lookup uses the "
@@ -234,10 +236,10 @@ set(RAMA_COMMON_SOURCES
     "${GRAPH_DIR}/realignment_internal.cpp"
     "${GRAPH_DIR}/structural_break_repair.cpp"
     "${GRAPH_DIR}/short_block_repair.cpp"
-    "${GRAPH_DIR}/ramesh_export.cpp"
     "${GRAPH_DIR}/aligned_block_view.cpp"
     "${GRAPH_DIR}/gfa_export.cpp"
     "${SOURCE_DIR}/hal/export.cpp"
+    "${SOURCE_DIR}/hal/subtree_writer.cpp"
     "${GRAPH_DIR}/paf_utils.cpp"
     "${GRAPH_DIR}/paf_export.cpp"
 )
@@ -248,6 +250,7 @@ set(MAIN_X "${SOURCE_DIR}/RaMAx.cpp")
 set(RAMA_INCLUDE_DIRS
     "${INCLUDE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/hal_safety"
 )
 
 set(RAMA_SYSTEM_INCLUDE_DIRS
@@ -261,11 +264,77 @@ set(RAMA_SYSTEM_INCLUDE_DIRS
     ${HDF5_CXX_INCLUDE_DIRS}
 )
 
+# Build a source-pinned private replacement for the complete HDF5 backend and
+# its outside alignment factory. All copied translation units resolve quoted
+# private includes inside one generated directory, and their direct objects
+# precede libHal.a so no original backend/factory archive member is extracted.
+set(RAMAX_HAL_SOURCE_DIR "${HAL_DIR}")
+set(RAMAX_HAL_PATCH_OUTPUT_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/hal_safety")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${HAL_DIR}/api/hdf5_impl/hdf5Alignment.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Alignment.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5BottomSegment.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5BottomSegment.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Common.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5DnaArray.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5DnaDriver.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5DnaDriver.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5ExternalArray.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5ExternalArray.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Genome.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Genome.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5MetaData.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5MetaData.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Sequence.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5Sequence.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5SequenceIterator.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5SequenceIterator.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5TopSegment.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5TopSegment.h"
+    "${HAL_DIR}/api/hdf5_impl/hdf5UDCFuseDriver.cpp"
+    "${HAL_DIR}/api/hdf5_impl/hdf5UDCFuseDriver.h"
+    "${HAL_DIR}/api/impl/halAlignmentInstance.cpp"
+    "${HAL_DIR}/api/impl/halCLParser.cpp")
+include("${SOURCE_DIR}/hal/patch_bundled_hal.cmake")
+add_library(ramax_hal_safety OBJECT
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/halAlignmentInstance.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/halCLParser.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5Alignment.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5BottomSegment.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5DnaDriver.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5ExternalArray.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5Genome.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5MetaData.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5Sequence.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5SequenceIterator.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5TopSegment.cpp"
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}/hdf5UDCFuseDriver.cpp")
+target_include_directories(ramax_hal_safety PRIVATE
+    "${RAMAX_HAL_PATCH_OUTPUT_DIR}")
+target_include_directories(ramax_hal_safety SYSTEM PRIVATE
+    "${HAL_DIR}/api/inc"
+    "${HAL_DIR}/api/hdf5_impl"
+    "${HAL_DIR}/api/mmap_impl"
+    "${SONLIB_DIR}/C/inc"
+    ${HDF5_CXX_INCLUDE_DIRS})
+target_link_libraries(ramax_hal_safety PRIVATE OpenMP::OpenMP_CXX ZLIB::ZLIB)
+target_compile_definitions(ramax_hal_safety PRIVATE M64)
+target_compile_options(ramax_hal_safety PRIVATE -w)
+add_dependencies(ramax_hal_safety hal_library)
+
 # ================= 编译配置函数 =================
 function(configure_rama_target target)
     target_include_directories(${target} PRIVATE ${RAMA_INCLUDE_DIRS})
     target_include_directories(${target} SYSTEM PRIVATE ${RAMA_SYSTEM_INCLUDE_DIRS})
 
+
+    get_target_property(_ramax_target_type ${target} TYPE)
+    if(_ramax_target_type STREQUAL "EXECUTABLE")
+        target_sources(${target} PRIVATE
+            $<TARGET_OBJECTS:ramax_hal_safety>)
+        add_dependencies(${target} ramax_hal_safety)
+    endif()
     target_link_libraries(${target} PRIVATE
         # CLI11::CLI11
         ZLIB::ZLIB
@@ -328,8 +397,7 @@ target_compile_definitions(ramax_core PRIVATE
     RAMAX_MINIPOA_CONFIGURED_PATH="${RAMAX_COMPILED_MINIPOA}"
     RAMAX_MASH_CONFIGURED_PATH="${RAMAX_COMPILED_MASH}"
     RAMAX_SAMTOOLS_CONFIGURED_PATH="${RAMAX_COMPILED_SAMTOOLS}"
-    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_COMPILED_WFMASH}"
-    RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH="${RAMAX_COMPILED_HAL_APPEND_CACTUS_SUBTREE}")
+    RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_COMPILED_WFMASH}")
 
 add_executable(ramax ${MAIN_X})
 configure_rama_target(ramax)
@@ -384,8 +452,27 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 endif()
 
 install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/licenses/ramax")
 
-option(RAMAX_BUILD_TESTS "Build RaMAx regression tests" OFF)
+option(RAMAX_BUILD_TESTS "Build optional extended regression tests" OFF)
+if(RAMAX_BUILD_TESTS)
+    enable_testing()
+endif()
+
+# Release-only readers and metadata checks; never part of installed products.
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(ramax_release_hal_check ci/release_hal_check.cpp)
+    configure_rama_target(ramax_release_hal_check)
+    target_link_libraries(ramax_release_hal_check PRIVATE ramax_core)
+    add_test(NAME ramax_release_metadata_test
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/ci -p release_checks_test.py -v)
+    set_tests_properties(ramax_release_metadata_test PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
 if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(ramax_hal_export_test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hal_export_test.cpp")

@@ -9,7 +9,7 @@ HAL output additionally requires a Newick species tree as the first record.
 ### Conda
 
 ```bash
-conda install -c malab -c conda-forge -c bioconda ramax=1.0.9 -y
+conda install -c malab -c conda-forge -c bioconda ramax=1.1.0 -y
 
 ramax --version
 ```
@@ -17,8 +17,8 @@ ramax --version
 ### Docker
 
 ```bash
-docker pull pingluzhang/ramax:1.0.9
-docker run --rm pingluzhang/ramax:1.0.9 --version
+docker pull pingluzhang/ramax:1.1.0
+docker run --rm pingluzhang/ramax:1.1.0 --version
 ```
 
 ## Quick start
@@ -138,11 +138,12 @@ cmake --install build --prefix "$HOME/.local"
 
 Before creating a work directory or reading input genomes, RaMAx requires
 `minipoa`, PGGB-compatible wfmash `v0.14.0-0-g517e1bc`, and Mash 2.3.
-`halAppendCactusSubtree` is required only when the output list contains HAL;
-otherwise a missing HAL helper produces a warning and the run continues.
-The source build uses `RAMAX_TOOL_BIN_DIR` as a shared external-tool
-directory. It defaults to the source tree's `bin/` and expects `mash`,
-`minipoa`, `wfmash`, `samtools`, and `halAppendCactusSubtree` there:
+HAL output is written in-process through the linked HAL/HDF5 libraries;
+no external HAL append executable is required.
+The source build uses `RAMAX_TOOL_BIN_DIR` as an optional shared external-tool
+directory. It defaults to the source tree's `bin/` when that directory exists;
+otherwise sibling/PATH lookup is used. An explicitly supplied directory must
+exist and should contain `mash`, `minipoa`, `wfmash`, and `samtools`:
 
 ```bash
 cmake -S . -B build \
@@ -158,31 +159,29 @@ then `PATH`. Per-tool overrides remain available:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
   -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
   -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
   -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash \
   -DRAMAX_SAMTOOLS_EXECUTABLE=/opt/samtools/bin/samtools
 ```
 
-To move a source-built bundle to another machine, place `ramax` and the five
-tools in the same destination `bin/`; sibling lookup remains available if the
-original configured directory no longer exists. CMake records tool locations
-but does not make dynamically linked executables self-contained. A Conda
-executable must retain its complete prefix/library closure or be reinstalled
-on the destination. The bundled `halAppendCactusSubtree` is static and can be
-copied directly.
+For a source-built bundle, place `ramax` and the four tools in the same
+destination `bin/`. Dynamically linked executables still require compatible
+libraries; a Conda build must retain its complete environment or be reinstalled
+on the destination.
+
+Installed executables retain external library search paths by default
+(`CMAKE_INSTALL_RPATH_USE_LINK_PATH=ON`). Packagers can override the standard
+CMake install-RPATH settings for their target environment.
 
 Missing unconditional startup dependencies are reported together and RaMAx
-exits before creating or modifying the work directory. A missing HAL helper
-also stops HAL runs before normal work-directory initialization. `ramax --help` and
+exits before creating or modifying the work directory. `ramax --help` and
 `ramax --version` remain available without these tools. Mash and wfmash
 retain their strict version checks before use. Samtools/HTSlib 1.23.1 remains
 required by the wfmash routing stage and can be configured with
 `RAMAX_SAMTOOLS_EXECUTABLE`.
-The official Conda and Docker packages install minipoa 1.4.2 from the
-`malab` channel and bundle the validated cactus-bin-v2.9.9
-`halAppendCactusSubtree` helper.
+The official Conda and Docker configurations install minipoa 1.4.2 from the
+`malab` channel. HAL storage is linked into `ramax`.
 Conda builds set `RAMAX_EMBED_TOOL_PATHS=OFF`; the installed executable finds
 all dependencies beside itself in the active environment's `$PREFIX/bin`
 without retaining conda-build's temporary path.

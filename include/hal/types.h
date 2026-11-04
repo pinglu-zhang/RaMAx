@@ -187,7 +187,7 @@ struct ReferenceJoin {
 };
 
 struct AncestralSequencePath {
-    std::vector<std::vector<OccurrenceId>> supported_fragments;
+    std::vector<OccurrenceId> path;
     std::vector<ReferenceJoin> joins;
 };
 

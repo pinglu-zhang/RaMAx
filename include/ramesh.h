@@ -19,10 +19,6 @@
 #include "anchor.h"
 #include "paf_export.h"
 #include "gfa_export.h"
-#include "softmask_index.h"
-
-// 前向声明：NewickParser 位于全局命名空间（见 data_process.h）
-class NewickParser;
 
 namespace RaMesh {
 
@@ -508,11 +504,6 @@ namespace RaMesh {
         std::vector<SpeciesName>                           reference_order;
         mutable std::shared_mutex                          rw;             // multi‑reader / single‑writer
 
-        void exportToMaf(
-            const FilePath& maf_path,
-            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-            bool pairwise_mode) const;
-
         Paf::PafExportStats exportToPaf(
             const FilePath& paf_path,
             const std::map<SpeciesName, SeqPro::SharedManagerVariant>&
@@ -525,13 +516,6 @@ namespace RaMesh {
                 seqpro_managers,
             const Gfa::GfaExportOptions& options = {}) const;
 
-        void exportToHal(
-            const FilePath& hal_path,
-            const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-            const NewickParser& parser,
-            const std::string& root_name,
-            int parallel_threads,
-            const SoftMask::PathMap& softmask_paths) const;
 
         
         // ――― high-performance deletion methods ―――
@@ -542,6 +526,9 @@ namespace RaMesh {
         
         void removeSpecies(const SpeciesName& species);
         void removeChromosome(const SpeciesName& species, const ChrName& chr);
+        // Terminal, idempotent teardown after every direct graph user is
+        // quiescent. Invalidates graph-container references and detaches
+        // retained Block/Segment objects from paths, anchors, and CIGAR storage.
         void clearAllGraphs();
         
         // ――― garbage collection and maintenance ―――

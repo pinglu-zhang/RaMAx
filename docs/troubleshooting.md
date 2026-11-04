@@ -36,12 +36,11 @@ that a successful run removes its work directory automatically.
 
 Every normal RaMAx run requires executable copies of `minipoa`, `wfmash`, and
 `mash`. RaMAx reports missing unconditional programs in one error and exits
-before work-directory preparation. `halAppendCactusSubtree` is mandatory only
-when HAL output is requested; without HAL, its absence is a warning. Check the
-launch environment with:
+before work-directory preparation. HAL output uses the linked HAL/HDF5
+libraries rather than an external append helper. Check the launch environment
+with:
 
 ```bash
-command -v halAppendCactusSubtree
 command -v minipoa
 command -v wfmash
 command -v mash
@@ -68,7 +67,6 @@ overrides:
 
 ```bash
 cmake -S . -B build \
-  -DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=/opt/cactus/bin/halAppendCactusSubtree \
   -DRAMAX_MINIPOA_EXECUTABLE=/opt/minipoa/bin/minipoa \
   -DRAMAX_WFMASH_EXECUTABLE=/opt/wfmash/bin/wfmash \
   -DRAMAX_MASH_EXECUTABLE=/opt/mash/bin/mash

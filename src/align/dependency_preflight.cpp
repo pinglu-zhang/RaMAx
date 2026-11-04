@@ -7,10 +7,6 @@
 #include <stdexcept>
 #include <string_view>
 
-#ifndef RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH
-#define RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH ""
-#endif
-
 #ifndef RAMAX_MINIPOA_CONFIGURED_PATH
 #define RAMAX_MINIPOA_CONFIGURED_PATH ""
 #endif
@@ -24,12 +20,6 @@
 #endif
 
 namespace RaMAxDependencies {
-
-std::filesystem::path locateHalAppendCactusSubtreeExecutable() {
-    return RaMAxExternalTool::locateExecutable(
-        "halAppendCactusSubtree",
-        RAMAX_HAL_APPEND_CACTUS_SUBTREE_CONFIGURED_PATH);
-}
 
 std::filesystem::path locateMinipoaExecutable() {
     return RaMAxExternalTool::locateExecutable(
@@ -48,8 +38,6 @@ std::filesystem::path locateMashExecutable() {
 
 StartupDependencies locateStartupDependencies() {
     return {
-        .hal_append_cactus_subtree =
-            locateHalAppendCactusSubtreeExecutable(),
         .minipoa = locateMinipoaExecutable(),
         .wfmash = locateWfmashExecutable(),
         .mash = locateMashExecutable(),
@@ -102,27 +90,8 @@ void validateUnconditionalStartupDependencies(
     }
 }
 
-void validateHalAppendCactusSubtree(
-    const std::filesystem::path& executable,
-    bool hal_output_requested) {
-    if (!hal_output_requested ||
-        RaMAxExternalTool::isExecutable(executable)) {
-        return;
-    }
-    throw std::runtime_error(
-        "HAL output requires halAppendCactusSubtree, but it was not found. "
-        "Configure it with "
-        "-DRAMAX_HAL_APPEND_CACTUS_SUBTREE_EXECUTABLE=<path>, place it "
-        "beside the ramax executable, or add it to PATH.");
-}
-
 StartupDependencies requireUnconditionalStartupDependencies() {
-    StartupDependencies dependencies{
-        .hal_append_cactus_subtree = {},
-        .minipoa = locateMinipoaExecutable(),
-        .wfmash = locateWfmashExecutable(),
-        .mash = locateMashExecutable(),
-    };
+    auto dependencies = locateStartupDependencies();
     validateUnconditionalStartupDependencies(dependencies);
     return dependencies;
 }

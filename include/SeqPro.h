@@ -150,6 +150,9 @@ public:
 
   size_t getFileSize() const { return file_size_; }
   std::span<const char> getData(Position offset, Length length) const;
+  // Discard resident pages without changing the mapping or invalidating views.
+  // Later reads transparently fault the same file-backed bytes back in.
+  void releaseMappedPages() const;
   bool isValid() const { return mapped_data_ != nullptr; }
 
 private:
@@ -262,6 +265,10 @@ public:
   // APIs keep their original behavior.
   void getSubSequenceInto(SequenceId seq_id, Position start, Length length,
                           std::string &output) const;
+
+  // Discard resident FASTA pages while preserving the source mapping and all
+  // non-owning view addresses. Subsequent reads keep their existing semantics.
+  void releaseMappedPages() const;
 
   // 全局坐标获取（原始坐标）
   std::string getSubSequenceGlobal(Position global_start, Length length) const;

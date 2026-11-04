@@ -471,6 +471,21 @@ void writeCanonicalPaf(const std::filesystem::path& path,
     if (!output) throw std::runtime_error("Cannot finalize validated PAF: " + path.string());
 }
 
+// Persist the validated fine alignment before graph constraints remove columns.
+void writeNormalizationAudit(const std::filesystem::path& directory,
+                             const WfmashRouterDetail::PafNormalizationStats& stats) {
+    std::ofstream out(directory / "normalization.tsv");
+    if (!out) throw std::runtime_error("Cannot write PAF normalization audit");
+    out << "record_0based\tdecision\taccepted_query_bases\trecovered_fragments\trecovered_query_bases\n";
+    for (size_t i = 0; i < stats.records.size(); ++i) {
+        const auto& row = stats.records[i];
+        out << i << '\t' << row.decision << '\t' << row.accepted_query_bases
+            << '\t' << row.recovered_fragments << '\t' << row.recovered_query_bases << '\n';
+    }
+    out.flush();
+    if (!out) throw std::runtime_error("Cannot finish PAF normalization audit");
+}
+
 AnchorVec makeAnchors(
     std::vector<ParsedPafRecord> parsed,
     const SeqPro::SharedManagerVariant& reference_manager,
@@ -705,6 +720,7 @@ PairExecutionResult executePair(
         auto parsed = parseAndValidatePaf(
             alignment_partial, reference_records, query.records, true);
         sortAndDeduplicatePaf(parsed);
+        writeCanonicalPaf(alignment_partial.parent_path() / "alignment.raw.paf", parsed);
         const auto normalization =
             WfmashRouterDetail::normalizePafForGraph(parsed);
         spdlog::info(
@@ -713,6 +729,7 @@ PairExecutionResult executePair(
             query.species, normalization.input_records,
             normalization.trimmed_records, normalization.skipped_records,
             parsed.size());
+        writeNormalizationAudit(alignment_partial.parent_path(), normalization);
         writeCanonicalPaf(alignment_partial, parsed);
         auto anchors = makeAnchors(std::move(parsed), reference_manager,
                                    query.manager, query.alias_to_original);
@@ -1318,6 +1335,7 @@ std::vector<PairExecutionResult> executeChunkedPairs(
                         "wfmash chunked alignment produced no alignments");
                 }
                 sortAndDeduplicatePaf(parsed);
+                writeCanonicalPaf(queries[query_index].directory / "alignment.raw.paf", parsed);
                 const auto normalization =
                     WfmashRouterDetail::normalizePafForGraph(parsed);
                 spdlog::info(
@@ -1328,6 +1346,7 @@ std::vector<PairExecutionResult> executeChunkedPairs(
                     normalization.trimmed_records,
                     normalization.skipped_records, parsed.size(),
                     chunks[query_index].size());
+                writeNormalizationAudit(queries[query_index].directory, normalization);
                 const auto alignment =
                     queries[query_index].directory / "alignment.paf";
                 auto partial = alignment;
@@ -1693,7 +1712,6 @@ bool trimPafPrefix(ParsedPafRecord& record,
     Cigar_t remaining;
     uint64_t target_removed = 0;
     uint64_t query_removed = 0;
-    uint64_t matches_removed = 0;
     bool trimming = true;
     for (const CigarUnit unit : record.cigar) {
         char operation = 0;
@@ -1722,9 +1740,6 @@ bool trimPafPrefix(ParsedPafRecord& record,
                     : static_cast<uint32_t>(std::min<uint64_t>(length, useful_need));
                 if (consumes_target) target_removed += removed;
                 if (consumes_query) query_removed += removed;
-                if (operation == 'M' || operation == '=') {
-                    matches_removed += removed;
-                }
                 // If this operation cannot satisfy the other coordinate's
                 // outstanding trim, its remainder is still before the future
                 // cut point and must be removed as well.
@@ -1735,9 +1750,6 @@ bool trimPafPrefix(ParsedPafRecord& record,
                     removed = length;
                     if (consumes_target) target_removed += extra;
                     if (consumes_query) query_removed += extra;
-                    if (operation == 'M' || operation == '=') {
-                        matches_removed += extra;
-                    }
                 }
                 if (removed < length &&
                     target_removed >= target_required &&
@@ -1761,48 +1773,184 @@ bool trimPafPrefix(ParsedPafRecord& record,
         record.query_start >= record.query_end) {
         return false;
     }
-    record.matches = matches_removed >= record.matches
-        ? 0 : record.matches - matches_removed;
+    uint64_t original_m = 0, original_eq = 0, kept_m = 0, kept_eq = 0, paired = 0;
+    for (const auto unit : record.cigar) {
+        char op; uint32_t n; intToCigar(unit, op, n);
+        if (op == 'M') original_m += n;
+        if (op == '=') original_eq += n;
+    }
+    for (const auto unit : remaining) {
+        char op; uint32_t n; intToCigar(unit, op, n);
+        if (op == 'M') kept_m += n;
+        if (op == '=') kept_eq += n;
+        if (op == 'M' || op == '=' || op == 'X') paired += n;
+    }
+    if (!paired) return false;
+    const uint64_t m_matches = std::min(original_m,
+        record.matches > original_eq ? record.matches - original_eq : 0);
+    record.matches = kept_eq + (original_m ?
+        static_cast<uint64_t>(static_cast<unsigned __int128>(kept_m) * m_matches / original_m) : 0);
     record.cigar = std::move(remaining);
     record.cigar_text = cigarToString(record.cigar);
     record.cigar_columns = countAlignmentLength(record.cigar);
-    record.block_length = std::max(record.target_end - record.target_start,
-                                   record.query_end - record.query_start);
+    record.block_length = record.cigar_columns;
     return true;
 }
 
 }  // namespace
 
+namespace {
+
+// Project occupied genomic intervals onto the alignment's column axis. An I
+// only tests query occupancy and a D only tests target occupancy. Reverse query
+// coordinates are traversed from query_end downwards, while target is forward.
+void occupiedColumns(const IntervalSet& occupied, uint64_t start, uint64_t end,
+                     uint64_t column, bool reverse,
+                     std::vector<std::pair<uint64_t, uint64_t>>& blocked) {
+    auto it = occupied.lower_bound(start);
+    if (it != occupied.begin()) --it;
+    for (; it != occupied.end() && it->first < end; ++it) {
+        const uint64_t lo = std::max(start, it->first);
+        const uint64_t hi = std::min(end, it->second);
+        if (lo < hi) blocked.emplace_back(
+            column + (reverse ? end - hi : lo - start),
+            column + (reverse ? end - lo : hi - start));
+    }
+}
+
+std::vector<ParsedPafRecord> recoverPafFragments(
+    const ParsedPafRecord& raw, const IntervalSet& targets,
+    const IntervalSet& queries) {
+    struct Op { char code; uint64_t length, column, target, query, m_offset; };
+    std::vector<Op> ops;
+    std::vector<std::pair<uint64_t, uint64_t>> blocked;
+    uint64_t t = raw.target_start, q = 0, col = 0, eq = 0, m = 0;
+    const bool reverse = raw.strand != Strand::FORWARD;
+    for (const auto unit : raw.cigar) {
+        char code; uint32_t n; intToCigar(unit, code, n);
+        const bool ct = code == '=' || code == 'X' || code == 'M' || code == 'D';
+        const bool cq = code == '=' || code == 'X' || code == 'M' || code == 'I';
+        if (!n || (!ct && !cq)) throw std::runtime_error("Unsupported recovery CIGAR");
+        ops.push_back({code, n, col, t, q, m});
+        if (ct) occupiedColumns(targets, t, t + n, col, false, blocked);
+        if (cq) occupiedColumns(queries,
+            reverse ? raw.query_end - q - n : raw.query_start + q,
+            reverse ? raw.query_end - q : raw.query_start + q + n,
+            col, reverse, blocked);
+        t += ct ? n : 0; q += cq ? n : 0; col += n;
+        if (code == '=') eq += n;
+        if (code == 'M') m += n;
+    }
+    if (t != raw.target_end || q != raw.query_end - raw.query_start)
+        throw std::runtime_error("Recovery CIGAR consumption mismatch");
+    std::sort(blocked.begin(), blocked.end());
+    std::vector<std::pair<uint64_t, uint64_t>> allowed;
+    uint64_t cursor = 0;
+    for (const auto& [lo, hi] : blocked) {
+        if (cursor < lo) allowed.emplace_back(cursor, lo);
+        cursor = std::max(cursor, hi);
+    }
+    if (cursor < col) allowed.emplace_back(cursor, col);
+    std::vector<ParsedPafRecord> result;
+    size_t op_index = 0;
+    // M does not encode individual mismatches. Preserve its aggregate match
+    // estimate proportionally; exact =/X counts remain exact.
+    const uint64_t m_matches = std::min(m, raw.matches > eq ? raw.matches - eq : 0);
+    const auto m_count = [&](uint64_t x) -> uint64_t {
+        return m ? static_cast<unsigned __int128>(x) * m_matches / m : 0;
+    };
+    for (auto [lo, hi] : allowed) {
+        while (op_index < ops.size() && ops[op_index].column + ops[op_index].length <= lo) ++op_index;
+        size_t first = op_index, last = first;
+        while (last < ops.size() && ops[last].column < hi) ++last;
+        // Terminal gaps do not assert homology and can otherwise reserve bases
+        // needed by another fragment. Keep internal gaps, including mixed I/D.
+        while (first < last && (ops[first].code == 'I' || ops[first].code == 'D')) ++first;
+        while (last > first && (ops[last-1].code == 'I' || ops[last-1].code == 'D')) --last;
+        if (first == last) continue;
+        lo = std::max(lo, ops[first].column);
+        hi = std::min(hi, ops[last-1].column + ops[last-1].length);
+        ParsedPafRecord piece;
+        piece.query_name = raw.query_name; piece.query_length = raw.query_length;
+        piece.target_name = raw.target_name; piece.target_length = raw.target_length;
+        piece.strand = raw.strand; piece.mapq = raw.mapq;
+        const auto& f = ops[first];
+        piece.target_start = f.target + lo - f.column;
+        const uint64_t q_start = f.query + lo - f.column;
+        uint64_t tn = 0, qn = 0;
+        for (size_t i = first; i < last; ++i) {
+            const auto& op = ops[i];
+            const uint64_t offset = std::max(lo, op.column) - op.column;
+            const uint64_t n = std::min(hi, op.column + op.length) - std::max(lo, op.column);
+            appendCigarOp(piece.cigar, op.code, static_cast<uint32_t>(n));
+            if (op.code != 'I') tn += n;
+            if (op.code != 'D') qn += n;
+            if (op.code == '=') piece.matches += n;
+            if (op.code == 'M') piece.matches += m_count(op.m_offset + offset + n) - m_count(op.m_offset + offset);
+        }
+        piece.target_end = piece.target_start + tn;
+        piece.query_start = reverse ? raw.query_end - q_start - qn : raw.query_start + q_start;
+        piece.query_end = piece.query_start + qn;
+        piece.cigar_text = cigarToString(piece.cigar);
+        piece.cigar_columns = hi - lo;
+        piece.block_length = piece.cigar_columns;
+        if (!tn || !qn || piece.target_end > raw.target_length || piece.query_end > raw.query_length ||
+            overlaps(targets, piece.target_start, piece.target_end) || overlaps(queries, piece.query_start, piece.query_end))
+            throw std::runtime_error("Invalid recovered PAF fragment");
+        result.push_back(std::move(piece));
+    }
+    return result;
+}
+
+} // namespace
+
 PafNormalizationStats normalizePafForGraph(
     std::vector<ParsedPafRecord>& records) {
     PafNormalizationStats stats;
     stats.input_records = records.size();
-    std::map<std::string, IntervalSet> target_intervals;
-    std::map<std::string, IntervalSet> query_intervals;
+    stats.records.resize(records.size());
+    std::map<std::string, IntervalSet> target_intervals, query_intervals;
     std::vector<ParsedPafRecord> normalized;
     normalized.reserve(records.size());
-    for (auto& record : records) {
+    // Reserve the previously accepted records first. Recovering from a rejected
+    // early record must not displace a valid later record or change its pairing.
+    for (size_t i = 0; i < records.size(); ++i) {
+        auto record = records[i];
+        auto& audit = stats.records[i];
         auto& targets = target_intervals[record.target_name];
         auto& queries = query_intervals[record.query_name];
-        const uint64_t target_trim =
-            forwardPrefixOverlap(targets, record.target_start);
+        const uint64_t target_trim = forwardPrefixOverlap(targets, record.target_start);
         const uint64_t query_trim = record.strand == Strand::FORWARD
             ? forwardPrefixOverlap(queries, record.query_start)
             : reversePrefixOverlap(queries, record.query_end);
-        if ((target_trim != 0 || query_trim != 0) &&
-            !trimPafPrefix(record, target_trim, query_trim)) {
-            ++stats.skipped_records;
-            continue;
+        if ((target_trim || query_trim) && !trimPafPrefix(record, target_trim, query_trim)) {
+            ++stats.skipped_records; audit.decision = "prefix_exhausted"; continue;
         }
-        if (target_trim != 0 || query_trim != 0) ++stats.trimmed_records;
+        if (target_trim || query_trim) ++stats.trimmed_records;
         if (overlaps(targets, record.target_start, record.target_end) ||
             overlaps(queries, record.query_start, record.query_end)) {
-            ++stats.skipped_records;
-            continue;
+            ++stats.skipped_records; audit.decision = "residual_overlap"; continue;
         }
+        audit.decision = (target_trim || query_trim) ? "prefix_trimmed" : "accepted";
+        audit.accepted_query_bases = record.query_end - record.query_start;
         targets.emplace(record.target_start, record.target_end);
         queries.emplace(record.query_start, record.query_end);
         normalized.push_back(std::move(record));
+    }
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (stats.records[i].decision == "accepted") continue;
+        const auto& raw = records[i];
+        auto& targets = target_intervals[raw.target_name];
+        auto& queries = query_intervals[raw.query_name];
+        auto fragments = recoverPafFragments(raw, targets, queries);
+        for (auto& piece : fragments) {
+            targets.emplace(piece.target_start, piece.target_end);
+            queries.emplace(piece.query_start, piece.query_end);
+            ++stats.recovered_fragments;
+            ++stats.records[i].recovered_fragments;
+            stats.records[i].recovered_query_bases += piece.query_end - piece.query_start;
+            normalized.push_back(std::move(piece));
+        }
     }
     records = std::move(normalized);
     return stats;

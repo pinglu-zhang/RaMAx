@@ -5,6 +5,8 @@
 #include "hal/types.h"
 #include "ramesh.h"
 
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -12,6 +14,14 @@
 #include <vector>
 
 namespace RaMesh::hal_export {
+class PreparedExportInput;
+
+std::shared_ptr<const PreparedExportInput> prepareExportInput(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+    const std::filesystem::path& scratch_directory,
+    int parallel_threads = 1);
+
 
 TreeMeta buildTreeMeta(const NewickParser& parser);
 
@@ -29,7 +39,6 @@ LeafInterval projectLeafInterval(
 std::vector<ElementaryRunProjection> projectElementaryRuns(
     const std::vector<AlignedOccurrence>& rows);
 
-int c2hHasBottomFlag(size_t bottom_count);
 
 bool computeForwardToParent(bool child_forward_to_canonical, bool parent_forward_to_canonical);
 
@@ -78,7 +87,7 @@ std::vector<GenomeSequenceName> buildOutputSequenceOrder(
     const std::vector<std::string>& genome_order,
     const std::vector<GenomeSequenceName>& genome_sequences);
 void exportToMaf(
-    const std::vector<std::weak_ptr<Block>>& blocks,
+    const PreparedExportInput& input,
     const std::filesystem::path& maf_path,
     const std::map<
         SpeciesName,
@@ -96,7 +105,7 @@ findRejectedSecondaryHomologyBlocks(
 
 
 void exportToHal(
-    const std::vector<std::weak_ptr<Block>>& blocks,
+    const PreparedExportInput& input,
     const std::filesystem::path& hal_path,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     NewickParser parser,

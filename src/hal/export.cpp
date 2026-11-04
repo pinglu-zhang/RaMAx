@@ -1,39 +1,54 @@
 #include "hal/export.h"
+#include "subtree_writer.h"
 
 #include "align.h"
-#include "dependency_preflight.h"
-#include "external_tool.h"
+#include "process_memory.h"
 
-#include "halAlignmentInstance.h"
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/maximum_weighted_matching.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <deque>
+#include <exception>
 #include <iterator>
 #include <list>
 #include <limits>
 #include <map>
 #include <optional>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <string_view>
 #include <stdexcept>
 #include <tuple>
 #include <set>
 #include <unordered_set>
+#include <system_error>
+#include <type_traits>
 #include <unordered_map>
+#include <variant>
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#if defined(__GLIBC__)
+#include <malloc.h>
 #endif
 
 namespace RaMesh::hal_export {
@@ -43,17 +58,214 @@ struct PathCoverResult {
     std::vector<std::vector<OccurrenceId>> paths;
     std::unordered_map<OccurrenceId, bool> forward_by_occurrence;
 };
+struct OccurrenceIdView {
+    std::span<const OccurrenceId> explicit_ids;
+    OccurrenceId dense_first = 0;
+    size_t dense_count = 0;
 
+    static OccurrenceIdView explicitList(
+        const std::vector<OccurrenceId>& ids) {
+        return OccurrenceIdView{
+            std::span<const OccurrenceId>(ids),
+            0,
+            0};
+    }
 
+    static OccurrenceIdView dense(
+        OccurrenceId first,
+        size_t count) {
+        return OccurrenceIdView{{}, first, count};
+    }
+
+    bool isDense() const noexcept {
+        return explicit_ids.empty() && dense_count != 0;
+    }
+
+    size_t size() const noexcept {
+        return isDense() ? dense_count
+                         : explicit_ids.size();
+    }
+};
+
+template<typename Index>
+struct EdgeIndexView {
+    static_assert(
+        std::is_same_v<Index, uint32_t> ||
+        std::is_same_v<Index, uint64_t>);
+
+    explicit EdgeIndexView(
+        const std::vector<Index>& indices)
+        : values(indices) {}
+
+    size_t size() const noexcept {
+        return values.size();
+    }
+
+    uint64_t operator[](size_t index) const noexcept {
+        return static_cast<uint64_t>(values[index]);
+    }
+
+private:
+    std::span<const Index> values;
+};
+
+struct ImplicitEdgeIndexView {
+    explicit ImplicitEdgeIndexView(size_t all_edge_count)
+        : count(all_edge_count) {}
+
+    size_t size() const noexcept {
+        return count;
+    }
+
+    uint64_t operator[](size_t index) const noexcept {
+        return static_cast<uint64_t>(index);
+    }
+
+private:
+    size_t count;
+};
+
+template<typename EdgeIndices, typename OrderKeyFor>
 PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
     const std::vector<uint64_t>& run_ids,
     const std::vector<EdgeSupport>& edges,
-    const std::unordered_map<uint64_t, RunOrderKey>& run_order_keys,
+    EdgeIndices edge_indices,
+    const OrderKeyFor& order_key_for,
     ExportStats* stats);
+
+template<typename EdgeIndices, typename OrderKeyFor>
+PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
+    OccurrenceIdView run_ids,
+    const std::vector<EdgeSupport>& edges,
+    EdgeIndices edge_indices,
+    const OrderKeyFor& order_key_for,
+    ExportStats* stats);
+
+template<typename OrderKeyFor>
+AncestralSequenceAssembly buildAncestralSequenceAssemblyImpl(
+    const std::vector<uint64_t>& occurrence_ids,
+    const std::vector<EdgeSupport>& edges,
+    const OrderKeyFor& order_key_for,
+    const std::vector<TerminalEndSupport>& terminal_ends,
+    uint32_t scaffold_gap_length,
+    ExportStats* stats);
+
+template<typename OrderKeyFor>
+AncestralSequenceAssembly buildAncestralSequenceAssemblyImpl(
+    OccurrenceIdView occurrence_ids,
+    const std::vector<EdgeSupport>& edges,
+    const OrderKeyFor& order_key_for,
+    const std::vector<TerminalEndSupport>& terminal_ends,
+    uint32_t scaffold_gap_length,
+    ExportStats* stats);
+
+struct PreparedRecordIndex {
+    ExportBlockOrderKey order_key;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+struct PreparedManagerSequence {
+    std::string species;
+    std::string sequence;
+    uint64_t length = 0;
+};
+
+struct CommonRunPreparationStats {
+    uint64_t projected_run_count = 0;
+    uint64_t secondary_candidate_runs = 0;
+    uint64_t secondary_accepted_runs = 0;
+    uint64_t secondary_conflict_rejected_runs = 0;
+    uint64_t secondary_redundant_runs = 0;
+    uint64_t secondary_rejected_bases = 0;
+    bool source_lengths_valid = true;
+};
+
+struct PreparedCommonRunCache {
+    std::filesystem::path metadata_path;
+    std::filesystem::path dna_path;
+    uint64_t dna_bytes = 0;
+    CommonRunPreparationStats stats;
+};
+
+class PreparedExportInput {
+public:
+    PreparedExportInput(
+        std::filesystem::path spool_path,
+        std::vector<PreparedRecordIndex> records,
+        std::vector<PreparedManagerSequence> manager_sequences)
+        : spool_path_(std::move(spool_path)),
+          records_(std::move(records)),
+          manager_sequences_(std::move(manager_sequences)) {}
+
+    ~PreparedExportInput() {
+        std::error_code error;
+        std::filesystem::remove(spool_path_, error);
+        if (common_run_cache_) {
+            std::filesystem::remove(
+                common_run_cache_->metadata_path,
+                error);
+            error.clear();
+            std::filesystem::remove(
+                common_run_cache_->dna_path,
+                error);
+        }
+    }
+
+    PreparedExportInput(const PreparedExportInput&) = delete;
+    PreparedExportInput& operator=(const PreparedExportInput&) = delete;
+
+    const std::filesystem::path& spoolPath() const noexcept {
+        return spool_path_;
+    }
+
+    const std::vector<PreparedRecordIndex>& records() const noexcept {
+        return records_;
+    }
+
+    const std::vector<PreparedManagerSequence>& managerSequences() const noexcept {
+        return manager_sequences_;
+    }
+
+    // Callers must hold commonRunCacheMutex() while inspecting or publishing
+    // the cache. Keeping synchronization with the prepared input makes cache
+    // construction single-writer without changing either public export API.
+    std::mutex& commonRunCacheMutex() const noexcept {
+        return common_run_cache_mutex_;
+    }
+
+    const std::optional<PreparedCommonRunCache>&
+    commonRunCacheLocked() const noexcept {
+        return common_run_cache_;
+    }
+
+    void publishCommonRunCacheLocked(
+        PreparedCommonRunCache cache) const {
+        if (common_run_cache_) {
+            throw std::logic_error(
+                "Prepared common run cache was published twice");
+        }
+        common_run_cache_ = std::move(cache);
+    }
+
+private:
+    std::filesystem::path spool_path_;
+    std::vector<PreparedRecordIndex> records_;
+    std::vector<PreparedManagerSequence> manager_sequences_;
+    mutable std::mutex common_run_cache_mutex_;
+    mutable std::optional<PreparedCommonRunCache> common_run_cache_;
+};
 
 
 
 namespace {
+
+void rejectDirectoryOutput(const std::filesystem::path& path) {
+    if (std::filesystem::is_directory(path)) {
+        throw std::invalid_argument(
+            "Output destination is a directory: " + path.string());
+    }
+}
 
 
 struct LeafRow {
@@ -70,7 +282,6 @@ struct LeafRow {
 };
 
 struct BlockMSA {
-    BlockPtr block;
     uint64_t block_id = 0;
     std::string ref_row_id;
     size_t alignment_length = 0;
@@ -78,25 +289,1062 @@ struct BlockMSA {
     ExportBlockOrderKey order_key;
     std::vector<LeafRow> leaf_rows;
 };
+template <typename T>
+void writePreparedPod(std::ostream& output, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    output.write(
+        reinterpret_cast<const char*>(&value),
+        static_cast<std::streamsize>(sizeof(T)));
+    if (!output) {
+        throw std::runtime_error("Failed writing prepared export input");
+    }
+}
+
+template <typename T>
+T readPreparedPod(std::istream& input) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    T value{};
+    input.read(
+        reinterpret_cast<char*>(&value),
+        static_cast<std::streamsize>(sizeof(T)));
+    if (!input) {
+        throw std::runtime_error("Prepared export input is truncated");
+    }
+    return value;
+}
+
+void writePreparedString(
+    std::ostream& output,
+    std::string_view value) {
+    const uint64_t size = value.size();
+    writePreparedPod(output, size);
+    output.write(
+        value.data(),
+        static_cast<std::streamsize>(size));
+    if (!output) {
+        throw std::runtime_error("Failed writing prepared export input");
+    }
+}
+
+std::string readPreparedString(std::istream& input) {
+    const uint64_t size = readPreparedPod<uint64_t>(input);
+    if (size > static_cast<uint64_t>(
+                   std::numeric_limits<size_t>::max()) ||
+        size > static_cast<uint64_t>(
+                   std::numeric_limits<std::streamsize>::max())) {
+        throw std::overflow_error(
+            "Prepared export string exceeds addressable storage");
+    }
+    std::string value(static_cast<size_t>(size), '\0');
+    input.read(
+        value.data(),
+        static_cast<std::streamsize>(size));
+    if (!input) {
+        throw std::runtime_error("Prepared export input is truncated");
+    }
+    return value;
+}
+
+void skipPreparedString(
+    std::istream& input,
+    uint64_t record_end) {
+    const uint64_t size = readPreparedPod<uint64_t>(input);
+    if (size > static_cast<uint64_t>(
+                   std::numeric_limits<std::streamoff>::max())) {
+        throw std::overflow_error(
+            "Prepared export string exceeds seekable storage");
+    }
+    const auto begin = input.tellg();
+    if (begin < 0) {
+        throw std::runtime_error(
+            "Prepared export input is truncated");
+    }
+    const auto begin_offset = static_cast<uint64_t>(
+        static_cast<std::streamoff>(begin));
+    if (begin_offset > record_end ||
+        size > record_end - begin_offset) {
+        throw std::runtime_error(
+            "Prepared export string exceeds its record");
+    }
+    const auto offset = static_cast<std::streamoff>(size);
+    input.seekg(offset, std::ios::cur);
+    if (!input || input.tellg() != begin + offset) {
+        throw std::runtime_error(
+            "Prepared export input is truncated");
+    }
+}
+
+void writePreparedBlockMSA(
+    std::ostream& output,
+    const BlockMSA& msa) {
+    constexpr uint32_t kRecordVersion = 1;
+    writePreparedPod(output, kRecordVersion);
+    writePreparedPod(output, msa.block_id);
+    writePreparedString(output, msa.ref_row_id);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(msa.alignment_length));
+    writePreparedPod(
+        output,
+        static_cast<uint8_t>(msa.secondary_homology));
+    writePreparedString(output, msa.order_key.ref_species);
+    writePreparedString(output, msa.order_key.ref_chr);
+    writePreparedPod(output, msa.order_key.ref_start);
+    writePreparedPod(output, msa.order_key.block_id);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(msa.leaf_rows.size()));
+    for (const auto& row : msa.leaf_rows) {
+        writePreparedString(output, row.row_id);
+        writePreparedString(output, row.leaf_name);
+        writePreparedString(output, row.chr_name);
+        writePreparedString(output, row.hal_sequence_name);
+        writePreparedPod(output, row.segment_start);
+        writePreparedPod(output, row.segment_length);
+        writePreparedPod(
+            output,
+            static_cast<uint8_t>(row.reversed));
+        writePreparedString(output, row.aligned);
+    }
+}
+
+BlockMSA readPreparedBlockMSA(std::istream& input) {
+    constexpr uint32_t kRecordVersion = 1;
+    if (readPreparedPod<uint32_t>(input) != kRecordVersion) {
+        throw std::runtime_error(
+            "Prepared export input has an unsupported record version");
+    }
+    BlockMSA msa;
+    msa.block_id = readPreparedPod<uint64_t>(input);
+    msa.ref_row_id = readPreparedString(input);
+    const uint64_t alignment_length =
+        readPreparedPod<uint64_t>(input);
+    if (alignment_length >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Prepared alignment width exceeds addressable storage");
+    }
+    msa.alignment_length =
+        static_cast<size_t>(alignment_length);
+    msa.secondary_homology =
+        readPreparedPod<uint8_t>(input) != 0;
+    msa.order_key.ref_species =
+        readPreparedString(input);
+    msa.order_key.ref_chr =
+        readPreparedString(input);
+    msa.order_key.ref_start =
+        readPreparedPod<uint64_t>(input);
+    msa.order_key.block_id =
+        readPreparedPod<uint64_t>(input);
+    const uint64_t row_count =
+        readPreparedPod<uint64_t>(input);
+    if (row_count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Prepared row count exceeds addressable storage");
+    }
+    msa.leaf_rows.reserve(
+        static_cast<size_t>(row_count));
+    for (uint64_t row_index = 0;
+         row_index < row_count;
+         ++row_index) {
+        LeafRow row;
+        row.row_id = readPreparedString(input);
+        row.leaf_name = readPreparedString(input);
+        row.chr_name = readPreparedString(input);
+        row.hal_sequence_name =
+            readPreparedString(input);
+        row.segment_start =
+            readPreparedPod<uint64_t>(input);
+        row.segment_length =
+            readPreparedPod<uint32_t>(input);
+        row.reversed =
+            readPreparedPod<uint8_t>(input) != 0;
+        row.aligned = readPreparedString(input);
+        if (row.aligned.size() !=
+            msa.alignment_length) {
+            throw std::runtime_error(
+                "Prepared aligned row has an inconsistent width");
+        }
+        msa.leaf_rows.push_back(std::move(row));
+    }
+    return msa;
+}
+
+template <typename Callback>
+void replayPreparedBlocks(
+    const PreparedExportInput& prepared,
+    Callback&& callback) {
+    std::ifstream input(
+        prepared.spoolPath(),
+        std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "Cannot reopen prepared export input: " +
+            prepared.spoolPath().string());
+    }
+    for (const auto& record : prepared.records()) {
+        input.seekg(
+            static_cast<std::streamoff>(record.offset),
+            std::ios::beg);
+        if (!input) {
+            throw std::runtime_error(
+                "Cannot seek prepared export input");
+        }
+        BlockMSA msa = readPreparedBlockMSA(input);
+        const auto end = input.tellg();
+        if (end < 0 ||
+            static_cast<uint64_t>(
+                static_cast<std::streamoff>(end)) !=
+                record.offset + record.size ||
+            exportBlockOrderLess(
+                msa.order_key,
+                record.order_key) ||
+            exportBlockOrderLess(
+                record.order_key,
+                msa.order_key)) {
+            throw std::runtime_error(
+                "Prepared export record index is inconsistent");
+        }
+        callback(std::move(msa));
+    }
+}
+
+struct TransparentStringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+    size_t operator()(const std::string& value) const noexcept {
+        return (*this)(std::string_view(value));
+    }
+};
+
+struct TransparentStringEqual {
+    using is_transparent = void;
+    bool operator()(
+        std::string_view lhs,
+        std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+};
+
+class RunStorage {
+public:
+    class DnaView {
+    public:
+        DnaView() = default;
+        DnaView(std::string_view view) noexcept
+            : view_(view) {}
+
+        const char* data() const noexcept {
+            return view_.data();
+        }
+        size_t size() const noexcept {
+            return view_.size();
+        }
+        bool empty() const noexcept {
+            return view_.empty();
+        }
+        std::string_view::const_iterator begin() const noexcept {
+            return view_.begin();
+        }
+        std::string_view::const_iterator end() const noexcept {
+            return view_.end();
+        }
+        char operator[](size_t index) const {
+            return view_[index];
+        }
+        operator std::string_view() const noexcept {
+            return view_;
+        }
+
+        friend bool operator==(
+            const DnaView& lhs,
+            const DnaView& rhs) noexcept {
+            return lhs.view_ == rhs.view_;
+        }
+        friend bool operator!=(
+            const DnaView& lhs,
+            const DnaView& rhs) noexcept {
+            return !(lhs == rhs);
+        }
+        friend bool operator<(
+            const DnaView& lhs,
+            const DnaView& rhs) noexcept {
+            return lhs.view_ < rhs.view_;
+        }
+
+    private:
+        friend class RunStorage;
+        DnaView(
+            std::shared_ptr<const std::vector<char>> owner,
+            size_t begin,
+            size_t length)
+            : owner_(std::move(owner)),
+              view_(owner_->data() + begin, length) {}
+
+        std::shared_ptr<const std::vector<char>> owner_;
+        std::string_view view_;
+    };
+
+    ~RunStorage() {
+        external_dna_input_.close();
+        if (!external_dna_path_.empty()) {
+            std::error_code error;
+            std::filesystem::remove(
+                external_dna_path_,
+                error);
+        }
+    }
+
+    RunStorage() = default;
+    RunStorage(const RunStorage&) = delete;
+    RunStorage& operator=(const RunStorage&) = delete;
+
+    uint32_t intern(std::string_view value) {
+        const auto found =
+            identity_by_text_.find(value);
+        if (found != identity_by_text_.end()) {
+            return found->second;
+        }
+        if (identities_.size() >=
+            std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "HAL run identity table exceeds 32-bit ids");
+        }
+        const uint32_t id =
+            static_cast<uint32_t>(identities_.size());
+        identities_.emplace_back(value);
+        identity_by_text_.emplace(
+            std::string_view(identities_.back()),
+            id);
+        return id;
+    }
+
+    const std::string& identity(uint32_t id) const {
+        if (id >= identities_.size()) {
+            throw std::out_of_range(
+                "HAL run identity id is outside its table");
+        }
+        return identities_[id];
+    }
+
+    uint64_t appendDNA(std::string_view dna) {
+        if (external_dna_active_) {
+            throw std::logic_error(
+                "Cannot append DNA after HAL run storage compaction");
+        }
+        if (dna.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("HAL run DNA exceeds 32-bit run length");
+        }
+        const uint64_t offset = allocateDNA(static_cast<uint32_t>(dna.size()));
+        std::copy(dna.begin(), dna.end(), mutableDNA(offset));
+        return offset;
+    }
+
+
+    uint64_t appendDNAFrom(
+        std::istream& input,
+        uint32_t length) {
+        const uint64_t offset =
+            allocateDNA(length);
+        input.read(
+            mutableDNA(offset),
+            static_cast<std::streamsize>(length));
+        if (static_cast<uint32_t>(
+                input.gcount()) != length) {
+            throw std::runtime_error(
+                "Prepared common run DNA cache is truncated");
+        }
+        return offset;
+    }
+    void replaceDNA(
+        uint64_t offset,
+        std::string_view dna) {
+        if (external_dna_active_) {
+            throw std::logic_error(
+                "Cannot replace compacted external HAL run DNA");
+        }
+        const size_t chunk_id =
+            static_cast<size_t>(offset >> 32U);
+        const uint32_t begin =
+            static_cast<uint32_t>(offset);
+        if (chunk_id >= dna_chunks_.size() ||
+            begin > dna_chunks_[chunk_id].used ||
+            dna.size() >
+                dna_chunks_[chunk_id].used - begin) {
+            throw std::out_of_range(
+                "HAL pooled run DNA replacement is outside its chunk");
+        }
+        std::copy(
+            dna.begin(),
+            dna.end(),
+            mutableDNA(offset));
+    }
+
+    DnaView dna(uint64_t offset, uint32_t length) const {
+        if (!external_dna_active_) {
+            const size_t chunk_id = static_cast<size_t>(offset >> 32U);
+            const uint32_t begin = static_cast<uint32_t>(offset);
+            if (chunk_id >= dna_chunks_.size() ||
+                begin > dna_chunks_[chunk_id].used ||
+                length > dna_chunks_[chunk_id].used - begin) {
+                throw std::out_of_range(
+                    "HAL pooled run DNA slice is outside its chunk");
+            }
+            return DnaView(std::string_view(
+                dna_chunks_[chunk_id].data.get() + begin,
+                length));
+        }
+
+        if (offset > external_dna_bytes_ ||
+            length > external_dna_bytes_ - offset) {
+            throw std::out_of_range(
+                "HAL external run DNA slice is outside its spool");
+        }
+        if (length == 0) {
+            return DnaView(std::string_view{});
+        }
+
+        constexpr uint64_t kCacheBlockBytes =
+            4ULL * 1024ULL * 1024ULL;
+        const uint64_t last = offset + length - 1;
+        const uint64_t block_begin =
+            (offset / kCacheBlockBytes) * kCacheBlockBytes;
+        if (last / kCacheBlockBytes ==
+            offset / kCacheBlockBytes) {
+            const size_t block_size = static_cast<size_t>(
+                std::min<uint64_t>(
+                    kCacheBlockBytes,
+                    external_dna_bytes_ - block_begin));
+            auto owner = externalBlock(
+                block_begin,
+                block_size);
+            return DnaView(
+                std::move(owner),
+                static_cast<size_t>(offset - block_begin),
+                length);
+        }
+
+        // A view must be contiguous. A span crossing a cache-block boundary
+        // therefore gets one exact, pinned allocation for the duration of
+        // that view instead of growing the resident cache.
+        auto owner = readExternalRange(
+            offset,
+            static_cast<size_t>(length));
+        return DnaView(
+            std::move(owner),
+            0,
+            length);
+    }
+
+    size_t identityBytes() const {
+        size_t bytes = 0;
+        for (const auto& identity : identities_) {
+            bytes += identity.capacity();
+        }
+        return bytes;
+    }
+    size_t identityCount() const noexcept {
+        return identities_.size();
+    }
+
+    size_t dnaCapacityBytes() const {
+        if (!external_dna_active_) {
+            return dna_capacity_bytes_;
+        }
+        std::shared_lock<std::shared_mutex> lock(
+            external_cache_mutex_);
+        return external_cache_bytes_;
+    }
+
+    uint64_t dnaDiskBytes() const noexcept {
+        return external_dna_bytes_;
+    }
+
+    void clearDNA() {
+        if (external_dna_active_) {
+            throw std::logic_error(
+                "Cannot clear compacted external HAL run DNA");
+        }
+        std::vector<DnaChunk>{}.swap(dna_chunks_);
+        dna_capacity_bytes_ = 0;
+    }
+
+    void adoptExternalDNA(
+        const std::filesystem::path& path,
+        uint64_t bytes) {
+        if (!dna_chunks_.empty() ||
+            external_dna_active_) {
+            throw std::logic_error(
+                "HAL run DNA storage is not empty before compaction");
+        }
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                "Cannot open compacted external HAL run DNA");
+        }
+        external_dna_path_ = path;
+        external_dna_bytes_ = bytes;
+        external_dna_input_ = std::move(input);
+        external_dna_active_ = true;
+    }
+
+private:
+    struct DnaChunk {
+        std::unique_ptr<char[]> data;
+        uint32_t capacity = 0;
+        uint32_t used = 0;
+    };
+
+    struct ExternalCacheBlock {
+        uint64_t begin = 0;
+        std::shared_ptr<const std::vector<char>> bytes;
+    };
+
+    uint64_t allocateDNA(uint32_t length) {
+        constexpr uint32_t kChunkBytes = 4U * 1024U * 1024U;
+        if (dna_chunks_.empty() ||
+            dna_chunks_.back().capacity - dna_chunks_.back().used < length) {
+            if (dna_chunks_.size() >= std::numeric_limits<uint32_t>::max()) {
+                throw std::overflow_error("HAL DNA chunk index overflow");
+            }
+            const uint32_t capacity = std::max(kChunkBytes, length);
+            if (capacity > std::numeric_limits<size_t>::max() - dna_capacity_bytes_) {
+                throw std::overflow_error("HAL DNA allocation size overflow");
+            }
+            dna_chunks_.push_back(
+                DnaChunk{std::unique_ptr<char[]>(new char[capacity]), capacity, 0});
+            dna_capacity_bytes_ += capacity;
+        }
+        DnaChunk& chunk = dna_chunks_.back();
+        // A whole run occupies one allocation. Slices can advance its low
+        // 32-bit offset without copying DNA or invalidating existing views.
+        const uint64_t offset =
+            (static_cast<uint64_t>(dna_chunks_.size() - 1) << 32U) | chunk.used;
+        chunk.used += length;
+        return offset;
+    }
+
+    char* mutableDNA(uint64_t offset) {
+        return dna_chunks_[static_cast<size_t>(offset >> 32U)].data.get() +
+               static_cast<uint32_t>(offset);
+    }
+
+    std::shared_ptr<const std::vector<char>> readExternalRangeLocked(
+        uint64_t offset,
+        size_t length) const {
+        if (offset >
+            static_cast<uint64_t>(
+                std::numeric_limits<std::streamoff>::max())) {
+            throw std::overflow_error(
+                "HAL external run DNA offset exceeds stream limits");
+        }
+        auto bytes =
+            std::make_shared<std::vector<char>>(length);
+        external_dna_input_.clear();
+        external_dna_input_.seekg(
+            static_cast<std::streamoff>(offset),
+            std::ios::beg);
+        if (!external_dna_input_) {
+            throw std::runtime_error(
+                "Cannot seek compacted external HAL run DNA");
+        }
+        external_dna_input_.read(
+            bytes->data(),
+            static_cast<std::streamsize>(length));
+        if (static_cast<size_t>(
+                external_dna_input_.gcount()) != length) {
+            throw std::runtime_error(
+                "Compacted external HAL run DNA is truncated");
+        }
+        return bytes;
+    }
+
+    std::shared_ptr<const std::vector<char>> readExternalRange(
+        uint64_t offset,
+        size_t length) const {
+        std::lock_guard<std::mutex> lock(
+            external_dna_input_mutex_);
+        return readExternalRangeLocked(offset, length);
+    }
+
+    std::shared_ptr<const std::vector<char>> externalBlock(
+        uint64_t block_begin,
+        size_t block_size) const {
+        constexpr size_t kCacheBytes =
+            64ULL * 1024ULL * 1024ULL;
+        {
+            // Hits do not mutate recency state, so independent consensus
+            // threads only take a shared metadata lock and keep their own
+            // shared_ptr pin across any later eviction.
+            std::shared_lock<std::shared_mutex> lock(
+                external_cache_mutex_);
+            const auto found =
+                external_cache_by_offset_.find(block_begin);
+            if (found != external_cache_by_offset_.end()) {
+                return found->second->bytes;
+            }
+        }
+
+        // Cache hits never wait for disk I/O. Misses share the stream lock
+        // through publication and recheck after acquiring it, so queued
+        // readers do not allocate and read the same cacheable block again.
+        std::lock_guard<std::mutex> input_lock(
+            external_dna_input_mutex_);
+        {
+            std::shared_lock<std::shared_mutex> lock(
+                external_cache_mutex_);
+            const auto found =
+                external_cache_by_offset_.find(block_begin);
+            if (found != external_cache_by_offset_.end()) {
+                return found->second->bytes;
+            }
+        }
+        auto bytes =
+            readExternalRangeLocked(
+                block_begin,
+                block_size);
+        const size_t resident_bytes =
+            bytes->capacity();
+        if (resident_bytes > kCacheBytes) {
+            return bytes;
+        }
+
+        std::unique_lock<std::shared_mutex> lock(
+            external_cache_mutex_);
+        while (external_cache_bytes_ >
+               kCacheBytes - resident_bytes) {
+            auto victim =
+                external_cache_.end();
+            for (auto candidate =
+                     external_cache_.end();
+                 candidate !=
+                     external_cache_.begin();) {
+                --candidate;
+                if (candidate->bytes.use_count() == 1) {
+                    victim = candidate;
+                    break;
+                }
+            }
+            if (victim == external_cache_.end()) {
+                // Current DnaViews pin the retained blocks. This miss stays
+                // transient rather than exceeding the 64 MiB cache budget.
+                return bytes;
+            }
+            external_cache_bytes_ -=
+                victim->bytes->capacity();
+            external_cache_by_offset_.erase(
+                victim->begin);
+            external_cache_.erase(victim);
+        }
+        external_cache_.push_front(
+            ExternalCacheBlock{
+                block_begin,
+                std::move(bytes)});
+        external_cache_by_offset_.emplace(
+            block_begin,
+            external_cache_.begin());
+        external_cache_bytes_ +=
+            external_cache_.front()
+                .bytes->capacity();
+        return external_cache_.front().bytes;
+    }
+
+    std::deque<std::string> identities_;
+    std::unordered_map<
+        std::string_view,
+        uint32_t,
+        TransparentStringHash,
+        TransparentStringEqual> identity_by_text_;
+    std::vector<DnaChunk> dna_chunks_;
+    size_t dna_capacity_bytes_ = 0;
+    bool external_dna_active_ = false;
+
+    std::filesystem::path external_dna_path_;
+    uint64_t external_dna_bytes_ = 0;
+    mutable std::ifstream external_dna_input_;
+    mutable std::mutex external_dna_input_mutex_;
+    mutable std::shared_mutex external_cache_mutex_;
+    mutable std::list<ExternalCacheBlock> external_cache_;
+    mutable std::unordered_map<
+        uint64_t,
+        std::list<ExternalCacheBlock>::iterator>
+        external_cache_by_offset_;
+    mutable size_t external_cache_bytes_ = 0;
+};
 
 struct LeafRunSpan {
-    std::string row_id;
-    std::string leaf_name;
-    std::string chr_name;
-    // Internal species-qualified key; never emit this as the HAL sequence
-    // name because HAL sequence names are scoped by genome.
-    std::string hal_sequence_name;
+    RunStorage* storage = nullptr;
+    uint32_t row_ordinal = 0;
+    uint32_t leaf_name = 0;
+    uint32_t chr_name = 0;
+    uint32_t hal_sequence_name = 0;
     uint64_t start = 0;
+    uint64_t dna_offset = 0;
     uint32_t length = 0;
     bool reversed = false;
-    std::string dna;
+};
+
+const std::string& spanIdentity(
+    const LeafRunSpan& span,
+    uint32_t identity_id) {
+    if (span.storage == nullptr) {
+        throw std::logic_error(
+            "HAL run span has no identity storage");
+    }
+    return span.storage->identity(identity_id);
+}
+
+RunStorage::DnaView spanDNA(
+    const LeafRunSpan& span) {
+    if (span.storage == nullptr) {
+        throw std::logic_error(
+            "HAL run span has no DNA storage");
+    }
+    return span.storage->dna(
+        span.dna_offset,
+        span.length);
+}
+uint32_t parseRowOrdinal(std::string_view row_id) {
+    const size_t separator = row_id.rfind('\1');
+    if (separator == std::string_view::npos ||
+        separator + 1 == row_id.size()) {
+        throw std::runtime_error(
+            "Prepared occurrence has an invalid row id");
+    }
+    uint32_t ordinal = 0;
+    const char* begin =
+        row_id.data() + separator + 1;
+    const char* end =
+        row_id.data() + row_id.size();
+    const auto parsed =
+        std::from_chars(begin, end, ordinal);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != end) {
+        throw std::runtime_error(
+            "Prepared occurrence has an invalid row ordinal");
+    }
+    return ordinal;
+}
+
+bool rowOrdinalLexLess(
+    uint32_t lhs,
+    uint32_t rhs) {
+    std::array<char, 10> lhs_text{};
+    std::array<char, 10> rhs_text{};
+    const auto lhs_end =
+        std::to_chars(
+            lhs_text.data(),
+            lhs_text.data() + lhs_text.size(),
+            lhs);
+    const auto rhs_end =
+        std::to_chars(
+            rhs_text.data(),
+            rhs_text.data() + rhs_text.size(),
+            rhs);
+    return std::string_view(
+               lhs_text.data(),
+               lhs_end.ptr) <
+           std::string_view(
+               rhs_text.data(),
+               rhs_end.ptr);
+}
+struct FlatLeafSpanStorage {
+    std::vector<LeafRunSpan> spans;
+};
+
+class LeafSpanList {
+    struct FlatView {
+        FlatLeafSpanStorage* storage = nullptr;
+        uint64_t offset = 0;
+        uint32_t count = 0;
+    };
+
+public:
+    using value_type = LeafRunSpan;
+    using iterator = LeafRunSpan*;
+    using const_iterator = const LeafRunSpan*;
+
+    size_t size() const noexcept {
+        if (const auto* flat = std::get_if<FlatView>(&state_)) {
+            return flat->count;
+        }
+        return std::get<std::vector<LeafRunSpan>>(state_).size();
+    }
+
+    bool empty() const noexcept {
+        return size() == 0;
+    }
+
+    iterator begin() noexcept {
+        if (const auto* flat = std::get_if<FlatView>(&state_)) {
+            return flat->storage->spans.data() + flat->offset;
+        }
+        return std::get<std::vector<LeafRunSpan>>(state_).data();
+    }
+
+    iterator end() noexcept {
+        return begin() + size();
+    }
+
+    const_iterator begin() const noexcept {
+        if (const auto* flat = std::get_if<FlatView>(&state_)) {
+            return flat->storage->spans.data() + flat->offset;
+        }
+        return std::get<std::vector<LeafRunSpan>>(state_).data();
+    }
+
+    const_iterator end() const noexcept {
+        return begin() + size();
+    }
+
+    const_iterator cbegin() const noexcept {
+        return begin();
+    }
+
+    const_iterator cend() const noexcept {
+        return end();
+    }
+
+    LeafRunSpan& operator[](size_t index) {
+        return begin()[index];
+    }
+
+    const LeafRunSpan& operator[](size_t index) const {
+        return begin()[index];
+    }
+
+    LeafRunSpan& back() {
+        return (*this)[size() - 1];
+    }
+
+    const LeafRunSpan& back() const {
+        return (*this)[size() - 1];
+    }
+
+    void reserve(size_t size) {
+        requireMutable().reserve(size);
+    }
+
+    void push_back(LeafRunSpan span) {
+        requireMutable().push_back(std::move(span));
+    }
+
+    template <typename Iterator>
+    void insert(
+        iterator position,
+        Iterator first,
+        Iterator last) {
+        auto& working = requireMutable();
+        if (position != end()) {
+            throw std::logic_error(
+                "HAL run span insertion is append-only");
+        }
+        working.insert(working.end(), first, last);
+    }
+
+    LeafSpanList& operator=(
+        std::vector<LeafRunSpan>&& spans) {
+        requireMutable() = std::move(spans);
+        return *this;
+    }
+
+    void bindFlat(FlatLeafSpanStorage& flat, uint64_t offset) {
+        const size_t count = requireMutable().size();
+        if (count > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("Too many occurrences in one HAL run");
+        }
+        state_.emplace<FlatView>(
+            FlatView{&flat, offset, static_cast<uint32_t>(count)});
+    }
+
+private:
+    std::vector<LeafRunSpan>& requireMutable() {
+        auto* working = std::get_if<std::vector<LeafRunSpan>>(&state_);
+        if (working == nullptr) {
+            throw std::logic_error(
+                "Cannot mutate compacted HAL run spans");
+        }
+        return *working;
+    }
+
+    std::variant<std::vector<LeafRunSpan>, FlatView> state_;
+};
+
+
+
+class FlatPresenceStorage {
+public:
+    explicit FlatPresenceStorage(size_t node_count)
+        : node_count_(node_count),
+          words_per_run_((node_count + 63) / 64) {}
+
+    uint64_t append(
+        const std::vector<uint8_t>& presence) {
+        if (presence.size() != node_count_) {
+            throw std::invalid_argument(
+                "HAL run presence width differs from the tree");
+        }
+        const uint64_t offset = words_.size();
+        words_.resize(
+            words_.size() + words_per_run_,
+            0);
+        for (size_t index = 0;
+             index < presence.size();
+             ++index) {
+            if (presence[index] != 0) {
+                words_[static_cast<size_t>(offset) +
+                       index / 64] |=
+                    uint64_t{1} << (index % 64);
+            }
+        }
+        return offset;
+    }
+
+    bool contains(
+        uint64_t offset,
+        size_t node_id) const {
+        if (node_id >= node_count_ ||
+            offset > words_.size() ||
+            words_per_run_ >
+                words_.size() - offset) {
+            throw std::out_of_range(
+                "HAL compact presence lookup is outside its domain");
+        }
+        return (words_[static_cast<size_t>(offset) +
+                       node_id / 64] &
+                (uint64_t{1} << (node_id % 64))) != 0;
+    }
+
+    size_t capacityBytes() const noexcept {
+        return words_.capacity() * sizeof(uint64_t);
+    }
+
+private:
+    size_t node_count_ = 0;
+    size_t words_per_run_ = 0;
+    std::vector<uint64_t> words_;
 };
 
 struct LeafOccurrence {
     uint64_t run_id = 0;
-    LeafRunSpan span;
+    const LeafRunSpan* span = nullptr;
     bool forward_to_canonical = true;
     uint32_t copy_index = 0;
+};
+
+class BlockIdList {
+    struct InlineIds {
+        std::array<uint64_t, 2> values{};
+        uint8_t count = 0;
+    };
+
+public:
+    using iterator = uint64_t*;
+    using const_iterator = const uint64_t*;
+
+    size_t size() const noexcept {
+        if (const auto* small = std::get_if<InlineIds>(&state_)) {
+            return small->count;
+        }
+        return std::get<std::vector<uint64_t>>(state_).size();
+    }
+
+    bool empty() const noexcept {
+        return size() == 0;
+    }
+
+    iterator begin() noexcept {
+        if (auto* small = std::get_if<InlineIds>(&state_)) {
+            return small->values.data();
+        }
+        return std::get<std::vector<uint64_t>>(state_).data();
+    }
+
+    iterator end() noexcept {
+        return begin() + size();
+    }
+
+    const_iterator begin() const noexcept {
+        if (const auto* small = std::get_if<InlineIds>(&state_)) {
+            return small->values.data();
+        }
+        return std::get<std::vector<uint64_t>>(state_).data();
+    }
+
+    const_iterator end() const noexcept {
+        return begin() + size();
+    }
+
+    void push_back(uint64_t value) {
+        if (auto* small = std::get_if<InlineIds>(&state_)) {
+            if (small->count < small->values.size()) {
+                small->values[small->count++] = value;
+                return;
+            }
+            std::vector<uint64_t> many;
+            many.reserve(4);
+            many.insert(
+                many.end(),
+                small->values.begin(),
+                small->values.end());
+            many.push_back(value);
+            state_.emplace<std::vector<uint64_t>>(std::move(many));
+        } else {
+            std::get<std::vector<uint64_t>>(state_).push_back(value);
+        }
+    }
+
+    template <typename Iterator>
+    void insert(
+        iterator position,
+        Iterator first,
+        Iterator last) {
+        if (position != end()) {
+            throw std::logic_error(
+                "HAL Block provenance insertion is append-only");
+        }
+        for (; first != last; ++first) {
+            push_back(*first);
+        }
+    }
+
+    void erase(iterator first, iterator last) {
+        if (last != end()) {
+            throw std::logic_error(
+                "HAL Block provenance erasure must trim a suffix");
+        }
+        const size_t kept =
+            static_cast<size_t>(first - begin());
+        if (auto* many = std::get_if<std::vector<uint64_t>>(&state_)) {
+            many->resize(kept);
+            if (kept <= 2) {
+                InlineIds small;
+                std::copy(many->begin(), many->end(), small.values.begin());
+                small.count = static_cast<uint8_t>(kept);
+                state_.emplace<InlineIds>(small);
+            }
+        } else {
+            std::get<InlineIds>(state_).count = static_cast<uint8_t>(kept);
+        }
+    }
+
+    friend bool operator==(
+        const BlockIdList& lhs,
+        const BlockIdList& rhs) {
+        return lhs.size() == rhs.size() &&
+               std::equal(
+                   lhs.begin(),
+                   lhs.end(),
+                   rhs.begin());
+    }
+
+private:
+    std::variant<InlineIds, std::vector<uint64_t>> state_{InlineIds{}};
 };
 
 struct ColumnRun {
@@ -105,12 +1353,538 @@ struct ColumnRun {
     uint32_t col_beg = 0;
     uint32_t col_end = 0;
     bool secondary_homology = false;
-    std::vector<uint8_t> leaf_present;
-    std::vector<LeafRunSpan> leaf_spans;
-    std::vector<uint64_t> source_block_ids;
-    std::vector<uint8_t> present_by_node;
-    std::vector<double> presence_margin;
+    uint64_t presence_offset = 0;
+    LeafSpanList leaf_spans;
+    BlockIdList source_block_ids;
 };
+
+constexpr uint64_t kCommonRunCacheMagic =
+    0x52414d415852554eULL;
+constexpr uint64_t kCommonRunCacheVersion = 1;
+
+struct CacheFileGuard {
+    std::filesystem::path path;
+    bool armed = true;
+    ~CacheFileGuard() {
+        if (!armed) {
+            return;
+        }
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+    void release() noexcept {
+        armed = false;
+    }
+};
+
+std::vector<ColumnRun> readCommonColumnRuns(
+    const PreparedCommonRunCache& cache,
+    RunStorage& storage) {
+    std::ifstream metadata_input(
+        cache.metadata_path,
+        std::ios::binary);
+    std::ifstream dna_input(
+        cache.dna_path,
+        std::ios::binary);
+    if (!metadata_input || !dna_input) {
+        throw std::runtime_error(
+            "Cannot reopen prepared common run cache");
+    }
+    const auto header =
+        readPreparedPod<std::array<uint64_t, 7>>(
+            metadata_input);
+    if (header[0] != kCommonRunCacheMagic ||
+        header[1] != kCommonRunCacheVersion) {
+        throw std::runtime_error(
+            "Prepared common run cache has an unsupported format");
+    }
+    const uint64_t identity_count = header[2];
+    const uint64_t run_count = header[3];
+    const uint64_t occurrence_count = header[4];
+    const uint64_t dna_bytes = header[5];
+    if (header[6] != 0 ||
+        dna_bytes != cache.dna_bytes ||
+        identity_count >
+            std::numeric_limits<uint32_t>::max() ||
+        run_count >
+            static_cast<uint64_t>(
+                std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error(
+            "Prepared common run cache header is inconsistent");
+    }
+    for (uint64_t identity_id = 0;
+         identity_id < identity_count;
+         ++identity_id) {
+        const uint32_t actual_id =
+            storage.intern(
+                readPreparedString(metadata_input));
+        if (actual_id != identity_id) {
+            throw std::runtime_error(
+                "Prepared common run identity order is inconsistent");
+        }
+    }
+
+    std::vector<ColumnRun> runs;
+    runs.reserve(static_cast<size_t>(run_count));
+    uint64_t observed_occurrences = 0;
+    uint64_t observed_dna_bytes = 0;
+
+    for (uint64_t run_index = 0;
+         run_index < run_count;
+         ++run_index) {
+        const auto metadata =
+            readPreparedPod<std::array<uint64_t, 7>>(
+                metadata_input);
+        if (metadata[2] >
+            std::numeric_limits<uint32_t>::max() ||
+            metadata[3] >
+                std::numeric_limits<uint32_t>::max() ||
+            metadata[2] >= metadata[3] ||
+            metadata[4] > 1 ||
+            metadata[6] >
+                std::numeric_limits<uint32_t>::max() ||
+            metadata[6] >
+                occurrence_count -
+                    observed_occurrences) {
+            throw std::runtime_error(
+                "Prepared common run metadata is out of range");
+        }
+        ColumnRun run;
+        run.run_id = metadata[0];
+        run.block_id = metadata[1];
+        run.col_beg =
+            static_cast<uint32_t>(metadata[2]);
+        run.col_end =
+            static_cast<uint32_t>(metadata[3]);
+        run.secondary_homology =
+            metadata[4] != 0;
+        for (uint64_t source_index = 0;
+             source_index < metadata[5];
+             ++source_index) {
+            run.source_block_ids.push_back(
+                readPreparedPod<uint64_t>(
+                    metadata_input));
+        }
+        run.leaf_spans.reserve(
+            static_cast<size_t>(metadata[6]));
+        for (uint64_t span_index = 0;
+             span_index < metadata[6];
+             ++span_index) {
+            const auto span_metadata =
+                readPreparedPod<std::array<uint64_t, 4>>(
+                    metadata_input);
+            if ((span_metadata[3] >> 33U) != 0 ||
+                static_cast<uint32_t>(
+                    span_metadata[0]) >=
+                    identity_count ||
+                static_cast<uint32_t>(
+                    span_metadata[1] >> 32U) >=
+                    identity_count ||
+                static_cast<uint32_t>(
+                    span_metadata[1]) >=
+                    identity_count) {
+                throw std::runtime_error(
+                    "Prepared common run span metadata is out of range");
+            }
+            LeafRunSpan span;
+            span.storage = &storage;
+            span.row_ordinal =
+                static_cast<uint32_t>(
+                    span_metadata[0] >> 32U);
+            span.leaf_name =
+                static_cast<uint32_t>(
+                    span_metadata[0]);
+            span.chr_name =
+                static_cast<uint32_t>(
+                    span_metadata[1] >> 32U);
+            span.hal_sequence_name =
+                static_cast<uint32_t>(
+                    span_metadata[1]);
+            span.start = span_metadata[2];
+            span.length =
+                static_cast<uint32_t>(
+                    span_metadata[3] >> 1U);
+            span.reversed =
+                (span_metadata[3] & 1U) != 0;
+            if (span.length >
+                dna_bytes - observed_dna_bytes) {
+                throw std::runtime_error(
+                    "Prepared common run spans exceed their DNA spool");
+            }
+            span.dna_offset =
+                storage.appendDNAFrom(
+                    dna_input,
+                    span.length);
+            observed_dna_bytes += span.length;
+            ++observed_occurrences;
+            run.leaf_spans.push_back(
+                std::move(span));
+        }
+        runs.push_back(std::move(run));
+    }
+    if (observed_occurrences != occurrence_count ||
+        observed_dna_bytes != dna_bytes ||
+        metadata_input.peek() !=
+            std::char_traits<char>::eof() ||
+        dna_input.peek() !=
+            std::char_traits<char>::eof()) {
+        throw std::runtime_error(
+            "Prepared common run cache has trailing or missing data");
+    }
+    return runs;
+}
+
+void writeCommonRunCache(
+    const std::vector<ColumnRun>& runs,
+    const RunStorage& storage,
+    const std::filesystem::path& scratch_directory,
+    const CommonRunPreparationStats& stats,
+    const PreparedExportInput& prepared) {
+    static std::atomic<uint64_t> next_id{0};
+    std::filesystem::path metadata_path;
+    std::filesystem::path dna_path;
+    const uint64_t clock_id = static_cast<uint64_t>(
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count());
+    do {
+        metadata_path =
+            scratch_directory /
+            ("ramax-common-runs-" +
+             std::to_string(clock_id) + "-" +
+             std::to_string(
+                 next_id.fetch_add(
+                     1,
+                     std::memory_order_relaxed)) +
+             ".bin");
+        dna_path = metadata_path;
+        dna_path += ".dna";
+    } while (std::filesystem::exists(metadata_path) ||
+             std::filesystem::exists(dna_path));
+    CacheFileGuard metadata_guard{metadata_path};
+    CacheFileGuard dna_guard{dna_path};
+
+    uint64_t occurrence_count = 0;
+    uint64_t dna_bytes = 0;
+    for (const auto& run : runs) {
+        if (run.leaf_spans.size() >
+            std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "Too many occurrences in one compact common run");
+        }
+        if (run.leaf_spans.size() >
+            std::numeric_limits<uint64_t>::max() -
+                occurrence_count) {
+            throw std::overflow_error(
+                "Compact common run occurrence count overflow");
+        }
+        occurrence_count += run.leaf_spans.size();
+        for (const auto& span : run.leaf_spans) {
+            if (span.length >
+                std::numeric_limits<uint64_t>::max() -
+                    dna_bytes) {
+                throw std::overflow_error(
+                    "Compact common run DNA size overflow");
+            }
+            dna_bytes += span.length;
+        }
+    }
+    if (storage.identityCount() >
+        std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error(
+            "Compact common run identity count overflow");
+    }
+
+    // This is the former compact-run spool promoted to a reusable artifact:
+    // identities and run boundaries precede the same fixed-width leaf-span
+    // records, while DNA remains in one sequential companion file.
+    std::ofstream metadata_output(
+        metadata_path,
+        std::ios::binary | std::ios::trunc);
+    std::ofstream dna_output(
+        dna_path,
+        std::ios::binary | std::ios::trunc);
+    if (!metadata_output || !dna_output) {
+        throw std::runtime_error(
+            "Cannot create prepared common run cache");
+    }
+    writePreparedPod(
+        metadata_output,
+        std::array<uint64_t, 7>{
+            kCommonRunCacheMagic,
+            kCommonRunCacheVersion,
+            storage.identityCount(),
+            runs.size(),
+            occurrence_count,
+            dna_bytes,
+            0});
+    for (uint32_t identity_id = 0;
+         identity_id < storage.identityCount();
+         ++identity_id) {
+        writePreparedString(
+            metadata_output,
+            storage.identity(identity_id));
+    }
+    for (const auto& run : runs) {
+        writePreparedPod(
+            metadata_output,
+            std::array<uint64_t, 7>{
+                run.run_id,
+                run.block_id,
+                run.col_beg,
+                run.col_end,
+                run.secondary_homology ? 1ULL : 0ULL,
+                run.source_block_ids.size(),
+                run.leaf_spans.size()});
+        for (uint64_t source_block_id :
+             run.source_block_ids) {
+            writePreparedPod(
+                metadata_output,
+                source_block_id);
+        }
+        for (const auto& span : run.leaf_spans) {
+            writePreparedPod(
+                metadata_output,
+                std::array<uint64_t, 4>{
+                    (static_cast<uint64_t>(
+                         span.row_ordinal) << 32U) |
+                        span.leaf_name,
+                    (static_cast<uint64_t>(
+                         span.chr_name) << 32U) |
+                        span.hal_sequence_name,
+                    span.start,
+                    (static_cast<uint64_t>(
+                         span.length) << 1U) |
+                        span.reversed});
+            const auto dna = spanDNA(span);
+            if (dna.size() != span.length) {
+                throw std::runtime_error(
+                    "Compact common run DNA length is inconsistent");
+            }
+            dna_output.write(
+                dna.data(),
+                static_cast<std::streamsize>(
+                    dna.size()));
+            if (!dna_output) {
+                throw std::runtime_error(
+                    "Failed writing compact common run DNA");
+            }
+        }
+    }
+    metadata_output.close();
+    dna_output.close();
+    if (!metadata_output || !dna_output) {
+        throw std::runtime_error(
+            "Failed closing prepared common run cache");
+    }
+    std::error_code size_error;
+    if (std::filesystem::file_size(
+            dna_path,
+            size_error) != dna_bytes ||
+        size_error) {
+        throw std::runtime_error(
+            "Prepared common run DNA spool size is inconsistent");
+    }
+
+    PreparedCommonRunCache cache{
+        metadata_path,
+        dna_path,
+        dna_bytes,
+        stats};
+    prepared.publishCommonRunCacheLocked(
+        std::move(cache));
+    metadata_guard.release();
+    dna_guard.release();
+}
+
+
+
+
+void compactRuns(
+    std::vector<ColumnRun>& runs,
+    RunStorage& storage,
+    FlatLeafSpanStorage& flat,
+    const std::filesystem::path& scratch_directory) {
+    static std::atomic<uint64_t> next_id{0};
+    std::filesystem::path metadata_path;
+    std::filesystem::path dna_path;
+    const uint64_t clock_id = static_cast<uint64_t>(
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count());
+    do {
+        metadata_path =
+            scratch_directory /
+            ("ramax-compact-runs-" +
+             std::to_string(clock_id) + "-" +
+             std::to_string(
+                 next_id.fetch_add(
+                     1,
+                     std::memory_order_relaxed)) +
+             ".bin");
+        dna_path = metadata_path;
+        dna_path += ".dna";
+    } while (std::filesystem::exists(metadata_path) ||
+             std::filesystem::exists(dna_path));
+    CacheFileGuard metadata_guard{metadata_path};
+    CacheFileGuard dna_guard{dna_path};
+    std::ofstream metadata_output(
+        metadata_path,
+        std::ios::binary | std::ios::trunc);
+    if (!metadata_output) {
+        throw std::runtime_error(
+            "Cannot create compact HAL run metadata spool");
+    }
+    std::ofstream dna_output(
+        dna_path,
+        std::ios::binary | std::ios::trunc);
+    if (!dna_output) {
+        throw std::runtime_error(
+            "Cannot create compact HAL run DNA spool");
+    }
+    size_t occurrence_count = 0;
+    uint64_t dna_bytes = 0;
+    for (auto& run : runs) {
+        const size_t count = run.leaf_spans.size();
+        if (count >
+            flat.spans.max_size() -
+                occurrence_count) {
+            throw std::overflow_error(
+                "HAL flat occurrence storage overflow");
+        }
+        for (const auto& span : run.leaf_spans) {
+            const std::array<uint64_t, 4> metadata{
+                (static_cast<uint64_t>(
+                     span.row_ordinal) << 32U) |
+                    span.leaf_name,
+                (static_cast<uint64_t>(
+                     span.chr_name) << 32U) |
+                    span.hal_sequence_name,
+                span.start,
+                (static_cast<uint64_t>(
+                     span.length) << 1U) |
+                    span.reversed};
+            writePreparedPod(
+                metadata_output,
+                metadata);
+            const auto dna = spanDNA(span);
+            if (dna.size() >
+                std::numeric_limits<uint64_t>::max() -
+                    dna_bytes) {
+                throw std::overflow_error(
+                    "Compact HAL run DNA spool size overflow");
+            }
+            dna_output.write(
+                dna.data(),
+                static_cast<std::streamsize>(
+                    dna.size()));
+            if (!dna_output) {
+                throw std::runtime_error(
+                    "Failed writing compact HAL run DNA spool");
+            }
+            dna_bytes += dna.size();
+        }
+        run.leaf_spans.bindFlat(
+            flat,
+            occurrence_count);
+        occurrence_count += count;
+    }
+    metadata_output.close();
+    if (!metadata_output) {
+        throw std::runtime_error(
+            "Failed closing compact HAL run metadata spool");
+    }
+    dna_output.close();
+    if (!dna_output) {
+        throw std::runtime_error(
+            "Failed closing compact HAL run DNA spool");
+    }
+    std::error_code size_error;
+    const uintmax_t on_disk_dna_bytes =
+        std::filesystem::file_size(
+            dna_path,
+            size_error);
+    if (size_error ||
+        on_disk_dna_bytes != dna_bytes) {
+        throw std::runtime_error(
+            "Compact HAL run DNA spool size is inconsistent");
+    }
+
+    storage.clearDNA();
+#if defined(__GLIBC__)
+    ::malloc_trim(0);
+#endif
+    flat.spans.reserve(occurrence_count);
+    std::ifstream input(
+        metadata_path,
+        std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "Cannot reopen compact HAL run metadata spool");
+    }
+    LeafRunSpan span;
+    span.storage = &storage;
+    uint64_t dna_offset = 0;
+    for (size_t index = 0;
+         index < occurrence_count;
+         ++index) {
+        const auto metadata =
+            readPreparedPod<std::array<uint64_t, 4>>(
+                input);
+        if ((metadata[3] >> 33U) != 0) {
+            throw std::runtime_error(
+                "Compact HAL run length is out of range");
+        }
+        span.row_ordinal =
+            static_cast<uint32_t>(
+                metadata[0] >> 32U);
+        span.leaf_name =
+            static_cast<uint32_t>(metadata[0]);
+        span.chr_name =
+            static_cast<uint32_t>(
+                metadata[1] >> 32U);
+        span.hal_sequence_name =
+            static_cast<uint32_t>(metadata[1]);
+        span.start = metadata[2];
+        span.length =
+            static_cast<uint32_t>(
+                metadata[3] >> 1U);
+        span.reversed =
+            (metadata[3] & 1U) != 0;
+        if (span.length >
+            dna_bytes - dna_offset) {
+            throw std::runtime_error(
+                "Compact HAL run metadata exceeds its DNA spool");
+        }
+        span.dna_offset = dna_offset;
+        dna_offset += span.length;
+        flat.spans.push_back(span);
+    }
+    if (dna_offset != dna_bytes ||
+        input.peek() !=
+            std::char_traits<char>::eof()) {
+        throw std::runtime_error(
+            "Compact HAL run spool has trailing or missing data");
+    }
+    input.close();
+    storage.adoptExternalDNA(
+        dna_path,
+        dna_bytes);
+    dna_guard.release();
+}
+
+const ColumnRun& columnRunById(
+    const std::vector<ColumnRun>& runs,
+    uint64_t run_id) {
+    if (run_id == 0 ||
+        run_id > runs.size() ||
+        runs[static_cast<size_t>(run_id - 1)]
+                .run_id != run_id) {
+        throw std::out_of_range(
+            "HAL normalized run id is outside its dense domain");
+    }
+    return runs[static_cast<size_t>(run_id - 1)];
+}
 
 struct OrientedOccurrence {
     OccurrenceId occurrence_id = 0;
@@ -132,56 +1906,517 @@ struct SequenceModel {
     std::vector<SequenceGap> gaps;
 };
 
-struct NodePlacement {
-    std::string seq_name;
+constexpr uint32_t kMissingDenseIndex =
+    std::numeric_limits<uint32_t>::max();
+
+struct ModelOccurrence {
     uint64_t start = 0;
+    uint32_t run_index = kMissingDenseIndex;
+    uint32_t copy_index = 0;
+    uint32_t sequence_index = kMissingDenseIndex;
     uint32_t length = 0;
     bool forward = true;
 };
 
-using ChildRunCopyMap = std::unordered_map<
-    int,
-    std::unordered_map<
-        uint64_t,
-        std::vector<uint32_t>>>;
+struct NodeRun {
+    uint64_t run_id = 0;
+    OccurrenceId first_occurrence = 0;
+    uint32_t occurrence_count = 0;
+    std::string dna;
+};
 
+struct ChildRunCopies {
+    uint64_t run_id = 0;
+    uint32_t values_offset = 0;
+    uint32_t value_count = 0;
+};
+
+struct ChildCopyTable {
+    int child_id = -1;
+    std::vector<ChildRunCopies> runs;
+    std::vector<uint32_t> values;
+};
+
+using ChildRunCopyMap = std::vector<ChildCopyTable>;
 
 struct NodeModel {
     std::string genome_name;
     std::vector<SequenceModel> sequences;
-    std::unordered_map<uint64_t, std::string> run_dna;
-    std::unordered_map<OccurrenceId, uint64_t> run_by_occurrence;
-    std::unordered_map<uint64_t, std::vector<OccurrenceId>> occurrences_by_run;
-    std::unordered_map<OccurrenceId, uint32_t> copy_index_by_occurrence;
+    OccurrenceId first_occurrence = 0;
+    std::vector<ModelOccurrence> occurrences;
+    std::vector<NodeRun> runs;
+    std::vector<uint32_t> run_index_by_id;
     ChildRunCopyMap parent_copy_by_child_run;
-    std::unordered_map<OccurrenceId, NodePlacement> placements;
     std::vector<TerminalEndSupport> terminal_ends;
+    // False only for short-lived ancestry inputs. Such a model retains every
+    // structural field and per-run DNA, but must never be emitted or stored.
+    bool has_materialized_sequence_dna = true;
+    // Cleared only after projected children are persisted. Native emission uses
+    // assembled sequence DNA and run placements, not the per-run consensus.
+    bool has_materialized_run_dna = true;
 };
 
-struct TopSegmentLine {
-    OccurrenceId occurrence_id = 0;
-    uint64_t start = 0;
-    uint32_t length = 0;
-    std::optional<uint64_t> parent_bottom_name;
-    bool forward_to_parent = true;
+enum class NodeModelLoadMode {
+    FULL,
+    ANCESTRY_INPUT
+};
+template <typename T>
+void writePreparedVector(
+    std::ostream& output,
+    const std::vector<T>& values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(values.size()));
+    if (!values.empty()) {
+        output.write(
+            reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(
+                values.size() * sizeof(T)));
+        if (!output) {
+            throw std::runtime_error(
+                "Failed writing disk-backed HAL model");
+        }
+    }
+}
+
+template <typename T>
+std::vector<T> readPreparedVector(std::istream& input) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    const uint64_t count = readPreparedPod<uint64_t>(input);
+    if (count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max() /
+            sizeof(T))) {
+        throw std::overflow_error(
+            "Disk-backed HAL model vector exceeds addressable storage");
+    }
+    std::vector<T> values(static_cast<size_t>(count));
+    if (!values.empty()) {
+        input.read(
+            reinterpret_cast<char*>(values.data()),
+            static_cast<std::streamsize>(
+                values.size() * sizeof(T)));
+        if (!input) {
+            throw std::runtime_error(
+                "Disk-backed HAL model is truncated");
+        }
+    }
+    return values;
+}
+
+void writeNodeModel(
+    std::ostream& output,
+    const NodeModel& model) {
+    if (!model.has_materialized_sequence_dna ||
+        !model.has_materialized_run_dna) {
+        throw std::logic_error(
+            "Cannot store an incomplete HAL node model");
+    }
+    constexpr uint32_t kModelVersion = 1;
+    writePreparedPod(output, kModelVersion);
+    writePreparedString(output, model.genome_name);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(model.sequences.size()));
+    for (const auto& sequence : model.sequences) {
+        writePreparedString(output, sequence.seq_name);
+        writePreparedString(output, sequence.dna);
+        writePreparedVector(output, sequence.path);
+        writePreparedVector(output, sequence.joins);
+        writePreparedVector(output, sequence.gaps);
+    }
+    writePreparedPod(output, model.first_occurrence);
+    writePreparedVector(output, model.occurrences);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(model.runs.size()));
+    for (const auto& run : model.runs) {
+        writePreparedPod(output, run.run_id);
+        writePreparedPod(output, run.first_occurrence);
+        writePreparedPod(output, run.occurrence_count);
+        writePreparedString(output, run.dna);
+    }
+    writePreparedVector(output, model.run_index_by_id);
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(
+            model.parent_copy_by_child_run.size()));
+    for (const auto& table :
+         model.parent_copy_by_child_run) {
+        writePreparedPod(output, table.child_id);
+        writePreparedVector(output, table.runs);
+        writePreparedVector(output, table.values);
+    }
+    writePreparedPod(
+        output,
+        static_cast<uint64_t>(model.terminal_ends.size()));
+    for (const auto& terminal :
+         model.terminal_ends) {
+        writePreparedPod(
+            output,
+            terminal.end.occurrence_id);
+        writePreparedPod(
+            output,
+            static_cast<uint8_t>(terminal.end.side));
+        writePreparedPod(
+            output,
+            terminal.occurrence_support);
+        writePreparedVector(
+            output,
+            terminal.supporting_lineages);
+        writePreparedPod(
+            output,
+            terminal.weighted_support);
+    }
+}
+
+NodeModel readNodeModel(
+    std::istream& input,
+    NodeModelLoadMode load_mode,
+    uint64_t record_end) {
+    constexpr uint32_t kModelVersion = 1;
+    if (readPreparedPod<uint32_t>(input) !=
+        kModelVersion) {
+        throw std::runtime_error(
+            "Disk-backed HAL model has an unsupported version");
+    }
+    NodeModel model;
+    model.has_materialized_sequence_dna =
+        load_mode == NodeModelLoadMode::FULL;
+    model.genome_name = readPreparedString(input);
+    const uint64_t sequence_count =
+        readPreparedPod<uint64_t>(input);
+    if (sequence_count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Disk-backed HAL sequence count exceeds addressable storage");
+    }
+    model.sequences.reserve(
+        static_cast<size_t>(sequence_count));
+    for (uint64_t index = 0;
+         index < sequence_count;
+         ++index) {
+        SequenceModel sequence;
+        sequence.seq_name =
+            readPreparedString(input);
+        if (load_mode == NodeModelLoadMode::FULL) {
+            sequence.dna =
+                readPreparedString(input);
+        } else {
+            // Ancestry construction consumes paths, joins, occurrence
+            // placements, and NodeRun::dna, never assembled sequence DNA.
+            // Seek over that payload without allocating or copying it.
+            skipPreparedString(input, record_end);
+        }
+        sequence.path =
+            readPreparedVector<OrientedOccurrence>(input);
+        sequence.joins =
+            readPreparedVector<ReferenceJoin>(input);
+        sequence.gaps =
+            readPreparedVector<SequenceGap>(input);
+        model.sequences.push_back(
+            std::move(sequence));
+    }
+    model.first_occurrence =
+        readPreparedPod<OccurrenceId>(input);
+    model.occurrences =
+        readPreparedVector<ModelOccurrence>(input);
+    const uint64_t run_count =
+        readPreparedPod<uint64_t>(input);
+    if (run_count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Disk-backed HAL run count exceeds addressable storage");
+    }
+    model.runs.reserve(static_cast<size_t>(run_count));
+    for (uint64_t index = 0;
+         index < run_count;
+         ++index) {
+        NodeRun run;
+        run.run_id =
+            readPreparedPod<uint64_t>(input);
+        run.first_occurrence =
+            readPreparedPod<OccurrenceId>(input);
+        run.occurrence_count =
+            readPreparedPod<uint32_t>(input);
+        run.dna = readPreparedString(input);
+        model.runs.push_back(std::move(run));
+    }
+    model.run_index_by_id =
+        readPreparedVector<uint32_t>(input);
+    const uint64_t table_count =
+        readPreparedPod<uint64_t>(input);
+    if (table_count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Disk-backed HAL child table count exceeds addressable storage");
+    }
+    model.parent_copy_by_child_run.reserve(
+        static_cast<size_t>(table_count));
+    for (uint64_t index = 0;
+         index < table_count;
+         ++index) {
+        ChildCopyTable table;
+        table.child_id =
+            readPreparedPod<int>(input);
+        table.runs =
+            readPreparedVector<ChildRunCopies>(input);
+        table.values =
+            readPreparedVector<uint32_t>(input);
+        model.parent_copy_by_child_run.push_back(
+            std::move(table));
+    }
+    const uint64_t terminal_count =
+        readPreparedPod<uint64_t>(input);
+    if (terminal_count >
+        static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::overflow_error(
+            "Disk-backed HAL terminal count exceeds addressable storage");
+    }
+    model.terminal_ends.reserve(
+        static_cast<size_t>(terminal_count));
+    for (uint64_t index = 0;
+         index < terminal_count;
+         ++index) {
+        TerminalEndSupport terminal;
+        terminal.end.occurrence_id =
+            readPreparedPod<OccurrenceId>(input);
+        terminal.end.side =
+            static_cast<OccurrenceEndSide>(
+                readPreparedPod<uint8_t>(input));
+        terminal.occurrence_support =
+            readPreparedPod<uint32_t>(input);
+        terminal.supporting_lineages =
+            readPreparedVector<int>(input);
+        terminal.weighted_support =
+            readPreparedPod<long double>(input);
+        model.terminal_ends.push_back(
+            std::move(terminal));
+    }
+    return model;
+}
+
+class DiskNodeModelStore {
+public:
+    explicit DiskNodeModelStore(
+        const std::filesystem::path& directory) {
+        static std::atomic<uint64_t> next_id{0};
+        const uint64_t clock_id = static_cast<uint64_t>(
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+                .count());
+        do {
+            path_ =
+                directory /
+                ("ramax-hal-models-" +
+                 std::to_string(clock_id) + "-" +
+                 std::to_string(
+                     next_id.fetch_add(
+                         1,
+                         std::memory_order_relaxed)) +
+                 ".bin");
+        } while (std::filesystem::exists(path_));
+    }
+
+    ~DiskNodeModelStore() {
+        std::error_code error;
+        std::filesystem::remove(path_, error);
+    }
+
+    void store(int node_id, const NodeModel& model) {
+        std::ofstream output(
+            path_,
+            std::ios::binary | std::ios::app);
+        if (!output) {
+            throw std::runtime_error(
+                "Cannot open disk-backed HAL model store");
+        }
+        const auto begin = output.tellp();
+        writeNodeModel(output, model);
+        const auto end = output.tellp();
+        output.close();
+        if (!output || begin < 0 || end < begin) {
+            throw std::runtime_error(
+                "Failed writing disk-backed HAL model");
+        }
+        records_[node_id] =
+            PreparedRecordIndex{
+                {},
+                static_cast<uint64_t>(
+                    static_cast<std::streamoff>(begin)),
+                static_cast<uint64_t>(
+                    static_cast<std::streamoff>(
+                        end - begin))};
+    }
+
+    NodeModel load(
+        int node_id,
+        NodeModelLoadMode load_mode) const {
+        const auto record_it =
+            records_.find(node_id);
+        if (record_it == records_.end()) {
+            throw std::runtime_error(
+                "Missing disk-backed HAL node model");
+        }
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                "Cannot open disk-backed HAL model store");
+        }
+        if (record_it->second.offset >
+            std::numeric_limits<uint64_t>::max() -
+                record_it->second.size) {
+            throw std::runtime_error(
+                "Disk-backed HAL model index is inconsistent");
+        }
+        const uint64_t record_end =
+            record_it->second.offset +
+            record_it->second.size;
+        if (record_end >
+            static_cast<uint64_t>(
+                std::numeric_limits<std::streamoff>::max())) {
+            throw std::runtime_error(
+                "Disk-backed HAL model index exceeds seekable storage");
+        }
+        input.seekg(
+            static_cast<std::streamoff>(
+                record_it->second.offset),
+            std::ios::beg);
+        if (!input) {
+            throw std::runtime_error(
+                "Disk-backed HAL model index is inconsistent");
+        }
+        NodeModel model =
+            readNodeModel(
+                input, load_mode, record_end);
+        const auto end = input.tellg();
+        if (end < 0 ||
+            static_cast<uint64_t>(
+                static_cast<std::streamoff>(end)) !=
+                record_end) {
+            throw std::runtime_error(
+                "Disk-backed HAL model index is inconsistent");
+        }
+        return model;
+    }
+
+    uint64_t bytes() const {
+        return std::filesystem::exists(path_)
+                   ? std::filesystem::file_size(path_)
+                   : 0;
+    }
+
+private:
+    std::filesystem::path path_;
+    std::unordered_map<int, PreparedRecordIndex> records_;
 };
 
-struct BottomSegmentLine {
-    OccurrenceId occurrence_id = 0;
-    uint64_t name = 0;
-    uint64_t start = 0;
-    uint32_t length = 0;
-};
 
-struct SequenceEmission {
-    std::string genome_name;
-    std::string seq_name;
-    size_t bottom_count = 0;
-    std::vector<BottomSegmentLine> bottoms;
-    std::vector<TopSegmentLine> tops;
-    std::optional<std::string> dna;
-    std::optional<std::pair<std::string, std::string>> leaf_source;
-};
+const ChildCopyTable* findChildCopies(
+    const ChildRunCopyMap& mappings,
+    int child_id) {
+    const auto it = std::lower_bound(
+        mappings.begin(),
+        mappings.end(),
+        child_id,
+        [](const ChildCopyTable& mapping, int id) {
+            return mapping.child_id < id;
+        });
+    return it != mappings.end() && it->child_id == child_id
+               ? &*it
+               : nullptr;
+}
+
+ChildCopyTable* findChildCopies(
+    ChildRunCopyMap& mappings,
+    int child_id) {
+    const auto it = std::lower_bound(
+        mappings.begin(),
+        mappings.end(),
+        child_id,
+        [](const ChildCopyTable& mapping, int id) {
+            return mapping.child_id < id;
+        });
+    return it != mappings.end() && it->child_id == child_id
+               ? &*it
+               : nullptr;
+}
+
+std::span<const uint32_t> childCopiesForRun(
+    const ChildCopyTable& mapping,
+    uint64_t run_id) {
+    const auto it = std::lower_bound(
+        mapping.runs.begin(),
+        mapping.runs.end(),
+        run_id,
+        [](const ChildRunCopies& copies, uint64_t id) {
+            return copies.run_id < id;
+        });
+    if (it == mapping.runs.end() || it->run_id != run_id) {
+        return {};
+    }
+    return std::span<const uint32_t>(
+        mapping.values.data() + it->values_offset,
+        it->value_count);
+}
+
+const NodeRun* findNodeRun(
+    const NodeModel& model,
+    uint64_t run_id) {
+    if (run_id >= model.run_index_by_id.size()) {
+        return nullptr;
+    }
+    const uint32_t index =
+        model.run_index_by_id[static_cast<size_t>(run_id)];
+    return index == kMissingDenseIndex ? nullptr
+                                       : &model.runs[index];
+}
+
+const ModelOccurrence& modelOccurrence(
+    const NodeModel& model,
+    OccurrenceId occurrence_id) {
+    if (occurrence_id < model.first_occurrence ||
+        occurrence_id - model.first_occurrence >=
+            model.occurrences.size()) {
+        throw std::out_of_range(
+            "Unknown HAL model occurrence id");
+    }
+    return model.occurrences[static_cast<size_t>(
+        occurrence_id - model.first_occurrence)];
+}
+
+ModelOccurrence& modelOccurrence(
+    NodeModel& model,
+    OccurrenceId occurrence_id) {
+    return const_cast<ModelOccurrence&>(
+        modelOccurrence(
+            static_cast<const NodeModel&>(model),
+            occurrence_id));
+}
+
+void logHalMemory(
+    std::string_view stage,
+    size_t run_count,
+    size_t occurrence_count) {
+    const auto memory =
+        RaMAxMemory::readProcessMemorySnapshot();
+    spdlog::info(
+        "[hal-memory] stage={} rss_kib={} peak_rss_kib={} "
+        "virtual_kib={} runs={} occurrences={} available={}",
+        stage,
+        memory.rss_kib,
+        memory.peak_rss_kib,
+        memory.virtual_kib,
+        run_count,
+        occurrence_count,
+        memory.available);
+}
+
 
 
 struct ChildEdgeContribution {
@@ -406,43 +2641,59 @@ std::vector<int> computePostorderInternal(const TreeMeta& tree, int node_id) {
     return out;
 }
 
-FastInferenceResult inferDescendantUnionFast(
+std::vector<uint8_t> inferDescendantUnionPresence(
     const TreeMeta& tree,
     const std::vector<uint8_t>& leaf_present) {
     if (leaf_present.size() != tree.leaf_ids.size()) {
-        throw std::runtime_error("Descendant-union inference received a malformed leaf state vector");
+        throw std::runtime_error(
+            "Descendant-union inference received a malformed leaf state vector");
     }
-
-    FastInferenceResult result;
-    result.present_by_node.assign(tree.nodes.size(), 0);
-    result.margin.assign(tree.nodes.size(), 1.0);
+    std::vector<uint8_t> present_by_node(
+        tree.nodes.size(),
+        0);
     for (int leaf_id : tree.leaf_ids) {
-        const int leaf_index = tree.nodes[leaf_id].leaf_index;
-        result.present_by_node[leaf_id] = leaf_present[static_cast<size_t>(leaf_index)];
+        const int leaf_index =
+            tree.nodes[leaf_id].leaf_index;
+        present_by_node[leaf_id] =
+            leaf_present[
+                static_cast<size_t>(leaf_index)];
     }
     for (int node_id : tree.internal_postorder) {
         const auto& node = tree.nodes[node_id];
-        result.present_by_node[node_id] = std::any_of(
-            node.children.begin(), node.children.end(), [&](int child_id) {
-                return result.present_by_node[child_id] != 0;
-            });
+        present_by_node[node_id] =
+            std::any_of(
+                node.children.begin(),
+                node.children.end(),
+                [&](int child_id) {
+                    return present_by_node[child_id] != 0;
+                });
     }
+    return present_by_node;
+}
+
+FastInferenceResult inferDescendantUnionFast(
+    const TreeMeta& tree,
+    const std::vector<uint8_t>& leaf_present) {
+    FastInferenceResult result;
+    result.present_by_node =
+        inferDescendantUnionPresence(
+            tree,
+            leaf_present);
+    result.margin.assign(tree.nodes.size(), 1.0);
     return result;
 }
 
 BlockMSA buildBlockMSA(
     const BlockPtr& block,
     const TreeMeta& tree,
-    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-    const SoftMask::IndexMap* softmask_indexes) {
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
     if (!block) {
         throw std::runtime_error("Null block passed to buildBlockMSA");
     }
 
     std::unordered_map<std::string, std::string> sequences;
-    // Alignment decisions must not depend on output-only soft-mask case.
-    // Keep an oriented case-preserving copy and overlay it only after the
-    // uppercase rows have been aligned.
+    // Freeze source case separately, but make every alignment decision on
+    // uppercase DNA. HAL soft masking is restored only during HAL replay.
     std::unordered_map<std::string, std::string> output_sequences;
     std::unordered_map<ChrName, Cigar_t> cigars;
     std::unordered_map<std::string, LeafRow> rows;
@@ -492,30 +2743,21 @@ BlockMSA buildBlockMSA(
           sequence_key + '\1' + std::to_string(occurrence);
       std::string dna = fetchSubSequence(mgr_it->second, species_chr.second,
                                          segment->start, segment->length);
-      std::string output_dna;
-      if (softmask_indexes != nullptr) {
-        const auto softmask_it =
-            softmask_indexes->find(species_chr.first);
-        if (softmask_it == softmask_indexes->end() ||
-            !softmask_it->second) {
-          throw std::runtime_error("Missing soft-mask index for leaf genome: " +
-                                   species_chr.first);
-        }
-        output_dna = dna;
-        softmask_it->second->restore(
-            species_chr.second, segment->start, output_dna);
-      }
+      std::string output_dna = dna;
+      std::transform(
+          dna.begin(),
+          dna.end(),
+          dna.begin(),
+          [](unsigned char base) {
+              return static_cast<char>(std::toupper(base));
+          });
       if (segment->strand == Strand::REVERSE) {
         reverseComplement(dna);
-        if (!output_dna.empty()) {
-          reverseComplement(output_dna);
-        }
+        reverseComplement(output_dna);
       }
       sequences.emplace(row_id, std::move(dna));
-      if (!output_dna.empty()) {
-        output_sequences.emplace(
-            row_id, std::move(output_dna));
-      }
+      output_sequences.emplace(
+          row_id, std::move(output_dna));
       cigars.emplace(row_id, segment->cigar);
 
       LeafRow row;
@@ -558,7 +2800,6 @@ BlockMSA buildBlockMSA(
     }
 
     BlockMSA msa;
-    msa.block = block;
     msa.block_id = block->block_id;
     msa.ref_row_id = ref_row_id;
     msa.alignment_length = sequences.at(ref_row_id).size();
@@ -577,27 +2818,26 @@ BlockMSA buildBlockMSA(
         }
         const auto output_it =
             output_sequences.find(row_id);
-        if (output_it != output_sequences.end()) {
-            size_t source_index = 0;
-            for (char& base : aligned) {
-                if (base == '-') {
-                    continue;
-                }
-                if (source_index >=
-                    output_it->second.size()) {
-                    throw std::runtime_error(
-                        "HAL export failed: aligned occurrence exceeds "
-                        "its soft-mask source");
-                }
-                base = output_it->second[
-                    source_index++];
+        if (output_it == output_sequences.end()) {
+            throw std::runtime_error(
+                "HAL export failed: aligned occurrence lost its source case");
+        }
+        size_t source_index = 0;
+        for (char& base : aligned) {
+            if (base == '-') {
+                continue;
             }
-            if (source_index !=
-                output_it->second.size()) {
+            if (source_index >= output_it->second.size()) {
                 throw std::runtime_error(
-                    "HAL export failed: aligned occurrence did not consume "
-                    "its soft-mask source");
+                    "HAL export failed: aligned occurrence exceeds "
+                    "its source sequence");
             }
+            base = output_it->second[source_index++];
+        }
+        if (source_index != output_it->second.size()) {
+            throw std::runtime_error(
+                "HAL export failed: aligned occurrence did not consume "
+                "its source sequence");
         }
         auto row_it = rows.find(row_id);
         if (row_it == rows.end()) {
@@ -611,62 +2851,148 @@ BlockMSA buildBlockMSA(
     });
     return msa;
 }
+void restoreHalSoftmask(
+    const LeafRunSpan& span,
+    std::string& dna,
+    const SoftMask::IndexMap& softmask_indexes) {
+    const std::string& leaf_name =
+        spanIdentity(span, span.leaf_name);
+    const auto softmask_it =
+        softmask_indexes.find(leaf_name);
+    if (softmask_it == softmask_indexes.end() ||
+        !softmask_it->second) {
+        throw std::runtime_error(
+            "Missing soft-mask index for leaf genome: " +
+            leaf_name);
+    }
+    if (dna.size() != span.length) {
+        throw std::runtime_error(
+            "Prepared run DNA length differs from its leaf span");
+    }
+    std::transform(
+        dna.begin(),
+        dna.end(),
+        dna.begin(),
+        [](unsigned char base) {
+            return static_cast<char>(
+                std::toupper(base));
+        });
+    if (span.reversed) {
+        reverseComplement(dna);
+    }
+    softmask_it->second->restore(
+        spanIdentity(span, span.chr_name),
+        span.start,
+        dna);
+    if (span.reversed) {
+        reverseComplement(dna);
+    }
+}
 
-std::vector<ColumnRun> buildColumnRuns(const std::vector<BlockMSA>& block_msas, const TreeMeta& tree) {
+void appendColumnRuns(
+    const BlockMSA& msa,
+    const TreeMeta& tree,
+    RunStorage& storage,
+    std::vector<ColumnRun>& runs,
+    uint64_t& next_run_id) {
+    if (msa.alignment_length == 0) {
+        return;
+    }
+    std::vector<AlignedOccurrence> aligned_rows;
+    aligned_rows.reserve(msa.leaf_rows.size());
+    for (const auto& row : msa.leaf_rows) {
+        aligned_rows.push_back(AlignedOccurrence{
+            row.row_id,
+            row.leaf_name,
+            row.chr_name,
+            row.segment_start,
+            row.segment_length,
+            row.reversed,
+            row.aligned});
+    }
+
+    for (auto& projection : projectElementaryRuns(aligned_rows)) {
+        ColumnRun run;
+        run.run_id = next_run_id++;
+        run.block_id = msa.block_id;
+        run.source_block_ids.push_back(msa.block_id);
+        run.col_beg = projection.col_beg;
+        run.col_end = projection.col_end;
+        run.secondary_homology = msa.secondary_homology;
+        run.leaf_spans.reserve(projection.occurrences.size());
+        for (auto& occurrence : projection.occurrences) {
+            const auto node_it =
+                tree.name_to_id.find(occurrence.genome_name);
+            if (node_it == tree.name_to_id.end()) {
+                throw std::runtime_error(
+                    "HAL export failed: projected leaf is absent from the phylogeny");
+            }
+            LeafRunSpan span;
+            span.storage = &storage;
+            span.row_ordinal =
+                parseRowOrdinal(occurrence.row_id);
+            span.leaf_name =
+                storage.intern(
+                    occurrence.genome_name);
+            span.chr_name =
+                storage.intern(
+                    occurrence.sequence_name);
+            span.hal_sequence_name =
+                storage.intern(
+                    makeQualifiedLeafSequenceName(
+                        occurrence.genome_name,
+                        occurrence.sequence_name));
+            span.start = occurrence.start;
+            span.length = occurrence.length;
+            span.reversed = occurrence.reversed;
+            span.dna_offset =
+                storage.appendDNA(occurrence.dna);
+            run.leaf_spans.push_back(
+                std::move(span));
+        }
+        runs.push_back(std::move(run));
+    }
+}
+
+
+std::vector<ColumnRun> buildColumnRuns(
+    const PreparedExportInput& prepared,
+    const TreeMeta& tree,
+    RunStorage& storage,
+    bool* source_lengths_valid = nullptr) {
+    // Projection boundaries, coordinates, orientation, homology class and
+    // source DNA are independent of the phylogeny topology and HAL masking.
+    // The tree is used only to reject a prepared leaf outside the validated
+    // leaf-name domain. Consumer-specific case is restored after the common
+    // normalized geometry has been loaded.
     std::vector<ColumnRun> runs;
     uint64_t next_run_id = 1;
-    for (const auto& msa : block_msas) {
-        if (!msa.block || msa.alignment_length == 0) {
-            continue;
-        }
-
-        std::vector<AlignedOccurrence> aligned_rows;
-        aligned_rows.reserve(msa.leaf_rows.size());
-        for (const auto& row : msa.leaf_rows) {
-            aligned_rows.push_back(AlignedOccurrence{
-                row.row_id,
-                row.leaf_name,
-                row.chr_name,
-                row.segment_start,
-                row.segment_length,
-                row.reversed,
-                row.aligned});
-        }
-
-        for (auto& projection : projectElementaryRuns(aligned_rows)) {
-            ColumnRun run;
-            run.run_id = next_run_id++;
-            run.block_id = msa.block_id;
-            run.source_block_ids.push_back(
-                msa.block_id);
-            run.col_beg = projection.col_beg;
-            run.col_end = projection.col_end;
-            run.secondary_homology =
-                msa.secondary_homology;
-            run.leaf_present.assign(tree.leaf_ids.size(), 0);
-            run.leaf_spans.reserve(projection.occurrences.size());
-
-            for (auto& occurrence : projection.occurrences) {
-                const auto node_it = tree.name_to_id.find(occurrence.genome_name);
-                if (node_it == tree.name_to_id.end()) {
-                    throw std::runtime_error("HAL export failed: projected leaf is absent from the phylogeny");
+    replayPreparedBlocks(
+        prepared,
+        [&](BlockMSA msa) {
+            if (source_lengths_valid != nullptr) {
+                for (const auto& row : msa.leaf_rows) {
+                    const size_t source_length =
+                        static_cast<size_t>(
+                            std::count_if(
+                                row.aligned.begin(),
+                                row.aligned.end(),
+                                [](char base) {
+                                    return base != '-';
+                                }));
+                    if (source_length !=
+                        row.segment_length) {
+                        *source_lengths_valid = false;
+                    }
                 }
-                const auto& leaf_node = tree.nodes[node_it->second];
-                LeafRunSpan span;
-                span.row_id = std::move(occurrence.row_id);
-                span.leaf_name = std::move(occurrence.genome_name);
-                span.chr_name = std::move(occurrence.sequence_name);
-                span.hal_sequence_name = makeQualifiedLeafSequenceName(span.leaf_name, span.chr_name);
-                span.start = occurrence.start;
-                span.length = occurrence.length;
-                span.reversed = occurrence.reversed;
-                span.dna = std::move(occurrence.dna);
-                run.leaf_spans.push_back(std::move(span));
-                run.leaf_present[static_cast<size_t>(leaf_node.leaf_index)] = 1;
             }
-            runs.push_back(std::move(run));
-        }
-    }
+            appendColumnRuns(
+                msa,
+                tree,
+                storage,
+                runs,
+                next_run_id);
+        });
     return runs;
 }
 
@@ -1114,7 +3440,9 @@ selectCoordinateConsistentSecondaryRuns(
                     "Primary HAL leaf span coordinate overflow");
             }
             primary_windows_by_sequence[
-                span.hal_sequence_name]
+                spanIdentity(
+                    span,
+                    span.hal_sequence_name)]
                 .push_back(
                     PrimaryWindow{
                         span.start,
@@ -1182,8 +3510,10 @@ selectCoordinateConsistentSecondaryRuns(
             }
             const auto windows_it =
                 primary_windows_by_sequence.find(
-                    secondary_span
-                        .hal_sequence_name);
+                    spanIdentity(
+                        secondary_span,
+                        secondary_span
+                            .hal_sequence_name));
             if (windows_it ==
                 primary_windows_by_sequence.end()) {
                 secondary_has_novel_span[
@@ -1304,20 +3634,34 @@ selectCoordinateConsistentSecondaryRuns(
             const auto span_less =
                 [](const LeafRunSpan& left,
                    const LeafRunSpan& right) {
-                    return std::tie(
-                               left.leaf_name,
-                               left.chr_name,
-                               left.start,
-                               left.length,
-                               left.reversed,
-                               left.row_id) <
-                           std::tie(
-                               right.leaf_name,
-                               right.chr_name,
-                               right.start,
-                               right.length,
-                               right.reversed,
-                               right.row_id);
+                    const auto left_key =
+                        std::tie(
+                            spanIdentity(
+                                left,
+                                left.leaf_name),
+                            spanIdentity(
+                                left,
+                                left.chr_name),
+                            left.start,
+                            left.length,
+                            left.reversed);
+                    const auto right_key =
+                        std::tie(
+                            spanIdentity(
+                                right,
+                                right.leaf_name),
+                            spanIdentity(
+                                right,
+                                right.chr_name),
+                            right.start,
+                            right.length,
+                            right.reversed);
+                    if (left_key != right_key) {
+                        return left_key < right_key;
+                    }
+                    return rowOrdinalLexLess(
+                        left.row_ordinal,
+                        right.row_ordinal);
                 };
             if (std::lexicographical_compare(
                     lhs.leaf_spans.begin(),
@@ -1574,44 +3918,6 @@ TreeMeta buildLeafOnlyTree(
     return leaf_tree;
 }
 
-std::vector<BlockMSA> buildLeafBlockMSAs(
-    const std::vector<std::weak_ptr<Block>>& blocks,
-    const TreeMeta& leaf_tree,
-    const std::map<
-        SpeciesName,
-        SeqPro::SharedManagerVariant>&
-        seqpro_managers) {
-    std::vector<BlockMSA> block_msas;
-    block_msas.reserve(blocks.size());
-    for (const auto& weak_block : blocks) {
-        const auto block =
-            weak_block.lock();
-        if (!block) {
-            continue;
-        }
-        auto msa = buildBlockMSA(
-            block,
-            leaf_tree,
-            seqpro_managers,
-            nullptr);
-        if (msa.block &&
-            !msa.leaf_rows.empty()) {
-            block_msas.push_back(
-                std::move(msa));
-        }
-    }
-    std::sort(
-        block_msas.begin(),
-        block_msas.end(),
-        [](const BlockMSA& lhs,
-           const BlockMSA& rhs) {
-            return exportBlockOrderLess(
-                lhs.order_key,
-                rhs.order_key);
-        });
-    return block_msas;
-}
-
 std::unordered_set<uint64_t>
 findRejectedSecondaryHomologyBlocksImpl(
     const std::vector<std::weak_ptr<Block>>& blocks,
@@ -1619,21 +3925,22 @@ findRejectedSecondaryHomologyBlocksImpl(
         SpeciesName,
         SeqPro::SharedManagerVariant>&
         seqpro_managers) {
-    const TreeMeta leaf_tree =
-        buildLeafOnlyTree(
-            seqpro_managers);
-    const auto block_msas =
-        buildLeafBlockMSAs(
+    const auto prepared =
+        prepareExportInput(
             blocks,
-            leaf_tree,
-            seqpro_managers);
+            seqpro_managers,
+            std::filesystem::temp_directory_path(),
+            1);
+    const TreeMeta leaf_tree =
+        buildLeafOnlyTree(seqpro_managers);
+    RunStorage run_storage;
     auto runs =
         buildColumnRuns(
-            block_msas,
-            leaf_tree);
+            *prepared,
+            leaf_tree,
+            run_storage);
     auto selection =
-        selectCoordinateConsistentSecondaryRuns(
-            runs);
+        selectCoordinateConsistentSecondaryRuns(runs);
     return std::move(
         selection.rejected_block_ids);
 }
@@ -1642,13 +3949,13 @@ ColumnRun sliceColumnRun(
     const ColumnRun& run,
     uint32_t local_begin,
     uint32_t local_end) {
-    const uint32_t run_length = run.col_end - run.col_beg;
+    const uint32_t run_length =
+        run.col_end - run.col_beg;
     if (local_begin >= local_end ||
         local_end > run_length) {
         throw std::runtime_error(
             "HAL column run slice lies outside its source run");
     }
-
     ColumnRun result;
     result.run_id = run.run_id;
     result.block_id = run.block_id;
@@ -1658,11 +3965,13 @@ ColumnRun sliceColumnRun(
     result.col_end = run.col_beg + local_end;
     result.secondary_homology =
         run.secondary_homology;
-    result.leaf_spans.reserve(run.leaf_spans.size());
-    const uint32_t slice_length = local_end - local_begin;
+    result.leaf_spans.reserve(
+        run.leaf_spans.size());
+    const uint32_t slice_length =
+        local_end - local_begin;
     for (const auto& span : run.leaf_spans) {
         if (span.length != run_length ||
-            span.dna.size() != run_length) {
+            spanDNA(span).size() != run_length) {
             throw std::runtime_error(
                 "HAL elementary run span length is inconsistent");
         }
@@ -1671,16 +3980,19 @@ ColumnRun sliceColumnRun(
             ? span.length - local_end
             : local_begin;
         sliced.length = slice_length;
-        sliced.dna =
-            span.dna.substr(local_begin, slice_length);
-        result.leaf_spans.push_back(std::move(sliced));
+        sliced.dna_offset += local_begin;
+        result.leaf_spans.push_back(
+            std::move(sliced));
     }
     return result;
 }
 
 void reverseColumnRun(ColumnRun& run) {
     for (auto& span : run.leaf_spans) {
-        reverseComplement(span.dna);
+        std::string reversed_dna(spanDNA(span));
+        reverseComplement(reversed_dna);
+        span.dna_offset =
+            span.storage->appendDNA(reversed_dna);
         span.reversed = !span.reversed;
     }
 }
@@ -1704,37 +4016,51 @@ void finalizeNormalizedRun(
     std::sort(
         run.leaf_spans.begin(),
         run.leaf_spans.end(),
-        [](const LeafRunSpan& lhs, const LeafRunSpan& rhs) {
-            return std::tie(
-                       lhs.hal_sequence_name,
-                       lhs.start,
-                       lhs.length,
-                       lhs.row_id) <
-                   std::tie(
-                       rhs.hal_sequence_name,
-                       rhs.start,
-                       rhs.length,
-                       rhs.row_id);
+        [](const LeafRunSpan& lhs,
+           const LeafRunSpan& rhs) {
+            const auto lhs_key =
+                std::tie(
+                    spanIdentity(
+                        lhs,
+                        lhs.hal_sequence_name),
+                    lhs.start,
+                    lhs.length);
+            const auto rhs_key =
+                std::tie(
+                    spanIdentity(
+                        rhs,
+                        rhs.hal_sequence_name),
+                    rhs.start,
+                    rhs.length);
+            if (lhs_key != rhs_key) {
+                return lhs_key < rhs_key;
+            }
+            return rowOrdinalLexLess(
+                lhs.row_ordinal,
+                rhs.row_ordinal);
         });
-
     std::vector<LeafRunSpan> unique_spans;
     unique_spans.reserve(run.leaf_spans.size());
     for (auto& span : run.leaf_spans) {
-        if (span.length != run.col_end - run.col_beg ||
-            span.dna.size() != span.length) {
+        if (span.length !=
+                run.col_end - run.col_beg ||
+            spanDNA(span).size() != span.length) {
             throw std::runtime_error(
                 "HAL normalized leaf span length is inconsistent");
         }
         if (!unique_spans.empty()) {
-            const auto& previous = unique_spans.back();
+            const auto& previous =
+                unique_spans.back();
             const bool same_occurrence =
                 previous.hal_sequence_name ==
                     span.hal_sequence_name &&
                 previous.start == span.start &&
                 previous.length == span.length;
             if (same_occurrence) {
-                if (previous.reversed != span.reversed ||
-                    previous.dna != span.dna) {
+                if (previous.reversed !=
+                        span.reversed ||
+                    spanDNA(previous) !=
+                        spanDNA(span)) {
                     throw std::runtime_error(
                         "HAL homology links assign conflicting "
                         "orientations or DNA to one leaf occurrence");
@@ -1746,21 +4072,23 @@ void finalizeNormalizedRun(
         unique_spans.push_back(std::move(span));
     }
     run.leaf_spans = std::move(unique_spans);
-    run.leaf_present.assign(tree.leaf_ids.size(), 0);
     for (const auto& span : run.leaf_spans) {
         const auto node_it =
-            tree.name_to_id.find(span.leaf_name);
+            tree.name_to_id.find(
+                spanIdentity(
+                    span,
+                    span.leaf_name));
         if (node_it == tree.name_to_id.end()) {
             throw std::runtime_error(
                 "HAL normalized leaf is absent from the phylogeny");
         }
-        const auto& node = tree.nodes[node_it->second];
-        if (!node.is_leaf || node.leaf_index < 0) {
+        const auto& node =
+            tree.nodes[node_it->second];
+        if (!node.is_leaf ||
+            node.leaf_index < 0) {
             throw std::runtime_error(
                 "HAL normalized occurrence belongs to a non-leaf node");
         }
-        run.leaf_present[
-            static_cast<size_t>(node.leaf_index)] = 1;
     }
 }
 
@@ -1819,7 +4147,9 @@ RunNormalizationStats normalizeOverlappingColumnRuns(
                     "HAL leaf span coordinate overflow");
             }
             windows_by_sequence[
-                span.hal_sequence_name]
+                spanIdentity(
+                    span,
+                    span.hal_sequence_name)]
                 .push_back(
                     LeafWindow{
                         span.start,
@@ -2427,6 +4757,122 @@ RunNormalizationStats normalizeOverlappingColumnRuns(
     return stats;
 }
 
+struct PreparedColumnRuns {
+    std::vector<ColumnRun> runs;
+    CommonRunPreparationStats stats;
+    bool reused_cache = false;
+};
+
+void validatePreparedSoftmaskCoverage(
+    const PreparedExportInput& prepared,
+    const SoftMask::IndexMap& softmask_indexes) {
+    std::string probe(1, 'N');
+    for (const auto& sequence :
+         prepared.managerSequences()) {
+        // Baseline never asks the index about an unused empty contig, and the
+        // native leaf writer also skips zero-length emissions.
+        if (sequence.length == 0) {
+            continue;
+        }
+        const auto softmask_it =
+            softmask_indexes.find(
+                sequence.species);
+        if (softmask_it ==
+                softmask_indexes.end() ||
+            !softmask_it->second) {
+            throw std::runtime_error(
+                "Missing soft-mask index for leaf genome: " +
+                sequence.species);
+        }
+        // Every prepared occurrence is manager-bounded. Probing the final
+        // manager base preserves missing/short-index failures even when a
+        // coordinate-only secondary run is removed before HAL masking.
+        softmask_it->second->restore(
+            sequence.sequence,
+            sequence.length - 1,
+            probe);
+    }
+}
+
+void restoreSelectedRunSoftmask(
+    std::vector<ColumnRun>& runs,
+    RunStorage& storage,
+    const SoftMask::IndexMap& softmask_indexes,
+    bool source_lengths_valid) {
+    if (!source_lengths_valid) {
+        throw std::runtime_error(
+            "Prepared occurrence length differs from its source segment");
+    }
+    std::string dna;
+    for (auto& run : runs) {
+        for (auto& span : run.leaf_spans) {
+            const auto original = spanDNA(span);
+            dna.assign(
+                original.begin(),
+                original.end());
+            restoreHalSoftmask(
+                span,
+                dna,
+                softmask_indexes);
+            storage.replaceDNA(
+                span.dna_offset,
+                dna);
+        }
+    }
+}
+
+PreparedColumnRuns prepareCommonColumnRuns(
+    const PreparedExportInput& prepared,
+    const TreeMeta& tree,
+    RunStorage& storage) {
+    std::unique_lock<std::mutex> cache_lock(
+        prepared.commonRunCacheMutex());
+    if (prepared.commonRunCacheLocked()) {
+        PreparedCommonRunCache cache =
+            *prepared.commonRunCacheLocked();
+        cache_lock.unlock();
+        return {
+            readCommonColumnRuns(
+                cache,
+                storage),
+            cache.stats,
+            true};
+    }
+
+    PreparedColumnRuns result;
+    result.runs = buildColumnRuns(
+        prepared,
+        tree,
+        storage,
+        &result.stats.source_lengths_valid);
+    result.stats.projected_run_count =
+        result.runs.size();
+    // Secondary selection examines only intervals, orientation, support and
+    // deterministic IDs. Keeping it in the common stage avoids repeating the
+    // coordinate forest while leaving all case-sensitive normalization after
+    // consumer DNA preparation.
+    const auto selection =
+        selectCoordinateConsistentSecondaryRuns(
+            result.runs);
+    result.stats.secondary_candidate_runs =
+        selection.candidate_runs;
+    result.stats.secondary_accepted_runs =
+        selection.accepted_runs;
+    result.stats.secondary_conflict_rejected_runs =
+        selection.conflict_rejected_runs;
+    result.stats.secondary_redundant_runs =
+        selection.redundant_runs;
+    result.stats.secondary_rejected_bases =
+        selection.rejected_bases;
+    writeCommonRunCache(
+        result.runs,
+        storage,
+        prepared.spoolPath().parent_path(),
+        result.stats,
+        prepared);
+    return result;
+}
+
 void sanitizeLeafCoverage(
     const std::vector<ColumnRun>& runs,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
@@ -2440,8 +4886,15 @@ void sanitizeLeafCoverage(
     std::unordered_map<std::string, std::vector<LeafWindow>> by_sequence;
     for (const auto& run : runs) {
         for (const auto& span : run.leaf_spans) {
-            by_sequence[span.hal_sequence_name].push_back(
-                LeafWindow{span.start, span.start + span.length, run.run_id});
+            by_sequence[
+                spanIdentity(
+                    span,
+                    span.hal_sequence_name)]
+                .push_back(
+                    LeafWindow{
+                        span.start,
+                        span.start + span.length,
+                        run.run_id});
         }
     }
 
@@ -2472,7 +4925,7 @@ void sanitizeLeafCoverage(
 }
 
 struct MafReblockedRow {
-    std::string row_id;
+    uint32_t row_ordinal = 0;
     std::string leaf_name;
     std::string chr_name;
     std::string hal_sequence_name;
@@ -2483,6 +4936,33 @@ struct MafReblockedRow {
     std::string aligned_dna;
 };
 
+struct MafRowKey {
+    uint32_t leaf_name = 0;
+    uint32_t chr_name = 0;
+    uint32_t row_ordinal = 0;
+
+    friend bool operator==(
+        const MafRowKey&,
+        const MafRowKey&) = default;
+};
+
+struct MafRowKeyHash {
+    size_t operator()(
+        const MafRowKey& key) const noexcept {
+        size_t hash = key.leaf_name;
+        hash ^= static_cast<size_t>(key.chr_name) +
+                0x9e3779b9U +
+                (hash << 6) +
+                (hash >> 2);
+        hash ^= static_cast<size_t>(
+                    key.row_ordinal) +
+                0x9e3779b9U +
+                (hash << 6) +
+                (hash >> 2);
+        return hash;
+    }
+};
+
 struct MafReblockedBlock {
     bool initialized = false;
     bool has_multi_occurrence_column = false;
@@ -2490,8 +4970,9 @@ struct MafReblockedBlock {
     size_t alignment_width = 0;
     std::vector<MafReblockedRow> rows;
     std::unordered_map<
-        std::string,
-        std::vector<size_t>>
+        MafRowKey,
+        std::vector<size_t>,
+        MafRowKeyHash>
         row_indices;
 };
 
@@ -2508,13 +4989,18 @@ bool mafRowContinues(
     const LeafRunSpan& span,
     uint64_t span_end) {
     if (row.leaf_name !=
-            span.leaf_name ||
+            spanIdentity(
+                span,
+                span.leaf_name) ||
         row.chr_name !=
-            span.chr_name ||
+            spanIdentity(
+                span,
+                span.chr_name) ||
         row.hal_sequence_name !=
-            span.hal_sequence_name ||
-        row.reversed !=
-            span.reversed) {
+            spanIdentity(
+                span,
+                span.hal_sequence_name) ||
+        row.reversed != span.reversed) {
         return false;
     }
     return span.reversed
@@ -2553,9 +5039,8 @@ void appendMafRun(
         run.leaf_spans.size());
     for (const auto& span :
          run.leaf_spans) {
-        if (span.length !=
-                run_length ||
-            span.dna.size() !=
+        if (span.length != run_length ||
+            spanDNA(span).size() !=
                 run_length) {
             throw std::runtime_error(
                 "MAF run span length is inconsistent");
@@ -2570,9 +5055,12 @@ void appendMafRun(
         size_t row_index =
             std::numeric_limits<
                 size_t>::max();
+        const MafRowKey row_key{
+            span.leaf_name,
+            span.chr_name,
+            span.row_ordinal};
         const auto row_it =
-            block.row_indices.find(
-                span.row_id);
+            block.row_indices.find(row_key);
         if (row_it !=
             block.row_indices.end()) {
             for (const size_t candidate :
@@ -2592,13 +5080,20 @@ void appendMafRun(
             std::numeric_limits<
                 size_t>::max()) {
             MafReblockedRow row;
-            row.row_id = span.row_id;
+            row.row_ordinal =
+                span.row_ordinal;
             row.leaf_name =
-                span.leaf_name;
+                spanIdentity(
+                    span,
+                    span.leaf_name);
             row.chr_name =
-                span.chr_name;
+                spanIdentity(
+                    span,
+                    span.chr_name);
             row.hal_sequence_name =
-                span.hal_sequence_name;
+                spanIdentity(
+                    span,
+                    span.hal_sequence_name);
             row.interval_start =
                 span.start;
             row.interval_end =
@@ -2613,14 +5108,11 @@ void appendMafRun(
                 old_width,
                 '-');
             row.aligned_dna.append(
-                span.dna);
-            row_index =
-                block.rows.size();
-            block.rows.push_back(
-                std::move(row));
-            block.row_indices[
-                span.row_id].push_back(
-                    row_index);
+                spanDNA(span));
+            row_index = block.rows.size();
+            block.rows.push_back(std::move(row));
+            block.row_indices[row_key].push_back(
+                row_index);
             used_rows.insert(
                 row_index);
             continue;
@@ -2630,9 +5122,10 @@ void appendMafRun(
 
         auto& row =
             block.rows[row_index];
+        const auto dna = spanDNA(span);
         std::copy(
-            span.dna.begin(),
-            span.dna.end(),
+            dna.begin(),
+            dna.end(),
             row.aligned_dna.end() -
                 run_length);
         if (span.reversed) {
@@ -2693,16 +5186,22 @@ bool emitReblockedMafBlock(
             copies.end(),
             [](const MafReblockedRow* lhs,
                const MafReblockedRow* rhs) {
-                return std::tie(
-                           lhs->hal_sequence_name,
-                           lhs->interval_start,
-                           lhs->interval_end,
-                           lhs->row_id) <
-                       std::tie(
-                           rhs->hal_sequence_name,
-                           rhs->interval_start,
-                           rhs->interval_end,
-                           rhs->row_id);
+                const auto lhs_key =
+                    std::tie(
+                        lhs->hal_sequence_name,
+                        lhs->interval_start,
+                        lhs->interval_end);
+                const auto rhs_key =
+                    std::tie(
+                        rhs->hal_sequence_name,
+                        rhs->interval_start,
+                        rhs->interval_end);
+                if (lhs_key != rhs_key) {
+                    return lhs_key < rhs_key;
+                }
+                return rowOrdinalLexLess(
+                    lhs->row_ordinal,
+                    rhs->row_ordinal);
             });
     }
 
@@ -2836,7 +5335,7 @@ size_t emitReblockedMafRuns(
 }
 
 void exportCanonicalMafImpl(
-    const std::vector<std::weak_ptr<Block>>& blocks,
+    const PreparedExportInput& prepared,
     const std::filesystem::path& maf_path,
     const std::map<
         SpeciesName,
@@ -2844,42 +5343,90 @@ void exportCanonicalMafImpl(
         seqpro_managers,
     bool pairwise_mode) {
     const TreeMeta leaf_tree =
-        buildLeafOnlyTree(
-            seqpro_managers);
-    const auto block_msas =
-        buildLeafBlockMSAs(
-            blocks,
+        buildLeafOnlyTree(seqpro_managers);
+    RunStorage run_storage;
+    auto prepared_runs =
+        prepareCommonColumnRuns(
+            prepared,
             leaf_tree,
-            seqpro_managers);
-    auto runs =
-        buildColumnRuns(
-            block_msas,
-            leaf_tree);
-    const size_t projected_run_count =
-        runs.size();
-    const auto selection =
-        selectCoordinateConsistentSecondaryRuns(
-            runs);
+            run_storage);
+    auto runs = std::move(prepared_runs.runs);
+    const auto& preparation =
+        prepared_runs.stats;
     const auto normalization =
         normalizeOverlappingColumnRuns(
             runs,
             leaf_tree);
-    sanitizeLeafCoverage(
+    FlatLeafSpanStorage flat_spans;
+    compactRuns(
         runs,
-        seqpro_managers);
+        run_storage,
+        flat_spans,
+        prepared.spoolPath().parent_path());
+    const size_t compact_maf_bytes =
+        runs.capacity() * sizeof(ColumnRun) +
+        flat_spans.spans.capacity() *
+            sizeof(LeafRunSpan) +
+        run_storage.dnaCapacityBytes() +
+        run_storage.identityBytes() +
+        run_storage.identityCount() *
+            (sizeof(std::string) +
+             sizeof(std::string_view) +
+             sizeof(uint32_t));
+    spdlog::info(
+        "MAF compact runs hold {} flat occurrences and {} identities; "
+        "approximate resident compact payload/capacity is {} bytes "
+        "({} resident DNA cache capacity bytes, {} external DNA spool bytes)",
+        flat_spans.spans.size(),
+        run_storage.identityCount(),
+        compact_maf_bytes,
+        run_storage.dnaCapacityBytes(),
+        run_storage.dnaDiskBytes());
+    sanitizeLeafCoverage(runs, seqpro_managers);
 
-    if (!maf_path.parent_path().empty()) {
+    const std::filesystem::path absolute_path =
+        std::filesystem::absolute(maf_path);
+    if (!absolute_path.parent_path().empty()) {
         std::filesystem::create_directories(
-            maf_path.parent_path());
+            absolute_path.parent_path());
     }
+    std::filesystem::path temporary_path =
+        absolute_path;
+    temporary_path += ".tmp";
+    std::filesystem::path backup_path =
+        absolute_path;
+    backup_path += ".replace-backup";
+    std::error_code cleanup_error;
+    std::filesystem::remove(
+        temporary_path,
+        cleanup_error);
+    if (std::filesystem::exists(backup_path)) {
+        if (std::filesystem::exists(absolute_path)) {
+            std::filesystem::remove(backup_path);
+        } else {
+            std::filesystem::rename(
+                backup_path,
+                absolute_path);
+        }
+    }
+    struct TemporaryMafGuard {
+        std::filesystem::path path;
+        bool committed = false;
+        ~TemporaryMafGuard() {
+            if (!committed) {
+                std::error_code error;
+                std::filesystem::remove(path, error);
+            }
+        }
+    } temporary_guard{temporary_path};
+
     std::ofstream output(
-        maf_path,
-        std::ios::binary |
-            std::ios::trunc);
+        temporary_path,
+        std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error(
-            "Cannot open: " +
-            maf_path.string());
+            "Cannot open temporary MAF output: " +
+            temporary_path.string());
     }
     output << "##maf version=1 scoring=none\n";
     size_t emitted_blocks = 0;
@@ -2887,10 +5434,8 @@ void exportCanonicalMafImpl(
     size_t isolated_overlap_runs = 0;
     auto run = runs.cbegin();
     while (run != runs.cend()) {
-        auto group_end = run;
-        ++group_end;
-        if (run->source_block_ids.size() ==
-            1) {
+        auto group_end = std::next(run);
+        if (run->source_block_ids.size() == 1) {
             while (
                 group_end != runs.cend() &&
                 group_end->source_block_ids ==
@@ -2908,7 +5453,46 @@ void exportCanonicalMafImpl(
                 group_end,
                 seqpro_managers,
                 pairwise_mode);
+        if (!output) {
+            throw std::runtime_error(
+                "Failed writing temporary MAF output");
+        }
         run = group_end;
+    }
+    output.close();
+    if (!output) {
+        throw std::runtime_error(
+            "Failed closing temporary MAF output");
+    }
+
+    rejectDirectoryOutput(absolute_path);
+    const bool had_destination =
+        std::filesystem::exists(absolute_path);
+    if (had_destination) {
+        std::filesystem::rename(
+            absolute_path,
+            backup_path);
+    }
+    try {
+        std::filesystem::rename(
+            temporary_path,
+            absolute_path);
+    } catch (...) {
+        if (had_destination) {
+            std::error_code restore_error;
+            std::filesystem::rename(
+                backup_path,
+                absolute_path,
+                restore_error);
+        }
+        throw;
+    }
+    temporary_guard.committed = true;
+    if (had_destination) {
+        std::error_code remove_error;
+        std::filesystem::remove(
+            backup_path,
+            remove_error);
     }
     spdlog::info(
         "MAF export split {} elementary column runs; "
@@ -2918,12 +5502,12 @@ void exportCanonicalMafImpl(
         "homology components, reblocked {} single-source "
         "groups, kept {} overlap-normalized runs isolated, "
         "and emitted {} MAF blocks",
-        projected_run_count,
-        selection.accepted_runs,
-        selection.candidate_runs,
-        selection.conflict_rejected_runs,
-        selection.redundant_runs,
-        selection.rejected_bases,
+        preparation.projected_run_count,
+        preparation.secondary_accepted_runs,
+        preparation.secondary_candidate_runs,
+        preparation.secondary_conflict_rejected_runs,
+        preparation.secondary_redundant_runs,
+        preparation.secondary_rejected_bases,
         normalization.output_runs,
         normalization.connected_components,
         reblocked_groups,
@@ -2931,19 +5515,54 @@ void exportCanonicalMafImpl(
         emitted_blocks);
 }
 
+struct ConsensusDonorView {
+    std::string_view dna;
+    double weight = 0.0;
+    bool prefer_internal = false;
+};
+
+bool preferConsensusDonor(
+    const ConsensusDonorView& donor, const ConsensusDonorView& current) {
+    if (donor.prefer_internal != current.prefer_internal) {
+        return donor.prefer_internal;
+    }
+    if (donor.weight != current.weight) {
+        return donor.weight > current.weight;
+    }
+    return donor.dna < current.dna;
+}
+
+template <typename DNA>
 std::string buildConsensusDNAImpl(
-    const std::vector<std::pair<std::string, double>>& donors,
+    const std::vector<std::pair<DNA, double>>& donors,
     size_t expected_length,
     double consensus_threshold) {
 
     if (donors.empty()) {
         return {};
     }
+    const bool donors_cover_expected_length =
+        std::all_of(
+            donors.begin(),
+            donors.end(),
+            [expected_length](const auto& donor) {
+                return donor.first.size() >=
+                       expected_length;
+            });
+    double full_coverage_total = 0.0;
+    if (donors_cover_expected_length) {
+        for (const auto& donor : donors) {
+            full_coverage_total += donor.second;
+        }
+    }
     std::string consensus(expected_length, 'N');
     for (size_t col = 0; col < expected_length; ++col) {
         std::array<double, 5> weights{0.0, 0.0, 0.0, 0.0, 0.0};
         std::array<double, 5> masked_weights{0.0, 0.0, 0.0, 0.0, 0.0};
-        double total = 0.0;
+        double total =
+            donors_cover_expected_length
+                ? full_coverage_total
+                : 0.0;
         for (const auto& [dna, weight] : donors) {
             if (col >= dna.size()) {
                 continue;
@@ -2962,7 +5581,9 @@ std::string buildConsensusDNAImpl(
             if (std::islower(raw_base)) {
                 masked_weights[idx] += weight;
             }
-            total += weight;
+            if (!donors_cover_expected_length) {
+                total += weight;
+            }
         }
 
         size_t best_idx = 4;
@@ -2989,19 +5610,117 @@ std::string buildConsensusDNAImpl(
     return consensus;
 }
 
+class CactusZScorePrecompute {
+public:
+    CactusZScorePrecompute(
+        long double theta,
+        size_t max_cached_exponent)
+        : theta_(theta),
+          beta_(1.0L - theta) {
+
+        if (theta_ < 0.0L || theta_ > 1.0L) {
+            throw std::invalid_argument(
+                "Cactus adjacency theta must be in [0, 1]");
+        }
+        if (theta_ == 0.0L) {
+            return;
+        }
+        terms_.reserve(max_cached_exponent + 1);
+        for (size_t exponent = 0;
+             exponent <= max_cached_exponent;
+             ++exponent) {
+            const long double power =
+                std::pow(
+                    beta_,
+                    static_cast<long double>(exponent));
+            terms_.push_back(
+                PowerAndSide{
+                    power,
+                    (1.0L - power) / theta_});
+        }
+    }
+
+    long double score(
+        uint64_t left_length,
+        uint64_t right_length,
+        uint64_t gap_length) const {
+
+        if (theta_ == 0.0L) {
+            return static_cast<long double>(left_length) *
+                   static_cast<long double>(right_length);
+        }
+        return sideTerm(left_length) *
+               powerTerm(gap_length) *
+               sideTerm(right_length);
+    }
+
+private:
+    struct PowerAndSide {
+        long double power = 0.0L;
+        long double side = 0.0L;
+    };
+
+    long double powerTerm(uint64_t exponent) const {
+        if (exponent < terms_.size()) {
+            return terms_[static_cast<size_t>(exponent)]
+                .power;
+        }
+        return std::pow(
+            beta_,
+            static_cast<long double>(exponent));
+    }
+
+    long double sideTerm(uint64_t length) const {
+        if (length < terms_.size()) {
+            return terms_[static_cast<size_t>(length)]
+                .side;
+        }
+        return (1.0L - std::pow(
+                           beta_,
+                           static_cast<long double>(length))) /
+               theta_;
+    }
+
+    long double theta_ = 0.0L;
+    long double beta_ = 1.0L;
+    std::vector<PowerAndSide> terms_;
+};
+
+
+
 
 std::vector<EdgeSupport> collectAdjacencySupport(
     int node_id,
     const TreeMeta& tree,
-    const std::unordered_map<uint64_t, std::vector<OccurrenceId>>&
-        occurrences_by_run,
-    const ChildRunCopyMap& parent_copy_by_child_run,
-    const std::unordered_map<OccurrenceId, uint32_t>& candidate_index,
+    const NodeModel& model,
     const std::unordered_map<int, NodeModel>& prior_models,
     const std::unordered_map<std::string, std::vector<LeafOccurrence>>&
         leaf_paths,
     const ExportConfig& config,
     ExportStats* stats) {
+    constexpr size_t kMaximumCachedCactusExponent =
+        65536;
+    const size_t cache_work_budget =
+        model.runs.size() >=
+                kMaximumCachedCactusExponent / 4
+            ? kMaximumCachedCactusExponent
+            : model.runs.size() * 4;
+    size_t maximum_run_length = 0;
+    for (const auto& model_run : model.runs) {
+        maximum_run_length =
+            std::max(maximum_run_length, model_run.dna.size());
+        if (maximum_run_length >= cache_work_budget) {
+            break;
+        }
+    }
+    const CactusZScorePrecompute cactus_score(
+        static_cast<long double>(
+            config.adjacency_theta),
+        std::min(
+            maximum_run_length,
+            cache_work_budget));
+
+
 
     auto canonical_key = [](const AdjacencyVote& vote) {
         std::pair<uint64_t, bool> first_end{
@@ -3030,10 +5749,11 @@ std::vector<EdgeSupport> collectAdjacencySupport(
     std::vector<ChildEdgeContribution> contributions;
     for (int child_id :
          tree.nodes[static_cast<size_t>(node_id)].children) {
-        const auto child_mapping_it =
-            parent_copy_by_child_run.find(child_id);
-        if (child_mapping_it ==
-            parent_copy_by_child_run.end()) {
+        const ChildCopyTable* child_mapping =
+            findChildCopies(
+                model.parent_copy_by_child_run,
+                child_id);
+        if (child_mapping == nullptr) {
             continue;
         }
         const long double branch_length =
@@ -3054,34 +5774,25 @@ std::vector<EdgeSupport> collectAdjacencySupport(
             [&](uint64_t run_id,
                 uint32_t copy_index)
             -> std::optional<OccurrenceId> {
-            const auto copy_map_it =
-                child_mapping_it->second.find(
+            const auto copy_map =
+                childCopiesForRun(
+                    *child_mapping,
                     run_id);
-            const auto occurrence_it =
-                occurrences_by_run.find(run_id);
-            if (copy_map_it ==
-                    child_mapping_it->second.end() ||
-                occurrence_it ==
-                    occurrences_by_run.end() ||
-                copy_index >=
-                    copy_map_it->second.size()) {
+            const NodeRun* parent_run =
+                findNodeRun(model, run_id);
+            if (parent_run == nullptr ||
+                copy_index >= copy_map.size()) {
                 return std::nullopt;
             }
             const uint32_t parent_copy_index =
-                copy_map_it->second[copy_index];
+                copy_map[copy_index];
             if (parent_copy_index >=
-                occurrence_it->second.size()) {
+                parent_run->occurrence_count) {
                 throw std::runtime_error(
                     "HAL child adjacency maps outside parent copy range");
             }
-            const OccurrenceId occurrence_id =
-                occurrence_it->second[
-                    parent_copy_index];
-            return candidate_index.contains(
-                       occurrence_id)
-                       ? std::optional{
-                             occurrence_id}
-                       : std::nullopt;
+            return parent_run->first_occurrence +
+                   parent_copy_index;
         };
 
         std::optional<ProjectedOccurrence> previous;
@@ -3171,12 +5882,10 @@ std::vector<EdgeSupport> collectAdjacencySupport(
                             gap_bases);
                     contribution
                         .weighted_support +=
-                        calculateCactusZScore(
+                        cactus_score.score(
                             previous->length,
                             current.length,
-                            gap_bases,
-                            config
-                                .adjacency_theta) *
+                            gap_bases) *
                         child_weight;
                     ++contribution
                           .occurrence_support;
@@ -3198,22 +5907,24 @@ std::vector<EdgeSupport> collectAdjacencySupport(
             std::string_view sequence_name;
             for (const auto& occurrence :
                  path_it->second) {
+                const std::string& current_sequence =
+                    spanIdentity(
+                        *occurrence.span,
+                        occurrence.span
+                            ->hal_sequence_name);
                 if (!sequence_name.empty() &&
                     sequence_name !=
-                        occurrence.span
-                            .hal_sequence_name) {
+                        current_sequence) {
                     reset_path();
                 }
-                sequence_name =
-                    occurrence.span
-                        .hal_sequence_name;
+                sequence_name = current_sequence;
                 add_occurrence(
                     occurrence.run_id,
                     occurrence.copy_index,
                     occurrence
                         .forward_to_canonical,
-                    occurrence.span.start,
-                    occurrence.span.length);
+                    occurrence.span->start,
+                    occurrence.span->length);
             }
         } else {
             const auto model_it =
@@ -3247,10 +5958,9 @@ std::vector<EdgeSupport> collectAdjacencySupport(
                         sequence.path[
                             occurrence_index];
                     const auto& placement =
-                        model_it->second
-                            .placements.at(
-                                occurrence
-                                    .occurrence_id);
+                        modelOccurrence(
+                            model_it->second,
+                            occurrence.occurrence_id);
                     add_occurrence(
                         occurrence.run_id,
                         occurrence.copy_index,
@@ -3340,25 +6050,61 @@ std::unordered_map<std::string, std::vector<LeafOccurrence>> buildLeafPaths(
     const std::vector<ColumnRun>& runs) {
 
     std::unordered_map<std::string, std::vector<LeafOccurrence>> paths;
+    // Normalized run IDs are the dense 1..runs.size() domain. Reuse one
+    // flat counter slab for every leaf and reset only entries that occurred.
+    std::vector<uint32_t> next_copy_index(
+        runs.size() + 1,
+        0);
     for (const auto& run : runs) {
         for (const auto& span : run.leaf_spans) {
-            paths[span.leaf_name].push_back(LeafOccurrence{run.run_id, span, !span.reversed});
+            paths[
+                spanIdentity(
+                    span,
+                    span.leaf_name)]
+                .push_back(
+                    LeafOccurrence{
+                        run.run_id,
+                        &span,
+                        !span.reversed});
         }
     }
     for (auto& [leaf_name, ordered] : paths) {
-        std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-            if (a.span.hal_sequence_name != b.span.hal_sequence_name) {
-                return a.span.hal_sequence_name < b.span.hal_sequence_name;
-            }
-            if (a.span.start != b.span.start) {
-                return a.span.start < b.span.start;
-            }
-            return a.run_id < b.run_id;
-        });
-        std::unordered_map<uint64_t, uint32_t> next_copy_index;
+        (void)leaf_name;
+        std::sort(
+            ordered.begin(),
+            ordered.end(),
+            [](const auto& a, const auto& b) {
+                const auto& a_sequence =
+                    spanIdentity(
+                        *a.span,
+                        a.span->hal_sequence_name);
+                const auto& b_sequence =
+                    spanIdentity(
+                        *b.span,
+                        b.span->hal_sequence_name);
+                if (a_sequence != b_sequence) {
+                    return a_sequence < b_sequence;
+                }
+                if (a.span->start != b.span->start) {
+                    return a.span->start < b.span->start;
+                }
+                return a.run_id < b.run_id;
+            });
         for (auto& occurrence : ordered) {
+            if (occurrence.run_id == 0 ||
+                occurrence.run_id > runs.size()) {
+                throw std::out_of_range(
+                    "Leaf occurrence references a run outside the dense domain");
+            }
             occurrence.copy_index =
-                next_copy_index[occurrence.run_id]++;
+                next_copy_index[
+                    static_cast<size_t>(
+                        occurrence.run_id)]++;
+        }
+        for (const auto& occurrence : ordered) {
+            next_copy_index[
+                static_cast<size_t>(
+                    occurrence.run_id)] = 0;
         }
     }
     return paths;
@@ -3369,10 +6115,7 @@ std::unordered_map<std::string, std::vector<LeafOccurrence>> buildLeafPaths(
 std::vector<TerminalEndSupport> buildTerminalEndSupport(
     int node_id,
     const TreeMeta& tree,
-    const std::unordered_map<uint64_t, std::vector<OccurrenceId>>&
-        occurrences_by_run,
-    const ChildRunCopyMap& parent_copy_by_child_run,
-    const std::unordered_map<OccurrenceId, uint32_t>& candidate_index,
+    const NodeModel& model,
     const std::unordered_map<int, NodeModel>& prior_models,
     const std::unordered_map<std::string, std::vector<LeafOccurrence>>&
         leaf_paths,
@@ -3390,35 +6133,30 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
             uint64_t run_id,
             uint32_t copy_index)
         -> std::optional<OccurrenceId> {
-        const auto child_it =
-            parent_copy_by_child_run.find(child_id);
-        if (child_it ==
-            parent_copy_by_child_run.end()) {
+        const ChildCopyTable* child =
+            findChildCopies(
+                model.parent_copy_by_child_run,
+                child_id);
+        if (child == nullptr) {
             return std::nullopt;
         }
-        const auto copy_map_it =
-            child_it->second.find(run_id);
-        if (copy_map_it ==
-                child_it->second.end() ||
-            copy_index >=
-                copy_map_it->second.size()) {
+        const auto copies =
+            childCopiesForRun(*child, run_id);
+        const NodeRun* run =
+            findNodeRun(model, run_id);
+        if (run == nullptr ||
+            copy_index >= copies.size()) {
             return std::nullopt;
         }
-        const auto run_it =
-            occurrences_by_run.find(run_id);
-        if (run_it ==
-                occurrences_by_run.end() ||
-            copy_map_it->second[copy_index] >=
-                run_it->second.size()) {
-            return std::nullopt;
+        const uint32_t parent_copy_index =
+            copies[copy_index];
+        if (parent_copy_index >=
+            run->occurrence_count) {
+            throw std::runtime_error(
+                "HAL terminal mapping exceeds parent copy range");
         }
-        const OccurrenceId occurrence_id =
-            run_it->second[
-                copy_map_it->second[copy_index]];
-        return candidate_index.contains(
-                   occurrence_id)
-                   ? std::optional{occurrence_id}
-                   : std::nullopt;
+        return run->first_occurrence +
+               parent_copy_index;
     };
     auto add_terminal =
         [&](int child_id,
@@ -3513,13 +6251,14 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
             };
             for (const auto& occurrence :
                  path_it->second) {
-                if (sequence_name !=
-                    occurrence.span
-                        .hal_sequence_name) {
-                    flush_sequence();
-                    sequence_name =
+                const std::string& current_sequence =
+                    spanIdentity(
+                        *occurrence.span,
                         occurrence.span
-                            .hal_sequence_name;
+                            ->hal_sequence_name);
+                if (sequence_name != current_sequence) {
+                    flush_sequence();
+                    sequence_name = current_sequence;
                     first = nullptr;
                     last = nullptr;
                 }
@@ -3548,21 +6287,12 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
             model_it->second;
         for (const auto& terminal :
              child_model.terminal_ends) {
-            const auto run_it =
-                child_model.run_by_occurrence.find(
+            const auto& child_occurrence =
+                modelOccurrence(
+                    child_model,
                     terminal.end.occurrence_id);
-            const auto copy_it =
-                child_model
-                    .copy_index_by_occurrence.find(
-                        terminal.end
-                            .occurrence_id);
-            if (run_it ==
-                    child_model
-                        .run_by_occurrence.end() ||
-                copy_it ==
-                    child_model
-                        .copy_index_by_occurrence
-                        .end()) {
+            if (child_occurrence.run_index >=
+                child_model.runs.size()) {
                 throw std::runtime_error(
                     "HAL terminal provenance references an unknown child occurrence");
             }
@@ -3572,8 +6302,10 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
                 add_terminal(
                     child_id,
                     child_id,
-                    run_it->second,
-                    copy_it->second,
+                    child_model.runs[
+                        child_occurrence.run_index]
+                        .run_id,
+                    child_occurrence.copy_index,
                     terminal.end.side);
             }
         }
@@ -3592,17 +6324,14 @@ std::vector<TerminalEndSupport> buildTerminalEndSupport(
                 OccurrenceEndSide>(
                 key.second)};
         for (const auto& [lineage_id,
-                          contribution] :
+                         contribution] :
              by_lineage) {
-            support
-                .supporting_lineages
+            support.supporting_lineages
                 .push_back(lineage_id);
             support.occurrence_support +=
-                contribution
-                    .occurrence_support;
+                contribution.occurrence_support;
             support.weighted_support +=
-                contribution
-                    .weighted_support;
+                contribution.weighted_support;
         }
         terminal_ends.push_back(
             std::move(support));
@@ -3615,8 +6344,8 @@ NodeModel buildNodeModel(
     int node_id,
     const TreeMeta& tree,
     const std::vector<ColumnRun>& runs,
-    const std::unordered_map<uint64_t, const ColumnRun*>& run_by_id,
-    const std::unordered_map<int, NodeModel>& prior_models,
+    const FlatPresenceStorage& run_presence,
+    std::unordered_map<int, NodeModel> prior_models,
     const std::unordered_map<std::string, std::vector<LeafOccurrence>>& leaf_paths,
     const ExportConfig& config,
     OccurrenceId* next_occurrence_id,
@@ -3635,251 +6364,463 @@ NodeModel buildNodeModel(
     std::vector<uint64_t> candidate_runs;
     candidate_runs.reserve(runs.size());
     for (const auto& run : runs) {
-        if (run.present_by_node[node_id]) {
+        if (run_presence.contains(
+                run.presence_offset,
+                static_cast<size_t>(node_id))) {
             candidate_runs.push_back(run.run_id);
         }
     }
     if (candidate_runs.empty()) {
         return model;
     }
-    std::unordered_map<uint64_t, uint32_t> candidate_index;
-    candidate_index.reserve(candidate_runs.size());
-    for (uint32_t index = 0; index < candidate_runs.size(); ++index) {
-        candidate_index.emplace(candidate_runs[index], index);
+    if (candidate_runs.size() >
+        static_cast<size_t>(
+            std::numeric_limits<uint32_t>::max())) {
+        throw std::overflow_error(
+            "Too many HAL runs in one ancestor model");
     }
+    model.first_occurrence = *next_occurrence_id;
+    model.run_index_by_id.assign(
+        runs.size() + 1,
+        kMissingDenseIndex);
+    model.runs.reserve(candidate_runs.size());
 
-    using ContextToken =
-        std::tuple<uint8_t, uint64_t, uint8_t>;
-    using ContextSignature =
-        std::pair<ContextToken, ContextToken>;
-    struct ContextOccurrence {
-        uint64_t run_id = 0;
-        uint32_t copy_index = 0;
-        bool forward = true;
-    };
-    std::map<
-        int,
-        std::map<
-            uint64_t,
-            std::map<uint32_t, ContextSignature>>>
-        contexts_by_child;
-    const ContextToken terminal_context{0, 0, 0};
-    auto add_context_path =
-        [&](int child_id,
-            const std::vector<ContextOccurrence>& path) {
-            for (size_t index = 0;
-                 index < path.size();
-                 ++index) {
-                const auto& occurrence = path[index];
-                auto context_for_side =
-                    [&](OccurrenceEndSide side) {
-                        const bool neighbor_before =
-                            side == OccurrenceEndSide::LEFT
-                                ? occurrence.forward
-                                : !occurrence.forward;
-                        const bool has_neighbor =
-                            neighbor_before
-                                ? index != 0
-                                : index + 1 < path.size();
-                        if (!has_neighbor) {
-                            return terminal_context;
-                        }
-                        const auto& neighbor =
-                            path[neighbor_before
-                                     ? index - 1
-                                     : index + 1];
-                        const auto neighbor_side =
-                            neighbor_before
-                                ? (neighbor.forward
-                                       ? OccurrenceEndSide::RIGHT
-                                       : OccurrenceEndSide::LEFT)
-                                : (neighbor.forward
-                                       ? OccurrenceEndSide::LEFT
-                                       : OccurrenceEndSide::RIGHT);
-                        return ContextToken{
-                            1,
-                            neighbor.run_id,
-                            static_cast<uint8_t>(
-                                neighbor_side)};
-                    };
-                const ContextSignature signature{
-                    context_for_side(
-                        OccurrenceEndSide::LEFT),
-                    context_for_side(
-                        OccurrenceEndSide::RIGHT)};
-                auto [it, inserted] =
-                    contexts_by_child[child_id]
-                        [occurrence.run_id]
-                            .emplace(
-                                occurrence.copy_index,
-                                signature);
-                if (!inserted && it->second != signature) {
-                    throw std::runtime_error(
-                        "HAL child occurrence has inconsistent bilateral context");
-                }
-            }
+    {
+        using ContextToken =
+            std::tuple<uint8_t, uint64_t, uint8_t>;
+        using ContextSignature =
+            std::pair<ContextToken, ContextToken>;
+        struct ContextOccurrence {
+            uint64_t run_id = 0;
+            uint32_t copy_index = 0;
+            bool forward = true;
+        };
+        struct ContextRecord {
+            int child_id = -1;
+            uint64_t run_id = 0;
+            uint32_t copy_index = 0;
+            ContextSignature signature;
         };
 
-    for (int child_id :
-         tree.nodes[static_cast<size_t>(node_id)].children) {
-        if (tree.nodes[static_cast<size_t>(child_id)].is_leaf) {
-            const auto& child_name =
-                tree.nodes[static_cast<size_t>(child_id)].name;
-            const auto path_it = leaf_paths.find(child_name);
-            if (path_it == leaf_paths.end()) {
-                continue;
-            }
-            std::vector<ContextOccurrence> path;
-            std::string sequence_name;
-            for (const auto& occurrence : path_it->second) {
-                if (!sequence_name.empty() &&
-                    occurrence.span.hal_sequence_name !=
-                        sequence_name) {
-                    add_context_path(child_id, path);
-                    path.clear();
+        std::vector<ContextRecord> contexts;
+        const ContextToken terminal_context{0, 0, 0};
+        auto add_context_path =
+            [&](int child_id,
+                const std::vector<ContextOccurrence>& path) {
+                for (size_t index = 0;
+                     index < path.size();
+                     ++index) {
+                    const auto& occurrence = path[index];
+                    auto context_for_side =
+                        [&](OccurrenceEndSide side) {
+                            const bool neighbor_before =
+                                side == OccurrenceEndSide::LEFT
+                                    ? occurrence.forward
+                                    : !occurrence.forward;
+                            const bool has_neighbor =
+                                neighbor_before
+                                    ? index != 0
+                                    : index + 1 < path.size();
+                            if (!has_neighbor) {
+                                return terminal_context;
+                            }
+                            const auto& neighbor =
+                                path[neighbor_before
+                                         ? index - 1
+                                         : index + 1];
+                            const auto neighbor_side =
+                                neighbor_before
+                                    ? (neighbor.forward
+                                           ? OccurrenceEndSide::RIGHT
+                                           : OccurrenceEndSide::LEFT)
+                                    : (neighbor.forward
+                                           ? OccurrenceEndSide::LEFT
+                                           : OccurrenceEndSide::RIGHT);
+                            return ContextToken{
+                                1,
+                                neighbor.run_id,
+                                static_cast<uint8_t>(
+                                    neighbor_side)};
+                        };
+                    contexts.push_back(
+                        ContextRecord{
+                            child_id,
+                            occurrence.run_id,
+                            occurrence.copy_index,
+                            ContextSignature{
+                                context_for_side(
+                                    OccurrenceEndSide::LEFT),
+                                context_for_side(
+                                    OccurrenceEndSide::RIGHT)}});
                 }
-                sequence_name =
-                    occurrence.span.hal_sequence_name;
-                path.push_back(ContextOccurrence{
-                    occurrence.run_id,
-                    occurrence.copy_index,
-                    occurrence.forward_to_canonical});
-            }
-            add_context_path(child_id, path);
-        } else {
-            const auto child_model_it =
-                prior_models.find(child_id);
-            if (child_model_it == prior_models.end()) {
-                continue;
-            }
-            for (const auto& sequence :
-                 child_model_it->second.sequences) {
+            };
+
+        for (int child_id :
+             tree.nodes[static_cast<size_t>(node_id)].children) {
+            if (tree.nodes[static_cast<size_t>(child_id)].is_leaf) {
+                const auto& child_name =
+                    tree.nodes[static_cast<size_t>(child_id)].name;
+                const auto path_it =
+                    leaf_paths.find(child_name);
+                if (path_it == leaf_paths.end()) {
+                    continue;
+                }
                 std::vector<ContextOccurrence> path;
-                path.reserve(sequence.path.size());
+                std::string_view sequence_name;
                 for (const auto& occurrence :
-                     sequence.path) {
+                     path_it->second) {
+                    const std::string& current_sequence =
+                        spanIdentity(
+                            *occurrence.span,
+                            occurrence.span
+                                ->hal_sequence_name);
+                    if (!sequence_name.empty() &&
+                        current_sequence !=
+                            sequence_name) {
+                        add_context_path(
+                            child_id,
+                            path);
+                        path.clear();
+                    }
+                    sequence_name = current_sequence;
                     path.push_back(ContextOccurrence{
                         occurrence.run_id,
                         occurrence.copy_index,
-                        occurrence.forward});
+                        occurrence.forward_to_canonical});
                 }
                 add_context_path(child_id, path);
-            }
-        }
-    }
-
-    std::vector<OccurrenceId> candidate_occurrences;
-    for (uint64_t run_id : candidate_runs) {
-        using CopiesByChild =
-            std::map<int, std::vector<uint32_t>>;
-        std::map<ContextSignature, CopiesByChild>
-            copies_by_signature;
-        for (int child_id :
-             tree.nodes[static_cast<size_t>(node_id)].children) {
-            const auto child_it =
-                contexts_by_child.find(child_id);
-            if (child_it == contexts_by_child.end()) {
-                continue;
-            }
-            const auto run_it =
-                child_it->second.find(run_id);
-            if (run_it == child_it->second.end()) {
-                continue;
-            }
-            auto& copy_map =
-                model.parent_copy_by_child_run[child_id]
-                    [run_id];
-            if (!run_it->second.empty()) {
-                copy_map.resize(
-                    static_cast<size_t>(
-                        run_it->second.rbegin()->first) +
-                        1,
-                    0);
-            }
-            for (const auto& [copy_index, signature] :
-                 run_it->second) {
-                copies_by_signature[signature][child_id]
-                    .push_back(copy_index);
-            }
-        }
-
-        uint32_t ancestor_copy_count = 0;
-        for (auto& [signature, copies_by_child] :
-             copies_by_signature) {
-            (void)signature;
-            std::vector<size_t> child_counts;
-            child_counts.reserve(copies_by_child.size());
-            for (auto& [child_id, copies] :
-                 copies_by_child) {
-                (void)child_id;
-                std::sort(copies.begin(), copies.end());
-                child_counts.push_back(copies.size());
-            }
-            if (child_counts.size() < 2) {
-                continue;
-            }
-            std::sort(
-                child_counts.begin(),
-                child_counts.end(),
-                std::greater<>());
-            const size_t shared_copy_count =
-                child_counts[1];
-            if (shared_copy_count >
-                std::numeric_limits<uint32_t>::max() -
-                    ancestor_copy_count) {
-                throw std::overflow_error(
-                    "HAL reconciled ancestor copy count overflow");
-            }
-            for (size_t shared_index = 0;
-                 shared_index < shared_copy_count;
-                 ++shared_index) {
-                const uint32_t parent_copy_index =
-                    ancestor_copy_count++;
-                for (const auto& [child_id, copies] :
-                     copies_by_child) {
-                    if (shared_index >= copies.size()) {
-                        continue;
+            } else {
+                const auto child_model_it =
+                    prior_models.find(child_id);
+                if (child_model_it == prior_models.end()) {
+                    continue;
+                }
+                for (const auto& sequence :
+                     child_model_it->second.sequences) {
+                    std::vector<ContextOccurrence> path;
+                    path.reserve(sequence.path.size());
+                    for (const auto& occurrence :
+                         sequence.path) {
+                        path.push_back(ContextOccurrence{
+                            occurrence.run_id,
+                            occurrence.copy_index,
+                            occurrence.forward});
                     }
-                    model.parent_copy_by_child_run
-                        .at(child_id)
-                        .at(run_id)
-                        .at(copies[shared_index]) =
-                        parent_copy_index;
+                    add_context_path(child_id, path);
                 }
             }
         }
-        ancestor_copy_count =
-            std::max<uint32_t>(1, ancestor_copy_count);
-        auto& run_occurrences =
-            model.occurrences_by_run[run_id];
-        run_occurrences.reserve(ancestor_copy_count);
-        for (uint32_t copy_index = 0;
-             copy_index < ancestor_copy_count;
-             ++copy_index) {
-            if (*next_occurrence_id ==
-                std::numeric_limits<OccurrenceId>::max()) {
-                throw std::overflow_error(
-                    "HAL ancestor occurrence id overflow");
+        std::sort(
+            contexts.begin(),
+            contexts.end(),
+            [](const ContextRecord& lhs,
+               const ContextRecord& rhs) {
+                return std::tie(
+                           lhs.run_id,
+                           lhs.child_id,
+                           lhs.copy_index,
+                           lhs.signature) <
+                       std::tie(
+                           rhs.run_id,
+                           rhs.child_id,
+                           rhs.copy_index,
+                           rhs.signature);
+            });
+        for (size_t index = 1;
+             index < contexts.size();
+             ++index) {
+            if (contexts[index - 1].child_id ==
+                    contexts[index].child_id &&
+                contexts[index - 1].run_id ==
+                    contexts[index].run_id &&
+                contexts[index - 1].copy_index ==
+                    contexts[index].copy_index &&
+                contexts[index - 1].signature !=
+                    contexts[index].signature) {
+                throw std::runtime_error(
+                    "HAL child occurrence has inconsistent bilateral context");
             }
-            const OccurrenceId occurrence_id =
-                (*next_occurrence_id)++;
-            candidate_occurrences.push_back(occurrence_id);
-            run_occurrences.push_back(occurrence_id);
-            model.run_by_occurrence.emplace(
-                occurrence_id,
-                run_id);
-            model.copy_index_by_occurrence.emplace(
-                occurrence_id,
-                copy_index);
+        }
+        contexts.erase(
+            std::unique(
+                contexts.begin(),
+                contexts.end(),
+                [](const ContextRecord& lhs,
+                   const ContextRecord& rhs) {
+                    return lhs.child_id == rhs.child_id &&
+                           lhs.run_id == rhs.run_id &&
+                           lhs.copy_index == rhs.copy_index;
+                }),
+            contexts.end());
+
+        model.parent_copy_by_child_run.reserve(
+            tree.nodes[node_id].children.size());
+        for (int child_id :
+             tree.nodes[node_id].children) {
+            model.parent_copy_by_child_run.push_back(
+                ChildCopyTable{child_id, {}, {}});
+        }
+        std::sort(
+            model.parent_copy_by_child_run.begin(),
+            model.parent_copy_by_child_run.end(),
+            [](const ChildCopyTable& lhs,
+               const ChildCopyTable& rhs) {
+                return lhs.child_id < rhs.child_id;
+            });
+
+        std::vector<size_t> planned_run_records(
+            model.parent_copy_by_child_run.size(),
+            0);
+        std::vector<size_t> planned_copy_values(
+            model.parent_copy_by_child_run.size(),
+            0);
+        for (size_t begin = 0;
+             begin < contexts.size();) {
+            size_t end = begin + 1;
+            while (end < contexts.size() &&
+                   contexts[end].run_id ==
+                       contexts[begin].run_id &&
+                   contexts[end].child_id ==
+                       contexts[begin].child_id) {
+                ++end;
+            }
+            const auto table_it =
+                std::lower_bound(
+                    model.parent_copy_by_child_run.begin(),
+                    model.parent_copy_by_child_run.end(),
+                    contexts[begin].child_id,
+                    [](const ChildCopyTable& table,
+                       int child_id) {
+                        return table.child_id <
+                               child_id;
+                    });
+            if (table_it ==
+                    model.parent_copy_by_child_run.end() ||
+                table_it->child_id !=
+                    contexts[begin].child_id) {
+                throw std::logic_error(
+                    "HAL context references a non-child lineage");
+            }
+            const size_t table_index =
+                static_cast<size_t>(
+                    table_it -
+                    model.parent_copy_by_child_run.begin());
+            ++planned_run_records[table_index];
+            const uint64_t value_count =
+                static_cast<uint64_t>(
+                    contexts[end - 1].copy_index) +
+                1;
+            if (value_count >
+                    std::numeric_limits<uint32_t>::max() ||
+                planned_copy_values[table_index] >
+                    std::numeric_limits<uint32_t>::max() -
+                        value_count) {
+                throw std::overflow_error(
+                    "HAL child copy mapping exceeds dense index range");
+            }
+            planned_copy_values[table_index] +=
+                static_cast<size_t>(value_count);
+            begin = end;
+        }
+        for (size_t index = 0;
+             index <
+                 model.parent_copy_by_child_run.size();
+             ++index) {
+            model.parent_copy_by_child_run[index]
+                .runs.reserve(
+                    planned_run_records[index]);
+            model.parent_copy_by_child_run[index]
+                .values.reserve(
+                    planned_copy_values[index]);
+        }
+
+
+        size_t context_index = 0;
+        for (uint64_t run_id : candidate_runs) {
+            using CopiesByChild =
+                std::map<int, std::vector<uint32_t>>;
+            std::map<ContextSignature, CopiesByChild>
+                copies_by_signature;
+            std::map<int, uint32_t> value_offsets;
+            while (context_index < contexts.size() &&
+                   contexts[context_index].run_id <
+                       run_id) {
+                ++context_index;
+            }
+            size_t run_context_end = context_index;
+            while (run_context_end < contexts.size() &&
+                   contexts[run_context_end].run_id ==
+                       run_id) {
+                ++run_context_end;
+            }
+            size_t child_context_begin =
+                context_index;
+            while (child_context_begin <
+                   run_context_end) {
+                const int child_id =
+                    contexts[child_context_begin]
+                        .child_id;
+                size_t child_context_end =
+                    child_context_begin;
+                while (child_context_end <
+                           run_context_end &&
+                       contexts[child_context_end]
+                               .child_id ==
+                           child_id) {
+                    const auto& context =
+                        contexts[child_context_end];
+                    copies_by_signature[
+                        context.signature][child_id]
+                            .push_back(
+                                context.copy_index);
+                    ++child_context_end;
+                }
+                auto* table =
+                    findChildCopies(
+                        model.parent_copy_by_child_run,
+                        child_id);
+                const uint64_t value_count =
+                    static_cast<uint64_t>(
+                        contexts[
+                            child_context_end - 1]
+                            .copy_index) +
+                    1;
+                if (value_count >
+                        std::numeric_limits<uint32_t>::max() ||
+                    table->values.size() >
+                        std::numeric_limits<uint32_t>::max() -
+                            value_count) {
+                    throw std::overflow_error(
+                        "HAL child copy mapping exceeds dense index range");
+                }
+                const uint32_t offset =
+                    static_cast<uint32_t>(
+                        table->values.size());
+                value_offsets.emplace(child_id, offset);
+                table->runs.push_back(
+                    ChildRunCopies{
+                        run_id,
+                        offset,
+                        static_cast<uint32_t>(
+                            value_count)});
+                table->values.resize(
+                    table->values.size() +
+                        static_cast<size_t>(
+                            value_count),
+                    0);
+                child_context_begin =
+                    child_context_end;
+            }
+            context_index = run_context_end;
+
+            uint32_t ancestor_copy_count = 0;
+            for (auto& [signature, copies_by_child] :
+                 copies_by_signature) {
+                (void)signature;
+                std::vector<size_t> child_counts;
+                child_counts.reserve(copies_by_child.size());
+                for (auto& [child_id, copies] :
+                     copies_by_child) {
+                    (void)child_id;
+                    std::sort(copies.begin(), copies.end());
+                    child_counts.push_back(copies.size());
+                }
+                if (child_counts.size() < 2) {
+                    continue;
+                }
+                std::sort(
+                    child_counts.begin(),
+                    child_counts.end(),
+                    std::greater<>());
+                const size_t shared_copy_count =
+                    child_counts[1];
+                if (shared_copy_count >
+                    std::numeric_limits<uint32_t>::max() -
+                        ancestor_copy_count) {
+                    throw std::overflow_error(
+                        "HAL reconciled ancestor copy count overflow");
+                }
+                for (size_t shared_index = 0;
+                     shared_index < shared_copy_count;
+                     ++shared_index) {
+                    const uint32_t parent_copy_index =
+                        ancestor_copy_count++;
+                    for (const auto& [child_id, copies] :
+                         copies_by_child) {
+                        if (shared_index >= copies.size()) {
+                            continue;
+                        }
+                        auto* table =
+                            findChildCopies(
+                                model.parent_copy_by_child_run,
+                                child_id);
+                        table->values[
+                            value_offsets.at(child_id) +
+                            copies[shared_index]] =
+                            parent_copy_index;
+                    }
+                }
+            }
+            ancestor_copy_count =
+                std::max<uint32_t>(
+                    1,
+                    ancestor_copy_count);
+            const uint32_t run_index =
+                static_cast<uint32_t>(
+                    model.runs.size());
+            if (run_id >= model.run_index_by_id.size()) {
+                throw std::runtime_error(
+                    "HAL normalized run id is outside the dense run domain");
+            }
+            model.run_index_by_id[
+                static_cast<size_t>(run_id)] =
+                run_index;
+            model.runs.push_back(
+                NodeRun{
+                    run_id,
+                    0,
+                    ancestor_copy_count,
+                    {}});
         }
     }
-    std::unordered_map<OccurrenceId, uint32_t> occurrence_index;
-    occurrence_index.reserve(candidate_occurrences.size());
-    for (uint32_t index = 0;
-         index < candidate_occurrences.size();
-         ++index) {
-        occurrence_index.emplace(candidate_occurrences[index], index);
+
+    size_t total_occurrence_count = 0;
+    for (const auto& run : model.runs) {
+        if (total_occurrence_count >
+            model.occurrences.max_size() -
+                run.occurrence_count) {
+            throw std::overflow_error(
+                "HAL ancestor occurrence storage overflow");
+        }
+        total_occurrence_count +=
+            run.occurrence_count;
     }
+    if (total_occurrence_count >
+        std::numeric_limits<OccurrenceId>::max() -
+            *next_occurrence_id) {
+        throw std::overflow_error(
+            "HAL ancestor occurrence id overflow");
+    }
+    model.occurrences.reserve(
+        total_occurrence_count);
+    for (uint32_t run_index = 0;
+         run_index < model.runs.size();
+         ++run_index) {
+        NodeRun& run = model.runs[run_index];
+        run.first_occurrence =
+            *next_occurrence_id;
+        for (uint32_t copy_index = 0;
+             copy_index < run.occurrence_count;
+             ++copy_index) {
+            ModelOccurrence occurrence;
+            occurrence.run_index = run_index;
+            occurrence.copy_index = copy_index;
+            model.occurrences.push_back(
+                occurrence);
+            ++*next_occurrence_id;
+        }
+    }
+
     uint64_t candidate_filter_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - candidate_filter_begin)
@@ -3889,115 +6830,184 @@ NodeModel buildNodeModel(
         "in {} ms",
         model.genome_name,
         candidate_runs.size(),
-        candidate_occurrences.size(),
+        model.occurrences.size(),
         candidate_filter_ms);
+    std::vector<uint64_t>{}.swap(candidate_runs);
 
-    model.run_dna.reserve(candidate_runs.size());
-    model.placements.reserve(candidate_occurrences.size());
     if (stats != nullptr) {
         stats->ancestor_occurrence_count +=
-            candidate_occurrences.size();
+            model.occurrences.size();
     }
-    std::vector<BucketedDonor> donor_candidates;
-    donor_candidates.reserve(tree.nodes[node_id].children.size());
-
-    struct InternalChildLookup {
-        std::vector<const std::string*> run_dna;
-    };
 
     struct ChildBuildInput {
         int child_id = -1;
         double weight = 0.0;
         bool is_leaf = false;
-        std::string leaf_name;
-        const InternalChildLookup* internal_lookup = nullptr;
+        std::string_view leaf_name;
+        const NodeModel* internal_model = nullptr;
     };
-
-    std::unordered_map<int, InternalChildLookup> internal_child_lookups;
-    internal_child_lookups.reserve(tree.nodes[node_id].children.size());
     std::vector<ChildBuildInput> child_inputs;
     child_inputs.reserve(tree.nodes[node_id].children.size());
-
     for (int child_id : tree.nodes[node_id].children) {
-        double branch = std::max(1e-6, tree.nodes[child_id].branch_length_to_parent);
-        double weight = 1.0 / branch;
+        const double branch =
+            std::max(
+                1e-6,
+                tree.nodes[child_id]
+                    .branch_length_to_parent);
+        const double weight = 1.0 / branch;
         if (tree.nodes[child_id].is_leaf) {
-            child_inputs.push_back(ChildBuildInput{child_id, weight, true, tree.nodes[child_id].name, nullptr});
+            child_inputs.push_back(
+                ChildBuildInput{
+                    child_id,
+                    weight,
+                    true,
+                    tree.nodes[child_id].name,
+                    nullptr});
             continue;
         }
-        auto child_model_it = prior_models.find(child_id);
-        if (child_model_it == prior_models.end()) {
-            continue;
+        auto child_model_it =
+            prior_models.find(child_id);
+        if (child_model_it != prior_models.end()) {
+            child_inputs.push_back(
+                ChildBuildInput{
+                    child_id,
+                    weight,
+                    false,
+                    {},
+                    &child_model_it->second});
         }
-        auto [lookup_it, inserted] = internal_child_lookups.emplace(child_id, InternalChildLookup{});
-        (void)inserted;
-        auto& lookup = lookup_it->second;
-        lookup.run_dna.assign(candidate_runs.size(), nullptr);
-        for (const auto& [run_id, dna] : child_model_it->second.run_dna) {
-            auto idx_it = candidate_index.find(run_id);
-            if (idx_it != candidate_index.end()) {
-                lookup.run_dna[idx_it->second] = &dna;
-            }
-        }
-        child_inputs.push_back(ChildBuildInput{child_id, weight, false, {}, &lookup});
     }
+    // The public bucket selector emits donors in ascending bucket ID order.
+    std::sort(child_inputs.begin(), child_inputs.end(),
+              [](const ChildBuildInput& lhs, const ChildBuildInput& rhs) {
+                  return lhs.child_id < rhs.child_id;
+              });
 
     auto run_dna_begin = Clock::now();
-    for (uint32_t candidate_idx = 0; candidate_idx < candidate_runs.size(); ++candidate_idx) {
-        uint64_t run_id = candidate_runs[candidate_idx];
-        const auto* run = run_by_id.at(run_id);
-        donor_candidates.clear();
-        for (const auto& child : child_inputs) {
-            if (!run->present_by_node[child.child_id]) {
-                continue;
-            }
-            if (child.is_leaf) {
-                for (const auto& span : run->leaf_spans) {
-                    if (span.leaf_name != child.leaf_name) {
+    std::exception_ptr consensus_failure;
+    std::mutex consensus_failure_mutex;
+    const int consensus_threads = static_cast<int>(std::min<size_t>(
+        std::max(1, config.parallel_threads),
+        std::max<size_t>(1, model.runs.size())));
+#pragma omp parallel num_threads(consensus_threads)
+    {
+        // Each external leaf view carries a shared cache pin through the
+        // consensus call. Internal-child DNA remains borrowed from its model.
+        std::vector<
+            std::pair<RunStorage::DnaView, double>>
+            donors;
+#pragma omp for schedule(dynamic, 16)
+        for (int64_t run_index = 0;
+             run_index < static_cast<int64_t>(model.runs.size()); ++run_index) {
+            try {
+                donors.clear();
+                donors.reserve(child_inputs.size());
+                auto& model_run = model.runs[static_cast<size_t>(run_index)];
+                const auto& run = columnRunById(runs, model_run.run_id);
+                for (const auto& child : child_inputs) {
+                    if (!run_presence.contains(
+                            run.presence_offset,
+                            static_cast<size_t>(
+                                child.child_id))) {
                         continue;
                     }
-                    donor_candidates.push_back(
-                        BucketedDonor{child.child_id, false, span.dna, child.weight});
+                    ConsensusDonorView best{{}, child.weight, !child.is_leaf};
+                    RunStorage::DnaView best_leaf_pin;
+                    if (child.is_leaf) {
+                        for (const auto& span :
+                             run.leaf_spans) {
+                            if (spanIdentity(
+                                    span,
+                                    span.leaf_name) !=
+                                child.leaf_name) {
+                                continue;
+                            }
+                            const auto dna =
+                                spanDNA(span);
+                            if (dna.empty()) {
+                                continue;
+                            }
+                            const ConsensusDonorView donor{
+                                dna,
+                                child.weight,
+                                false};
+                            if (best.dna.empty() ||
+                                preferConsensusDonor(donor, best)) {
+                                best = donor;
+                                best_leaf_pin = dna;
+                            }
+                        }
+                    } else {
+                        const NodeRun* child_run =
+                            findNodeRun(*child.internal_model, model_run.run_id);
+                        if (child_run != nullptr) {
+                            best.dna = child_run->dna;
+                        }
+                    }
+                    if (!best.dna.empty()) {
+                        donors.emplace_back(
+                            child.is_leaf
+                                ? best_leaf_pin
+                                : RunStorage::DnaView(best.dna),
+                            best.weight);
+                    }
                 }
-                continue;
-            }
-            const auto* dna = child.internal_lookup->run_dna[candidate_idx];
-            if (dna != nullptr) {
-                donor_candidates.push_back(
-                    BucketedDonor{child.child_id, true, *dna, child.weight});
+                if (donors.empty()) {
+                    donors.reserve(
+                        run.leaf_spans.size());
+                    for (const auto& span :
+                         run.leaf_spans) {
+                        donors.emplace_back(
+                            spanDNA(span),
+                            1.0);
+                    }
+                }
+                model_run.dna =
+                    buildConsensusDNAImpl(
+                        donors,
+                        run.col_end - run.col_beg,
+                        config.consensus_threshold);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(consensus_failure_mutex);
+                if (!consensus_failure) {
+                    consensus_failure = std::current_exception();
+                }
             }
         }
-        auto donors = selectBestDonorsByBucket(donor_candidates);
-        if (donors.empty()) {
-            for (const auto& span : run->leaf_spans) {
-                donors.emplace_back(span.dna, 1.0);
-            }
-        }
-        model.run_dna.emplace(
-            run_id,
-            buildConsensusDNA(donors, run->col_end - run->col_beg, config.consensus_threshold));
     }
+    if (consensus_failure) {
+        std::rethrow_exception(
+            consensus_failure);
+    }
+    std::vector<ChildBuildInput>{}.swap(
+        child_inputs);
     uint64_t run_dna_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - run_dna_begin).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - run_dna_begin)
+            .count());
     spdlog::info(
         "HAL export ancestor {} reconstructed {} run sequences "
         "in {} ms",
         model.genome_name,
-        model.run_dna.size(),
+        model.runs.size(),
         run_dna_ms);
 
+    uint64_t edge_collect_ms = 0;
+    size_t edge_count = 0;
+    Clock::time_point path_decompose_begin;
+    AncestralSequenceAssembly assembly;
+    {
     auto edge_collect_begin = Clock::now();
     auto edges = collectAdjacencySupport(
         node_id,
         tree,
-        model.occurrences_by_run,
-        model.parent_copy_by_child_run,
-        occurrence_index,
+        model,
         prior_models,
         leaf_paths,
         config,
         stats);
-    uint64_t edge_collect_ms = static_cast<uint64_t>(
+    edge_count = edges.size();
+    edge_collect_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - edge_collect_begin)
             .count());
@@ -4005,27 +7015,39 @@ NodeModel buildNodeModel(
         "HAL export ancestor {} collected {} adjacency candidates "
         "in {} ms",
         model.genome_name,
-        edges.size(),
+        edge_count,
         edge_collect_ms);
-    std::unordered_map<OccurrenceId, RunOrderKey>
-        occurrence_order_keys;
-    occurrence_order_keys.reserve(candidate_occurrences.size());
-    for (OccurrenceId occurrence_id : candidate_occurrences) {
-        const uint64_t run_id =
-            model.run_by_occurrence.at(occurrence_id);
-        const auto* run = run_by_id.at(run_id);
-        occurrence_order_keys.emplace(
-            occurrence_id,
-            RunOrderKey{run->block_id, run->col_beg});
-    }
-    auto path_decompose_begin = Clock::now();
+    const auto occurrence_order_key_for =
+        [&](uint64_t occurrence_id)
+            -> std::optional<RunOrderKey> {
+            if (occurrence_id <
+                model.first_occurrence) {
+                return std::nullopt;
+            }
+            const uint64_t index =
+                occurrence_id -
+                model.first_occurrence;
+            if (index >= model.occurrences.size()) {
+                return std::nullopt;
+            }
+            const auto& occurrence =
+                model.occurrences[
+                    static_cast<size_t>(index)];
+            const uint64_t run_id =
+                model.runs[
+                    occurrence.run_index].run_id;
+            const auto& run =
+                columnRunById(runs, run_id);
+            return RunOrderKey{
+                run.block_id,
+                run.col_beg};
+        };
+    path_decompose_begin = Clock::now();
     model.terminal_ends =
         buildTerminalEndSupport(
             node_id,
             tree,
-            model.occurrences_by_run,
-            model.parent_copy_by_child_run,
-            occurrence_index,
+            model,
             prior_models,
             leaf_paths,
             config);
@@ -4033,11 +7055,16 @@ NodeModel buildNodeModel(
         "HAL export ancestor {} collected {} terminal-end candidates",
         model.genome_name,
         model.terminal_ends.size());
-    AncestralSequenceAssembly assembly =
-        buildAncestralSequenceAssembly(
-            candidate_occurrences,
+    // Child evidence has become owned IDs, weights and lineage vectors.
+    // Release the consumed models before matching allocates its workspace.
+    prior_models.clear();
+    assembly =
+        buildAncestralSequenceAssemblyImpl(
+            OccurrenceIdView::dense(
+                model.first_occurrence,
+                model.occurrences.size()),
             edges,
-            occurrence_order_keys,
+            occurrence_order_key_for,
             model.terminal_ends,
             config.scaffold_gap_length,
             stats);
@@ -4045,16 +7072,18 @@ NodeModel buildNodeModel(
         "HAL export ancestor {} decomposed {} occurrences into {} "
         "reference intervals",
         model.genome_name,
-        candidate_occurrences.size(),
+        model.occurrences.size(),
         assembly.sequences.size());
-    size_t supported_fragment_count = 0;
-    for (const auto& sequence : assembly.sequences) {
-        supported_fragment_count += sequence.supported_fragments.size();
     }
-    if (assembly.sequences.size() < supported_fragment_count) {
+    size_t supported_occurrence_count = 0;
+    for (const auto& sequence : assembly.sequences) {
+        supported_occurrence_count += sequence.path.size();
+    }
+    if (assembly.sequences.size() <
+        supported_occurrence_count) {
         spdlog::info(
-            "HAL export assembled {} supported chains into {} reference intervals for {}",
-            supported_fragment_count,
+            "HAL export assembled {} supported occurrences into {} reference intervals for {}",
+            supported_occurrence_count,
             assembly.sequences.size(),
             model.genome_name);
     }
@@ -4066,13 +7095,11 @@ NodeModel buildNodeModel(
             assembly.sequences.begin(),
             assembly.sequences.end(),
             [](const auto& sequence) {
-                size_t run_count = 0;
-                for (const auto& fragment : sequence.supported_fragments) {
-                    run_count += fragment.size();
-                }
-                return run_count == 1;
+                return sequence.path.size() == 1;
             });
     }
+    const size_t candidate_occurrence_count =
+        model.occurrences.size();
 
     auto sequence_materialize_begin = Clock::now();
     model.sequences.reserve(assembly.sequences.size());
@@ -4081,28 +7108,22 @@ NodeModel buildNodeModel(
         SequenceModel sequence;
         sequence.seq_name = formatScaffoldName(
             model.genome_name, scaffold_index++);
-        if (assembled_sequence.supported_fragments.empty() ||
+        if (assembled_sequence.path.empty() ||
             assembled_sequence.joins.size() + 1 !=
-                assembled_sequence.supported_fragments.size()) {
+                assembled_sequence.path.size()) {
             throw std::runtime_error(
-                "Reference interval has an invalid chain/join layout");
+                "Reference interval has an invalid path/join layout");
         }
-        size_t occurrence_count = 0;
+        const size_t occurrence_count =
+            assembled_sequence.path.size();
         size_t dna_size = 0;
-        for (const auto& fragment :
-             assembled_sequence.supported_fragments) {
-            occurrence_count += fragment.size();
-            for (OccurrenceId occurrence_id : fragment) {
-                const uint64_t run_id =
-                    model.run_by_occurrence.at(occurrence_id);
-                dna_size += model.run_dna.at(run_id).size();
-            }
-        }
-        if (occurrence_count !=
-            assembled_sequence
-                .supported_fragments.size()) {
-            throw std::runtime_error(
-                "Reference interval contains a non-elementary supported fragment");
+        for (OccurrenceId occurrence_id :
+             assembled_sequence.path) {
+            const auto& occurrence =
+                modelOccurrence(model, occurrence_id);
+            dna_size +=
+                model.runs[occurrence.run_index]
+                    .dna.size();
         }
         sequence.joins =
             assembled_sequence.joins;
@@ -4110,17 +7131,24 @@ NodeModel buildNodeModel(
             dna_size += join.gap_length;
         }
         sequence.path.reserve(occurrence_count);
-        sequence.gaps.reserve(assembled_sequence.joins.size());
+        const size_t nonzero_gap_count =
+            static_cast<size_t>(std::count_if(
+                assembled_sequence.joins.begin(),
+                assembled_sequence.joins.end(),
+                [](const ReferenceJoin& join) {
+                    return join.gap_length != 0;
+                }));
+        sequence.gaps.reserve(nonzero_gap_count);
         sequence.dna.reserve(dna_size);
         uint64_t cursor = 0;
-        for (size_t fragment_index = 0;
-             fragment_index <
-                 assembled_sequence.supported_fragments.size();
-             ++fragment_index) {
-            if (fragment_index != 0) {
+        for (size_t occurrence_index = 0;
+             occurrence_index <
+                 assembled_sequence.path.size();
+             ++occurrence_index) {
+            if (occurrence_index != 0) {
                 const uint32_t gap_length =
                     assembled_sequence
-                        .joins[fragment_index - 1]
+                        .joins[occurrence_index - 1]
                         .gap_length;
                 if (gap_length != 0) {
                     sequence.gaps.push_back(
@@ -4129,34 +7157,45 @@ NodeModel buildNodeModel(
                     cursor += gap_length;
                 }
             }
-            for (OccurrenceId occurrence_id :
-                 assembled_sequence
-                     .supported_fragments[fragment_index]) {
+            const OccurrenceId occurrence_id =
+                assembled_sequence.path[
+                    occurrence_index];
+                auto& model_occurrence =
+                    modelOccurrence(model, occurrence_id);
+                const NodeRun& node_run =
+                    model.runs[
+                        model_occurrence.run_index];
                 const uint64_t run_id =
-                    model.run_by_occurrence.at(occurrence_id);
+                    node_run.run_id;
                 const bool forward =
                     assembly.forward_by_occurrence.at(
                         occurrence_id);
-                std::string dna = orientRunDNAForPlacement(
-                    model.run_dna.at(run_id),
-                    forward);
+                std::string dna =
+                    orientRunDNAForPlacement(
+                        node_run.dna,
+                        forward);
                 OrientedOccurrence occurrence{
                     occurrence_id,
                     run_id,
-                    model.copy_index_by_occurrence.at(
-                        occurrence_id),
+                    model_occurrence.copy_index,
                     forward};
                 sequence.path.push_back(occurrence);
-                model.placements.emplace(
-                    occurrence_id,
-                    NodePlacement{
-                        sequence.seq_name,
-                        cursor,
-                        static_cast<uint32_t>(dna.size()),
-                        forward});
-                sequence.dna += dna;
-                cursor += dna.size();
-            }
+                if (model.sequences.size() >=
+                    static_cast<size_t>(
+                        kMissingDenseIndex)) {
+                    throw std::overflow_error(
+                        "Too many HAL sequences in one ancestor model");
+                }
+                model_occurrence.sequence_index =
+                    static_cast<uint32_t>(
+                        model.sequences.size());
+                model_occurrence.start = cursor;
+                model_occurrence.length =
+                    static_cast<uint32_t>(
+                        dna.size());
+                model_occurrence.forward = forward;
+            sequence.dna += dna;
+            cursor += dna.size();
         }
         model.sequences.push_back(std::move(sequence));
     }
@@ -4165,8 +7204,8 @@ NodeModel buildNodeModel(
 
     if (timings_out != nullptr) {
         timings_out->candidate_occurrence_count =
-            candidate_occurrences.size();
-        timings_out->edge_count = edges.size();
+            candidate_occurrence_count;
+        timings_out->edge_count = edge_count;
         timings_out->path_count = model.sequences.size();
         timings_out->candidate_filter_ms = candidate_filter_ms;
         timings_out->run_dna_ms = run_dna_ms;
@@ -4178,153 +7217,113 @@ NodeModel buildNodeModel(
     return model;
 }
 
-std::unordered_map<int, NodeModel> buildNodeModels(
+void buildNodeModelsOnDisk(
     const TreeMeta& tree,
     const std::vector<ColumnRun>& runs,
-    const std::unordered_map<uint64_t, const ColumnRun*>& run_by_id,
-    const std::unordered_map<std::string, std::vector<LeafOccurrence>>& leaf_paths,
+    const FlatPresenceStorage& run_presence,
+    const std::unordered_map<
+        std::string,
+        std::vector<LeafOccurrence>>& leaf_paths,
     const ExportConfig& config,
-    ExportStats* stats) {
-
+    ExportStats* stats,
+    DiskNodeModelStore& store) {
     using Clock = std::chrono::steady_clock;
-    std::unordered_map<int, NodeModel> models;
     OccurrenceId next_occurrence_id = 1;
     for (int node_id : tree.internal_postorder) {
+#if defined(__GLIBC__)
+        // The preceding node and its scratch state have left scope.
+        ::malloc_trim(0);
+#endif
+        const std::string before_stage =
+            "ancestor-build-before:" +
+            tree.nodes[node_id].name;
+        logHalMemory(
+            before_stage,
+            runs.size(),
+            static_cast<size_t>(
+                next_occurrence_id - 1));
+        std::unordered_map<int, NodeModel>
+            direct_internal_children;
+        for (int child_id :
+             tree.nodes[node_id].children) {
+            if (!tree.nodes[child_id].is_leaf) {
+                direct_internal_children.emplace(
+                    child_id,
+                    store.load(
+                        child_id,
+                        NodeModelLoadMode::
+                            ANCESTRY_INPUT));
+            }
+        }
         NodeModelBuildTimings node_timings;
-        auto node_begin = Clock::now();
+        const auto node_begin = Clock::now();
         NodeModel model = buildNodeModel(
             node_id,
             tree,
             runs,
-            run_by_id,
-            models,
+            run_presence,
+            std::move(direct_internal_children),
             leaf_paths,
             config,
             &next_occurrence_id,
             stats,
             &node_timings);
-        uint64_t node_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - node_begin).count());
+        const std::string after_stage =
+            "ancestor-build-after:" +
+            tree.nodes[node_id].name;
+        logHalMemory(
+            after_stage,
+            model.runs.size(),
+            model.occurrences.size());
+        const uint64_t node_ms =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                    Clock::now() - node_begin)
+                    .count());
         node_timings.total_ms = node_ms;
         if (stats != nullptr) {
             if (node_id == tree.root_id) {
                 stats->root_build_models_ms += node_ms;
-                stats->root_candidate_filter_ms += node_timings.candidate_filter_ms;
-                stats->root_run_dna_ms += node_timings.run_dna_ms;
-                stats->root_edge_collect_ms += node_timings.edge_collect_ms;
-                stats->root_path_decompose_ms += node_timings.path_decompose_ms;
-                stats->root_sequence_materialize_ms += node_timings.sequence_materialize_ms;
+                stats->root_candidate_filter_ms +=
+                    node_timings.candidate_filter_ms;
+                stats->root_run_dna_ms +=
+                    node_timings.run_dna_ms;
+                stats->root_edge_collect_ms +=
+                    node_timings.edge_collect_ms;
+                stats->root_path_decompose_ms +=
+                    node_timings.path_decompose_ms;
+                stats->root_sequence_materialize_ms +=
+                    node_timings.sequence_materialize_ms;
             } else {
                 stats->non_root_build_models_ms += node_ms;
-                stats->non_root_candidate_filter_ms += node_timings.candidate_filter_ms;
-                stats->non_root_run_dna_ms += node_timings.run_dna_ms;
-                stats->non_root_edge_collect_ms += node_timings.edge_collect_ms;
-                stats->non_root_path_decompose_ms += node_timings.path_decompose_ms;
-                stats->non_root_sequence_materialize_ms += node_timings.sequence_materialize_ms;
+                stats->non_root_candidate_filter_ms +=
+                    node_timings.candidate_filter_ms;
+                stats->non_root_run_dna_ms +=
+                    node_timings.run_dna_ms;
+                stats->non_root_edge_collect_ms +=
+                    node_timings.edge_collect_ms;
+                stats->non_root_path_decompose_ms +=
+                    node_timings.path_decompose_ms;
+                stats->non_root_sequence_materialize_ms +=
+                    node_timings.sequence_materialize_ms;
             }
         }
-        models.emplace(node_id, std::move(model));
+        store.store(node_id, model);
+        spdlog::info(
+            "HAL export persisted ancestor {} in disk-backed model "
+            "store ({} total bytes)",
+            tree.nodes[node_id].name,
+            store.bytes());
     }
-    return models;
+#if defined(__GLIBC__)
+    ::malloc_trim(0);
+#endif
 }
 
-void writeHalFasta(
-    const std::filesystem::path& hal_fa_path,
-    const std::vector<std::string>& genome_order,
-    const std::vector<SequenceEmission>& emissions,
-    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-    const SoftMask::IndexMap& softmask_indexes) {
 
-    std::ofstream out(hal_fa_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("Cannot open HAL FASTA output: " + hal_fa_path.string());
-    }
 
-    std::vector<GenomeSequenceName> genome_sequences;
-    genome_sequences.reserve(emissions.size());
-    std::unordered_map<std::string, const SequenceEmission*> emission_by_key;
-    emission_by_key.reserve(emissions.size());
-    for (const auto& emission : emissions) {
-        genome_sequences.emplace_back(emission.genome_name, emission.seq_name);
-        emission_by_key.emplace(emission.genome_name + '\t' + emission.seq_name, &emission);
-    }
-
-    for (const auto& [genome_name, seq_name] : buildOutputSequenceOrder(genome_order, genome_sequences)) {
-        auto key = genome_name + '\t' + seq_name;
-        auto emission_it = emission_by_key.find(key);
-        if (emission_it == emission_by_key.end()) {
-            throw std::runtime_error("Missing emission for HAL FASTA output key: " + key);
-        }
-        const auto& emission = *emission_it->second;
-        if (emission.dna) {
-            out << '>' << emission.seq_name << '\n' << *emission.dna << '\n';
-            continue;
-        }
-        if (!emission.leaf_source) {
-            continue;
-        }
-        const auto& [species_name, chr_name] = *emission.leaf_source;
-        auto mgr_it = seqpro_managers.find(species_name);
-        if (mgr_it == seqpro_managers.end()) {
-            throw std::runtime_error("Missing SeqPro manager for leaf genome: " + species_name);
-        }
-        uint64_t chr_length = fetchSequenceLength(mgr_it->second, chr_name);
-        std::string dna = fetchSubSequence(mgr_it->second, chr_name, 0, chr_length);
-        const auto softmask_it = softmask_indexes.find(species_name);
-        if (softmask_it == softmask_indexes.end() || !softmask_it->second) {
-            throw std::runtime_error(
-                "Missing soft-mask index for leaf genome: " + species_name);
-        }
-        softmask_it->second->restore(chr_name, 0, dna);
-        out << '>' << emission.seq_name << '\n' << dna << '\n';
-    }
-}
-
-void writeC2H(const std::filesystem::path& c2h_path,
-              const std::vector<std::string>& genome_order,
-              const std::vector<SequenceEmission>& emissions) {
-
-    std::ofstream out(c2h_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("Cannot open c2h output: " + c2h_path.string());
-    }
-
-    std::vector<GenomeSequenceName> genome_sequences;
-    genome_sequences.reserve(emissions.size());
-    std::unordered_map<std::string, const SequenceEmission*> emission_by_key;
-    emission_by_key.reserve(emissions.size());
-    for (const auto& emission : emissions) {
-        genome_sequences.emplace_back(emission.genome_name, emission.seq_name);
-        emission_by_key.emplace(emission.genome_name + '\t' + emission.seq_name, &emission);
-    }
-
-    for (const auto& [genome_name, seq_name] : buildOutputSequenceOrder(genome_order, genome_sequences)) {
-        auto key = genome_name + '\t' + seq_name;
-        auto emission_it = emission_by_key.find(key);
-        if (emission_it == emission_by_key.end()) {
-            throw std::runtime_error("Missing emission for c2h output key: " + key);
-        }
-        const auto& emission = *emission_it->second;
-        // The cactus .c2h sequence header stores a 0/1 "has bottoms" flag,
-        // not the raw count of bottom segments for the sequence.
-        out << "s\t'" << emission.genome_name << "'\t'" << emission.seq_name << "'\t"
-            << c2hHasBottomFlag(emission.bottom_count) << "\n";
-        for (const auto& bottom : emission.bottoms) {
-            out << "a\t" << bottom.name << '\t' << bottom.start << '\t' << bottom.length << "\n";
-        }
-        for (const auto& top : emission.tops) {
-            if (!top.parent_bottom_name) {
-                out << "a\t" << top.start << '\t' << top.length << "\n";
-            } else {
-                out << "a\t" << top.start << '\t' << top.length << '\t'
-                    << *top.parent_bottom_name << '\t' << (top.forward_to_parent ? 1 : 0) << "\n";
-            }
-        }
-        out << "\n";
-    }
-}
-
-std::unordered_map<OccurrenceId, uint64_t>
+std::vector<uint64_t>
 appendBottomEmissionsForNode(
     int node_id,
     const TreeMeta& tree,
@@ -4337,27 +7336,33 @@ appendBottomEmissionsForNode(
             "Missing node model for local subtree root");
     }
 
-    std::unordered_map<OccurrenceId, uint64_t> bottom_names;
-    uint64_t next_bottom_name = 1;
     const auto& model = model_it->second;
+    std::vector<uint64_t> bottom_names(model.occurrences.size(), 0);
+    uint64_t next_bottom_name = 1;
     for (const auto& sequence : model.sequences) {
         SequenceEmission emission;
         emission.genome_name = tree.nodes[node_id].name;
         emission.seq_name = sequence.seq_name;
         emission.bottom_count = sequence.path.size() + sequence.gaps.size();
-        emission.dna = sequence.dna;
+        emission.bottoms.reserve(emission.bottom_count);
+        emission.dna =
+            std::string_view(sequence.dna);
         for (const auto& occurrence : sequence.path) {
             const auto& placement =
-                model.placements.at(occurrence.occurrence_id);
+                modelOccurrence(
+                    model,
+                    occurrence.occurrence_id);
             emission.bottoms.push_back(
                 BottomSegmentLine{
                     occurrence.occurrence_id,
                     next_bottom_name,
                     placement.start,
                     placement.length});
-            bottom_names.emplace(
-                occurrence.occurrence_id,
-                next_bottom_name);
+            auto& name = bottom_names[
+                static_cast<size_t>(occurrence.occurrence_id - model.first_occurrence)];
+            if (name == 0) {
+                name = next_bottom_name;
+            }
             ++next_bottom_name;
         }
         for (const auto& gap : sequence.gaps) {
@@ -4379,33 +7384,41 @@ appendBottomEmissionsForNode(
     }
     return bottom_names;
 }
+uint64_t parentBottomName(
+    const NodeModel& model,
+    const std::vector<uint64_t>& bottom_names,
+    OccurrenceId occurrence_id) {
+    if (occurrence_id < model.first_occurrence ||
+        occurrence_id - model.first_occurrence >= bottom_names.size()) {
+        return 0;
+    }
+    return bottom_names[static_cast<size_t>(occurrence_id - model.first_occurrence)];
+}
 OccurrenceId mapChildCopyToParentOccurrence(
     const NodeModel& parent_model,
     int child_id,
     uint64_t run_id,
     uint32_t child_copy_index) {
-    const auto child_it =
-        parent_model.parent_copy_by_child_run.find(
+    const ChildCopyTable* child =
+        findChildCopies(
+            parent_model.parent_copy_by_child_run,
             child_id);
-    const auto occurrences_it =
-        parent_model.occurrences_by_run.find(run_id);
-    if (child_it ==
-            parent_model.parent_copy_by_child_run.end() ||
-        occurrences_it ==
-            parent_model.occurrences_by_run.end()) {
+    const NodeRun* run =
+        findNodeRun(parent_model, run_id);
+    if (child == nullptr || run == nullptr) {
         throw std::runtime_error(
             "Missing reconciled child-to-parent occurrence mapping");
     }
-    const auto run_it = child_it->second.find(run_id);
-    if (run_it == child_it->second.end() ||
-        child_copy_index >= run_it->second.size() ||
-        run_it->second[child_copy_index] >=
-            occurrences_it->second.size()) {
+    const auto copies =
+        childCopiesForRun(*child, run_id);
+    if (child_copy_index >= copies.size() ||
+        copies[child_copy_index] >=
+            run->occurrence_count) {
         throw std::runtime_error(
             "Invalid reconciled child-to-parent occurrence mapping");
     }
-    return occurrences_it->second[
-        run_it->second[child_copy_index]];
+    return run->first_occurrence +
+           copies[child_copy_index];
 }
 
 
@@ -4438,22 +7451,6 @@ void projectInternalChildContainer(
     NodeModel& child_model =
         child_it->second;
 
-    std::unordered_map<std::string, size_t>
-        parent_sequence_rank;
-    parent_sequence_rank.reserve(
-        parent_model.sequences.size());
-    for (size_t rank = 0;
-         rank < parent_model.sequences.size();
-         ++rank) {
-        const auto& sequence =
-            parent_model.sequences[rank];
-        if (!parent_sequence_rank
-                 .emplace(sequence.seq_name, rank)
-                 .second) {
-            throw std::runtime_error(
-                "Duplicate parent reference sequence name");
-        }
-    }
 
     const size_t old_sequence_count =
         child_model.sequences.size();
@@ -4493,7 +7490,7 @@ void projectInternalChildContainer(
                 fragment_rank;
             auto find_parent_placement =
                 [&](const OrientedOccurrence& occurrence)
-                    -> const NodePlacement& {
+                    -> const ModelOccurrence& {
                     const OccurrenceId
                         parent_occurrence_id =
                             mapChildCopyToParentOccurrence(
@@ -4501,30 +7498,23 @@ void projectInternalChildContainer(
                                 child_id,
                                 occurrence.run_id,
                                 occurrence.copy_index);
-                    const auto placement_it =
-                        parent_model.placements.find(
+                    const auto& placement =
+                        modelOccurrence(
+                            parent_model,
                             parent_occurrence_id);
-                    if (placement_it ==
-                        parent_model.placements.end()) {
+                    if (placement.sequence_index >=
+                        parent_model.sequences.size()) {
                         throw std::runtime_error(
                             "Projected child occurrence has no parent placement");
                     }
-                    return placement_it->second;
+                    return placement;
                 };
             auto parent_rank =
                 [&](const OrientedOccurrence& occurrence) {
-                    const auto& placement =
+                    return static_cast<size_t>(
                         find_parent_placement(
-                            occurrence);
-                    const auto rank_it =
-                        parent_sequence_rank.find(
-                            placement.seq_name);
-                    if (rank_it ==
-                        parent_sequence_rank.end()) {
-                        throw std::runtime_error(
-                            "Projected child occurrence references an unknown parent sequence");
-                    }
-                    return rank_it->second;
+                            occurrence)
+                            .sequence_index);
                 };
             const size_t first_parent_rank =
                 parent_rank(
@@ -4705,8 +7695,7 @@ void projectInternalChildContainer(
     }
 
     if (projected_occurrence_count !=
-        child_model
-            .run_by_occurrence.size()) {
+        child_model.occurrences.size()) {
         throw std::runtime_error(
             "Parent-constrained projection did not retain every child occurrence");
     }
@@ -4725,10 +7714,11 @@ void projectInternalChildContainer(
         .swap(fragments);
     std::vector<SequenceModel>{}.swap(
         child_model.sequences);
-    std::unordered_map<
-        OccurrenceId,
-        NodePlacement>{}
-        .swap(child_model.placements);
+    for (auto& occurrence :
+         child_model.occurrences) {
+        occurrence.sequence_index =
+            kMissingDenseIndex;
+    }
 
     uint64_t new_scaffold_join_count = 0;
     uint64_t new_scaffold_gap_bases = 0;
@@ -4762,17 +7752,29 @@ void projectInternalChildContainer(
                 child_model.genome_name,
                 scaffold_index++);
         size_t path_size = 0;
+        size_t nonzero_gap_count = 0;
         size_t dna_size = 0;
         for (const auto& fragment :
              parent_fragments) {
-            path_size +=
-                fragment.path.size();
+            if (path_size >
+                std::numeric_limits<size_t>::max() -
+                    fragment.path.size()) {
+                throw std::overflow_error(
+                    "Projected child reference path size overflow");
+            }
+            path_size += fragment.path.size();
             for (const auto& occurrence :
                  fragment.path) {
+                const NodeRun* run =
+                    findNodeRun(
+                        child_model,
+                        occurrence.run_id);
+                if (run == nullptr) {
+                    throw std::runtime_error(
+                        "Projected child references an unknown run");
+                }
                 const size_t run_length =
-                    child_model.run_dna
-                        .at(occurrence.run_id)
-                        .size();
+                    run->dna.size();
                 if (dna_size >
                     std::numeric_limits<
                         size_t>::max() -
@@ -4784,6 +7786,14 @@ void projectInternalChildContainer(
             }
             for (const auto& join :
                  fragment.joins) {
+                if (join.gap_length != 0) {
+                    if (nonzero_gap_count ==
+                        std::numeric_limits<size_t>::max()) {
+                        throw std::overflow_error(
+                            "Projected child reference gap count overflow");
+                    }
+                    ++nonzero_gap_count;
+                }
                 if (dna_size >
                     std::numeric_limits<
                         size_t>::max() -
@@ -4813,6 +7823,15 @@ void projectInternalChildContainer(
             dna_size +=
                 bridge_count *
                 scaffold_gap_length;
+            if (scaffold_gap_length != 0) {
+                if (nonzero_gap_count >
+                    std::numeric_limits<size_t>::max() -
+                        bridge_count) {
+                    throw std::overflow_error(
+                        "Projected child reference gap count overflow");
+                }
+                nonzero_gap_count += bridge_count;
+            }
         }
         projected.path.reserve(path_size);
         if (path_size != 0) {
@@ -4820,7 +7839,7 @@ void projectInternalChildContainer(
                 path_size - 1);
         }
         projected.gaps.reserve(
-            path_size);
+            nonzero_gap_count);
         projected.dna.reserve(dna_size);
         uint64_t cursor = 0;
 
@@ -4873,32 +7892,42 @@ void projectInternalChildContainer(
                     std::move(
                         fragment.path[
                             occurrence_index]);
-                const auto& canonical_dna =
-                    child_model.run_dna.at(
+                const NodeRun* run =
+                    findNodeRun(
+                        child_model,
                         occurrence.run_id);
+                if (run == nullptr) {
+                    throw std::runtime_error(
+                        "Projected child references an unknown run");
+                }
                 std::string dna =
                     orientRunDNAForPlacement(
-                        canonical_dna,
+                        run->dna,
                         occurrence.forward);
-                auto [placement_it,
-                      inserted] =
-                    child_model
-                        .placements.emplace(
-                            occurrence
-                                .occurrence_id,
-                            NodePlacement{
-                                projected.seq_name,
-                                cursor,
-                                static_cast<
-                                    uint32_t>(
-                                    dna.size()),
-                                occurrence
-                                    .forward});
-                (void)placement_it;
-                if (!inserted) {
+                auto& placement =
+                    modelOccurrence(
+                        child_model,
+                        occurrence.occurrence_id);
+                if (placement.sequence_index !=
+                    kMissingDenseIndex) {
                     throw std::runtime_error(
                         "Parent-constrained projection duplicated a child occurrence");
                 }
+                if (child_model.sequences.size() >=
+                    static_cast<size_t>(
+                        kMissingDenseIndex)) {
+                    throw std::overflow_error(
+                        "Too many projected HAL sequences");
+                }
+                placement.sequence_index =
+                    static_cast<uint32_t>(
+                        child_model.sequences.size());
+                placement.start = cursor;
+                placement.length =
+                    static_cast<uint32_t>(
+                        dna.size());
+                placement.forward =
+                    occurrence.forward;
                 projected.path.push_back(
                     std::move(occurrence));
                 projected.dna += dna;
@@ -4916,9 +7945,13 @@ void projectInternalChildContainer(
             std::move(projected));
     }
 
-    if (child_model.placements.size() !=
-        child_model
-            .run_by_occurrence.size()) {
+    if (std::any_of(
+            child_model.occurrences.begin(),
+            child_model.occurrences.end(),
+            [](const ModelOccurrence& occurrence) {
+                return occurrence.sequence_index ==
+                       kMissingDenseIndex;
+            })) {
         throw std::runtime_error(
             "Parent-constrained projection lost a child occurrence placement");
     }
@@ -4954,35 +7987,6 @@ void projectInternalChildContainer(
 }
 
 
-void projectInternalReferenceContainersTopDown(
-    const TreeMeta& tree,
-    const ExportConfig& config,
-    std::unordered_map<int, NodeModel>& models,
-    ExportStats* stats) {
-    std::function<void(int)> project_children =
-        [&](int parent_id) {
-            for (int child_id :
-                 tree.nodes[
-                     static_cast<size_t>(
-                         parent_id)]
-                     .children) {
-                if (tree.nodes[
-                        static_cast<size_t>(
-                            child_id)]
-                        .is_leaf) {
-                    continue;
-                }
-                projectInternalChildContainer(
-                    parent_id,
-                    child_id,
-                    models,
-                    config.scaffold_gap_length,
-                    stats);
-                project_children(child_id);
-            }
-        };
-    project_children(tree.root_id);
-}
 
 
 void appendInternalChildTopEmissions(
@@ -4990,8 +7994,9 @@ void appendInternalChildTopEmissions(
     int child_id,
     const TreeMeta& tree,
     const std::unordered_map<int, NodeModel>& models,
-    const std::unordered_map<uint64_t, const ColumnRun*>& run_by_id,
-    const std::unordered_map<OccurrenceId, uint64_t>& bottom_names,
+    const std::vector<ColumnRun>& runs,
+    const FlatPresenceStorage& run_presence,
+    const std::vector<uint64_t>& bottom_names,
     std::vector<SequenceEmission>& emissions) {
 
     auto model_it = models.find(child_id);
@@ -5006,23 +8011,25 @@ void appendInternalChildTopEmissions(
         emission.genome_name = model.genome_name;
         emission.seq_name = sequence.seq_name;
         emission.bottom_count = 0;
-        emission.dna = sequence.dna;
+        emission.dna =
+            std::string_view(sequence.dna);
+        emission.tops.reserve(sequence.path.size() + sequence.gaps.size());
         for (const auto& occurrence : sequence.path) {
             const auto& placement =
-                model.placements.at(occurrence.occurrence_id);
-            auto run_it = run_by_id.find(occurrence.run_id);
-            if (run_it == run_by_id.end()) {
-                throw std::runtime_error(
-                    "Missing run metadata while building local internal child emissions");
-            }
-            const auto& run = *run_it->second;
-            if (run.present_by_node[parent_id]) {
-                const auto parent_occurrences_it =
-                    parent_model.occurrences_by_run.find(
-                        occurrence.run_id);
-                if (parent_occurrences_it ==
-                        parent_model.occurrences_by_run.end() ||
-                    parent_occurrences_it->second.empty()) {
+                modelOccurrence(
+                    model,
+                    occurrence.occurrence_id);
+            const auto& run =
+                columnRunById(
+                    runs,
+                    occurrence.run_id);
+            if (run_presence.contains(
+                    run.presence_offset,
+                    static_cast<size_t>(parent_id))) {
+                if (findNodeRun(
+                        parent_model,
+                        occurrence.run_id) ==
+                    nullptr) {
                     throw std::runtime_error(
                         "Missing parent occurrence for local aligned run");
                 }
@@ -5032,21 +8039,22 @@ void appendInternalChildTopEmissions(
                         child_id,
                         occurrence.run_id,
                         occurrence.copy_index);
-                auto name_it =
-                    bottom_names.find(parent_occurrence_id);
-                if (name_it == bottom_names.end()) {
+                const uint64_t bottom_name =
+                    parentBottomName(parent_model, bottom_names, parent_occurrence_id);
+                if (bottom_name == 0) {
                     throw std::runtime_error(
                         "Missing parent bottom segment name for local aligned occurrence");
                 }
                 const auto& parent_placement =
-                    parent_model.placements.at(
+                    modelOccurrence(
+                        parent_model,
                         parent_occurrence_id);
                 emission.tops.push_back(
                     TopSegmentLine{
                         occurrence.occurrence_id,
                         placement.start,
                         placement.length,
-                        name_it->second,
+                        bottom_name,
                         computeForwardToParent(
                             occurrence.forward,
                             parent_placement.forward)});
@@ -5085,9 +8093,10 @@ void appendLeafChildTopEmissions(
     const TreeMeta& tree,
     const std::unordered_map<int, NodeModel>& models,
     const std::unordered_map<std::string, std::vector<LeafOccurrence>>& leaf_paths,
-    const std::unordered_map<uint64_t, const ColumnRun*>& run_by_id,
+    const std::vector<ColumnRun>& runs,
+    const FlatPresenceStorage& run_presence,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
-    const std::unordered_map<OccurrenceId, uint64_t>& bottom_names,
+    const std::vector<uint64_t>& bottom_names,
     std::vector<SequenceEmission>& emissions) {
 
     const std::string& species_name = tree.nodes[leaf_id].name;
@@ -5097,11 +8106,20 @@ void appendLeafChildTopEmissions(
     }
     const auto& parent_model = models.at(parent_id);
 
-    std::unordered_map<std::string, std::vector<LeafOccurrence>> windows_by_sequence;
+    std::unordered_map<
+        std::string,
+        std::vector<const LeafOccurrence*>>
+        windows_by_sequence;
     auto path_it = leaf_paths.find(species_name);
     if (path_it != leaf_paths.end()) {
-        for (const auto& occurrence : path_it->second) {
-            windows_by_sequence[occurrence.span.hal_sequence_name].push_back(occurrence);
+        for (const auto& occurrence :
+             path_it->second) {
+            windows_by_sequence[
+                spanIdentity(
+                    *occurrence.span,
+                    occurrence.span
+                        ->hal_sequence_name)]
+                .push_back(&occurrence);
         }
     }
 
@@ -5116,29 +8134,32 @@ void appendLeafChildTopEmissions(
 
         uint64_t chr_length = fetchSequenceLength(mgr_it->second, chr_name);
         auto& windows = windows_by_sequence[qualified_sequence_name];
-        std::sort(windows.begin(), windows.end(), [](const auto& lhs, const auto& rhs) {
-            if (lhs.span.start != rhs.span.start) {
-                return lhs.span.start < rhs.span.start;
+        std::sort(windows.begin(), windows.end(), [](const auto* lhs, const auto* rhs) {
+            if (lhs->span->start != rhs->span->start) {
+                return lhs->span->start < rhs->span->start;
             }
-            return lhs.run_id < rhs.run_id;
+            return lhs->run_id < rhs->run_id;
         });
 
         uint64_t cursor = 0;
-        for (const auto& occurrence : windows) {
-            const auto& span = occurrence.span;
+        for (const LeafOccurrence* occurrence_ptr : windows) {
+            const auto& occurrence = *occurrence_ptr;
+            const auto& span = *occurrence.span;
             if (span.start > cursor) {
                 emission.tops.push_back(
                     TopSegmentLine{0, cursor, static_cast<uint32_t>(span.start - cursor), std::nullopt, true});
             }
             const auto& run =
-                *run_by_id.at(occurrence.run_id);
-            if (run.present_by_node[parent_id]) {
-                const auto parent_occurrences_it =
-                    parent_model.occurrences_by_run.find(
-                        occurrence.run_id);
-                if (parent_occurrences_it ==
-                        parent_model.occurrences_by_run.end() ||
-                    parent_occurrences_it->second.empty()) {
+                columnRunById(
+                    runs,
+                    occurrence.run_id);
+            if (run_presence.contains(
+                    run.presence_offset,
+                    static_cast<size_t>(parent_id))) {
+                if (findNodeRun(
+                        parent_model,
+                        occurrence.run_id) ==
+                    nullptr) {
                     throw std::runtime_error(
                         "Missing parent occurrence for local leaf-aligned run");
                 }
@@ -5148,21 +8169,22 @@ void appendLeafChildTopEmissions(
                         leaf_id,
                         occurrence.run_id,
                         occurrence.copy_index);
-                auto name_it =
-                    bottom_names.find(parent_occurrence_id);
-                if (name_it == bottom_names.end()) {
+                const uint64_t bottom_name =
+                    parentBottomName(parent_model, bottom_names, parent_occurrence_id);
+                if (bottom_name == 0) {
                     throw std::runtime_error(
                         "Missing parent bottom segment name for local leaf-aligned occurrence");
                 }
                 const auto& parent_placement =
-                    parent_model.placements.at(
+                    modelOccurrence(
+                        parent_model,
                         parent_occurrence_id);
                 emission.tops.push_back(
                     TopSegmentLine{
                         0,
                         span.start,
                         span.length,
-                        name_it->second,
+                        bottom_name,
                         computeForwardToParent(
                             occurrence.forward_to_canonical,
                             parent_placement.forward)});
@@ -5190,7 +8212,8 @@ std::vector<SequenceEmission> buildLocalSubtreeEmissions(
     const TreeMeta& tree,
     const std::unordered_map<int, NodeModel>& models,
     const std::unordered_map<std::string, std::vector<LeafOccurrence>>& leaf_paths,
-    const std::unordered_map<uint64_t, const ColumnRun*>& run_by_id,
+    const std::vector<ColumnRun>& runs,
+    const FlatPresenceStorage& run_presence,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers) {
 
     std::vector<SequenceEmission> emissions;
@@ -5198,57 +8221,40 @@ std::vector<SequenceEmission> buildLocalSubtreeEmissions(
     for (int child_id : tree.nodes[node_id].children) {
         if (tree.nodes[child_id].is_leaf) {
             appendLeafChildTopEmissions(
-                node_id, child_id, tree, models, leaf_paths, run_by_id, seqpro_managers, bottom_names, emissions);
+                node_id, child_id, tree, models, leaf_paths, runs,
+                run_presence, seqpro_managers, bottom_names, emissions);
         } else {
             appendInternalChildTopEmissions(
-                node_id, child_id, tree, models, run_by_id, bottom_names, emissions);
+                node_id, child_id, tree, models, runs,
+                run_presence, bottom_names, emissions);
         }
     }
     return emissions;
 }
 
-std::vector<std::string> buildLocalGenomeOrder(const TreeMeta& tree, int node_id) {
-    std::vector<std::string> order;
-    order.reserve(tree.nodes[node_id].children.size() + 1);
-    order.push_back(tree.nodes[node_id].name);
-    for (int child_id : tree.nodes[node_id].children) {
-        order.push_back(tree.nodes[child_id].name);
-    }
-    return order;
-}
 
-std::string buildLocalNewick(const TreeMeta& tree, int node_id) {
-    const auto& node = tree.nodes[node_id];
-    std::ostringstream oss;
-    if (!node.children.empty()) {
-        oss << '(';
-        for (size_t i = 0; i < node.children.size(); ++i) {
-            if (i != 0) {
-                oss << ',';
-            }
-            const auto& child = tree.nodes[static_cast<size_t>(node.children[i])];
-            oss << child.name << ':' << std::fixed << std::setprecision(6) << child.branch_length_to_parent;
-        }
-        oss << ')';
-    }
-    oss << node.name << ';';
-    return oss.str();
-}
 
 void accumulateEmissionStats(
     const std::vector<SequenceEmission>& emissions,
     ExportStats* stats) {
-
     if (stats == nullptr) {
         return;
     }
-    std::unordered_map<std::string, std::unordered_map<uint64_t, uint64_t>>
-        top_count_by_child_and_parent_bottom;
+    struct ChildReferences {
+        uint64_t count = 0;
+        uint64_t maximum_name = 0;
+        std::vector<uint64_t> seen_bits;
+        std::unordered_set<uint64_t> sparse_seen;
+    };
+    std::unordered_map<std::string, ChildReferences> by_child;
     for (const auto& emission : emissions) {
         for (const auto& top : emission.tops) {
             if (top.parent_bottom_name) {
                 ++stats->aligned_top_count;
-                ++top_count_by_child_and_parent_bottom[emission.genome_name][*top.parent_bottom_name];
+                auto& references = by_child[emission.genome_name];
+                ++references.count;
+                references.maximum_name =
+                    std::max(references.maximum_name, *top.parent_bottom_name);
                 if (!top.forward_to_parent) {
                     ++stats->reverse_top_count;
                 }
@@ -5257,72 +8263,295 @@ void accumulateEmissionStats(
             }
         }
     }
-    for (const auto& [child_name, counts] : top_count_by_child_and_parent_bottom) {
-        (void)child_name;
-        for (const auto& [parent_bottom, count] : counts) {
-            (void)parent_bottom;
-            if (count > 1) {
-                stats->paralogous_top_count += count - 1;
+    for (auto& [child, references] : by_child) {
+        (void)child;
+        const uint64_t words = references.maximum_name / 64 + 1;
+        // Dense parent names need only one bit each. For genuinely sparse
+        // names, a set retains unique names rather than allocating their range
+        // or storing every repeated top. Both paths count exactly repeats.
+        if (words <= references.count &&
+            words <= references.seen_bits.max_size()) {
+            references.seen_bits.assign(static_cast<size_t>(words), 0);
+        }
+    }
+    for (const auto& emission : emissions) {
+        for (const auto& top : emission.tops) {
+            if (!top.parent_bottom_name) {
+                continue;
             }
+            auto& references = by_child.at(emission.genome_name);
+            const uint64_t name = *top.parent_bottom_name;
+            bool repeated = false;
+            if (!references.seen_bits.empty()) {
+                auto& word = references.seen_bits[static_cast<size_t>(name / 64)];
+                const uint64_t mask = uint64_t{1} << (name % 64);
+                repeated = (word & mask) != 0;
+                word |= mask;
+            } else {
+                repeated = !references.sparse_seen.insert(name).second;
+            }
+            stats->paralogous_top_count += repeated;
         }
     }
 }
 
-void writeTreeFile(const std::filesystem::path& tree_path, const std::string& newick) {
-    std::ofstream out(tree_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("Cannot open tree output: " + tree_path.string());
-    }
-    out << newick << '\n';
-}
 
-void runHalAppend(const std::filesystem::path& c2h_path,
-                  const std::filesystem::path& hal_fa_path,
-                  const std::filesystem::path& tree_path,
-                  const std::filesystem::path& hal_path) {
-    const auto executable =
-        RaMAxDependencies::locateHalAppendCactusSubtreeExecutable();
-    if (executable.empty()) {
-        throw std::runtime_error(
-            "halAppendCactusSubtree is required but is no longer available");
-    }
-
-    std::filesystem::path stdout_path = hal_path;
-    stdout_path += ".halAppendCactusSubtree.stdout.log";
-    std::filesystem::path stderr_path = hal_path;
-    stderr_path += ".halAppendCactusSubtree.stderr.log";
-    const auto result = RaMAxExternalTool::run(
-        executable,
-        {
-            c2h_path.string(),
-            hal_fa_path.string(),
-            tree_path.string(),
-            hal_path.string(),
-            "--hdf5InMemory",
-        },
-        stdout_path,
-        stderr_path);
-    if (result.exit_code != 0) {
-        std::ostringstream error;
-        error << "halAppendCactusSubtree failed with exit code "
-              << result.exit_code << "; stderr: " << stderr_path;
-        throw std::runtime_error(error.str());
-    }
-}
 
 
 } // namespace
+std::shared_ptr<const PreparedExportInput> prepareExportInput(
+    const std::vector<std::weak_ptr<Block>>& blocks,
+    const std::map<SpeciesName, SeqPro::SharedManagerVariant>& managers,
+    const std::filesystem::path& scratch_directory,
+    int parallel_threads) {
+    if (managers.empty()) {
+        throw std::invalid_argument(
+            "Prepared export input requires non-empty sequence managers");
+    }
+    if (parallel_threads < 1) {
+        throw std::invalid_argument(
+            "Prepared export input thread count must be positive");
+    }
+    std::filesystem::create_directories(scratch_directory);
+    static std::atomic<uint64_t> next_spool_id{0};
+    const uint64_t clock_id = static_cast<uint64_t>(
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count());
+    std::filesystem::path spool_path;
+    do {
+        spool_path =
+            scratch_directory /
+            ("ramax-export-input-" +
+             std::to_string(clock_id) + "-" +
+             std::to_string(
+                 next_spool_id.fetch_add(
+                     1,
+                     std::memory_order_relaxed)) +
+             ".bin");
+    } while (std::filesystem::exists(spool_path));
+
+    struct SpoolGuard {
+        std::filesystem::path path;
+        bool committed = false;
+        ~SpoolGuard() {
+            if (!committed) {
+                std::error_code error;
+                std::filesystem::remove(path, error);
+            }
+        }
+    } spool_guard{spool_path};
+    std::ofstream output(
+        spool_path,
+        std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error(
+            "Cannot create prepared export input: " +
+            spool_path.string());
+    }
+
+    const TreeMeta leaf_tree = buildLeafOnlyTree(managers);
+    std::vector<PreparedRecordIndex> records;
+    records.reserve(blocks.size());
+    const size_t batch_size =
+        std::max<size_t>(
+            1,
+            static_cast<size_t>(parallel_threads) * 2);
+    for (size_t batch_begin = 0;
+         batch_begin < blocks.size();
+         batch_begin += batch_size) {
+        const size_t batch_end =
+            std::min(blocks.size(), batch_begin + batch_size);
+        std::vector<BlockPtr> live_blocks(
+            batch_end - batch_begin);
+        for (size_t index = batch_begin;
+             index < batch_end;
+             ++index) {
+            live_blocks[index - batch_begin] =
+                blocks[index].lock();
+        }
+        std::vector<std::optional<BlockMSA>> results(
+            live_blocks.size());
+        std::exception_ptr failure;
+        std::mutex failure_mutex;
+#pragma omp parallel for schedule(dynamic) num_threads(parallel_threads)
+        for (int64_t local_index = 0;
+             local_index <
+                 static_cast<int64_t>(live_blocks.size());
+             ++local_index) {
+            try {
+                const auto& block =
+                    live_blocks[
+                        static_cast<size_t>(local_index)];
+                if (!block) {
+                    continue;
+                }
+                BlockMSA msa =
+                    buildBlockMSA(
+                        block,
+                        leaf_tree,
+                        managers);
+                if (!msa.leaf_rows.empty()) {
+                    results[
+                        static_cast<size_t>(local_index)] =
+                        std::move(msa);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(
+                    failure_mutex);
+                if (!failure) {
+                    failure = std::current_exception();
+                }
+            }
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+        for (auto& result : results) {
+            if (!result) {
+                continue;
+            }
+            const auto begin = output.tellp();
+            if (begin < 0) {
+                throw std::runtime_error(
+                    "Cannot position prepared export input");
+            }
+            writePreparedBlockMSA(output, *result);
+            const auto end = output.tellp();
+            if (end < begin) {
+                throw std::runtime_error(
+                    "Prepared export record size overflow");
+            }
+            records.push_back(
+                PreparedRecordIndex{
+                    result->order_key,
+                    static_cast<uint64_t>(
+                        static_cast<std::streamoff>(begin)),
+                    static_cast<uint64_t>(
+                        static_cast<std::streamoff>(
+                            end - begin))});
+        }
+    }
+    output.close();
+    if (!output) {
+        throw std::runtime_error(
+            "Failed closing prepared export input");
+    }
+    std::sort(
+        records.begin(),
+        records.end(),
+        [](const PreparedRecordIndex& lhs,
+           const PreparedRecordIndex& rhs) {
+            return exportBlockOrderLess(
+                lhs.order_key,
+                rhs.order_key);
+        });
+
+    std::vector<PreparedManagerSequence> layout;
+    for (const auto& [species, manager] : managers) {
+        for (const auto& sequence :
+             fetchSequenceNames(manager)) {
+            layout.push_back(
+                PreparedManagerSequence{
+                    species,
+                    sequence,
+                    fetchSequenceLength(
+                        manager,
+                        sequence)});
+        }
+    }
+    std::sort(
+        layout.begin(),
+        layout.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(
+                       lhs.species,
+                       lhs.sequence,
+                       lhs.length) <
+                   std::tie(
+                       rhs.species,
+                       rhs.sequence,
+                       rhs.length);
+        });
+    const uint64_t spool_bytes =
+        std::filesystem::file_size(spool_path);
+    auto prepared =
+        std::make_shared<PreparedExportInput>(
+            spool_path,
+            std::move(records),
+            std::move(layout));
+    spool_guard.committed = true;
+    spdlog::info(
+        "Prepared export input captured {} leaf MSAs in {} bytes "
+        "(record index capacity {} bytes)",
+        prepared->records().size(),
+        spool_bytes,
+        prepared->records().capacity() *
+            sizeof(PreparedRecordIndex));
+    return prepared;
+}
+
+
+void validatePreparedManagers(
+    const PreparedExportInput& prepared,
+    const std::map<
+        SpeciesName,
+        SeqPro::SharedManagerVariant>& managers) {
+    std::vector<PreparedManagerSequence> current;
+    for (const auto& [species, manager] : managers) {
+        for (const auto& sequence :
+             fetchSequenceNames(manager)) {
+            current.push_back(
+                PreparedManagerSequence{
+                    species,
+                    sequence,
+                    fetchSequenceLength(
+                        manager,
+                        sequence)});
+        }
+    }
+    const auto less = [](const auto& lhs, const auto& rhs) {
+        return std::tie(
+                   lhs.species,
+                   lhs.sequence,
+                   lhs.length) <
+               std::tie(
+                   rhs.species,
+                   rhs.sequence,
+                   rhs.length);
+    };
+    std::sort(current.begin(), current.end(), less);
+    const auto& expected = prepared.managerSequences();
+    if (current.size() != expected.size() ||
+        !std::equal(
+            current.begin(),
+            current.end(),
+            expected.begin(),
+            expected.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.species == rhs.species &&
+                       lhs.sequence == rhs.sequence &&
+                       lhs.length == rhs.length;
+            })) {
+        throw std::invalid_argument(
+            "Prepared export input does not match the supplied sequence managers");
+    }
+}
 
 void exportToMaf(
-    const std::vector<std::weak_ptr<Block>>& blocks,
+    const PreparedExportInput& prepared,
     const std::filesystem::path& maf_path,
     const std::map<
         SpeciesName,
         SeqPro::SharedManagerVariant>&
         seqpro_managers,
     bool pairwise_mode) {
+    validatePreparedManagers(
+        prepared,
+        seqpro_managers);
+    rejectDirectoryOutput(maf_path);
     exportCanonicalMafImpl(
-        blocks,
+        prepared,
         maf_path,
         seqpro_managers,
         pairwise_mode);
@@ -5513,9 +8742,6 @@ std::vector<ElementaryRunProjection> projectElementaryRuns(
     return projections;
 }
 
-int c2hHasBottomFlag(size_t bottom_count) {
-    return bottom_count == 0 ? 0 : 1;
-}
 
 
 bool computeForwardToParent(bool child_forward_to_canonical, bool parent_forward_to_canonical) {
@@ -5582,27 +8808,21 @@ std::string buildConsensusDNA(
 std::vector<std::pair<std::string, double>> selectBestDonorsByBucket(
     const std::vector<BucketedDonor>& donors) {
 
-    std::map<int, BucketedDonor> best_by_bucket;
+    std::map<int, const BucketedDonor*> best_by_bucket;
     for (const auto& donor : donors) {
         if (donor.dna.empty()) {
             continue;
         }
         auto it = best_by_bucket.find(donor.bucket_id);
         if (it == best_by_bucket.end()) {
-            best_by_bucket.emplace(donor.bucket_id, donor);
+            best_by_bucket.emplace(donor.bucket_id, &donor);
             continue;
         }
-        const auto& current = it->second;
-        bool replace = false;
-        if (donor.prefer_internal != current.prefer_internal) {
-            replace = donor.prefer_internal;
-        } else if (donor.weight != current.weight) {
-            replace = donor.weight > current.weight;
-        } else if (donor.dna != current.dna) {
-            replace = donor.dna < current.dna;
-        }
-        if (replace) {
-            it->second = donor;
+        const auto& current = *it->second;
+        if (preferConsensusDonor(
+                {donor.dna, donor.weight, donor.prefer_internal},
+                {current.dna, current.weight, current.prefer_internal})) {
+            it->second = &donor;
         }
     }
 
@@ -5610,7 +8830,7 @@ std::vector<std::pair<std::string, double>> selectBestDonorsByBucket(
     selected.reserve(best_by_bucket.size());
     for (const auto& [bucket_id, donor] : best_by_bucket) {
         (void)bucket_id;
-        selected.emplace_back(donor.dna, donor.weight);
+        selected.emplace_back(donor->dna, donor->weight);
     }
     return selected;
 }
@@ -6511,34 +9731,52 @@ std::vector<uint32_t> solveSparseMaximumWeightMatching(
 
 }  // namespace
 
+template<typename EdgeIndices, typename OrderKeyFor>
 PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
-    const std::vector<uint64_t>& run_ids,
+    OccurrenceIdView run_ids,
     const std::vector<EdgeSupport>& edges,
-    const std::unordered_map<uint64_t, RunOrderKey>& run_order_keys,
+    EdgeIndices edge_indices,
+    const OrderKeyFor& order_key_for,
     ExportStats* stats) {
 
     PathCoverResult result;
-    if (run_ids.empty()) {
+    if (run_ids.size() == 0) {
         return result;
     }
 
     auto run_less = [&](uint64_t lhs, uint64_t rhs) {
-        const auto lhs_it = run_order_keys.find(lhs);
-        const auto rhs_it = run_order_keys.find(rhs);
-        if (lhs_it == run_order_keys.end() || rhs_it == run_order_keys.end()) {
+        const auto lhs_key = order_key_for(lhs);
+        const auto rhs_key = order_key_for(rhs);
+        if (!lhs_key || !rhs_key) {
             return lhs < rhs;
         }
         return std::tie(
-                   lhs_it->second.block_id,
-                   lhs_it->second.col_beg,
+                   lhs_key->block_id,
+                   lhs_key->col_beg,
                    lhs) <
                std::tie(
-                   rhs_it->second.block_id,
-                   rhs_it->second.col_beg,
+                   rhs_key->block_id,
+                   rhs_key->col_beg,
                    rhs);
     };
-
-    std::vector<uint64_t> sorted_runs = run_ids;
+    std::vector<uint64_t> sorted_runs;
+    if (run_ids.isDense()) {
+        if (run_ids.dense_count - 1 >
+            std::numeric_limits<OccurrenceId>::max() -
+                run_ids.dense_first) {
+            throw std::overflow_error(
+                "Dense occurrence ID range overflows");
+        }
+        sorted_runs.resize(run_ids.dense_count);
+        std::iota(
+            sorted_runs.begin(),
+            sorted_runs.end(),
+            run_ids.dense_first);
+    } else {
+        sorted_runs.assign(
+            run_ids.explicit_ids.begin(),
+            run_ids.explicit_ids.end());
+    }
     std::sort(sorted_runs.begin(), sorted_runs.end(), run_less);
     if (std::adjacent_find(sorted_runs.begin(), sorted_runs.end()) != sorted_runs.end()) {
         throw std::runtime_error("Duplicate run id in maximum-weight path cover");
@@ -6550,12 +9788,18 @@ PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
 
     const uint32_t run_count = static_cast<uint32_t>(sorted_runs.size());
     const uint32_t endpoint_count = run_count * 2U;
-    std::unordered_map<uint64_t, uint32_t> run_index;
-    run_index.reserve(sorted_runs.size());
-    for (uint32_t index = 0; index < run_count; ++index) {
-        run_index.emplace(sorted_runs[index], index);
-    }
-
+    const uint64_t minimum_run_id =
+        *std::min_element(
+            sorted_runs.begin(),
+            sorted_runs.end());
+    const uint64_t maximum_run_id =
+        *std::max_element(
+            sorted_runs.begin(),
+            sorted_runs.end());
+    const bool use_dense_index =
+        maximum_run_id - minimum_run_id <
+        static_cast<uint64_t>(sorted_runs.size()) * 2;
+    std::vector<int64_t> edge_by_endpoint;
     struct CandidateEdge {
         uint32_t first_endpoint = 0;
         uint32_t second_endpoint = 0;
@@ -6565,58 +9809,138 @@ PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
     };
 
     std::vector<CandidateEdge> candidates;
-    candidates.reserve(edges.size());
-    for (const auto& edge : edges) {
-        const auto from_it = run_index.find(edge.from);
-        const auto to_it = run_index.find(edge.to);
-        if (from_it == run_index.end() || to_it == run_index.end()) {
-            continue;
+    candidates.reserve(edge_indices.size());
+    {
+        std::vector<uint32_t> dense_run_index;
+        std::unordered_map<uint64_t, uint32_t>
+            sparse_run_index;
+        if (use_dense_index) {
+            dense_run_index.assign(
+                static_cast<size_t>(
+                    maximum_run_id - minimum_run_id + 1),
+                kMissingDenseIndex);
+        } else {
+            sparse_run_index.reserve(sorted_runs.size());
         }
-        if (edge.from == edge.to) {
-            throw std::runtime_error(
-                "Self adjacency in ancestral thread evidence for run " +
-                std::to_string(edge.from));
+        for (uint32_t index = 0;
+             index < run_count;
+             ++index) {
+            if (use_dense_index) {
+                dense_run_index[
+                    static_cast<size_t>(
+                        sorted_runs[index] -
+                        minimum_run_id)] = index;
+            } else {
+                sparse_run_index.emplace(
+                    sorted_runs[index],
+                    index);
+            }
         }
-        if (edge.supporting_children.empty() && edge.occurrence_support == 0) {
-            continue;
-        }
+        const auto run_index_for =
+            [&](uint64_t run_id)
+                -> std::optional<uint32_t> {
+                if (use_dense_index) {
+                    if (run_id < minimum_run_id ||
+                        run_id > maximum_run_id) {
+                        return std::nullopt;
+                    }
+                    const uint32_t value =
+                        dense_run_index[
+                            static_cast<size_t>(
+                                run_id -
+                                minimum_run_id)];
+                    return value == kMissingDenseIndex
+                               ? std::nullopt
+                               : std::optional<uint32_t>(
+                                     value);
+                }
+                const auto it =
+                    sparse_run_index.find(run_id);
+                return it == sparse_run_index.end()
+                           ? std::nullopt
+                           : std::optional<uint32_t>(
+                                 it->second);
+            };
 
-        uint32_t first_endpoint =
-            from_it->second * 2U +
-            (edge.from_forward_to_canonical ? 1U : 0U);
-        uint32_t second_endpoint =
-            to_it->second * 2U +
-            (edge.to_forward_to_canonical ? 0U : 1U);
-        if (second_endpoint < first_endpoint) {
-            std::swap(first_endpoint, second_endpoint);
+        for (size_t edge_position = 0;
+             edge_position < edge_indices.size();
+             ++edge_position) {
+            const uint64_t edge_index =
+                edge_indices[edge_position];
+            if (edge_index >= edges.size()) {
+                throw std::out_of_range(
+                    "Ancestral edge index is outside its source vector");
+            }
+            const auto& edge = edges[edge_index];
+            const auto from_index =
+                run_index_for(edge.from);
+            const auto to_index =
+                run_index_for(edge.to);
+            if (!from_index || !to_index) {
+                continue;
+            }
+            if (edge.from == edge.to) {
+                throw std::runtime_error(
+                    "Self adjacency in ancestral thread evidence for run " +
+                    std::to_string(edge.from));
+            }
+            if (edge.supporting_children.empty() &&
+                edge.occurrence_support == 0) {
+                continue;
+            }
+
+            uint32_t first_endpoint =
+                *from_index * 2U +
+                (edge.from_forward_to_canonical ? 1U : 0U);
+            uint32_t second_endpoint =
+                *to_index * 2U +
+                (edge.to_forward_to_canonical ? 0U : 1U);
+            if (second_endpoint < first_endpoint) {
+                std::swap(first_endpoint, second_endpoint);
+            }
+            candidates.push_back(CandidateEdge{
+                first_endpoint,
+                second_endpoint,
+                static_cast<uint32_t>(edge.supporting_children.size()),
+                edge.occurrence_support,
+                edge.weighted_support});
         }
-        candidates.push_back(CandidateEdge{
-            first_endpoint,
-            second_endpoint,
-            static_cast<uint32_t>(edge.supporting_children.size()),
-            edge.occurrence_support,
-            edge.weighted_support});
     }
     std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
         return std::tie(lhs.first_endpoint, lhs.second_endpoint) <
                std::tie(rhs.first_endpoint, rhs.second_endpoint);
     });
 
-    std::vector<CandidateEdge> unique_candidates;
-    unique_candidates.reserve(candidates.size());
-    for (const auto& edge : candidates) {
-        if (!unique_candidates.empty() &&
-            unique_candidates.back().first_endpoint == edge.first_endpoint &&
-            unique_candidates.back().second_endpoint == edge.second_endpoint) {
-            auto& aggregate = unique_candidates.back();
+    size_t unique_candidate_count = 0;
+    for (size_t index = 0;
+         index < candidates.size();
+         ++index) {
+        if (unique_candidate_count != 0 &&
+            candidates[unique_candidate_count - 1]
+                    .first_endpoint ==
+                candidates[index].first_endpoint &&
+            candidates[unique_candidate_count - 1]
+                    .second_endpoint ==
+                candidates[index].second_endpoint) {
+            auto& aggregate =
+                candidates[unique_candidate_count - 1];
             aggregate.child_support =
-                std::max(aggregate.child_support, edge.child_support);
-            aggregate.occurrence_support += edge.occurrence_support;
-            aggregate.weighted_support += edge.weighted_support;
+                std::max(
+                    aggregate.child_support,
+                    candidates[index].child_support);
+            aggregate.occurrence_support +=
+                candidates[index].occurrence_support;
+            aggregate.weighted_support +=
+                candidates[index].weighted_support;
         } else {
-            unique_candidates.push_back(edge);
+            if (unique_candidate_count != index) {
+                candidates[unique_candidate_count] =
+                    std::move(candidates[index]);
+            }
+            ++unique_candidate_count;
         }
     }
+    candidates.resize(unique_candidate_count);
     auto candidate_score = [](const CandidateEdge& edge) {
         return edge.weighted_support > 0.0L
                    ? edge.weighted_support
@@ -6627,96 +9951,105 @@ PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
     };
 
 
-    std::vector<SparseMatchingEdge> matching_edges;
-    matching_edges.reserve(unique_candidates.size());
-    for (uint32_t edge_index = 0;
-         edge_index < unique_candidates.size();
-         ++edge_index) {
-        const auto& edge =
-            unique_candidates[edge_index];
-        matching_edges.push_back(
-            SparseMatchingEdge{
-                edge.first_endpoint,
-                edge.second_endpoint,
-                candidate_score(edge),
-                edge_index});
-    }
-    std::vector<uint32_t> matched_edges =
-        solveSparseMaximumWeightMatching(
-            endpoint_count,
-            matching_edges);
-    std::vector<int64_t> edge_by_endpoint(
-        endpoint_count,
-        -1);
-    std::sort(
-        matched_edges.begin(),
-        matched_edges.end(),
-        [&](uint32_t lhs, uint32_t rhs) {
-            const long double lhs_score =
-                candidate_score(
-                    unique_candidates[lhs]);
-            const long double rhs_score =
-                candidate_score(
-                    unique_candidates[rhs]);
-            if (lhs_score != rhs_score) {
-                return lhs_score > rhs_score;
+    {
+        std::vector<uint32_t> matched_edges;
+        {
+            std::vector<SparseMatchingEdge>
+                matching_edges;
+            matching_edges.reserve(candidates.size());
+            for (uint32_t edge_index = 0;
+                 edge_index < candidates.size();
+                 ++edge_index) {
+                const auto& edge =
+                    candidates[edge_index];
+                matching_edges.push_back(
+                    SparseMatchingEdge{
+                        edge.first_endpoint,
+                        edge.second_endpoint,
+                        candidate_score(edge),
+                        edge_index});
             }
-            return std::tie(
-                       unique_candidates[lhs]
-                           .first_endpoint,
-                       unique_candidates[lhs]
-                           .second_endpoint) <
-                   std::tie(
-                       unique_candidates[rhs]
-                           .first_endpoint,
-                       unique_candidates[rhs]
-                           .second_endpoint);
-        });
+            matched_edges =
+                solveSparseMaximumWeightMatching(
+                    endpoint_count,
+                    matching_edges);
+        }
+        std::sort(
+            matched_edges.begin(),
+            matched_edges.end(),
+            [&](uint32_t lhs, uint32_t rhs) {
+                const long double lhs_score =
+                    candidate_score(
+                        candidates[lhs]);
+                const long double rhs_score =
+                    candidate_score(
+                        candidates[rhs]);
+                if (lhs_score != rhs_score) {
+                    return lhs_score > rhs_score;
+                }
+                return std::tie(
+                           candidates[lhs]
+                               .first_endpoint,
+                           candidates[lhs]
+                               .second_endpoint) <
+                       std::tie(
+                           candidates[rhs]
+                               .first_endpoint,
+                           candidates[rhs]
+                               .second_endpoint);
+            });
 
-    std::vector<uint32_t> chain_parent(run_count);
-    std::iota(
-        chain_parent.begin(),
-        chain_parent.end(),
-        0);
-    auto find_chain_root = [&](uint32_t value) {
-        uint32_t root = value;
-        while (chain_parent[root] != root) {
-            root = chain_parent[root];
+        edge_by_endpoint.assign(
+            endpoint_count,
+            -1);
+        std::vector<uint32_t> chain_parent(run_count);
+        std::iota(
+            chain_parent.begin(),
+            chain_parent.end(),
+            0);
+        auto find_chain_root = [&](uint32_t value) {
+            uint32_t root = value;
+            while (chain_parent[root] != root) {
+                root = chain_parent[root];
+            }
+            while (chain_parent[value] != value) {
+                const uint32_t next =
+                    chain_parent[value];
+                chain_parent[value] = root;
+                value = next;
+            }
+            return root;
+        };
+        for (uint32_t edge_index : matched_edges) {
+            const auto& edge =
+                candidates[edge_index];
+            uint32_t first_root = find_chain_root(
+                edge.first_endpoint / 2U);
+            uint32_t second_root = find_chain_root(
+                edge.second_endpoint / 2U);
+            if (first_root == second_root) {
+                continue;
+            }
+            if (edge_by_endpoint[
+                    edge.first_endpoint] >= 0 ||
+                edge_by_endpoint[
+                    edge.second_endpoint] >= 0) {
+                throw std::runtime_error(
+                    "Maximum-weight adjacency matching emitted duplicate extremities");
+            }
+            if (second_root < first_root) {
+                std::swap(first_root, second_root);
+            }
+            chain_parent[second_root] = first_root;
+            edge_by_endpoint[edge.first_endpoint] =
+                static_cast<int64_t>(
+                    edge.second_endpoint);
+            edge_by_endpoint[edge.second_endpoint] =
+                static_cast<int64_t>(
+                    edge.first_endpoint);
         }
-        while (chain_parent[value] != value) {
-            const uint32_t next =
-                chain_parent[value];
-            chain_parent[value] = root;
-            value = next;
-        }
-        return root;
-    };
-    for (uint32_t edge_index : matched_edges) {
-        const auto& edge =
-            unique_candidates[edge_index];
-        uint32_t first_root = find_chain_root(
-            edge.first_endpoint / 2U);
-        uint32_t second_root = find_chain_root(
-            edge.second_endpoint / 2U);
-        if (first_root == second_root) {
-            continue;
-        }
-        if (edge_by_endpoint[
-                edge.first_endpoint] >= 0 ||
-            edge_by_endpoint[
-                edge.second_endpoint] >= 0) {
-            throw std::runtime_error(
-                "Maximum-weight adjacency matching emitted duplicate extremities");
-        }
-        if (second_root < first_root) {
-            std::swap(first_root, second_root);
-        }
-        chain_parent[second_root] = first_root;
-        edge_by_endpoint[edge.first_endpoint] =
-            static_cast<int64_t>(edge_index);
-        edge_by_endpoint[edge.second_endpoint] =
-            static_cast<int64_t>(edge_index);
     }
+    std::vector<CandidateEdge>().swap(candidates);
 
     std::vector<uint32_t> start_endpoints;
     start_endpoints.reserve(run_count * 2U);
@@ -6748,16 +10081,14 @@ PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
                 (entry_endpoint & 1U) == 0);
 
             const uint32_t exit_endpoint = entry_endpoint ^ 1U;
-            const int64_t edge_index = edge_by_endpoint[exit_endpoint];
-            if (edge_index < 0) {
+            const int64_t adjacent_endpoint =
+                edge_by_endpoint[exit_endpoint];
+            if (adjacent_endpoint < 0) {
                 break;
             }
-            const auto& edge =
-                unique_candidates[static_cast<size_t>(edge_index)];
             entry_endpoint =
-                edge.first_endpoint == exit_endpoint
-                    ? edge.second_endpoint
-                    : edge.first_endpoint;
+                static_cast<uint32_t>(
+                    adjacent_endpoint);
         }
         result.paths.push_back(std::move(path));
     }
@@ -6775,21 +10106,51 @@ PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
     return result;
 }
 
+template<typename EdgeIndices, typename OrderKeyFor>
+PathCoverResult buildMaximumCardinalityWeightPathCoverDetailedImpl(
+    const std::vector<uint64_t>& run_ids,
+    const std::vector<EdgeSupport>& edges,
+    EdgeIndices edge_indices,
+    const OrderKeyFor& order_key_for,
+    ExportStats* stats) {
+    return buildMaximumCardinalityWeightPathCoverDetailedImpl(
+        OccurrenceIdView::explicitList(run_ids),
+        edges,
+        edge_indices,
+        order_key_for,
+        stats);
+}
+
 
 std::vector<std::vector<uint64_t>> buildMaximumCardinalityWeightPathCover(
     const std::vector<uint64_t>& run_ids,
     const std::vector<EdgeSupport>& edges,
     const std::unordered_map<uint64_t, RunOrderKey>& run_order_keys,
     ExportStats* stats) {
+    const auto lookup =
+        [&](uint64_t run_id)
+            -> std::optional<RunOrderKey> {
+            const auto it =
+                run_order_keys.find(run_id);
+            return it == run_order_keys.end()
+                       ? std::nullopt
+                       : std::optional<RunOrderKey>(
+                             it->second);
+        };
     return buildMaximumCardinalityWeightPathCoverDetailedImpl(
-        run_ids, edges, run_order_keys, stats).paths;
+               run_ids,
+               edges,
+               ImplicitEdgeIndexView(edges.size()),
+               lookup,
+               stats)
+        .paths;
 }
 
-AncestralSequenceAssembly buildAncestralSequenceAssembly(
-    const std::vector<uint64_t>& occurrence_ids,
+template<typename OrderKeyFor>
+AncestralSequenceAssembly buildAncestralSequenceAssemblyImpl(
+    OccurrenceIdView occurrence_ids,
     const std::vector<EdgeSupport>& edges,
-    const std::unordered_map<uint64_t, RunOrderKey>&
-        occurrence_order_keys,
+    const OrderKeyFor& order_key_for,
     const std::vector<TerminalEndSupport>& terminal_ends,
     uint32_t scaffold_gap_length,
     ExportStats* stats) {
@@ -6823,12 +10184,40 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
                         : OccurrenceEndSide::RIGHT)});
     };
 
-    std::unordered_set<OccurrenceId> occurrence_set(
-        occurrence_ids.begin(), occurrence_ids.end());
+    const bool occurrence_ids_sorted =
+        occurrence_ids.isDense() ||
+        std::is_sorted(
+            occurrence_ids.explicit_ids.begin(),
+            occurrence_ids.explicit_ids.end());
+    std::unordered_set<OccurrenceId>
+        sparse_occurrence_set;
+    if (!occurrence_ids.isDense() &&
+        !occurrence_ids_sorted) {
+        sparse_occurrence_set.insert(
+            occurrence_ids.explicit_ids.begin(),
+            occurrence_ids.explicit_ids.end());
+    }
+    const auto contains_occurrence =
+        [&](OccurrenceId occurrence_id) {
+            if (occurrence_ids.isDense()) {
+                return occurrence_id >=
+                           occurrence_ids.dense_first &&
+                       occurrence_id -
+                               occurrence_ids.dense_first <
+                           occurrence_ids.dense_count;
+            }
+            return occurrence_ids_sorted
+                       ? std::binary_search(
+                             occurrence_ids.explicit_ids.begin(),
+                             occurrence_ids.explicit_ids.end(),
+                             occurrence_id)
+                       : sparse_occurrence_set
+                             .contains(occurrence_id);
+        };
     std::map<EndKey, std::set<int>>
         terminal_children;
     for (const auto& terminal : terminal_ends) {
-        if (!occurrence_set.contains(
+        if (!contains_occurrence(
                 terminal.end.occurrence_id)) {
             throw std::invalid_argument(
                 "Terminal evidence references an unknown ancestor occurrence");
@@ -6848,139 +10237,176 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
         }
     }
 
-    std::vector<EdgeSupport> admissible_edges;
-    admissible_edges.reserve(edges.size());
-    std::map<EndPairKey, const EdgeSupport*>
-        evidence_by_ends;
-    auto evidence_is_better =
-        [](const EdgeSupport& lhs,
-           const EdgeSupport& rhs) {
-            if (lhs.weighted_support !=
-                rhs.weighted_support) {
-                return lhs.weighted_support >
-                       rhs.weighted_support;
-            }
-            if (lhs.supporting_children.size() !=
-                rhs.supporting_children.size()) {
-                return lhs.supporting_children.size() >
-                       rhs.supporting_children.size();
-            }
-            if (lhs.occurrence_support !=
-                rhs.occurrence_support) {
-                return lhs.occurrence_support >
-                       rhs.occurrence_support;
-            }
-            return lhs.minimum_gap <
-                   rhs.minimum_gap;
-        };
-    for (const auto& edge : edges) {
-        const auto ends = edge_ends(edge);
-        if (confirmed_terminal_ends.contains(
-                ends.first) ||
-            confirmed_terminal_ends.contains(
-                ends.second)) {
-            continue;
-        }
-        admissible_edges.push_back(edge);
-        const EdgeSupport* stored =
-            &admissible_edges.back();
-        auto [it, inserted] =
-            evidence_by_ends.emplace(ends, stored);
-        if (!inserted &&
-            evidence_is_better(*stored, *it->second)) {
-            it->second = stored;
-        }
-    }
-
-    PathCoverResult paths =
-        buildMaximumCardinalityWeightPathCoverDetailedImpl(
-            occurrence_ids,
-            admissible_edges,
-            occurrence_order_keys,
-            nullptr);
+    PathCoverResult paths;
     AncestralSequenceAssembly assembly;
-    assembly.forward_by_occurrence =
-        std::move(paths.forward_by_occurrence);
-
     uint64_t direct_join_count = 0;
     uint64_t indirect_join_count = 0;
     uint64_t scaffold_join_count = 0;
     uint64_t gap_bases = 0;
-    for (const auto& path : paths.paths) {
-        if (path.empty()) {
-            throw std::runtime_error(
-                "Evidence-constrained path cover emitted an empty path");
-        }
-        AncestralSequencePath sequence;
-        sequence.supported_fragments.reserve(
-            path.size());
-        sequence.joins.reserve(path.size() - 1);
-        for (size_t index = 0;
-             index < path.size();
-             ++index) {
-            const OccurrenceId occurrence_id =
-                path[index];
-            sequence.supported_fragments.push_back(
-                {occurrence_id});
-            if (index == 0) {
+    auto materialize_paths = [&]<typename EdgeIndex>() {
+        std::vector<EdgeIndex> admissible_edges;
+        admissible_edges.reserve(edges.size());
+        auto evidence_is_better =
+            [](const EdgeSupport& lhs,
+               const EdgeSupport& rhs) {
+                if (lhs.weighted_support !=
+                    rhs.weighted_support) {
+                    return lhs.weighted_support >
+                           rhs.weighted_support;
+                }
+                if (lhs.supporting_children.size() !=
+                    rhs.supporting_children.size()) {
+                    return lhs.supporting_children.size() >
+                           rhs.supporting_children.size();
+                }
+                if (lhs.occurrence_support !=
+                    rhs.occurrence_support) {
+                    return lhs.occurrence_support >
+                           rhs.occurrence_support;
+                }
+                return lhs.minimum_gap <
+                       rhs.minimum_gap;
+            };
+        for (size_t edge_index = 0;
+             edge_index < edges.size();
+             ++edge_index) {
+            const auto& edge = edges[edge_index];
+            const auto ends = edge_ends(edge);
+            if (confirmed_terminal_ends.contains(
+                    ends.first) ||
+                confirmed_terminal_ends.contains(
+                    ends.second)) {
                 continue;
             }
-            const OccurrenceId previous =
-                path[index - 1];
-            const bool previous_forward =
-                assembly.forward_by_occurrence.at(
-                    previous);
-            const bool current_forward =
-                assembly.forward_by_occurrence.at(
-                    occurrence_id);
-            const EndPairKey ends =
-                canonical_end_pair(
-                    EndKey{
-                        previous,
-                        static_cast<uint8_t>(
-                            previous_forward
-                                ? OccurrenceEndSide::RIGHT
-                                : OccurrenceEndSide::LEFT)},
-                    EndKey{
-                        occurrence_id,
-                        static_cast<uint8_t>(
-                            current_forward
-                                ? OccurrenceEndSide::LEFT
-                                : OccurrenceEndSide::RIGHT)});
-            const auto edge_it =
-                evidence_by_ends.find(ends);
-            if (edge_it == evidence_by_ends.end()) {
-                throw std::runtime_error(
-                    "Evidence-constrained path cover selected an unsupported join");
-            }
-            const EdgeSupport& edge =
-                *edge_it->second;
-            if (edge.minimum_gap == 0) {
-                sequence.joins.push_back(
-                    ReferenceJoin{
-                        ReferenceJoinKind::DIRECT,
-                        0,
-                        edge.weighted_support});
-                ++direct_join_count;
-            } else {
-                sequence.joins.push_back(
-                    ReferenceJoin{
-                        ReferenceJoinKind::INDIRECT,
-                        scaffold_gap_length,
-                        edge.weighted_support});
-                ++indirect_join_count;
-                gap_bases += scaffold_gap_length;
-            }
+            admissible_edges.push_back(
+                static_cast<EdgeIndex>(edge_index));
         }
-        assembly.sequences.push_back(
-            std::move(sequence));
+
+        paths =
+            buildMaximumCardinalityWeightPathCoverDetailedImpl(
+                occurrence_ids,
+                edges,
+                EdgeIndexView<EdgeIndex>(
+                    admissible_edges),
+                order_key_for,
+                nullptr);
+        std::sort(
+            admissible_edges.begin(),
+            admissible_edges.end(),
+            [&](EdgeIndex lhs,
+                EdgeIndex rhs) {
+                const EndPairKey lhs_ends =
+                    edge_ends(edges[lhs]);
+                const EndPairKey rhs_ends =
+                    edge_ends(edges[rhs]);
+                if (lhs_ends != rhs_ends) {
+                    return lhs_ends < rhs_ends;
+                }
+                return lhs < rhs;
+            });
+        assembly.forward_by_occurrence =
+            std::move(paths.forward_by_occurrence);
+        for (auto& path : paths.paths) {
+            if (path.empty()) {
+                throw std::runtime_error(
+                    "Evidence-constrained path cover emitted an empty path");
+            }
+            AncestralSequencePath sequence;
+            sequence.path = std::move(path);
+            sequence.joins.reserve(
+                sequence.path.size() - 1);
+            for (size_t index = 0;
+                 index < sequence.path.size();
+                 ++index) {
+                const OccurrenceId occurrence_id =
+                    sequence.path[index];
+                if (index == 0) {
+                    continue;
+                }
+                const OccurrenceId previous =
+                    sequence.path[index - 1];
+                const bool previous_forward =
+                    assembly.forward_by_occurrence.at(
+                        previous);
+                const bool current_forward =
+                    assembly.forward_by_occurrence.at(
+                        occurrence_id);
+                const EndPairKey ends =
+                    canonical_end_pair(
+                        EndKey{
+                            previous,
+                            static_cast<uint8_t>(
+                                previous_forward
+                                    ? OccurrenceEndSide::RIGHT
+                                    : OccurrenceEndSide::LEFT)},
+                        EndKey{
+                            occurrence_id,
+                            static_cast<uint8_t>(
+                                current_forward
+                                    ? OccurrenceEndSide::LEFT
+                                    : OccurrenceEndSide::RIGHT)});
+                auto edge_it = std::lower_bound(
+                    admissible_edges.begin(),
+                    admissible_edges.end(),
+                    ends,
+                    [&](EdgeIndex edge_index,
+                        const EndPairKey& candidate) {
+                        return edge_ends(
+                                   edges[edge_index]) <
+                               candidate;
+                    });
+                if (edge_it == admissible_edges.end() ||
+                    edge_ends(edges[*edge_it]) != ends) {
+                    throw std::runtime_error(
+                        "Evidence-constrained path cover selected an unsupported join");
+                }
+                const EdgeSupport* best_edge =
+                    &edges[*edge_it];
+                for (++edge_it;
+                     edge_it != admissible_edges.end() &&
+                     edge_ends(edges[*edge_it]) == ends;
+                     ++edge_it) {
+                    if (evidence_is_better(
+                            edges[*edge_it],
+                            *best_edge)) {
+                        best_edge =
+                            &edges[*edge_it];
+                    }
+                }
+                const EdgeSupport& edge = *best_edge;
+                if (edge.minimum_gap == 0) {
+                    sequence.joins.push_back(
+                        ReferenceJoin{
+                            ReferenceJoinKind::DIRECT,
+                            0,
+                            edge.weighted_support});
+                    ++direct_join_count;
+                } else {
+                    sequence.joins.push_back(
+                        ReferenceJoin{
+                            ReferenceJoinKind::INDIRECT,
+                            scaffold_gap_length,
+                            edge.weighted_support});
+                    ++indirect_join_count;
+                    gap_bases += scaffold_gap_length;
+                }
+            }
+            assembly.sequences.push_back(
+                std::move(sequence));
+        }
+    };
+    if (edges.empty() ||
+        edges.size() - 1 <=
+            std::numeric_limits<uint32_t>::max()) {
+        materialize_paths.template operator()<uint32_t>();
+    } else {
+        materialize_paths.template operator()<uint64_t>();
     }
 
     std::vector<AncestralSequencePath> reference_paths =
         std::move(assembly.sequences);
     for (const auto& sequence : reference_paths) {
-        if (sequence.supported_fragments.empty() ||
-            sequence.supported_fragments.front().empty()) {
+        if (sequence.path.empty()) {
             throw std::runtime_error(
                 "Evidence-constrained path cover emitted an empty reference interval");
         }
@@ -6991,15 +10417,9 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
     auto endpoint =
         [&](const AncestralSequencePath& sequence,
             bool left) {
-            const auto& fragment =
-                left
-                    ? sequence.supported_fragments
-                          .front()
-                    : sequence.supported_fragments
-                          .back();
             const OccurrenceId occurrence_id =
-                left ? fragment.front()
-                     : fragment.back();
+                left ? sequence.path.front()
+                     : sequence.path.back();
             const bool forward =
                 assembly.forward_by_occurrence.at(
                     occurrence_id);
@@ -7017,21 +10437,18 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
     auto reverse_path =
         [&](AncestralSequencePath& sequence) {
             std::reverse(
-                sequence.supported_fragments.begin(),
-                sequence.supported_fragments.end());
+                sequence.path.begin(),
+                sequence.path.end());
             std::reverse(
                 sequence.joins.begin(),
                 sequence.joins.end());
-            for (const auto& fragment :
-                 sequence.supported_fragments) {
-                for (OccurrenceId occurrence_id :
-                     fragment) {
-                    auto& forward =
-                        assembly
-                            .forward_by_occurrence
-                            .at(occurrence_id);
-                    forward = !forward;
-                }
+            for (OccurrenceId occurrence_id :
+                 sequence.path) {
+                auto& forward =
+                    assembly
+                        .forward_by_occurrence
+                        .at(occurrence_id);
+                forward = !forward;
             }
         };
     auto orient_canonically =
@@ -7056,14 +10473,12 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
                     ReferenceJoinKind::SCAFFOLD,
                     scaffold_gap_length,
                     0.0L});
-            merged.supported_fragments.insert(
-                merged.supported_fragments.end(),
+            merged.path.insert(
+                merged.path.end(),
                 std::make_move_iterator(
-                    next.supported_fragments
-                        .begin()),
+                    next.path.begin()),
                 std::make_move_iterator(
-                    next.supported_fragments
-                        .end()));
+                    next.path.end()));
             merged.joins.insert(
                 merged.joins.end(),
                 std::make_move_iterator(
@@ -7322,6 +10737,53 @@ AncestralSequenceAssembly buildAncestralSequenceAssembly(
     return assembly;
 }
 
+template<typename OrderKeyFor>
+AncestralSequenceAssembly buildAncestralSequenceAssemblyImpl(
+    const std::vector<uint64_t>& occurrence_ids,
+    const std::vector<EdgeSupport>& edges,
+    const OrderKeyFor& order_key_for,
+    const std::vector<TerminalEndSupport>& terminal_ends,
+    uint32_t scaffold_gap_length,
+    ExportStats* stats) {
+    return buildAncestralSequenceAssemblyImpl(
+        OccurrenceIdView::explicitList(
+            occurrence_ids),
+        edges,
+        order_key_for,
+        terminal_ends,
+        scaffold_gap_length,
+        stats);
+}
+AncestralSequenceAssembly buildAncestralSequenceAssembly(
+    const std::vector<uint64_t>& occurrence_ids,
+    const std::vector<EdgeSupport>& edges,
+    const std::unordered_map<uint64_t, RunOrderKey>&
+        occurrence_order_keys,
+    const std::vector<TerminalEndSupport>& terminal_ends,
+    uint32_t scaffold_gap_length,
+    ExportStats* stats) {
+    const auto lookup =
+        [&](uint64_t occurrence_id)
+            -> std::optional<RunOrderKey> {
+            const auto it =
+                occurrence_order_keys.find(
+                    occurrence_id);
+            return it ==
+                           occurrence_order_keys.end()
+                       ? std::nullopt
+                       : std::optional<RunOrderKey>(
+                             it->second);
+        };
+    return buildAncestralSequenceAssemblyImpl(
+        occurrence_ids,
+        edges,
+        lookup,
+        terminal_ends,
+        scaffold_gap_length,
+        stats);
+}
+
+
 
 std::vector<GenomeSequenceName> buildOutputSequenceOrder(
     const std::vector<std::string>& genome_order,
@@ -7353,7 +10815,7 @@ std::vector<GenomeSequenceName> buildOutputSequenceOrder(
 }
 
 void exportToHal(
-    const std::vector<std::weak_ptr<Block>>& blocks,
+    const PreparedExportInput& prepared,
     const std::filesystem::path& hal_path,
     const std::map<SpeciesName, SeqPro::SharedManagerVariant>& seqpro_managers,
     NewickParser parser,
@@ -7371,6 +10833,10 @@ void exportToHal(
     if (seqpro_managers.empty()) {
         throw std::runtime_error("HAL export requires non-empty sequence managers");
     }
+    validatePreparedManagers(
+        prepared,
+        seqpro_managers);
+    rejectDirectoryOutput(hal_path);
     if (softmask_indexes.size() != seqpro_managers.size()) {
         throw std::runtime_error(
             "HAL export requires one soft-mask index per leaf genome");
@@ -7402,65 +10868,46 @@ void exportToHal(
     validateLeafNamesExact(parser, seqpro_managers);
     TreeMeta tree = buildTreeMeta(parser);
     local_stats.internal_node_count = tree.internal_postorder.size();
+    validatePreparedSoftmaskCoverage(
+        prepared,
+        softmask_indexes);
 
-    auto build_msa_begin = Clock::now();
-    std::vector<BlockPtr> live_blocks;
-    live_blocks.reserve(blocks.size());
-    for (const auto& weak_block : blocks) {
-        if (auto block = weak_block.lock()) {
-            live_blocks.push_back(std::move(block));
-        }
-    }
-    local_stats.block_count = live_blocks.size();
-
-    std::vector<std::optional<BlockMSA>> block_results(live_blocks.size());
-    std::exception_ptr build_failure;
-    std::mutex build_failure_mutex;
-    const int build_threads = std::max(1, config.parallel_threads);
-#pragma omp parallel for schedule(dynamic) num_threads(build_threads)
-    for (int64_t i = 0; i < static_cast<int64_t>(live_blocks.size()); ++i) {
-        try {
-            BlockMSA msa = buildBlockMSA(
-                live_blocks[static_cast<size_t>(i)],
-                tree,
-                seqpro_managers,
-                &softmask_indexes);
-            if (msa.block && !msa.leaf_rows.empty()) {
-                block_results[static_cast<size_t>(i)] = std::move(msa);
-            }
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(build_failure_mutex);
-            if (!build_failure) {
-                build_failure = std::current_exception();
-            }
-        }
-    }
-    if (build_failure) {
-        std::rethrow_exception(build_failure);
-    }
-
-    std::vector<BlockMSA> block_msas;
-    block_msas.reserve(live_blocks.size());
-    for (auto& result : block_results) {
-        if (result) {
-            block_msas.push_back(std::move(*result));
-        }
-    }
-    std::sort(block_msas.begin(), block_msas.end(), [](const BlockMSA& a, const BlockMSA& b) {
-        return exportBlockOrderLess(a.order_key, b.order_key);
-    });
-    local_stats.msa_count = block_msas.size();
-    local_stats.build_msa_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_msa_begin).count());
-    spdlog::info("HAL export built {} leaf-only block MSAs", block_msas.size());
-
+    local_stats.block_count =
+        prepared.records().size();
+    local_stats.msa_count =
+        prepared.records().size();
+    local_stats.build_msa_ms = 0;
+    RunStorage run_storage;
     auto build_runs_begin = Clock::now();
-    auto runs = buildColumnRuns(block_msas, tree);
-    const size_t projected_run_count = runs.size();
-    const auto secondary_selection =
-        selectCoordinateConsistentSecondaryRuns(runs);
+    auto prepared_runs =
+        prepareCommonColumnRuns(
+            prepared,
+            tree,
+            run_storage);
+    auto runs = std::move(prepared_runs.runs);
+    const auto& preparation =
+        prepared_runs.stats;
+    logHalMemory(
+        prepared_runs.reused_cache
+            ? "common-runs-reused"
+            : "common-runs-built",
+        runs.size(),
+        0);
+    restoreSelectedRunSoftmask(
+        runs,
+        run_storage,
+        softmask_indexes,
+        preparation.source_lengths_valid);
     const auto normalization =
-        normalizeOverlappingColumnRuns(runs, tree);
+        normalizeOverlappingColumnRuns(
+            runs,
+            tree);
+    FlatLeafSpanStorage flat_spans;
+    compactRuns(
+        runs,
+        run_storage,
+        flat_spans,
+        prepared.spoolPath().parent_path());
     local_stats.run_count = runs.size();
     for (const auto& run : runs) {
         local_stats.observed_occurrence_count +=
@@ -7473,12 +10920,12 @@ void exportToHal(
         "then normalized to {} runs across {} overlapping homology "
         "components ({} overlap constraints, {} duplicate leaf "
         "occurrences removed)",
-        projected_run_count,
-        secondary_selection.accepted_runs,
-        secondary_selection.candidate_runs,
-        secondary_selection.conflict_rejected_runs,
-        secondary_selection.redundant_runs,
-        secondary_selection.rejected_bases,
+        preparation.projected_run_count,
+        preparation.secondary_accepted_runs,
+        preparation.secondary_candidate_runs,
+        preparation.secondary_conflict_rejected_runs,
+        preparation.secondary_redundant_runs,
+        preparation.secondary_rejected_bases,
         normalization.output_runs,
         normalization.connected_components,
         normalization.overlap_constraints,
@@ -7488,36 +10935,98 @@ void exportToHal(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_runs_begin).count());
 
     auto infer_presence_begin = Clock::now();
+    FlatPresenceStorage run_presence(
+        tree.nodes.size());
+    std::vector<uint8_t> leaf_presence(
+        tree.leaf_ids.size(),
+        0);
     for (size_t i = 0; i < runs.size(); ++i) {
         auto& run = runs[i];
-        auto inference = inferDescendantUnionFast(tree, run.leaf_present);
-        run.present_by_node = std::move(inference.present_by_node);
-        run.presence_margin = std::move(inference.margin);
-        if ((i + 1) % 100000 == 0 || i + 1 == runs.size()) {
-            spdlog::info("HAL export inferred binary presence for {}/{} runs", i + 1, runs.size());
+        std::fill(
+            leaf_presence.begin(),
+            leaf_presence.end(),
+            0);
+        for (const auto& span : run.leaf_spans) {
+            const auto node_it =
+                tree.name_to_id.find(
+                    spanIdentity(
+                        span,
+                        span.leaf_name));
+            if (node_it == tree.name_to_id.end() ||
+                !tree.nodes[node_it->second].is_leaf) {
+                throw std::runtime_error(
+                    "HAL compact presence references an unknown leaf");
+            }
+            leaf_presence[
+                static_cast<size_t>(
+                    tree.nodes[node_it->second]
+                        .leaf_index)] = 1;
+        }
+        run.presence_offset =
+            run_presence.append(
+                inferDescendantUnionPresence(
+                    tree,
+                    leaf_presence));
+        if ((i + 1) % 100000 == 0 ||
+            i + 1 == runs.size()) {
+            spdlog::info(
+                "HAL export inferred binary presence for {}/{} runs",
+                i + 1,
+                runs.size());
         }
     }
+    const size_t compact_hal_bytes =
+        runs.capacity() * sizeof(ColumnRun) +
+        flat_spans.spans.capacity() *
+            sizeof(LeafRunSpan) +
+        run_storage.dnaCapacityBytes() +
+        run_storage.identityBytes() +
+        run_storage.identityCount() *
+            (sizeof(std::string) +
+             sizeof(std::string_view) +
+             sizeof(uint32_t)) +
+        run_presence.capacityBytes();
+    spdlog::info(
+        "HAL compact runs hold {} flat occurrences and {} identities; "
+        "approximate resident compact payload/capacity is {} bytes "
+        "including {} bytes of presence capacity "
+        "({} resident DNA cache capacity bytes, {} external DNA spool bytes)",
+        flat_spans.spans.size(),
+        run_storage.identityCount(),
+        compact_hal_bytes,
+        run_presence.capacityBytes(),
+        run_storage.dnaCapacityBytes(),
+        run_storage.dnaDiskBytes());
     local_stats.infer_presence_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - infer_presence_begin).count());
+    logHalMemory(
+        "run-presence-inferred",
+        runs.size(),
+        local_stats.observed_occurrence_count);
 
-    std::unordered_map<uint64_t, const ColumnRun*> run_by_id;
-    run_by_id.reserve(runs.size());
-    for (const auto& run : runs) {
-        run_by_id.emplace(run.run_id, &run);
-    }
 
     auto leaf_paths = buildLeafPaths(runs);
     auto build_models_begin = Clock::now();
-    auto models = buildNodeModels(
-        tree, runs, run_by_id, leaf_paths, config, &local_stats);
-    projectInternalReferenceContainersTopDown(
-        tree, config, models, &local_stats);
-    local_stats.build_models_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - build_models_begin).count());
-    for (const auto& [node_id, model] : models) {
-        (void)node_id;
-        local_stats.scaffold_count += model.sequences.size();
-    }
+    DiskNodeModelStore model_store(
+        prepared.spoolPath().parent_path());
+    buildNodeModelsOnDisk(
+        tree,
+        runs,
+        run_presence,
+        leaf_paths,
+        config,
+        &local_stats,
+        model_store);
+    local_stats.build_models_ms =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                Clock::now() - build_models_begin)
+                .count());
+    logHalMemory(
+        "models-persisted",
+        runs.size(),
+        local_stats.ancestor_occurrence_count);
 
     std::filesystem::path abs_hal_path = std::filesystem::absolute(hal_path);
     if (abs_hal_path.has_parent_path() && !abs_hal_path.parent_path().empty()) {
@@ -7539,64 +11048,212 @@ void exportToHal(
         }
     } temporary_hal_guard{tmp_hal_path};
 
-    std::filesystem::path base_prefix = abs_hal_path;
-    base_prefix.replace_extension();
+    // OpenMP's thread-count ICV belongs to the calling task. Limit the private
+    // HAL compressor without changing the caller's subsequent parallel work.
+    struct RestoreNativeThreadCount {
+        int previous = omp_get_max_threads();
+        ~RestoreNativeThreadCount() { omp_set_num_threads(previous); }
+    } restore_native_thread_count;
+    omp_set_num_threads(std::max(1, config.parallel_threads));
 
-    std::function<void(int)> append_subtree = [&](int node_id) {
-        auto emit_begin = Clock::now();
-        auto emissions = buildLocalSubtreeEmissions(node_id, tree, models, leaf_paths, run_by_id, seqpro_managers);
-        local_stats.emit_subtrees_ms += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - emit_begin).count());
-        accumulateEmissionStats(emissions, &local_stats);
+    NativeHalWriter writer(
+        tmp_hal_path, tree, seqpro_managers, softmask_indexes);
+    std::function<void(int)> append_subtree =
+        [&](int node_id) {
+            std::unordered_map<int, NodeModel> models;
+            models.emplace(
+                node_id,
+                model_store.load(
+                    node_id,
+                    NodeModelLoadMode::FULL));
+            for (int child_id :
+                 tree.nodes[node_id].children) {
+                if (tree.nodes[child_id].is_leaf) {
+                    continue;
+                }
+                models.emplace(
+                    child_id,
+                    model_store.load(
+                        child_id,
+                        NodeModelLoadMode::FULL));
+                projectInternalChildContainer(
+                    node_id,
+                    child_id,
+                    models,
+                    config.scaffold_gap_length,
+                    &local_stats);
+                model_store.store(
+                    child_id,
+                    models.at(child_id));
+            }
+            // Projection is complete and full child models are safely on disk.
+            // Keep placements and assembled DNA for emission, not a second
+            // consensus copy for every run. Reloads for descendants remain full.
+            for (auto& [id, model] : models) {
+                (void)id;
+                for (auto& run : model.runs) {
+                    std::string{}.swap(run.dna);
+                }
+                model.has_materialized_run_dna = false;
+            }
+#if defined(__GLIBC__)
+            ::malloc_trim(0);
+#endif
+            logHalMemory("subtree-consensus-released", 0, 0);
+            const size_t model_runs =
+                models.at(node_id).runs.size();
+            const size_t model_occurrences =
+                models.at(node_id).occurrences.size();
+            local_stats.scaffold_count +=
+                models.at(node_id).sequences.size();
+            {
+                const auto emit_begin = Clock::now();
+                auto emissions =
+                    buildLocalSubtreeEmissions(
+                        node_id,
+                        tree,
+                        models,
+                        leaf_paths,
+                        runs,
+                        run_presence,
+                        seqpro_managers);
+                const auto emit_ms =
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            Clock::now() - emit_begin)
+                            .count());
+                local_stats.emit_subtrees_ms +=
+                    emit_ms;
+                accumulateEmissionStats(
+                    emissions,
+                    &local_stats);
+                logHalMemory(
+                    "subtree-emissions-ready",
+                    model_runs,
+                    model_occurrences);
 
-        std::filesystem::path node_prefix = base_prefix;
-        node_prefix += "." + tree.nodes[node_id].name;
-        std::filesystem::path c2h_path = node_prefix;
-        c2h_path += ".c2h";
-        std::filesystem::path hal_fa_path = node_prefix;
-        hal_fa_path += ".hal.fa";
-        std::filesystem::path tree_path = node_prefix;
-        tree_path += ".newick";
-        struct GeneratedFileGuard {
-            std::array<std::filesystem::path, 3> paths;
-            ~GeneratedFileGuard() {
-                for (const auto& path : paths) {
-                    std::error_code error;
-                    std::filesystem::remove(path, error);
+                // All routing fields are now owned by the emission records.
+                // Only sequence DNA is borrowed. Move its vector ownership,
+                // not individual strings: short-string views must stay valid.
+                std::vector<std::vector<SequenceModel>> sequence_owners;
+                sequence_owners.reserve(models.size());
+                for (auto& [id, model] : models) {
+                    (void)id;
+                    for (auto& sequence : model.sequences) {
+                        std::vector<OrientedOccurrence>{}.swap(sequence.path);
+                        std::vector<ReferenceJoin>{}.swap(sequence.joins);
+                        std::vector<SequenceGap>{}.swap(sequence.gaps);
+                    }
+                    sequence_owners.push_back(std::move(model.sequences));
+                }
+                models.clear();
+                models.rehash(0);
+                // Each leaf's native top records have now consumed its path;
+                // internal descendants reload their separate persisted models.
+                for (int child_id : tree.nodes[node_id].children) {
+                    if (tree.nodes[child_id].is_leaf) {
+                        leaf_paths.erase(tree.nodes[child_id].name);
+                    }
+                }
+#if defined(__GLIBC__)
+                ::malloc_trim(0);
+#endif
+                logHalMemory(
+                    "subtree-routing-released",
+                    model_runs,
+                    model_occurrences);
+
+                const auto append_begin = Clock::now();
+                writer.appendSubtree(
+                    node_id,
+                    emissions);
+                const auto append_ms =
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            Clock::now() - append_begin)
+                            .count());
+                local_stats.hal_append_ms +=
+                    append_ms;
+                spdlog::info(
+                    "HAL export subtree {} native emit={} ms write={} ms",
+                    tree.nodes[node_id].name,
+                    emit_ms,
+                    append_ms);
+                logHalMemory(
+                    "subtree-appended",
+                    model_runs,
+                    model_occurrences);
+            }
+            logHalMemory(
+                "subtree-emissions-released",
+                model_runs,
+                model_occurrences);
+#if defined(__GLIBC__)
+            ::malloc_trim(0);
+#endif
+            logHalMemory(
+                "subtree-models-released",
+                0,
+                0);
+            for (int child_id :
+                 tree.nodes[node_id].children) {
+                if (!tree.nodes[child_id].is_leaf) {
+                    append_subtree(child_id);
                 }
             }
-        } generated_file_guard{{c2h_path, hal_fa_path, tree_path}};
-
-        auto genome_order = buildLocalGenomeOrder(tree, node_id);
-        writeC2H(c2h_path, genome_order, emissions);
-        writeHalFasta(
-            hal_fa_path,
-            genome_order,
-            emissions,
-            seqpro_managers,
-            softmask_indexes);
-        writeTreeFile(tree_path, buildLocalNewick(tree, node_id));
-        spdlog::info("HAL export wrote {}", c2h_path.string());
-        spdlog::info("HAL export wrote {}", hal_fa_path.string());
-
-        auto hal_append_begin = Clock::now();
-        runHalAppend(c2h_path, hal_fa_path, tree_path, tmp_hal_path);
-        local_stats.hal_append_ms += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - hal_append_begin).count());
-        for (int child_id : tree.nodes[node_id].children) {
-            if (!tree.nodes[child_id].is_leaf) {
-                append_subtree(child_id);
-            }
-        }
-    };
+        };
     append_subtree(tree.root_id);
+    const auto close_begin = Clock::now();
+    writer.close();
+    local_stats.hal_append_ms += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - close_begin).count());
 
 
-    if (std::filesystem::exists(abs_hal_path)) {
-        std::filesystem::remove(abs_hal_path);
+    std::filesystem::path backup_hal_path =
+        abs_hal_path;
+    backup_hal_path += ".replace-backup";
+    if (std::filesystem::exists(backup_hal_path)) {
+        if (std::filesystem::exists(abs_hal_path)) {
+            std::filesystem::remove(
+                backup_hal_path);
+        } else {
+            std::filesystem::rename(
+                backup_hal_path,
+                abs_hal_path);
+        }
     }
-    std::filesystem::rename(tmp_hal_path, abs_hal_path);
+    rejectDirectoryOutput(abs_hal_path);
+    const bool had_hal_destination =
+        std::filesystem::exists(abs_hal_path);
+    if (had_hal_destination) {
+        std::filesystem::rename(
+            abs_hal_path,
+            backup_hal_path);
+    }
+    try {
+        std::filesystem::rename(
+            tmp_hal_path,
+            abs_hal_path);
+    } catch (...) {
+        if (had_hal_destination) {
+            std::error_code restore_error;
+            std::filesystem::rename(
+                backup_hal_path,
+                abs_hal_path,
+                restore_error);
+        }
+        throw;
+    }
     temporary_hal_guard.committed = true;
+    if (had_hal_destination) {
+        std::error_code remove_error;
+        std::filesystem::remove(
+            backup_hal_path,
+            remove_error);
+    }
     spdlog::info("HAL export finished {}", abs_hal_path.string());
     spdlog::info(
         "HAL export stats: {} sequences from {} path vertices "

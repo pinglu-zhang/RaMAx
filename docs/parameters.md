@@ -1,6 +1,6 @@
 # Command-line parameters
 
-This page documents the public RaMAx 1.0.9 interface. Values and ranges follow
+This page documents the public RaMAx 1.1.0 interface. Values and ranges follow
 the current CLI implementation. Run `ramax --help` to inspect the installed
 binary.
 
@@ -33,7 +33,7 @@ binary.
 | Option | Type/default/range | Description |
 |---|---|---|
 | `--chunk_size` | integer; `10000000`; `1000000..INT_MAX` bp | Reference/query chunk size used during parallel anchor search. |
-| `--ref` | string; automatic | Prefer a named genome as reference. When omitted, RaMAx determines reference order from assembly statistics. |
+| `--ref` | string; automatic | Use the named, nonempty input genome as the first-round reference, regardless of sequence count or assembly quality. Remaining automatic references must have 1–10,000 sequences and retain N50 order. Without `--ref`, if no normal candidate exists, select the nonempty genome with the fewest sequences for one round; ties use N50 descending, total length descending, then name ascending. Unknown or empty explicit references are errors. |
 | `--overlap_size` | integer; `0`; `0..INT_MAX` bp | Overlap between adjacent chunks. It must be smaller than `--chunk_size`. |
 | `--min_anchor_length` | integer; `20`; `1..INT_MAX` bp | Minimum anchor length. |
 | `--max_anchor_frequency` | integer; `50`; `0..INT_MAX` | Maximum accepted anchor occurrence frequency. |

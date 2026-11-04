@@ -1,0 +1,76 @@
+{% set name = "ramax" %}
+{% set version = "1.1.0" %}
+{% set repository = "https://github.com/pinglu-zhang/RaMAx" %}
+{% set source_mode = environ.get("RAMAX_CONDA_SOURCE", "path") %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+{% if source_mode == "git" %}
+  git_url: "{{ repository }}.git"
+  git_rev: v{{ version }}
+{% else %}
+  path: ..
+{% endif %}
+
+build:
+  number: 0
+  skip: true  # [not linux]
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - {{ stdlib("c") }}
+    - binutils
+    - git
+    - cmake <4
+    - file
+    - make
+    - patchelf
+    - pkg-config
+
+  host:
+    - boost-cpp
+    - hdf5 >=1.14,<1.15
+    - libcurl
+    - libgomp
+    - tbb-devel
+    - zlib
+
+  run:
+    - hdf5 >=1.14,<1.15
+    - htslib 1.23.1 h633afcb_0
+    - libcurl
+    - libgomp
+    - mash 2.3 hb105d93_9
+    - minipoa 1.4.2 hd5d28ae_0
+    - samtools 1.23.1 ha83d96e_0
+    - tbb
+    - wfmash 0.14.0 h11f254b_0
+    - zlib
+
+test:
+  requires:
+    - binutils
+    - file
+  commands:
+    - bash "$RECIPE_DIR/run_test.sh"
+
+about:
+  home: "{{ repository }}"
+  license: MIT
+  license_file:
+    - LICENSE
+    - third_party/hal/LICENSE.txt
+  summary: "Whole-genome alignment and pangenome graph construction"
+  description: |
+    RaMAx aligns multiple genomes and exports MAF, PAF, GFA, and HAL.
+    This package installs minipoa 1.4.2 from the malab channel and provides
+    native HAL export linked against the bundled HAL implementation.
+
+extra:
+  identifiers:
+    - biotools:ramax

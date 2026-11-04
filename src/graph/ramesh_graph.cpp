@@ -4006,42 +4006,67 @@ void RaMeshMultiGenomeGraph::removeChromosome(const SpeciesName &species,
 void RaMeshMultiGenomeGraph::clearAllGraphs() {
   std::unique_lock graph_lock(rw);
 
-  // 1. Break Block <-> Segment ownership while every GenomeEnd is still alive.
-  // This lets unlinkSegment() see the real neighbours instead of a list that
-  // has already been reset to head <-> tail.
-  for (const auto &weak_block : blocks) {
-    auto block = weak_block.lock();
-    if (block) {
-      block->removeAllSegments();
-    }
-  }
-  blocks.clear();
-
-  // 2. Clear sampling and explicitly break the final head <-> tail shared_ptr
-  // cycle before destroying each GenomeEnd. clearAllSegments() intentionally
-  // leaves an empty, reusable list; clearAllGraphs() is terminal teardown.
   for (auto &[species, genome_graph] : species_graphs) {
     std::unique_lock species_lock(genome_graph.rw);
-    for (auto &[chr, genome_end] : genome_graph.chr2end) {
-      genome_end.clearAllSegments();
-      genome_end.sample_vec.clear();
-      if (genome_end.head) {
-        genome_end.head->primary_path.next.store(
-            nullptr, std::memory_order_release);
+    for (auto &[chr, end] : genome_graph.chr2end) {
+      std::unique_lock end_lock(end.rw);
+      std::vector<SegPtr>().swap(end.sample_vec);
+
+      // Detach even unanchored path segments with constant traversal scratch.
+      // Keeping current/next alive prevents recursive shared_ptr teardown.
+      SegPtr current = std::move(end.head);
+      SegPtr tail = std::move(end.tail);
+      while (current) {
+        SegPtr next = current->primary_path.next.exchange(
+            nullptr, std::memory_order_acq_rel);
+        current->primary_path.prev.store(nullptr, std::memory_order_release);
+        current->parent_block.reset();
+        Cigar_t().swap(current->cigar);
+        if (current == tail) {
+          break;
+        }
+        current = std::move(next);
       }
-      if (genome_end.tail) {
-        genome_end.tail->primary_path.prev.store(
-            nullptr, std::memory_order_release);
+      if (tail) {
+        tail->primary_path.next.store(nullptr, std::memory_order_release);
+        tail->primary_path.prev.store(nullptr, std::memory_order_release);
+        tail->parent_block.reset();
+        Cigar_t().swap(tail->cigar);
       }
-      genome_end.head.reset();
-      genome_end.tail.reset();
+      end.head_holder.reset();
+      end.tail_holder.reset();
     }
-    genome_graph.chr2end.clear();
   }
 
-  // 3. Clear the outer species map after all per-chromosome ownership has
-  // been dismantled.
-  species_graphs.clear();
+  // Secondary-only blocks need not occur on a chromosome path. Drain their
+  // Block <-> Segment cycles one anchor at a time without a global owner list.
+  for (const auto &weak_block : blocks) {
+    auto block = weak_block.lock();
+    if (!block) {
+      continue;
+    }
+    std::unique_lock block_lock(block->rw);
+    while (!block->anchors.empty()) {
+      auto anchor = block->anchors.begin();
+      SegPtr segment = std::move(anchor->second);
+      block->anchors.erase(anchor);
+      if (segment) {
+        segment->primary_path.next.store(nullptr, std::memory_order_release);
+        segment->primary_path.prev.store(nullptr, std::memory_order_release);
+        segment->parent_block.reset();
+        Cigar_t().swap(segment->cigar);
+      }
+    }
+    ChrHeadMap().swap(block->anchors);
+    SpeciesName().swap(block->ref_species);
+    ChrName().swap(block->ref_chr);
+  }
+
+  std::vector<WeakBlock>().swap(blocks);
+  std::vector<SecondaryAnchorCandidate>().swap(secondary_anchor_candidates);
+  std::vector<SpeciesName>().swap(reference_order);
+  decltype(species_graphs) released_graphs;
+  species_graphs.swap(released_graphs);
 }
 
 size_t RaMeshMultiGenomeGraph::compactBlockPool() {
