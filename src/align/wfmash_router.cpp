@@ -8,6 +8,8 @@
 #include <atomic>
 #include <charconv>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -550,8 +552,18 @@ public:
 
 using SteadyClock = std::chrono::steady_clock;
 
+SteadyClock::time_point pairDeadline(
+    SteadyClock::time_point started, std::chrono::milliseconds timeout) {
+    return timeout == std::chrono::milliseconds::zero()
+        ? SteadyClock::time_point::max()
+        : started + timeout;
+}
+
 std::chrono::milliseconds remainingPairBudget(
     SteadyClock::time_point deadline) {
+    if (deadline == SteadyClock::time_point::max()) {
+        return std::chrono::milliseconds::max();
+    }
     const auto now = SteadyClock::now();
     if (now >= deadline) return std::chrono::milliseconds::zero();
     return std::max(
@@ -596,10 +608,13 @@ RaMAxExternalTool::CommandResult runWfmashStage(
         "[wfmash-router] {} stage={} start worker={} threads={} "
         "pair_elapsed_ms={} remaining_ms={}",
         query.species, stage, worker_index, pair_threads,
-        pair_elapsed.count(), remaining.count());
+        pair_elapsed.count(), deadline == SteadyClock::time_point::max()
+            ? "unlimited" : std::to_string(remaining.count()));
 
     RaMAxExternalTool::RunOptions run_options;
-    run_options.timeout = remaining;
+    if (deadline != SteadyClock::time_point::max()) {
+        run_options.timeout = remaining;
+    }
     run_options.termination_grace = policy.termination_grace;
     run_options.poll_interval = policy.poll_interval;
     run_options.create_process_group = true;
@@ -630,7 +645,7 @@ PairExecutionResult executePair(
     const PreparedQuery& query,
     const WfmashRouterDetail::ExecutionPolicy& policy) {
     const auto pair_started = SteadyClock::now();
-    const auto deadline = pair_started + policy.pair_timeout;
+    const auto deadline = pairDeadline(pair_started, policy.pair_timeout);
     try {
         const auto tmp_root = query.directory / "tmp";
         const auto mapping_tmp = tmp_root / "mapping.attempt1";
@@ -832,7 +847,7 @@ MappingExecutionResult executeMappingStage(
     const WfmashRouterDetail::ExecutionPolicy& policy) {
     MappingExecutionResult result;
     const auto started = SteadyClock::now();
-    const auto deadline = started + policy.pair_timeout;
+    const auto deadline = pairDeadline(started, policy.pair_timeout);
     try {
         const auto mapping_tmp = query.directory / "tmp" / "mapping.attempt1";
         std::filesystem::create_directories(mapping_tmp);
@@ -1016,7 +1031,7 @@ void executeAlignmentChunk(
         if (!state.started) {
             state.started = true;
             state.started_at = SteadyClock::now();
-            state.deadline = state.started_at + policy.pair_timeout;
+            state.deadline = pairDeadline(state.started_at, policy.pair_timeout);
         }
     }
 
@@ -1163,6 +1178,7 @@ std::vector<PairExecutionResult> executeChunkedPairs(
     std::vector<PreparedQuery>& queries,
     const std::vector<size_t>& runnable,
     const WfmashRouterDetail::PairThreadSchedule& schedule,
+    uint_t total_threads,
     const WfmashRouterDetail::ExecutionPolicy& policy) {
     std::vector<PairExecutionResult> pair_results(queries.size());
     std::vector<MappingExecutionResult> mappings(queries.size());
@@ -1230,55 +1246,126 @@ std::vector<PairExecutionResult> executeChunkedPairs(
         size_t local_index{0};
         uint64_t cost{0};
     };
-    std::vector<OrderedChunk> first_wave;
-    std::vector<OrderedChunk> remainder;
+    std::vector<OrderedChunk> order;
     for (const size_t query_index : successful) {
         if (!states[query_index]) continue;
-        std::vector<size_t> order(chunks[query_index].size());
-        for (size_t index = 0; index < order.size(); ++index) order[index] = index;
-        std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
-            const auto& lhs = chunks[query_index][left];
-            const auto& rhs = chunks[query_index][right];
-            if (lhs.estimated_cost != rhs.estimated_cost) {
-                return lhs.estimated_cost > rhs.estimated_cost;
-            }
-            return lhs.chunk_index < rhs.chunk_index;
-        });
-        first_wave.push_back({query_index, order.front(),
-                              chunks[query_index][order.front()].estimated_cost});
-        for (size_t position = 1; position < order.size(); ++position) {
-            const size_t local = order[position];
-            remainder.push_back({query_index, local,
-                                 chunks[query_index][local].estimated_cost});
+        for (const auto& chunk : chunks[query_index]) {
+            order.push_back({query_index, chunk.chunk_index, chunk.estimated_cost});
         }
     }
-    const auto order_less = [](const OrderedChunk& left,
-                               const OrderedChunk& right) {
+    if (order.empty()) return pair_results;
+    std::sort(order.begin(), order.end(), [](const OrderedChunk& left,
+                                             const OrderedChunk& right) {
         if (left.cost != right.cost) return left.cost > right.cost;
         if (left.query_index != right.query_index) {
             return left.query_index < right.query_index;
         }
         return left.local_index < right.local_index;
-    };
-    std::sort(first_wave.begin(), first_wave.end(), order_less);
-    std::sort(remainder.begin(), remainder.end(), order_less);
-    std::vector<OrderedChunk> order;
-    order.reserve(first_wave.size() + remainder.size());
-    order.insert(order.end(), first_wave.begin(), first_wave.end());
-    order.insert(order.end(), remainder.begin(), remainder.end());
+    });
 
-#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+    struct Assignment {
+        size_t position;
+        uint_t threads;
+    };
+    std::deque<size_t> pending;
     for (size_t position = 0; position < order.size(); ++position) {
-        const auto selected = order[position];
+        pending.push_back(position);
+    }
+    std::deque<Assignment> assigned;
+    std::vector<size_t> active_chunks(queries.size(), 0);
+    size_t active_pairs = 0;
+    size_t in_flight = 0;
+    uint_t available_threads = total_threads;
+    size_t pool_size = 1;
+    std::mutex scheduling_mutex;
+    std::condition_variable work_available;
+
+    // Reservations in assigned count against both limits before workers launch them.
+    const auto refill = [&] {
+        const size_t slots = std::min<size_t>(pool_size - in_flight, available_threads);
+        std::vector<size_t> next_batch;
+        next_batch.reserve(std::min(slots, pending.size()));
+        while (next_batch.size() < slots && !pending.empty()) {
+            const bool admit_pair = active_pairs < policy.maximum_alignment_processes;
+            auto next = pending.end();
+            if (admit_pair) {
+                next = std::find_if(pending.begin(), pending.end(), [&](size_t index) {
+                    return active_chunks[order[index].query_index] == 0;
+                });
+            }
+            if (next == pending.end()) {
+                next = std::find_if(pending.begin(), pending.end(), [&](size_t index) {
+                    return active_chunks[order[index].query_index] != 0;
+                });
+            }
+            if (next == pending.end()) break;
+            const size_t position = *next;
+            pending.erase(next);
+            if (active_chunks[order[position].query_index]++ == 0) ++active_pairs;
+            next_batch.push_back(position);
+        }
+        if (next_batch.empty()) return;
+        const uint_t count = static_cast<uint_t>(next_batch.size());
+        const uint_t base = available_threads / count;
+        const uint_t remainder = available_threads % count;
+        for (uint_t i = 0; i < count; ++i) {
+            assigned.push_back({next_batch[i], base + (i < remainder ? 1U : 0U)});
+        }
+        available_threads = 0;
+        in_flight += count;
+    };
+
+    const int alignment_workers = static_cast<int>(
+        std::min<size_t>(total_threads, order.size()));
+#pragma omp parallel num_threads(alignment_workers)
+    {
         size_t worker_index = 0;
 #ifdef _OPENMP
         worker_index = static_cast<size_t>(omp_get_thread_num());
 #endif
-        executeAlignmentChunk(
-            wfmash, reference_fasta, queries[selected.query_index],
-            chunks[selected.query_index][selected.local_index],
-            *states[selected.query_index], position, worker_index,
-            schedule.threads_per_worker.at(worker_index), policy);
+#pragma omp single
+        {
+#ifdef _OPENMP
+            pool_size = static_cast<size_t>(omp_get_num_threads());
+#endif
+            refill();
+        }
+        while (true) {
+            Assignment assignment;
+            {
+                std::unique_lock<std::mutex> lock(scheduling_mutex);
+                work_available.wait(lock, [&] {
+                    return !assigned.empty() || pending.empty();
+                });
+                if (assigned.empty()) break;
+                assignment = assigned.front();
+                assigned.pop_front();
+            }
+            const auto selected = order[assignment.position];
+            auto& state = *states[selected.query_index];
+            executeAlignmentChunk(
+                wfmash, reference_fasta, queries[selected.query_index],
+                chunks[selected.query_index][selected.local_index], state,
+                assignment.position, worker_index, assignment.threads, policy);
+            {
+                std::lock_guard<std::mutex> lock(scheduling_mutex);
+                if (--active_chunks[selected.query_index] == 0) --active_pairs;
+                --in_flight;
+                available_threads += assignment.threads;
+                if (state.cancellation_requested.load(std::memory_order_relaxed)) {
+                    std::erase_if(pending, [&](size_t position) {
+                        const auto chunk = order[position];
+                        if (chunk.query_index != selected.query_index) return false;
+                        auto& result = state.results[chunk.local_index];
+                        result.cancelled = true;
+                        result.error = "cancelled before launch";
+                        return true;
+                    });
+                }
+                refill();
+            }
+            work_available.notify_all();
+        }
     }
 
     for (const size_t query_index : successful) {
@@ -1290,7 +1377,7 @@ std::vector<PairExecutionResult> executeChunkedPairs(
                 successful.begin(), successful.end(), query_index) -
                 successful.begin())];
         pair.chunk_count = chunks[query_index].size();
-        pair.alignment_workers = schedule.workers();
+        pair.alignment_workers = pool_size;
 
         bool failed = false;
         size_t failed_chunk = std::numeric_limits<size_t>::max();
@@ -1967,19 +2054,15 @@ uint_t threadsPerTask(size_t tasks, uint_t total_threads) {
 }
 
 PairThreadSchedule pairThreadSchedule(
-    size_t tasks, uint_t total_threads,
-    uint_t minimum_threads_per_process) {
+    size_t tasks, uint_t total_threads, uint_t batch_size) {
     PairThreadSchedule schedule;
+    if (batch_size == 0) {
+        throw std::invalid_argument("wfmash batch size must be positive");
+    }
     if (tasks == 0) return schedule;
 
     const uint_t normalized_threads = std::max<uint_t>(1, total_threads);
-    const uint_t normalized_minimum =
-        std::max<uint_t>(1, minimum_threads_per_process);
-    const size_t workers = normalized_threads < normalized_minimum
-        ? 1
-        : std::max<size_t>(
-              1, std::min<size_t>(
-                     tasks, normalized_threads / normalized_minimum));
+    const size_t workers = std::min<size_t>({tasks, normalized_threads, batch_size});
     schedule.threads_per_worker.resize(workers);
     const uint_t base = normalized_threads / static_cast<uint_t>(workers);
     const uint_t remainder = normalized_threads % static_cast<uint_t>(workers);
@@ -2003,10 +2086,9 @@ FirstRoundWfmashRouter::FirstRoundWfmashRouter(
       output_directory_(std::move(output_directory)),
       threads_(std::max<uint_t>(1, threads)),
       execution_policy_(execution_policy) {
-    if (execution_policy_.minimum_threads_per_process == 0 ||
-        execution_policy_.maximum_alignment_processes == 0 ||
+    if (execution_policy_.maximum_alignment_processes == 0 ||
         execution_policy_.alignment_chunks_per_worker == 0 ||
-        execution_policy_.pair_timeout <= std::chrono::milliseconds::zero() ||
+        execution_policy_.pair_timeout < std::chrono::milliseconds::zero() ||
         execution_policy_.termination_grace < std::chrono::milliseconds::zero() ||
         execution_policy_.poll_interval <= std::chrono::milliseconds::zero()) {
         throw std::runtime_error("Invalid wfmash execution policy");
@@ -2105,7 +2187,9 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
     }
     if (!fai_groups.empty()) {
         const int workers = static_cast<int>(
-            WfmashRouterDetail::workerCount(fai_groups.size(), threads_));
+            WfmashRouterDetail::workerCount(
+                std::min<size_t>(fai_groups.size(), execution_policy_.maximum_alignment_processes),
+                threads_));
 #pragma omp parallel for schedule(dynamic) num_threads(workers)
         for (size_t group_index = 0; group_index < fai_groups.size(); ++group_index) {
             const auto& indices = fai_groups[group_index];
@@ -2147,11 +2231,8 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
         return lhs.species < rhs.species;
     });
 
-    const size_t process_slots = std::min<size_t>(
-        runnable.size(), execution_policy_.maximum_alignment_processes);
     const auto pair_schedule = WfmashRouterDetail::pairThreadSchedule(
-        process_slots, threads_,
-        execution_policy_.minimum_threads_per_process);
+        runnable.size(), threads_, execution_policy_.maximum_alignment_processes);
     std::ostringstream thread_budgets;
     for (size_t worker = 0;
          worker < pair_schedule.threads_per_worker.size(); ++worker) {
@@ -2160,17 +2241,18 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
     }
     spdlog::info(
         "[wfmash-router] reference={} near={} far={} candidates={} "
-        "runnable={} workers={} thread_budgets=[{}] pair_timeout_ms={} "
+        "runnable={} workers={} batch={} thread_budgets=[{}] pair_timeout_ms={} "
         "chunks_per_worker={} params={}",
         reference, near_distance, far_distance, queries.size(), runnable.size(),
-        pair_schedule.workers(), thread_budgets.str(),
+        pair_schedule.workers(), execution_policy_.maximum_alignment_processes,
+        thread_budgets.str(),
         execution_policy_.pair_timeout.count(),
         execution_policy_.alignment_chunks_per_worker, kWfmashParameterSummary);
 
     std::vector<PairExecutionResult> pair_results = executeChunkedPairs(
         wfmash_executable_, reference_fasta, reference_records,
         reference_it->second, queries, runnable, pair_schedule,
-        execution_policy_);
+        threads_, execution_policy_);
 
     std::ostringstream routing;
     routing << "species\tdistance\tbackend\tstatus\tdetail\n";
@@ -2220,8 +2302,7 @@ FirstRoundWfmashResult FirstRoundWfmashRouter::run(
              << "wfmash\t" << wfmash_executable_.string() << '\t'
              << wfmash_version_ << '\n'
              << "parameters\t" << kWfmashParameterSummary << '\n'
-             << "execution_policy\tminimum_threads_per_process="
-             << execution_policy_.minimum_threads_per_process
+             << "execution_policy\tminimum_threads_per_process=1"
              << ";pair_timeout_ms=" << execution_policy_.pair_timeout.count()
              << ";maximum_alignment_processes="
              << execution_policy_.maximum_alignment_processes

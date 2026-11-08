@@ -106,9 +106,11 @@ cmake -S . -B build \
 
 ## Restart schema is incompatible
 
-RaMAx 1.0.8 and later write `schema_version: 6`. They can read schema-1 through
-schema-5 work directories, recover schema-1 legacy sidecars, trust eligible
-legacy preprocessing caches once, and write schema 6 after input validation.
+RaMAx writes `schema_version: 7` to store `--batch`. Schema-1 through
+schema-6 work directories use the default batch size of 20 unless the option is
+overridden on restart. RaMAx can recover schema-1 legacy sidecars and trust
+eligible legacy preprocessing caches once. It writes schema 7 after input
+validation.
 Parameters absent from an older schema use compatibility defaults, including
 `--sa-sampling-rate 1`, GFA profile `exact`, and GFA 1.1 for schemas that
 predate the corresponding settings. Missing schema information or an
@@ -120,20 +122,17 @@ artifact is different: RaMAx rebuilds only the affected raw, clean, or
 softmask artifact. The suffix-array index is memory-only and is rebuilt on
 every process start.
 
-## A wfmash pair times out
+## A wfmash pair falls back
 
-First-round wfmash routing gives each query a fixed 60-minute budget covering
-mapping, validation, alignment, retry coordination, and any alignment retry. A
-timeout is a routing fallback rather than a fatal RaMAx error: RaMAx terminates
-the complete wfmash process group and continues the query through the native
-suffix-array alignment path in the same reference round.
+First-round wfmash mapping and alignment wait for the external process without
+a time limit. If a stage fails after any applicable retry, or the resulting PAF
+fails validation, RaMAx continues the affected query through the native
+suffix-array path in the same reference round.
 
-Inspect `<workdir>/wfmash/round_0/routing.tsv` for `timeout_fallback`, then use
-the species directory below `round_0` to identify the timed-out stage from the
-stderr and `.part` files. These diagnostic files are intentionally retained;
-they are not accepted as completed PAF output. The main log reports the worker
-index, assigned wfmash threads, elapsed pair time, remaining budget, exit code,
-and terminating signal for each external stage.
+Inspect `<workdir>/wfmash/round_0/routing.tsv` for `fallback` and use the
+species directory below `round_0` to inspect stderr and `.part` files. The
+main log reports each worker's assigned threads, elapsed time, exit code, and
+terminating signal.
 
 ## MAF validation fails
 

@@ -32,7 +32,7 @@
 // ------------------------------------------------------------------
 struct CommonArgs {
 
-    uint32_t schema_version = 6;
+    uint32_t schema_version = 7;
 
     // ========================
     // 输入 / 输出路径相关参数
@@ -51,6 +51,7 @@ struct CommonArgs {
 
     bool restart = false;                       // 是否从已有中间结果重新启动任务
     int thread_num = std::thread::hardware_concurrency(); // 使用的线程数（默认使用所有 CPU 核心）
+    uint_t batch = kDefaultPairwiseBatchSize;
 
     MultipleGenomeOutputFormat output_format =
         MultipleGenomeOutputFormat::UNKNOWN;    // 多基因组输出格式（HAL、MAF、PAF、GFA）
@@ -160,11 +161,12 @@ struct CommonArgs {
             CEREAL_NVP(structural_break_max_span),
             CEREAL_NVP(repair_short_blocks)
         );
+        if (schema_version >= 7) ar(CEREAL_NVP(batch));
     }
 };
 
 namespace {
-constexpr uint32_t CONFIG_SCHEMA_VERSION = 6;
+constexpr uint32_t CONFIG_SCHEMA_VERSION = 7;
 constexpr uint32_t OUTPUTS_SCHEMA_VERSION = 1;
 constexpr const char* OUTPUTS_FILE = "outputs.json";
 constexpr const char* INPUT_MANIFEST_FILE = "input_manifest.json";
@@ -861,7 +863,7 @@ RestartOverrides captureRestartOverrides(const CLI::App& app,
                                          const CommonArgs& values) {
     RestartOverrides overrides;
     overrides.values = values;
-    constexpr std::array<const char*, 32> names{
+    constexpr std::array<const char*, 33> names{
         "--output", "--paf-mode", "--gfa-version", "--gfa-profile", "--chunk_size", "--root", "--ref",
         "--overlap_size", "--min_anchor_length", "--max_anchor_frequency",
         "--search-mode", "--accurate-skip-threshold", "--allow-mem",
@@ -870,7 +872,8 @@ RestartOverrides captureRestartOverrides(const CLI::App& app,
         "--repair-breaks", "--break-span", "--merge-short-blocks",
         "--slow-build", "--sampling-interval", "--sa-sampling-rate",
         "--min-span", "--threads",
-        "--log-level", "--verbose", "--near-distance", "--far-distance"
+        "--log-level", "--verbose", "--near-distance", "--far-distance",
+        "--batch"
     };
     for (const char* name : names) {
         if (app.count(name) != 0) overrides.specified.emplace(name);
@@ -926,6 +929,7 @@ void applyRestartOverrides(CommonArgs& args,
     if (overrides.has("--far-distance"))
         args.far_distance = value.far_distance;
     if (overrides.has("--threads")) args.thread_num = value.thread_num;
+    if (overrides.has("--batch")) args.batch = value.batch;
     if (overrides.has("--log-level")) args.log_level = value.log_level;
     if (overrides.has("--verbose")) {
         args.verbose = true;
@@ -1178,6 +1182,7 @@ inline void printRunConfiguration(const CommonArgs& args) {
     // Performance section
     spdlog::info("Performance:");
     spdlog::info("  Thread count          : {}", args.thread_num);
+    spdlog::info("  Pairwise batch limit  : {}", args.batch);
     spdlog::info("  Restart mode          : {}", args.restart ? "Enabled" : "Disabled");
 
 
@@ -1515,6 +1520,14 @@ inline void setupCommonOptions(CLI::App* cmd, CommonArgs& args) {
         ->type_name("<int>")
         ->transform(trim_whitespace);
 
+    cmd->add_option("--batch", args.batch,
+        "Maximum concurrent pairwise genome alignments, also capped by --threads. "
+        "Currently applied to first-round wfmash.")
+        ->capture_default_str()
+        ->group("Performance")
+        ->check(CLI::Range(1, std::numeric_limits<int>::max()))
+        ->type_name("<int>");
+
     // 复用预处理和锚点索引缓存；比对与构图始终重新开始
     auto* restart_flag = cmd->add_flag("--restart", args.restart,
         "Reuse raw/clean FASTA and anchor-index caches, then rerun alignment from the beginning; explicitly supplied options override saved values.")
@@ -1691,7 +1704,7 @@ static int runRestartMode(CommonArgs& common_args,
     const FilePath config_path = requested_work_dir / CONFIG_FILE;
     const uint32_t schema = detectConfigSchema(config_path);
     CommonArgs loaded;
-    if (schema == CONFIG_SCHEMA_VERSION) {
+    if (schema == CONFIG_SCHEMA_VERSION || schema == 6) {
         try {
             std::ifstream input(config_path);
             cereal::JSONInputArchive archive(input);
@@ -1824,6 +1837,10 @@ static int runRestartMode(CommonArgs& common_args,
     loaded.restart = true;
     loaded.pending_config_update = true;
     applyRestartOverrides(loaded, overrides);
+    if (loaded.batch == 0 ||
+        loaded.batch > std::numeric_limits<int>::max()) {
+        throw std::runtime_error("Invalid --batch in restart configuration");
+    }
     applyGraphOptimizationOptions(app, loaded);
     configureOutputs(loaded, loaded.output_paths);
 
@@ -2268,6 +2285,7 @@ static std::unique_ptr<RaMesh::RaMeshMultiGenomeGraph> runStarAlignment(
         common_args.thread_num;
     mra.near_distance_threshold = common_args.near_distance;
     mra.far_distance_threshold = common_args.far_distance;
+    mra.batch = common_args.batch;
     auto t_start_align = std::chrono::steady_clock::now();
 
     // 初始化采样间隔：确保不超过 reference_min_seq_length（避免越界/无效采样）
