@@ -1,4 +1,5 @@
 #include "external_msa_runner.h"
+#include "spawn_compat.h"
 
 #include <spdlog/spdlog.h>
 
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <fcntl.h>
 #include <filesystem>
@@ -25,8 +27,12 @@
 #include <vector>
 
 #if defined(__linux__)
-#include <linux/memfd.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
+// Some 2.17 sysroots predate linux/memfd.h. These are stable Linux ABI values.
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 #endif
 
 extern char** environ;
@@ -37,13 +43,15 @@ namespace {
 std::mutex configuration_mutex;
 std::string default_executable;
 std::filesystem::path scratch_directory;
-std::atomic<uint64_t> file_counter{0};
 std::atomic<uint64_t> completed{0};
 std::atomic<uint64_t> input_nanoseconds{0};
 std::atomic<uint64_t> process_nanoseconds{0};
 std::atomic<uint64_t> parse_nanoseconds{0};
 std::atomic<uint64_t> memfd_inputs{0};
+std::atomic<uint64_t> shm_inputs{0};
 std::atomic<uint64_t> file_inputs{0};
+std::atomic_flag input_warning = ATOMIC_FLAG_INIT;
+std::atomic<bool> memfd_unavailable{false};
 std::atomic<uint64_t> failures{0};
 std::atomic<uint64_t> cache_hits{0};
 std::atomic<uint64_t> cache_misses{0};
@@ -414,6 +422,7 @@ bool writeAll(int fd, const std::string& contents) {
     while (offset < contents.size()) {
         const ssize_t written = ::write(
             fd, contents.data() + offset, contents.size() - offset);
+        if (written == 0) return false;
         if (written < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -425,6 +434,7 @@ bool writeAll(int fd, const std::string& contents) {
 
 ScopedFd createMemfd(const std::string& contents) {
 #if defined(__linux__) && defined(SYS_memfd_create)
+    if (memfd_unavailable.load(std::memory_order_relaxed)) return {};
     const int fd = static_cast<int>(
         ::syscall(SYS_memfd_create, "ramax-minipoa-input", MFD_CLOEXEC));
     if (fd >= 0) {
@@ -432,12 +442,56 @@ ScopedFd createMemfd(const std::string& contents) {
         if (writeAll(fd, contents) && ::lseek(fd, 0, SEEK_SET) == 0) {
             return result;
         }
+    } else if (errno == ENOSYS || errno == EPERM || errno == EACCES) {
+        // Kernel/seccomp denial will not improve on the next short window.
+        memfd_unavailable.store(true, std::memory_order_relaxed);
     }
 #else
     (void)contents;
 #endif
     return {};
 }
+
+ScopedFd createTmpfsInput(const std::string& contents) {
+#if defined(__linux__)
+    // No shm_open/librt dependency, and no mmap writes that can SIGBUS when
+    // /dev/shm is full. Unlink immediately; the descriptor owns the lifetime.
+    char name[] = "/dev/shm/ramax-minipoa-XXXXXX";
+    ScopedFd result(::mkostemp(name, O_CLOEXEC));
+    if (!result) return {};
+    if (::unlink(name) != 0) return {};
+    struct statfs filesystem{};
+    constexpr long tmpfs_magic = 0x01021994;
+    if (::fstatfs(result.get(), &filesystem) != 0 ||
+        filesystem.f_type != tmpfs_magic) return {};
+    if (writeAll(result.get(), contents) && ::lseek(result.get(), 0, SEEK_SET) == 0)
+        return result;
+#else
+    (void)contents;
+#endif
+    return {};
+}
+
+#ifndef RAMAX_SPAWN_HAS_CHDIR
+std::string spawnHelper() {
+    std::filesystem::path helper;
+    if (const char* configured = std::getenv("RAMAX_SPAWN_HELPER"); configured && *configured) {
+        helper = std::filesystem::absolute(configured);
+    } else {
+        std::error_code error;
+        helper = std::filesystem::read_symlink("/proc/self/exe", error).parent_path()
+            / "ramax-spawn-helper";
+        if (error) throw std::runtime_error("Cannot locate ramax-spawn-helper beside executable");
+    }
+    std::error_code status_error;
+    if (!std::filesystem::is_regular_file(helper, status_error) ||
+        ::access(helper.c_str(), X_OK) != 0) {
+        throw std::runtime_error("Missing executable cwd helper: " + helper.string() +
+            "; install ramax-spawn-helper beside ramax or set RAMAX_SPAWN_HELPER");
+    }
+    return helper.string();
+}
+#endif
 
 bool readAll(int fd, std::string& contents) {
     std::array<char, 8192> buffer{};
@@ -548,6 +602,8 @@ void ExternalMsaRunner::configureDefaultExecutable(std::string executable) {
 
 void ExternalMsaRunner::configureScratchDirectory(
     std::filesystem::path directory) {
+    if (const char* local = std::getenv("RAMAX_MINIPOA_TMPDIR"); local && *local)
+        directory = local;
     if (directory.empty()) {
         throw std::invalid_argument(
             "External MSA scratch directory must not be empty");
@@ -561,7 +617,16 @@ void ExternalMsaRunner::configureScratchDirectory(
             directory.string() +
             (create_error ? ": " + create_error.message() : ""));
     }
+    if (::access(directory.c_str(), W_OK | X_OK) != 0)
+        throw std::system_error(errno, std::generic_category(),
+            "External MSA scratch directory is not writable: " + directory.string());
     removeStaleInternalTempFiles(directory);
+    spdlog::info("[external-msa] scratch={} cwd_mode={}", directory.string(),
+#ifdef RAMAX_SPAWN_HAS_CHDIR
+        "spawn-chdir");
+#else
+        "exec-helper");
+#endif
     std::lock_guard lock(configuration_mutex);
     scratch_directory = std::move(directory);
 }
@@ -585,6 +650,7 @@ bool ExternalMsaRunner::align(
         std::lock_guard lock(configuration_mutex);
         invocation_scratch = scratch_directory;
     }
+    if (invocation_scratch.empty()) invocation_scratch = std::filesystem::current_path();
     const auto input_start = std::chrono::steady_clock::now();
 
     auto& keys = thread_buffers.keys;
@@ -623,28 +689,29 @@ bool ExternalMsaRunner::align(
     CacheFlightGuard cache_guard(std::move(cache_lookup.owner));
 
     ScopedFd input_fd = createMemfd(input_text);
+    if (input_fd) {
+        memfd_inputs.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        input_fd = createTmpfsInput(input_text);
+        if (input_fd) shm_inputs.fetch_add(1, std::memory_order_relaxed);
+    }
     TemporaryInput temporary;
     std::string input_path;
     if (!input_fd) {
         file_inputs.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t serial = file_counter.fetch_add(1);
-        const uint64_t stamp = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        const auto& input_directory = invocation_scratch.empty()
-            ? std::filesystem::temp_directory_path()
-            : invocation_scratch;
-        temporary.path = input_directory /
-            ("ramax-minipoa-input-" + std::to_string(stamp) + "-" +
-             std::to_string(serial) + ".fa");
-        std::ofstream input(temporary.path, std::ios::binary);
-        if (!input || !(input << input_text)) {
+        if (!input_warning.test_and_set(std::memory_order_relaxed))
+            spdlog::warn("[external-msa] memfd/tmpfs unavailable; input files use {}. "
+                "For shared storage, set RAMAX_MINIPOA_TMPDIR to a job-private local directory.",
+                invocation_scratch.string());
+        std::string name = (invocation_scratch / "ramax-minipoa-input-XXXXXX").string();
+        ScopedFd file(::mkostemp(name.data(), O_CLOEXEC));
+        if (file) temporary.path = name;
+        if (!file || !writeAll(file.get(), input_text)) {
             throw std::runtime_error(
                 "Cannot create external MSA input: " +
                 temporary.path.string());
         }
         input_path = temporary.path.string();
-    } else {
-        memfd_inputs.fetch_add(1, std::memory_order_relaxed);
     }
 
     int pipe_fds[2] = {-1, -1};
@@ -659,8 +726,17 @@ bool ExternalMsaRunner::align(
     }
     ScopedFd output_read(pipe_fds[0]);
     ScopedFd output_write(pipe_fds[1]);
+    // Old libc may leave CLOEXEC set on a dup2(fd, fd) file action. Avoid
+    // standard descriptors as pipe sources, including callers with 0/1/2 closed.
+    for (ScopedFd* fd : {&output_read, &output_write}) {
+        if (fd->get() > STDERR_FILENO) continue;
+        const int duplicate = ::fcntl(fd->get(), F_DUPFD_CLOEXEC, 3);
+        if (duplicate < 0) throw std::system_error(errno, std::generic_category(),
+            "Cannot relocate MSA pipe descriptor");
+        fd->reset(duplicate);
+    }
 #if !defined(__linux__)
-    for (const int fd : pipe_fds) {
+    for (const int fd : {output_read.get(), output_write.get()}) {
         const int flags = ::fcntl(fd, F_GETFD);
         if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
             throw std::system_error(
@@ -678,80 +754,38 @@ bool ExternalMsaRunner::align(
         input_path = "/proc/self/fd/" + std::to_string(child_input_fd);
     }
 
-    posix_spawn_file_actions_t actions;
-    const int init_error = posix_spawn_file_actions_init(&actions);
-    if (init_error != 0) {
-        throw std::system_error(init_error, std::generic_category(),
-                                "Cannot initialize MSA spawn actions");
-    }
-    int action_error = 0;
-#if defined(__linux__) && defined(__GLIBC__) && defined(__GLIBC_PREREQ) && \
-    __GLIBC_PREREQ(2, 29)
-    if (!invocation_scratch.empty()) {
-        action_error = posix_spawn_file_actions_addchdir_np(
-            &actions, invocation_scratch.c_str());
-    }
+    // Resolve relative executable paths before the child changes directory.
+    std::string command = executable.find('/') != std::string::npos
+        ? std::filesystem::absolute(executable).string() : executable;
+    std::string launch = command;
+    RaMAxSpawn::FileActions actions;
+#ifdef RAMAX_SPAWN_HAS_CHDIR
+    actions.chdir(invocation_scratch.c_str());
+#else
+    launch = spawnHelper();
 #endif
-    if (action_error == 0 && input_fd) {
-        action_error = posix_spawn_file_actions_adddup2(
-            &actions, input_fd.get(), child_input_fd);
-    }
-    if (action_error == 0) action_error = posix_spawn_file_actions_adddup2(
-        &actions, output_write.get(), STDOUT_FILENO);
-    if (action_error == 0) action_error = posix_spawn_file_actions_addclose(
-        &actions, output_read.get());
-    if (action_error == 0 && output_write.get() != STDOUT_FILENO) {
-        action_error = posix_spawn_file_actions_addclose(
-            &actions, output_write.get());
-    }
-    if (action_error != 0) {
-        posix_spawn_file_actions_destroy(&actions);
-        throw std::system_error(action_error, std::generic_category(),
-                                "Cannot configure MSA spawn actions");
-    }
-
+    if (input_fd) actions.dup2(input_fd.get(), child_input_fd);
+    actions.dup2(output_write.get(), STDOUT_FILENO);
+    if (output_read.get() != STDOUT_FILENO) actions.close(output_read.get());
+    if (output_write.get() != STDOUT_FILENO) actions.close(output_write.get());
+    std::string cwd = invocation_scratch.string();
     std::vector<char*> arguments{
-        const_cast<char*>(executable.c_str()), input_path.data(),
+#ifndef RAMAX_SPAWN_HAS_CHDIR
+        launch.data(), cwd.data(),
+#endif
+        command.data(), input_path.data(),
         const_cast<char*>("-S"), const_cast<char*>("-f"),
         const_cast<char*>("0"), const_cast<char*>("-r1"), nullptr};
-    const posix_spawnattr_t* spawn_attributes = nullptr;
-#if defined(__linux__) && defined(__GLIBC__) && defined(POSIX_SPAWN_USEVFORK)
-#if !__GLIBC_PREREQ(2, 24)
-    // Older glibc otherwise forks when file actions are present, copying
-    // the large parent's page tables for every short minipoa invocation.
-    // Let libc perform the redirections and exec through its vfork path.
-    // Builds targeting glibc >= 2.24 keep their existing spawn behavior;
-    // newer runtimes also ignore this flag in old-sysroot builds.
-    posix_spawnattr_t attributes;
-    int attribute_error = posix_spawnattr_init(&attributes);
-    if (attribute_error == 0) {
-        attribute_error = posix_spawnattr_setflags(
-            &attributes, POSIX_SPAWN_USEVFORK);
-        if (attribute_error != 0) posix_spawnattr_destroy(&attributes);
-    }
-    if (attribute_error != 0) {
-        posix_spawn_file_actions_destroy(&actions);
-        throw std::system_error(attribute_error, std::generic_category(),
-                                "Cannot configure MSA spawn attributes");
-    }
-    spawn_attributes = &attributes;
-#endif
-#endif
+    RaMAxSpawn::Attributes attributes;
     pid_t pid = -1;
     const auto process_start = std::chrono::steady_clock::now();
     input_nanoseconds.fetch_add(
         elapsedNanoseconds(input_start, process_start));
-    const int spawn_error = executable.find('/') != std::string::npos
-        ? posix_spawn(&pid, executable.c_str(), &actions, spawn_attributes,
+    const int spawn_error = launch.find('/') != std::string::npos
+        ? posix_spawn(&pid, launch.c_str(), actions.get(), attributes.get(),
                       arguments.data(), environ)
-        : posix_spawnp(&pid, executable.c_str(), &actions, spawn_attributes,
+        : posix_spawnp(&pid, launch.c_str(), actions.get(), attributes.get(),
                        arguments.data(), environ);
-#if defined(__linux__) && defined(__GLIBC__) && defined(POSIX_SPAWN_USEVFORK)
-#if !__GLIBC_PREREQ(2, 24)
-    posix_spawnattr_destroy(&attributes);
-#endif
-#endif
-    posix_spawn_file_actions_destroy(&actions);
     if (spawn_error != 0) {
         failures.fetch_add(1, std::memory_order_relaxed);
         if (!spawn_warning.test_and_set(std::memory_order_relaxed)) {
@@ -799,14 +833,14 @@ void ExternalMsaRunner::logSummary() const {
     constexpr double kNsPerSecond = 1.0e9;
     spdlog::info(
         "[external-msa] completed={} failures={} input/process/parse="
-        "{:.3f}/{:.3f}/{:.3f}s inputs(memfd/file)={}/{} "
+        "{:.3f}/{:.3f}/{:.3f}s inputs(memfd/file)={}/{} tmpfs_inputs={} "
         "cache(hit/miss/single_flight)={}/{}/{} enabled={} "
         "internal_temp(found/removed/cleanup_failed)={}/{}/{}",
         completed.load(), failures.load(),
         input_nanoseconds.load() / kNsPerSecond,
         process_nanoseconds.load() / kNsPerSecond,
         parse_nanoseconds.load() / kNsPerSecond, memfd_inputs.load(),
-        file_inputs.load(), cache_hits.load(), cache_misses.load(),
+        file_inputs.load(), shm_inputs.load(), cache_hits.load(), cache_misses.load(),
         cache_single_flight_hits.load(), cache_enabled.load(),
         internal_temp_files_found.load(),
         internal_temp_files_removed.load(),
