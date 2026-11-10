@@ -102,7 +102,7 @@ def main():
     p.add_argument('--ramax', default='ramax')
     p.add_argument('--docker-image')
     p.add_argument('--hal-validator', type=Path, required=True)
-    p.add_argument('--version', default='1.1.0')
+    p.add_argument('--version', default='1.1.1')
     args = p.parse_args()
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)

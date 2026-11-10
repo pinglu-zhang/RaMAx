@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 - 2026-11-11
+
+- Balance wfmash chunks within thread and pair limits.
+- Fix legacy glibc tool startup and minipoa scratch handling.
+- Validate the Conda package and HAL export on glibc 2.17.
+
 ## 1.1.0 - 2026-11-04
 
 - Export HAL directly through the bundled HAL library, without requiring a

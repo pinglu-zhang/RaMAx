@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing immutable release tag
         required: true
-        default: v1.1.0
+        default: v1.1.1
         type: string
       validated_run_id:
         description: Original tagged-source run with all three successful validation artifacts

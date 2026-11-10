@@ -9,7 +9,7 @@ HAL output additionally requires a Newick species tree as the first record.
 ### Conda
 
 ```bash
-conda install -c malab -c conda-forge -c bioconda ramax=1.1.0 -y
+conda install -c malab -c conda-forge -c bioconda ramax=1.1.1 -y
 
 ramax --version
 ```
@@ -17,8 +17,8 @@ ramax --version
 ### Docker
 
 ```bash
-docker pull pingluzhang/ramax:1.1.0
-docker run --rm pingluzhang/ramax:1.1.0 --version
+docker pull pingluzhang/ramax:1.1.1
+docker run --rm pingluzhang/ramax:1.1.1 --version
 ```
 
 ## Quick start

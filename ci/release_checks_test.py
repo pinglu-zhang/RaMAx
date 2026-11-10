@@ -28,7 +28,7 @@ class ReleaseChecks(unittest.TestCase):
         self.assertEqual(glibc.required_versions("No version information found."), [])
 
     def test_current_metadata_and_wrong_tag(self):
-        self.assertEqual(contract.read_contract(ROOT, 'v1.1.0'), '1.1.0')
+        self.assertEqual(contract.read_contract(ROOT, 'v1.1.1'), '1.1.1')
         with self.assertRaises(ValueError):
             contract.read_contract(ROOT, 'v1.0.9')
 

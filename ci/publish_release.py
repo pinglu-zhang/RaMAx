@@ -91,8 +91,19 @@ def main():
             require(a.validated_run_id.isdecimal(), 'invalid validation run ID')
             run = gh_json(f'repos/{REPO}/actions/runs/{a.validated_run_id}')
             require(run['head_sha'] == commit and run['event'] == 'push' and
-                    run['path'] == '.github/workflows/release.yml',
+                    run['path'] == '.github/workflows/release.yml' and
+                    run['head_branch'] == a.tag,
                     'resume artifacts must originate from the same tagged-source validation run')
+            jobs = gh_json(f'repos/{REPO}/actions/runs/{a.validated_run_id}/jobs?filter=all&per_page=100')
+            require(jobs['total_count'] == len(jobs['jobs']), 'incomplete resume job history')
+            latest_jobs = {job['name']: job for job in sorted(jobs['jobs'], key=lambda job: job['id'])}
+            successful_jobs = {job['name'] for job in latest_jobs.values()
+                               if job['conclusion'] == 'success'}
+            require({
+                'Source build and four-format integration',
+                'Conda build and fresh installation',
+                'Docker build and unprivileged integration',
+            } <= successful_jobs, 'resume requires all three validation jobs to pass')
         tag = gh_json(f'repos/{REPO}/git/ref/tags/{a.tag}')['object']
         if tag['type'] == 'tag':
             tag = gh_json(f'repos/{REPO}/git/tags/{tag["sha"]}')['object']
@@ -106,7 +117,15 @@ def main():
             data = json.loads(unique(a.artifacts / group, filename).read_text())
             require(data['status'] == 'PASS' and data['version'] == version,
                     f'{group} did not pass installed-product checks')
-        package = unique(a.artifacts / 'conda-package', f'ramax-{version}-*.conda')
+        conda_artifacts = a.artifacts / 'conda-package'
+        legacy_marker = unique(conda_artifacts, 'legacy-acceptance/PASS')
+        require(legacy_marker.read_text().strip() ==
+                'PASS: glibc 2.17 runtime, dependency closure, launchers, full program',
+                'missing successful glibc 2.17 runtime acceptance')
+        legacy = json.loads(unique(conda_artifacts, 'legacy-acceptance/full-program/RESULT.json').read_text())
+        require(legacy['status'] == 'PASS' and legacy['version'] == version,
+                'glibc 2.17 runtime acceptance version mismatch')
+        package = unique(conda_artifacts, f'ramax-{version}-*.conda')
         package_sums = (package.parent.parent / 'SHA256SUMS').read_text().split()
         require(len(package_sums) == 2 and package_sums[1] == 'linux-64/' + package.name and
                 package_sums[0] == digest(package), 'retained Conda checksum mismatch')
@@ -189,6 +208,7 @@ def main():
                 'docker': {'image': version_image, 'image_id': image_id,
                            'repo_digests': final_image['RepoDigests'], 'platform': 'linux/amd64'},
                 'validation': {'source': 'PASS', 'conda': 'PASS', 'docker': 'PASS',
+                               'glibc_2_17': 'PASS',
                                'public_installations': 'PASS'}}
         (assets / 'BUILD_INFO.json').write_text(json.dumps(info, indent=2, sort_keys=True) + '\n')
         (assets / 'SHA256SUMS').write_text(''.join(digest(f) + '  ' + f.name + '\n'
