@@ -53,9 +53,12 @@ requirements:
     - zlib
 
 test:
+  source_files:
+    - ci/check_glibc.py
   requires:
     - binutils
     - file
+    - python >=3.9
   commands:
     - bash "$RECIPE_DIR/run_test.sh"
 

@@ -813,7 +813,8 @@ starAlignment(
     // before any native suffix-array index can be built.
     FirstRoundWfmashRouter wfmash_router(
         locateSamtoolsExecutable(), locateWfmashExecutable(),
-        work_dir / "wfmash" / "round_0", thread_num);
+        work_dir / "wfmash" / "round_0", thread_num,
+        {.maximum_alignment_processes = batch});
     const FirstRoundWfmashResult first_round_wfmash = wfmash_router.run(
         reference_order.front(), first_reference_distances,
         near_distance_threshold, far_distance_threshold, seqpro_managers);

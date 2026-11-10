@@ -62,6 +62,7 @@ public:
     std::vector<MashDistanceRecord> first_reference_distances;
     double near_distance_threshold{0.01};
     double far_distance_threshold{0.02};
+    uint_t batch{kDefaultPairwiseBatchSize};
 
     // 构造函数声明：注意名称必须与类名完全一致
     MultipleRareAligner(

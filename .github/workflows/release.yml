@@ -5,6 +5,7 @@ on:
     branches: [dev, master]
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
 permissions:
   contents: read
 
@@ -66,6 +67,7 @@ jobs:
           path: |
             evidence/
             build/Testing/Temporary/
+            build/spawn-tests/
             ${{ runner.temp }}/source-smoke/RESULT.json
             ${{ runner.temp }}/source-smoke/run.log
           if-no-files-found: error
@@ -98,18 +100,30 @@ jobs:
           RAMAX_CONDA_SOURCE: path
         run: |
           conda install -y -n base -c conda-forge conda-build anaconda-client
-          conda build recipe -c malab -c bioconda -c conda-forge --no-anaconda-upload --output-folder "$RUNNER_TEMP/conda-bld"
+          CONDA_OVERRIDE_GLIBC=2.17 conda build recipe -c malab -c bioconda -c conda-forge --no-anaconda-upload --output-folder "$RUNNER_TEMP/conda-bld"
       - name: Fresh installation and four-format integration
         run: |
           sudo apt-get update
           sudo apt-get install -y libhdf5-cpp-103-1 libtbb12 libcurl4
-          conda create -y -p "$RUNNER_TEMP/installed" --override-channels -c "file://$RUNNER_TEMP/conda-bld" -c malab -c bioconda -c conda-forge ramax=${{ needs.source.outputs.version }} python=3.11
-          validator="$(find source-evidence -name halValidate -type f -print -quit)"
-          test -n "$validator"
-          chmod +x "$validator"
-          conda run -p "$RUNNER_TEMP/installed" python ci/release_smoke.py --ramax "$RUNNER_TEMP/installed/bin/ramax" --hal-validator "$PWD/$validator" --output "$RUNNER_TEMP/conda-smoke" --version '${{ needs.source.outputs.version }}'
+          CONDA_OVERRIDE_GLIBC=2.17 conda create -y -p "$RUNNER_TEMP/installed" --override-channels -c "file://$RUNNER_TEMP/conda-bld" -c malab -c bioconda -c conda-forge ramax=${{ needs.source.outputs.version }} python=3.11
+          conda run -p "$RUNNER_TEMP/installed" python ci/release_smoke.py --ramax "$RUNNER_TEMP/installed/bin/ramax" --hal-validator "$RUNNER_TEMP/installed/libexec/ramax/ramax_release_hal_check" --output "$RUNNER_TEMP/conda-smoke" --version '${{ needs.source.outputs.version }}'
           cp "$RUNNER_TEMP/conda-smoke/RESULT.json" "$RUNNER_TEMP/conda-bld/conda-smoke.json"
           (cd "$RUNNER_TEMP/conda-bld" && sha256sum linux-64/ramax-*.conda > SHA256SUMS)
+      - name: Require actual glibc 2.17 runtime acceptance
+        env:
+          RAMAX_VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          image=quay.io/pypa/manylinux2014_x86_64:latest
+          docker pull "$image"
+          mkdir -p "$RUNNER_TEMP/legacy-acceptance"
+          docker image inspect "$image" > "$RUNNER_TEMP/legacy-acceptance/image.json"
+          conda list -p "$RUNNER_TEMP/installed" --explicit > "$RUNNER_TEMP/legacy-acceptance/environment.txt"
+          # Same absolute prefix preserves relocation and RPATH. No host libraries.
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e RAMAX_PREFIX="$RUNNER_TEMP/installed" -e RAMAX_VERSION \
+            -e EVIDENCE="$RUNNER_TEMP/legacy-acceptance" \
+            "$image" bash /src/ci/legacy_runtime_acceptance.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -120,6 +134,7 @@ jobs:
             ${{ runner.temp }}/conda-bld/SHA256SUMS
             ${{ runner.temp }}/conda-smoke/RESULT.json
             ${{ runner.temp }}/conda-smoke/run.log
+            ${{ runner.temp }}/legacy-acceptance/
           if-no-files-found: error
 
   docker:
@@ -178,7 +193,7 @@ jobs:
   publish:
     name: Publish verified artifacts and finalize the release
     needs: [source, conda, docker]
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     permissions:
