@@ -714,15 +714,43 @@ bool ExternalMsaRunner::align(
         const_cast<char*>(executable.c_str()), input_path.data(),
         const_cast<char*>("-S"), const_cast<char*>("-f"),
         const_cast<char*>("0"), const_cast<char*>("-r1"), nullptr};
+    const posix_spawnattr_t* spawn_attributes = nullptr;
+#if defined(__linux__) && defined(__GLIBC__) && defined(POSIX_SPAWN_USEVFORK)
+#if !__GLIBC_PREREQ(2, 24)
+    // Older glibc otherwise forks when file actions are present, copying
+    // the large parent's page tables for every short minipoa invocation.
+    // Let libc perform the redirections and exec through its vfork path.
+    // Builds targeting glibc >= 2.24 keep their existing spawn behavior;
+    // newer runtimes also ignore this flag in old-sysroot builds.
+    posix_spawnattr_t attributes;
+    int attribute_error = posix_spawnattr_init(&attributes);
+    if (attribute_error == 0) {
+        attribute_error = posix_spawnattr_setflags(
+            &attributes, POSIX_SPAWN_USEVFORK);
+        if (attribute_error != 0) posix_spawnattr_destroy(&attributes);
+    }
+    if (attribute_error != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        throw std::system_error(attribute_error, std::generic_category(),
+                                "Cannot configure MSA spawn attributes");
+    }
+    spawn_attributes = &attributes;
+#endif
+#endif
     pid_t pid = -1;
     const auto process_start = std::chrono::steady_clock::now();
     input_nanoseconds.fetch_add(
         elapsedNanoseconds(input_start, process_start));
     const int spawn_error = executable.find('/') != std::string::npos
-        ? posix_spawn(&pid, executable.c_str(), &actions, nullptr,
+        ? posix_spawn(&pid, executable.c_str(), &actions, spawn_attributes,
                       arguments.data(), environ)
-        : posix_spawnp(&pid, executable.c_str(), &actions, nullptr,
+        : posix_spawnp(&pid, executable.c_str(), &actions, spawn_attributes,
                        arguments.data(), environ);
+#if defined(__linux__) && defined(__GLIBC__) && defined(POSIX_SPAWN_USEVFORK)
+#if !__GLIBC_PREREQ(2, 24)
+    posix_spawnattr_destroy(&attributes);
+#endif
+#endif
     posix_spawn_file_actions_destroy(&actions);
     if (spawn_error != 0) {
         failures.fetch_add(1, std::memory_order_relaxed);
