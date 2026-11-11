@@ -21,6 +21,7 @@ cmake -S . -B build-conda \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DRAMAX_BUILD_TESTS=OFF \
+  -DRAMAX_INSTALL_VALIDATION_TOOLS=ON \
   -DRAMAX_BUILD_TOOLS=ON -DRAMAX_EMBED_TOOL_PATHS=OFF -DRAMAX_NATIVE_ARCH=OFF \
   -DRAMAX_HAL_LIBS="${hal_libs}" -DRAMAX_HAL_JOBS="${CPU_COUNT:-2}"
 cmake --build build-conda --parallel "${CPU_COUNT:-2}"
@@ -28,6 +29,8 @@ cmake --install build-conda
 
 test "$("${PREFIX}/bin/ramax" --version)" = "RaMAx version ${PKG_VERSION}"
 test -x "${PREFIX}/bin/ramax-paf-fasta"
+test -x "${PREFIX}/bin/ramax-spawn-helper"
+test -x "${PREFIX}/libexec/ramax/ramax_release_hal_check"
 install -d "${PREFIX}/share/licenses/ramax" "${PREFIX}/share/ramax"
 install -m 0644 LICENSE "${PREFIX}/share/licenses/ramax/RaMAx-LICENSE"
 install -m 0644 third_party/hal/LICENSE.txt "${PREFIX}/share/licenses/ramax/HAL-LICENSE.txt"

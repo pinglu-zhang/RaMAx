@@ -32,15 +32,23 @@ queries fall back to RaMAx's in-memory suffix-array aligner, and all later
 rounds use the same native backend. The reserved `--far-distance` default is
 `0.02` and does not yet affect routing.
 
-wfmash pairs share the RaMAx thread budget without oversubscribing the host.
-RaMAx selects the number of concurrent pairs from the available threads and
-starts larger queries first. Each query has a fixed 60-minute budget covering
-mapping, validation, alignment, retry coordination, and any alignment retry.
-If the budget expires, RaMAx terminates the complete wfmash process group,
-records `timeout_fallback` in
-`<workdir>/wfmash/round_0/routing.tsv`, and reroutes the query through the native
-first-round suffix-array path. Partial PAF, temporary files, and stderr logs are
-retained for diagnosis but are never accepted as successful output.
+`--batch` sets the maximum number of concurrent pairwise genome alignments
+(default 20). RaMAx currently applies it to first-round wfmash. The mapping worker
+count is the smallest of the number of eligible queries, `--threads`, and
+`--batch`. For example, six queries and `-t 8` use six workers with thread
+budgets of 2, 2, 1, 1, 1, and 1. Set `--batch 4` to cap that run at four
+mapping workers. During base-level alignment, a shared queue fills idle slots
+from the existing chunks. It prioritizes queries with no active chunk, then
+uses spare slots for additional chunks of active queries. Each query uses one
+batch slot across all of its active chunks. Each dispatch divides the available
+threads among the chunks being started. A chunk keeps its assigned thread count
+until it finishes, including any retry.
+Mapping, alignment, and retry coordination wait without a time limit. If
+execution fails after any applicable retry, or the output fails validation,
+RaMAx records `fallback` in
+`<workdir>/wfmash/round_0/routing.tsv` and reroutes the affected query through
+the native first-round suffix-array path. Partial PAF, temporary files, and
+stderr logs are retained for diagnosis.
 
 RaMAx requires Mash 2.3, PGGB-compatible wfmash
 `v0.14.0-0-g517e1bc`, and Samtools/HTSlib 1.23.1. All wfmash

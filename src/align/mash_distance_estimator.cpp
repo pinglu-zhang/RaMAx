@@ -1,4 +1,5 @@
 #include "mash_distance_estimator.h"
+#include "external_tool.h"
 
 #include <spdlog/spdlog.h>
 
@@ -8,19 +9,14 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
-#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <limits.h>
-#include <spawn.h>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
-
-extern char** environ;
 
 #ifndef RAMAX_MASH_CONFIGURED_PATH
 #define RAMAX_MASH_CONFIGURED_PATH ""
@@ -83,53 +79,9 @@ void runCommand(const std::filesystem::path& executable,
                 const std::vector<std::string>& arguments,
                 const std::filesystem::path& stdout_path,
                 const std::filesystem::path& stderr_path) {
-    const int stdout_fd = ::open(stdout_path.c_str(),
-        O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (stdout_fd < 0) {
-        throw std::runtime_error("Cannot open Mash stdout file: " +
-                                 stdout_path.string());
-    }
-    const int stderr_fd = ::open(stderr_path.c_str(),
-        O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (stderr_fd < 0) {
-        ::close(stdout_fd);
-        throw std::runtime_error("Cannot open Mash stderr file: " +
-                                 stderr_path.string());
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, stdout_fd, STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, stderr_fd, STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, stdout_fd);
-    posix_spawn_file_actions_addclose(&actions, stderr_fd);
-
-    std::vector<std::string> storage;
-    storage.reserve(arguments.size() + 1);
-    storage.push_back(executable.string());
-    storage.insert(storage.end(), arguments.begin(), arguments.end());
-    std::vector<char*> argv;
-    argv.reserve(storage.size() + 1);
-    for (auto& item : storage) argv.push_back(item.data());
-    argv.push_back(nullptr);
-
-    pid_t pid = 0;
-    const int spawn_error = ::posix_spawn(
-        &pid, executable.c_str(), &actions, nullptr, argv.data(), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    ::close(stdout_fd);
-    ::close(stderr_fd);
-    if (spawn_error != 0) {
-        throw std::runtime_error("Cannot start Mash: " +
-                                 std::string(std::strerror(spawn_error)));
-    }
-
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        throw std::runtime_error("Cannot wait for Mash process");
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    const auto result = RaMAxExternalTool::run(
+        executable, arguments, stdout_path, stderr_path);
+    if (result.exit_code != 0) {
         const std::string detail = readText(stderr_path);
         throw std::runtime_error(
             "Mash exited unsuccessfully" +

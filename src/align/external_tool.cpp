@@ -1,4 +1,5 @@
 #include "external_tool.h"
+#include "spawn_compat.h"
 
 #include <algorithm>
 #include <array>
@@ -176,29 +177,6 @@ CommandResult run(
     const std::filesystem::path& stderr_path,
     const RunOptions& options) {
     const auto start = Clock::now();
-    const int stdout_fd = ::open(stdout_path.c_str(),
-        O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (stdout_fd < 0) {
-        throw std::runtime_error("Cannot open command stdout file " +
-                                 stdout_path.string() + ": " +
-                                 std::strerror(errno));
-    }
-    const int stderr_fd = ::open(stderr_path.c_str(),
-        O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (stderr_fd < 0) {
-        ::close(stdout_fd);
-        throw std::runtime_error("Cannot open command stderr file " +
-                                 stderr_path.string() + ": " +
-                                 std::strerror(errno));
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, stdout_fd, STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, stderr_fd, STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, stdout_fd);
-    posix_spawn_file_actions_addclose(&actions, stderr_fd);
-
     std::vector<std::string> storage;
     storage.reserve(arguments.size() + 1);
     storage.push_back(executable.string());
@@ -208,43 +186,34 @@ CommandResult run(
     for (auto& value : storage) argv.push_back(value.data());
     argv.push_back(nullptr);
 
-    posix_spawnattr_t attributes;
-    bool attributes_initialized = false;
-    posix_spawnattr_t* attributes_pointer = nullptr;
-    if (options.create_process_group) {
-        int attribute_error = ::posix_spawnattr_init(&attributes);
-        attributes_initialized = attribute_error == 0;
-        if (attribute_error == 0) {
-            attribute_error = ::posix_spawnattr_setpgroup(&attributes, 0);
-        }
-        if (attribute_error == 0) {
-            attribute_error = ::posix_spawnattr_setflags(
-                &attributes, POSIX_SPAWN_SETPGROUP);
-        }
-        if (attribute_error != 0) {
-            if (attributes_initialized) {
-                ::posix_spawnattr_destroy(&attributes);
-            }
-            ::posix_spawn_file_actions_destroy(&actions);
-            ::close(stdout_fd);
-            ::close(stderr_fd);
-            throw std::runtime_error(
-                "Cannot configure child process group for " +
-                executable.string() + ": " + std::strerror(attribute_error));
-        }
-        attributes_pointer = &attributes;
-    }
-
     pid_t pid = -1;
-    const int spawn_error = ::posix_spawn(
-        &pid, executable.c_str(), &actions, attributes_pointer,
-        argv.data(), environ);
-    if (attributes_pointer != nullptr) {
-        ::posix_spawnattr_destroy(&attributes);
+    int spawn_error;
+    {
+        auto open_output = [](const std::filesystem::path& path) {
+            RaMAxSpawn::FileDescriptor original(::open(path.c_str(),
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+            if (original.get() < 0) {
+                throw std::system_error(errno, std::generic_category(),
+                    "Cannot open command output " + path.string());
+            }
+            // Keep file-action sources away from 0/1/2 even when the caller
+            // started with closed standard descriptors. Avoid cross-redirection.
+            int fd = ::fcntl(original.get(), F_DUPFD_CLOEXEC, 3);
+            if (fd < 0) throw std::system_error(errno, std::generic_category(),
+                "Cannot duplicate command output descriptor");
+            return fd;
+        };
+        RaMAxSpawn::FileDescriptor stdout_fd(open_output(stdout_path));
+        RaMAxSpawn::FileDescriptor stderr_fd(open_output(stderr_path));
+        RaMAxSpawn::FileActions actions;
+        actions.dup2(stdout_fd.get(), STDOUT_FILENO);
+        actions.dup2(stderr_fd.get(), STDERR_FILENO);
+        actions.close(stdout_fd.get());
+        actions.close(stderr_fd.get());
+        RaMAxSpawn::Attributes attributes(options.create_process_group);
+        spawn_error = ::posix_spawn(&pid, executable.c_str(), actions.get(),
+            attributes.get(), argv.data(), environ);
     }
-    posix_spawn_file_actions_destroy(&actions);
-    ::close(stdout_fd);
-    ::close(stderr_fd);
     if (spawn_error != 0) {
         throw std::runtime_error("Cannot start " + executable.string() +
                                  ": " + std::strerror(spawn_error));

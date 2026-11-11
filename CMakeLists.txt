@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaMAx VERSION 1.1.0 LANGUAGES C CXX)
+project(RaMAx VERSION 1.1.1 LANGUAGES C CXX)
 if(POLICY CMP0048)
     cmake_policy(SET CMP0048 NEW)
 endif()
@@ -58,6 +58,13 @@ find_package(TBB REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS CXX)
 
 set(RAMAX_HAL_HDF5_INCLUDE_FLAGS "")
+set(RAMAX_MAKE_CC "${CMAKE_C_COMPILER} ${CMAKE_C_FLAGS}")
+set(RAMAX_MAKE_CXX "${CMAKE_CXX_COMPILER} ${CMAKE_CXX_FLAGS}")
+if(CMAKE_SYSROOT)
+    # Nested Make builds do not inherit CMake's --sysroot automatically.
+    string(APPEND RAMAX_MAKE_CC " --sysroot=${CMAKE_SYSROOT}")
+    string(APPEND RAMAX_MAKE_CXX " --sysroot=${CMAKE_SYSROOT}")
+endif()
 foreach(dir IN LISTS HDF5_CXX_INCLUDE_DIRS)
     set(RAMAX_HAL_HDF5_INCLUDE_FLAGS "${RAMAX_HAL_HDF5_INCLUDE_FLAGS} -I${dir}")
 endforeach()
@@ -65,8 +72,8 @@ endforeach()
 add_custom_command(
     OUTPUT ${SONLIB_DIR}/lib/sonLib.h ${SONLIB_DIR}/lib/sonLib.a
     COMMAND ${MAKE_EXE} -C ${SONLIB_DIR} ${RAMAX_HAL_MAKE_JOBS} libs
-            "CC=${CMAKE_C_COMPILER}"
-            "CXX=${CMAKE_CXX_COMPILER}"
+            "CC=${RAMAX_MAKE_CC}"
+            "CXX=${RAMAX_MAKE_CXX}"
             "AR=${CMAKE_AR}"
             "RANLIB=${CMAKE_RANLIB}"
     WORKING_DIRECTORY ${SONLIB_DIR}
@@ -80,8 +87,8 @@ add_custom_target(sonLib_build
 add_custom_command(
     OUTPUT ${HAL_DIR}/lib/libHal.a
     COMMAND ${MAKE_EXE} -C ${HAL_DIR} ${RAMAX_HAL_MAKE_JOBS} libs
-            "CC=${CMAKE_C_COMPILER}"
-            "CXX=${CMAKE_CXX_COMPILER}"
+            "CC=${RAMAX_MAKE_CC}"
+            "CXX=${RAMAX_MAKE_CXX}"
             "AR=${CMAKE_AR}"
             "RANLIB=${CMAKE_RANLIB}"
             "HAL_HDF5_CFLAGS=${RAMAX_HAL_HDF5_INCLUDE_FLAGS}"
@@ -400,6 +407,8 @@ target_compile_definitions(ramax_core PRIVATE
     RAMAX_WFMASH_CONFIGURED_PATH="${RAMAX_COMPILED_WFMASH}")
 
 add_executable(ramax ${MAIN_X})
+add_executable(ramax-spawn-helper src/align/spawn_helper.c)
+add_dependencies(ramax ramax-spawn-helper)
 configure_rama_target(ramax)
 target_link_libraries(ramax PRIVATE ramax_core)
 
@@ -451,7 +460,7 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     endif()
 endif()
 
-install(TARGETS ramax DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(TARGETS ramax ramax-spawn-helper DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/licenses/ramax")
 
@@ -460,17 +469,31 @@ if(RAMAX_BUILD_TESTS)
     enable_testing()
 endif()
 
-# Release-only readers and metadata checks; never part of installed products.
-if(BUILD_TESTING)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+# Optional reader for package acceptance, built with the package's own sysroot.
+option(RAMAX_INSTALL_VALIDATION_TOOLS "Install the internal HAL acceptance reader" OFF)
+if(BUILD_TESTING OR RAMAX_INSTALL_VALIDATION_TOOLS)
     add_executable(ramax_release_hal_check ci/release_hal_check.cpp)
     configure_rama_target(ramax_release_hal_check)
     target_link_libraries(ramax_release_hal_check PRIVATE ramax_core)
+    if(RAMAX_INSTALL_VALIDATION_TOOLS)
+        install(TARGETS ramax_release_hal_check
+            DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/ramax")
+    endif()
+endif()
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME ramax_release_metadata_test
         COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_CURRENT_SOURCE_DIR}/ci -p release_checks_test.py -v)
     set_tests_properties(ramax_release_metadata_test PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME ramax_external_spawn_test
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ci/external_msa_spawn_test.py
+                --output ${CMAKE_CURRENT_BINARY_DIR}/spawn-tests
+                --cxx ${CMAKE_CXX_COMPILER} --cc ${CMAKE_C_COMPILER})
+        set_tests_properties(ramax_external_spawn_test PROPERTIES TIMEOUT 600)
+    endif()
 endif()
 
 if(RAMAX_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
