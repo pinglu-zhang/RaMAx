@@ -81,10 +81,10 @@ struct MappingChunkPlan {
 };
 
 struct ExecutionPolicy {
-    uint_t minimum_threads_per_process{4};
-    uint_t maximum_alignment_processes{4};
+    uint_t maximum_alignment_processes{kDefaultPairwiseBatchSize};
     uint_t alignment_chunks_per_worker{4};
-    std::chrono::milliseconds pair_timeout{std::chrono::hours(1)};
+    // Zero allows mapping, alignment and retry coordination to finish without a deadline.
+    std::chrono::milliseconds pair_timeout{0};
     std::chrono::milliseconds termination_grace{std::chrono::seconds(10)};
     std::chrono::milliseconds poll_interval{std::chrono::milliseconds(200)};
 };
@@ -108,7 +108,7 @@ size_t workerCount(size_t tasks, uint_t total_threads);
 uint_t threadsPerTask(size_t tasks, uint_t total_threads);
 PairThreadSchedule pairThreadSchedule(
     size_t tasks, uint_t total_threads,
-    uint_t minimum_threads_per_process = 4);
+    uint_t batch_size = kDefaultPairwiseBatchSize);
 
 uint64_t mappingAlignmentCost(const ParsedPafRecord& record);
 MappingChunkPlan makeMappingChunkPlan(

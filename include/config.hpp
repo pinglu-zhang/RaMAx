@@ -86,6 +86,7 @@ typedef uint32_t uint_t;
 #define I_MIN	INT32_MIN
 #endif
 
+inline constexpr uint_t kDefaultPairwiseBatchSize = 20;
 
 // TODO 这部分序列化内容放在这里不合适，更改到其他位置
 // ------------------------------------------------------------------

@@ -15,11 +15,20 @@ def module(name, path):
 
 contract = module('release_contract', ROOT / 'ci/check_release.py')
 smoke = module('release_smoke', ROOT / 'ci/release_smoke.py')
+glibc = module('check_glibc', ROOT / 'ci/check_glibc.py')
 
 
 class ReleaseChecks(unittest.TestCase):
+    def test_glibc_requires_not_exported_versions(self):
+        text = ("Version definition section '.gnu.version_d'\n"
+                "  Name: GLIBC_2.39\n"
+                "Version needs section '.gnu.version_r'\n"
+                "  Name: GLIBC_2.17\n  Name: GLIBC_2.2.5\n  Name: GLIBC_PRIVATE\n")
+        self.assertEqual(glibc.required_versions(text), ['GLIBC_2.2.5', 'GLIBC_2.17'])
+        self.assertEqual(glibc.required_versions("No version information found."), [])
+
     def test_current_metadata_and_wrong_tag(self):
-        self.assertEqual(contract.read_contract(ROOT, 'v1.1.0'), '1.1.0')
+        self.assertEqual(contract.read_contract(ROOT, 'v1.1.1'), '1.1.1')
         with self.assertRaises(ValueError):
             contract.read_contract(ROOT, 'v1.0.9')
 
