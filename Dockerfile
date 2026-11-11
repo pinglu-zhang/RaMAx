@@ -57,6 +57,7 @@ COPY src ./src
 COPY tools ./tools
 COPY third_party ./third_party
 
+# Transitive RPATH keeps HDF5's OpenSSL dependency in the bundled runtime.
 RUN set -eux; \
     test ! -e /src/tests; \
     test ! -e /src/tools/ramax-paf-fasta/build/ramax-paf-fasta; \
@@ -73,6 +74,7 @@ RUN set -eux; \
         -DCMAKE_INSTALL_RPATH=/opt/ramax/lib \
         -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--disable-new-dtags" \
         -DBUILD_EXAMPLES=OFF \
         -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTING=OFF \
@@ -136,6 +138,8 @@ RUN set -eux; \
     if /opt/ramax/bin/ramax --help | grep -q -- "--mask-repeats"; then exit 1; fi; \
     ldd /opt/ramax/bin/ramax | tee /tmp/ramax.ldd; \
     if grep -q "not found" /tmp/ramax.ldd; then exit 1; fi; \
+    grep -E 'libcrypto\.so\.3 => /opt/ramax/lib/' /tmp/ramax.ldd; \
+    grep -E 'libssl\.so\.3 => /opt/ramax/lib/' /tmp/ramax.ldd; \
     for executable in ramax mash wfmash samtools minipoa; do \
         test "$(command -v "${executable}")" = "/opt/ramax/bin/${executable}"; \
     done; \
